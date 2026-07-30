@@ -12,9 +12,9 @@ export interface CpuInfo {
   logicalProcessors: number;
   baseFrequencyMhz: number;
   boostFrequencyMhz: number;
-  cacheL1Kb?: number;
-  cacheL2Kb?: number;
-  cacheL3Kb?: number;
+  cacheL1Kb?: number | null;
+  cacheL2Kb?: number | null;
+  cacheL3Kb?: number | null;
   virtualizationSupported: boolean;
   simdCapabilities: string[];
 }
@@ -25,8 +25,8 @@ export interface GpuInfo {
   isDedicated: boolean;
   vramTotalBytes: number;
   vramFreeBytes: number;
-  driverVersion: string;
-  computeCapability?: string;
+  driverVersion?: string | null;
+  computeCapability?: string | null;
   cudaSupported: boolean;
   rocmSupported: boolean;
   directxSupported: boolean;
@@ -39,9 +39,9 @@ export interface MemoryInfo {
   availableBytes: number;
   usedBytes: number;
   memoryType: string;
-  speedMts: number;
-  totalSlots: number;
-  populatedSlots: number;
+  speedMts?: number | null;
+  totalSlots?: number | null;
+  populatedSlots?: number | null;
 }
 
 export interface StorageInfo {
@@ -87,8 +87,8 @@ export interface SoftwareEnvironment {
 export interface AIRuntimeInfo {
   name: string;
   status: 'running' | 'stopped' | 'not_installed' | string;
-  version?: string;
-  endpoint?: string;
+  version?: string | null;
+  endpoint?: string | null;
   modelsAvailable?: string[];
 }
 
@@ -103,15 +103,15 @@ export interface SystemPaths {
 }
 
 export interface AICapabilityProfile {
-  maxRecommendedModelSizeBytes: number;
+  maxRecommendedModelSizeBytes?: number | null;
   recommendedQuantizations: string[];
-  recommendedContextLength: number;
-  preferredInferenceBackend: string;
+  recommendedContextLength?: number | null;
+  preferredInferenceBackend?: string | null;
   multiModelCapable: boolean;
   loraReady: boolean;
   visionReady: boolean;
   embeddingReady: boolean;
-  extraCapabilities?: Record<string, boolean | string>;
+  extraCapabilities?: Record<string, boolean | string | number>;
 }
 
 export interface SystemValidationResult {

@@ -28,7 +28,7 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
     if gpus.is_empty() {
         gpus.push(GpuInfo {
             vendor: "Unknown".to_string(),
-            model: "Generic Display Adapter".to_string(),
+            model: "Unknown".to_string(),
             is_dedicated: false,
             vram_total_bytes: 0,
             vram_free_bytes: 0,

@@ -391,13 +391,13 @@ export const SystemInfo: React.FC = () => {
             <div className={styles.specRow}>
               <span className={styles.specLabel}>Memory Type & Speed</span>
               <span className={styles.specValue}>
-                {memory.memoryType} @ {formatNumber(memory.speedMts)} MT/s
+                {memory.memoryType} {memory.speedMts ? `@ ${formatNumber(memory.speedMts)} MT/s` : ''}
               </span>
             </div>
             <div className={styles.specRow}>
               <span className={styles.specLabel}>Memory Slots</span>
               <span className={styles.specValue}>
-                {memory.populatedSlots} / {memory.totalSlots} Slots Populated
+                {memory.populatedSlots ?? 'Unknown'} / {memory.totalSlots ?? 'Unknown'} Slots Populated
               </span>
             </div>
           </div>
@@ -545,16 +545,16 @@ export const SystemInfo: React.FC = () => {
             <div className={styles.specRow}>
               <span className={styles.specLabel}>Max Recommended Model Memory</span>
               <span className={styles.specValue} style={{ color: 'var(--accent)', fontWeight: 600 }}>
-                {formatBytes(aiCapabilities.maxRecommendedModelSizeBytes)}
+                {aiCapabilities.maxRecommendedModelSizeBytes ? formatBytes(aiCapabilities.maxRecommendedModelSizeBytes) : 'Unknown'}
               </span>
             </div>
             <div className={styles.specRow}>
               <span className={styles.specLabel}>Optimal Inference Backend</span>
-              <span className={styles.specValue}>{aiCapabilities.preferredInferenceBackend}</span>
+              <span className={styles.specValue}>{aiCapabilities.preferredInferenceBackend || 'Unknown'}</span>
             </div>
             <div className={styles.specRow}>
               <span className={styles.specLabel}>Recommended Context Window</span>
-              <span className={styles.specValue}>{formatNumber(aiCapabilities.recommendedContextLength)} Tokens</span>
+              <span className={styles.specValue}>{aiCapabilities.recommendedContextLength ? `${formatNumber(aiCapabilities.recommendedContextLength)} Tokens` : 'Unknown'}</span>
             </div>
 
             <div className={styles.specRow}>
