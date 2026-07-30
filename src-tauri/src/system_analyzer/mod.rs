@@ -40,28 +40,40 @@ impl SystemAnalyzerManager {
         let event_bus = get_event_bus();
         event_bus.publish(SarathiEvent::SystemAnalysisStarted, None);
 
-        match self.collect_all() {
-            Ok(profile) => {
-                {
-                    let mut lock = self.profile.lock().unwrap();
-                    *lock = Some(profile.clone());
-                }
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting CPU", "progress": 15 })));
+        let cpu = self.detect_cpu()?;
 
-                let json_val = serde_json::to_value(&profile).ok();
-                event_bus.publish(SarathiEvent::SystemAnalysisCompleted, json_val.clone());
-                event_bus.publish(SarathiEvent::HardwareProfileUpdated, json_val);
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting GPU", "progress": 30 })));
+        let gpus = self.detect_gpus()?;
 
-                Ok(profile)
-            }
-            Err(err) => {
-                let err_msg = err.to_string();
-                event_bus.publish(
-                    SarathiEvent::SystemAnalysisFailed,
-                    Some(json!({ "error": err_msg })),
-                );
-                Err(err)
-            }
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting Memory", "progress": 45 })));
+        let memory = self.detect_memory()?;
+
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting Storage", "progress": 60 })));
+        let storage = self.detect_storage()?;
+
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting Operating System", "progress": 75 })));
+        let os = self.detect_os()?;
+
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Detecting Installed Software", "progress": 90 })));
+        let software = self.detect_software()?;
+        let ai_runtimes = self.detect_ai_runtimes()?;
+        let paths = self.detect_paths()?;
+
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Building Hardware Profile", "progress": 98 })));
+        let profile = self.normalize(cpu, gpus, memory, storage, os, software, ai_runtimes, paths)?;
+
+        {
+            let mut lock = self.profile.lock().unwrap();
+            *lock = Some(profile.clone());
         }
+
+        let json_val = serde_json::to_value(&profile).ok();
+        event_bus.publish(SarathiEvent::SystemAnalysisProgress, Some(json!({ "step": "Complete", "progress": 100 })));
+        event_bus.publish(SarathiEvent::SystemAnalysisCompleted, json_val.clone());
+        event_bus.publish(SarathiEvent::HardwareProfileUpdated, json_val);
+
+        Ok(profile)
     }
 
     /// Retrieves a copy of the current cached hardware profile
