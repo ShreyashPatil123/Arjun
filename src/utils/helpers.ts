@@ -7,6 +7,24 @@ export function formatBytes(bytes: number, decimals = 2) {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 }
 
+export function formatFrequency(mhz: number): string {
+  if (!mhz) return 'N/A';
+  if (mhz >= 1000) {
+    return `${(mhz / 1000).toFixed(2)} GHz`;
+  }
+  return `${mhz} MHz`;
+}
+
+export function formatPercentage(used: number, total: number): number {
+  if (!total || total <= 0) return 0;
+  const pct = Math.round((used / total) * 100);
+  return Math.min(100, Math.max(0, pct));
+}
+
+export function formatNumber(num: number): string {
+  return new Intl.NumberFormat().format(num);
+}
+
 export function formatDate(date: string | Date) {
   return new Intl.DateTimeFormat('default', {
     dateStyle: 'medium',

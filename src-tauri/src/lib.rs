@@ -7,7 +7,7 @@ pub mod config;
 pub mod logging;
 pub mod commands;
 
-// Future phase skeletons
+// Future phase modules & skeletons
 pub mod system_analyzer;
 pub mod model_manager;
 pub mod model_providers;
@@ -18,7 +18,7 @@ pub mod installer;
 pub mod plugins;
 
 use tauri_plugin_log::{Target, TargetKind};
-use tauri_plugin_sql::{Builder as SqlBuilder};
+use tauri_plugin_sql::Builder as SqlBuilder;
 use log::info;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -50,13 +50,21 @@ pub fn run() {
         .plugin(sql_plugin)
         .plugin(log_plugin)
         .manage(sarathi_core)
-        .setup(|app| {
+        .setup(|_app| {
             info!("Sarathi application starting...");
-            
+
             // Initial event publication
             let event_bus = core::event_bus::get_event_bus();
             event_bus.publish(core::event_bus::SarathiEvent::ApplicationStarted, None);
-            
+
+            // Run initial system analysis task asynchronously on startup
+            tauri::async_runtime::spawn(async move {
+                let analyzer = system_analyzer::get_system_analyzer_manager();
+                if let Err(e) = analyzer.analyze_system() {
+                    log::error!("Initial system analysis failed: {}", e);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -68,11 +76,16 @@ pub fn run() {
             commands::config::get_default_config,
             commands::config::reset_config,
             commands::config::get_app_paths,
-            
+
             // System commands
             commands::system::get_app_info,
             commands::system::get_app_state_info,
             commands::system::log_activity,
+            commands::system::get_hardware_profile,
+            commands::system::analyze_system,
+            commands::system::override_hardware_value,
+            commands::system::revert_hardware_override,
+            commands::system::validate_system,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

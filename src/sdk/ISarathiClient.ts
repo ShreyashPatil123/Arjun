@@ -12,6 +12,7 @@ import { AppConfig, AppPaths } from '../types/config';
 import { AppState } from '../types/app-state';
 import { Theme } from '../types/theme';
 import { Setting, ActivityLogEntry } from '../types/database';
+import { HardwareProfile, SystemValidationResult } from '../types/system';
 
 export interface ISarathiConfigService {
   getConfig(): Promise<AppConfig>;
@@ -42,10 +43,14 @@ export interface ISarathiThemeService {
   applyTheme(theme: 'dark' | 'light'): void;
 }
 
-// ─── FUTURE PHASE SERVICE INTERFACES (STUBS) ───
+// ─── PHASE 2 SERVICE INTERFACES ───
 
 export interface ISarathiSystemAnalyzerService {
-  getHardwareProfile(): Promise<unknown>;
+  getHardwareProfile(): Promise<HardwareProfile | null>;
+  analyzeSystem(): Promise<HardwareProfile>;
+  overrideHardwareValue(fieldPath: string, value: unknown): Promise<HardwareProfile>;
+  revertHardwareOverride(fieldPath: string): Promise<HardwareProfile>;
+  validateSystem(): Promise<SystemValidationResult>;
 }
 
 export interface ISarathiModelManagerService {
@@ -80,7 +85,7 @@ export interface ISarathiClient {
   readonly database: ISarathiDatabaseService;
   readonly theme: ISarathiThemeService;
   
-  // Future phase modules
+  // Modules
   readonly systemAnalyzer: ISarathiSystemAnalyzerService;
   readonly modelManager: ISarathiModelManagerService;
   readonly modelProviders: ISarathiModelProviderService;

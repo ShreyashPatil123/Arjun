@@ -1,4 +1,4 @@
-import { ISarathiClient } from './ISarathiClient';
+import { ISarathiClient, ISarathiSystemAnalyzerService } from './ISarathiClient';
 import * as configService from '../services/config.service';
 import * as appService from '../services/app.service';
 import * as dbService from '../services/database.service';
@@ -42,8 +42,12 @@ export class SarathiTauriClient implements ISarathiClient {
   };
 
   // Phase 2: System Analyzer
-  readonly systemAnalyzer = {
-    getHardwareProfile: async () => systemService.getHardwareProfile(),
+  readonly systemAnalyzer: ISarathiSystemAnalyzerService = {
+    getHardwareProfile: () => systemService.getHardwareProfile(),
+    analyzeSystem: () => systemService.analyzeSystem(),
+    overrideHardwareValue: (fieldPath: string, value: unknown) => systemService.overrideHardwareValue(fieldPath, value),
+    revertHardwareOverride: (fieldPath: string) => systemService.revertHardwareOverride(fieldPath),
+    validateSystem: () => systemService.validateSystem(),
   };
 
   // Phase 3: Model Manager
