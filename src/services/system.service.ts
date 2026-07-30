@@ -111,14 +111,18 @@ function setNestedField(obj: any, path: string, value: unknown): void {
   current[parts[parts.length - 1]] = value;
 }
 
-export async function getHardwareProfile(): Promise<HardwareProfile | null> {
+export async function getHardwareProfile(): Promise<HardwareProfile> {
   try {
     const profile = await getBackendService().invoke<HardwareProfile | null>('get_hardware_profile');
-    if (profile) return profile;
+    if (profile && profile.cpu && profile.cpu.model !== 'Unknown') {
+      return profile;
+    }
+    // If cached profile is null or un-analyzed, trigger fresh system analysis
+    return await analyzeSystem();
   } catch (err) {
-    console.debug('Tauri get_hardware_profile invoke fallback:', err);
+    console.debug('Tauri get_hardware_profile invoke fallback to analyzeSystem:', err);
+    return await analyzeSystem();
   }
-  return { ...emptyHardwareProfile };
 }
 
 export async function analyzeSystem(): Promise<HardwareProfile> {
@@ -126,7 +130,7 @@ export async function analyzeSystem(): Promise<HardwareProfile> {
     const profile = await getBackendService().invoke<HardwareProfile>('analyze_system');
     if (profile) return profile;
   } catch (err) {
-    console.debug('Tauri analyze_system invoke fallback:', err);
+    console.debug('Tauri analyze_system invoke failed:', err);
   }
   return { ...emptyHardwareProfile };
 }
