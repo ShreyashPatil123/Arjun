@@ -1,5 +1,6 @@
 //! System RAM memory specs collector using sysinfo and WMI/OS queries
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::MemoryInfo;
 use sysinfo::System;
 
@@ -33,10 +34,8 @@ fn query_memory_hardware_details() -> (String, Option<u32>, Option<u32>, Option<
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-
         // Query memory chip details via WMI
-        if let Ok(output) = Command::new("wmic")
+        if let Ok(output) = create_hidden_command("wmic")
             .args([
                 "memorychip",
                 "get",
@@ -83,7 +82,7 @@ fn query_memory_hardware_details() -> (String, Option<u32>, Option<u32>, Option<
         }
 
         // Query physical memory array for slot counts
-        if let Ok(output) = Command::new("wmic")
+        if let Ok(output) = create_hidden_command("wmic")
             .args([
                 "path",
                 "Win32_PhysicalMemoryArray",

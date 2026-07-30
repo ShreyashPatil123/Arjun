@@ -1,9 +1,9 @@
 //! Local AI Runtimes (Ollama, vLLM, etc.) health and status detector
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::AIRuntimeInfo;
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::process::Command;
 use std::time::Duration;
 
 #[derive(Deserialize)]
@@ -53,7 +53,7 @@ fn check_ollama() -> AIRuntimeInfo {
     }
 
     // Port not listening, check if ollama CLI binary exists
-    if let Ok(output) = Command::new("ollama").arg("--version").output() {
+    if let Ok(output) = create_hidden_command("ollama").arg("--version").output() {
         if output.status.success() || !output.stdout.is_empty() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let version = stdout.lines().next().unwrap_or("Ollama").trim().to_string();

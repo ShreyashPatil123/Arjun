@@ -10,6 +10,7 @@ pub mod normalization;
 pub mod os_collector;
 pub mod overrides;
 pub mod path_collector;
+pub mod process_utils;
 pub mod software_collector;
 pub mod storage_collector;
 pub mod traits;

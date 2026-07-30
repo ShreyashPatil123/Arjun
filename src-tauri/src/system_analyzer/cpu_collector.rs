@@ -1,5 +1,6 @@
 //! CPU specs collector using sysinfo and system APIs
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::CpuInfo;
 use sysinfo::{CpuRefreshKind, System};
 
@@ -120,8 +121,7 @@ fn query_cpu_cache_and_virt() -> (Option<u32>, Option<u32>, Option<u32>, bool) {
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        if let Ok(output) = Command::new("wmic")
+        if let Ok(output) = create_hidden_command("wmic")
             .args([
                 "cpu",
                 "get",

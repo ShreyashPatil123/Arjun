@@ -1,5 +1,6 @@
 //! OS details collector using sysinfo and platform utilities
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::OsInfo;
 use sysinfo::System;
 
@@ -28,8 +29,7 @@ fn query_os_edition_and_locale() -> (String, String) {
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        if let Ok(output) = Command::new("wmic")
+        if let Ok(output) = create_hidden_command("wmic")
             .args(["os", "get", "Caption,MUILanguages", "/format:list"])
             .output()
         {

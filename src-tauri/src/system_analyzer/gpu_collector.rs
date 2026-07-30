@@ -1,7 +1,7 @@
 //! GPU details collector using CLI tools (nvidia-smi, rocm-smi) and WMI/system tools
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::GpuInfo;
-use std::process::Command;
 
 /// Detects available GPUs on the system
 pub fn detect_gpus() -> Vec<GpuInfo> {
@@ -46,7 +46,7 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 }
 
 fn query_nvidia_smi() -> Result<Vec<GpuInfo>, ()> {
-    let output = Command::new("nvidia-smi")
+    let output = create_hidden_command("nvidia-smi")
         .args([
             "--query-gpu=gpu_name,driver_version,memory.total,memory.free,compute_cap",
             "--format=csv,noheader,nounits",
@@ -93,7 +93,7 @@ fn query_nvidia_smi() -> Result<Vec<GpuInfo>, ()> {
 fn query_wmi_videocontroller() -> Result<Vec<GpuInfo>, ()> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("wmic")
+        let output = create_hidden_command("wmic")
             .args([
                 "path",
                 "win32_videocontroller",
@@ -143,7 +143,7 @@ fn query_wmi_videocontroller() -> Result<Vec<GpuInfo>, ()> {
                         model: current_name.clone(),
                         is_dedicated,
                         vram_total_bytes: current_ram,
-                        vram_free_bytes: current_ram / 2, // Estimated available
+                        vram_free_bytes: current_ram / 2,
                         driver_version: current_driver.clone(),
                         compute_capability: None,
                         cuda_supported: is_cuda,

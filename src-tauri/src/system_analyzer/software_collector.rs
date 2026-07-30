@@ -1,7 +1,7 @@
 //! Developer software dependencies collector using PATH and registry checks
 
+use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::{SoftwareDetectorInfo, SoftwareEnvironment};
-use std::process::Command;
 
 /// Detects system software environment dependencies
 pub fn detect_software() -> SoftwareEnvironment {
@@ -33,7 +33,7 @@ pub fn detect_software() -> SoftwareEnvironment {
 
 fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&str]) -> SoftwareDetectorInfo {
     for bin in binary_names {
-        if let Ok(output) = Command::new(bin).args(version_args).output() {
+        if let Ok(output) = create_hidden_command(bin).args(version_args).output() {
             if output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -63,7 +63,7 @@ fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&
 fn resolve_binary_path(bin: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        if let Ok(output) = Command::new("where").arg(bin).output() {
+        if let Ok(output) = create_hidden_command("where").arg(bin).output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -75,7 +75,7 @@ fn resolve_binary_path(bin: &str) -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        if let Ok(output) = Command::new("which").arg(bin).output() {
+        if let Ok(output) = create_hidden_command("which").arg(bin).output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -94,7 +94,7 @@ fn parse_version_string(raw: &str) -> String {
 }
 
 fn check_cuda_toolkit() -> SoftwareDetectorInfo {
-    if let Ok(output) = Command::new("nvcc").arg("--version").output() {
+    if let Ok(output) = create_hidden_command("nvcc").arg("--version").output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let version = stdout
@@ -145,7 +145,7 @@ fn check_vc_redistributable() -> SoftwareDetectorInfo {
         }
 
         // Check Windows registry via reg query
-        if let Ok(output) = Command::new("reg")
+        if let Ok(output) = create_hidden_command("reg")
             .args([
                 "query",
                 "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
