@@ -5,6 +5,8 @@ use crate::system_analyzer::traits::{SoftwareDetectorInfo, SoftwareEnvironment};
 
 /// Detects system software environment dependencies
 pub fn detect_software() -> SoftwareEnvironment {
+    log::info!("[SYSTEM ANALYZER DEBUG] 🚀 Software Collector Started");
+
     let python = check_executable("Python", &["python", "python3"], &["--version"]);
     let rust = check_executable("Rust", &["rustc"], &["--version"]);
     let cargo = check_executable("Cargo", &["cargo"], &["--version"]);
@@ -15,6 +17,9 @@ pub fn detect_software() -> SoftwareEnvironment {
     let ollama = check_executable("Ollama", &["ollama"], &["--version"]);
     let cuda_toolkit = check_cuda_toolkit();
     let vc_redistributable = check_vc_redistributable();
+
+    log::info!("[SYSTEM ANALYZER DEBUG] ✓ Software Detection Summary: Python={}, Rust={}, Git={}, Node={}, Ollama={}",
+        python.installed, rust.installed, git.installed, nodejs.installed, ollama.installed);
 
     SoftwareEnvironment {
         python,
@@ -39,8 +44,9 @@ fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let raw_out = if !stdout.trim().is_empty() { stdout } else { stderr };
                 let version = parse_version_string(&raw_out);
-
                 let path = resolve_binary_path(bin);
+
+                log::info!("[SYSTEM ANALYZER DEBUG] ✓ Found {}: version={:?}, path={:?}", display_name, version, path);
 
                 return SoftwareDetectorInfo {
                     name: display_name.to_string(),
@@ -51,6 +57,8 @@ fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&
             }
         }
     }
+
+    log::info!("[SYSTEM ANALYZER DEBUG] ℹ️ {} not found on PATH", display_name);
 
     SoftwareDetectorInfo {
         name: display_name.to_string(),
@@ -133,7 +141,6 @@ fn check_cuda_toolkit() -> SoftwareDetectorInfo {
 fn check_vc_redistributable() -> SoftwareDetectorInfo {
     #[cfg(target_os = "windows")]
     {
-        // Check system32 for vcruntime140.dll
         let system32 = std::path::Path::new("C:\\Windows\\System32\\vcruntime140.dll");
         if system32.exists() {
             return SoftwareDetectorInfo {
@@ -142,26 +149,6 @@ fn check_vc_redistributable() -> SoftwareDetectorInfo {
                 version: Some("v140 (2015-2022)".to_string()),
                 path: Some(system32.to_string_lossy().to_string()),
             };
-        }
-
-        // Check Windows registry via reg query
-        if let Ok(output) = create_hidden_command("reg")
-            .args([
-                "query",
-                "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
-                "/v",
-                "Installed",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                return SoftwareDetectorInfo {
-                    name: "Visual C++ Redistributable".to_string(),
-                    installed: true,
-                    version: Some("v140 x64".to_string()),
-                    path: None,
-                };
-            }
         }
     }
 
