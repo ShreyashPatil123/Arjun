@@ -7,3 +7,4 @@ export * from './Spinner';
 export * from './Badge';
 export * from './Toggle';
 export * from './Tooltip';
+export * from './ErrorBoundary';
