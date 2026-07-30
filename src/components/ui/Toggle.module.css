@@ -1,0 +1,12 @@
+.container { display: flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+.toggle { position: relative; background: var(--bg-tertiary); border: 1px solid var(--border-default); border-radius: var(--radius-full); transition: all var(--transition-base); }
+.sm { width: 32px; height: 18px; }
+.md { width: 44px; height: 24px; }
+.checked { background: var(--accent-primary); border-color: var(--accent-primary); }
+.thumb { position: absolute; top: 1px; left: 1px; background: white; border-radius: 50%; transition: transform var(--transition-fast); }
+.sm .thumb { width: 14px; height: 14px; }
+.md .thumb { width: 20px; height: 20px; }
+.checked.sm .thumb { transform: translateX(14px); }
+.checked.md .thumb { transform: translateX(20px); }
+.disabled { opacity: 0.5; cursor: not-allowed; }
+.label { font-size: var(--text-sm); color: var(--text-primary); }

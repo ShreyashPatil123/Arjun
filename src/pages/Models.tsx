@@ -1,0 +1,2 @@
+import React from 'react';
+export const Models = () => <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100%',color:'var(--text-secondary)'}}>Model Management &mdash; Coming in Phase 3</div>;

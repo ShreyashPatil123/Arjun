@@ -1,0 +1,27 @@
+[package]
+name = "sarathi"
+version = "0.1.0"
+description = "Sarathi: A Local-First LoRA Orchestration System"
+authors = ["Sarathi Team"]
+edition = "2021"
+
+[lib]
+name = "sarathi_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt"] }
+uuid = { version = "1", features = ["v4"] }

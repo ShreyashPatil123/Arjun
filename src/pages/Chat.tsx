@@ -1,0 +1,2 @@
+import React from 'react';
+export const Chat = () => <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100%',color:'var(--text-secondary)'}}>AI Chat &mdash; Coming in Phase 5</div>;

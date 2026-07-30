@@ -1,0 +1,10 @@
+.container {
+  max-width: 800px; margin: 0 auto; padding: var(--space-8);
+  display: flex; flex-direction: column; gap: var(--space-6);
+}
+.title { font-size: var(--text-2xl); font-weight: var(--font-bold); margin: 0 0 var(--space-6); }
+.sectionTitle { font-size: var(--text-lg); font-weight: var(--font-semibold); margin: 0 0 var(--space-4); }
+.row { display: flex; justify-content: space-between; align-items: center; }
+.info { display: flex; flex-direction: column; gap: var(--space-1); }
+.label { font-weight: var(--font-medium); color: var(--text-primary); }
+.desc { font-size: var(--text-sm); color: var(--text-secondary); }

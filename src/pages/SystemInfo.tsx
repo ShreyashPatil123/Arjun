@@ -1,0 +1,2 @@
+import React from 'react';
+export const SystemInfo = () => <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100%',color:'var(--text-secondary)'}}>System Analysis &mdash; Coming in Phase 2</div>;

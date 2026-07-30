@@ -1,0 +1,17 @@
+.card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  transition: all var(--transition-base);
+}
+.hoverable:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-focus);
+}
+.padding-sm { padding: var(--space-3); }
+.padding-md { padding: var(--space-4); }
+.padding-lg { padding: var(--space-6); }
+.header { border-bottom: 1px solid var(--border-default); padding: var(--space-3) var(--space-4); font-weight: var(--font-semibold); }
+.footer { border-top: 1px solid var(--border-default); padding: var(--space-3) var(--space-4); background: var(--bg-tertiary); }

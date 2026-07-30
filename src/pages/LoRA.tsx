@@ -1,0 +1,2 @@
+import React from 'react';
+export const LoRA = () => <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100%',color:'var(--text-secondary)'}}>LoRA Orchestration &mdash; Coming in Phase 6</div>;
