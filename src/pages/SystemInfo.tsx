@@ -23,7 +23,7 @@ import {
 import { Card, Button, Badge, Dialog, Input, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
 import * as systemService from '../services/system.service';
-import { HardwareProfile, StorageInfo, SoftwareDetectorInfo } from '../types/system';
+import { HardwareProfile, CpuInfo, GpuInfo, MemoryInfo, StorageInfo, OsInfo, SoftwareEnvironment, AIRuntimeInfo, OverrideValue } from '../types/system';
 import {
   formatBytes,
   formatFrequency,
@@ -32,6 +32,48 @@ import {
   classNames
 } from '../utils/helpers';
 import styles from './SystemInfo.module.css';
+
+function unwrapOverride<T>(field: OverrideValue<T> | T | undefined, fallback: T): T {
+  if (field === undefined || field === null) return fallback;
+  if (typeof field === 'object' && field !== null && 'detected' in field) {
+    const ov = field as OverrideValue<T>;
+    if (ov.isOverridden || (ov as any).is_overridden) {
+      if (ov.overridden !== null && ov.overridden !== undefined) {
+        return ov.overridden;
+      }
+    }
+    return ov.detected ?? fallback;
+  }
+  return (field as T) ?? fallback;
+}
+
+const emptyCpu: CpuInfo = {
+  manufacturer: 'Unknown',
+  model: 'Unknown',
+  architecture: 'Unknown',
+  physicalCores: 0,
+  logicalProcessors: 0,
+  baseFrequencyMhz: 0,
+  boostFrequencyMhz: 0,
+  virtualizationSupported: false,
+  simdCapabilities: []
+};
+
+const emptyMemory: MemoryInfo = {
+  totalBytes: 0,
+  availableBytes: 0,
+  usedBytes: 0,
+  memoryType: 'Unknown'
+};
+
+const emptyOs: OsInfo = {
+  name: 'Unknown',
+  edition: 'Unknown',
+  version: 'Unknown',
+  buildNumber: 'Unknown',
+  architecture: 'Unknown',
+  locale: 'Unknown'
+};
 
 export const SystemInfo: React.FC = () => {
   const { addToast } = useToast();
@@ -153,13 +195,18 @@ export const SystemInfo: React.FC = () => {
     );
   }
 
-  const cpu = profile.cpu || { manufacturer: 'Unknown', model: 'Unknown', architecture: 'Unknown', physicalCores: 0, logicalProcessors: 0, baseFrequencyMhz: 0, boostFrequencyMhz: 0, virtualizationSupported: false, simdCapabilities: [] };
-  const gpus = profile.gpus || [];
-  const memory = profile.memory || { totalBytes: 0, availableBytes: 0, usedBytes: 0, memoryType: 'Unknown' };
-  const storage = profile.storage || [];
-  const os = profile.os || { name: 'Unknown', edition: 'Unknown', version: 'Unknown', buildNumber: 'Unknown', architecture: 'Unknown', locale: 'Unknown' };
-  const software = profile.software || {};
-  const aiRuntimes = profile.aiRuntimes || [];
+  // Safely unwrap OverrideValue<T> wrappers sent by Rust backend
+  const cpu: CpuInfo = unwrapOverride(profile.cpu, emptyCpu);
+  const rawGpus = unwrapOverride(profile.gpus, []);
+  const gpus: GpuInfo[] = Array.isArray(rawGpus) ? rawGpus : [];
+  const memory: MemoryInfo = unwrapOverride(profile.memory, emptyMemory);
+  const rawStorage = unwrapOverride(profile.storage, []);
+  const storage: StorageInfo[] = Array.isArray(rawStorage) ? rawStorage : [];
+  const os: OsInfo = unwrapOverride(profile.os, emptyOs);
+  const software: SoftwareEnvironment = unwrapOverride(profile.software, {} as SoftwareEnvironment);
+  const rawRuntimes = unwrapOverride(profile.aiRuntimes, []);
+  const aiRuntimes: AIRuntimeInfo[] = Array.isArray(rawRuntimes) ? rawRuntimes : [];
+
   const aiCapabilities = profile.aiCapabilities || { recommendedQuantizations: [], multiModelCapable: false, loraReady: false, visionReady: false, embeddingReady: false };
   const validation = profile.validation || { isReadyForAi: false, score: 0, warnings: [], errors: [], recommendations: [] };
   const overrides = profile.overrides || {};
@@ -487,10 +534,11 @@ export const SystemInfo: React.FC = () => {
               <span className={styles.specLabel} style={{ marginBottom: '6px' }}>Detected Software Runtimes:</span>
               <div className={styles.pillsGroup}>
                 {Object.entries(software).map(([key, sw]) => {
-                  if (!sw) return null;
+                  if (!sw || typeof sw !== 'object' || !('name' in sw)) return null;
+                  const item = sw as any;
                   return (
-                    <Badge key={key} variant={sw.installed ? 'success' : 'default'}>
-                      {sw.name}: {sw.installed ? (sw.version || 'Installed') : 'Not Installed'}
+                    <Badge key={key} variant={item.installed ? 'success' : 'default'}>
+                      {item.name}: {item.installed ? (item.version || 'Installed') : 'Not Installed'}
                     </Badge>
                   );
                 })}

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 /// Wrapper for values that can be manually overridden
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverrideValue<T> {
     /// Originally detected hardware/software value
     pub detected: T,
@@ -47,6 +48,7 @@ impl<T> OverrideValue<T> {
 
 /// Detailed information about the CPU
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CpuInfo {
     pub manufacturer: String,
     pub model: String,
@@ -64,6 +66,7 @@ pub struct CpuInfo {
 
 /// Detailed information about a GPU
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GpuInfo {
     pub vendor: String,
     pub model: String,
@@ -81,6 +84,7 @@ pub struct GpuInfo {
 
 /// Information about system RAM
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
@@ -93,6 +97,7 @@ pub struct MemoryInfo {
 
 /// Information about a storage drive
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageInfo {
     pub drive_name: String,
     pub mount_point: String,
@@ -105,6 +110,7 @@ pub struct StorageInfo {
 
 /// Operating system details
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OsInfo {
     pub name: String,
     pub edition: String,
@@ -116,6 +122,7 @@ pub struct OsInfo {
 
 /// Status and info for individual software tools
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SoftwareDetectorInfo {
     pub name: String,
     pub installed: bool,
@@ -125,6 +132,7 @@ pub struct SoftwareDetectorInfo {
 
 /// Status of local development software dependencies
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SoftwareEnvironment {
     pub python: SoftwareDetectorInfo,
     pub rust: SoftwareDetectorInfo,
@@ -141,6 +149,7 @@ pub struct SoftwareEnvironment {
 
 /// Local AI runtime status (e.g., Ollama, vLLM, Llama.cpp)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AIRuntimeInfo {
     pub name: String,
     pub status: String,
@@ -151,6 +160,7 @@ pub struct AIRuntimeInfo {
 
 /// Key directories on the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemPaths {
     pub user_home: String,
     pub downloads: String,
@@ -163,6 +173,7 @@ pub struct SystemPaths {
 
 /// AI model running capabilities computed based on hardware specs
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AICapabilityProfile {
     pub max_recommended_model_size_bytes: Option<u64>,
     pub recommended_quantizations: Vec<String>,
@@ -177,6 +188,7 @@ pub struct AICapabilityProfile {
 
 /// Result of evaluating the system against Sarathi AI requirements
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemValidationResult {
     pub is_ready_for_ai: bool,
     pub score: u32,
@@ -187,6 +199,7 @@ pub struct SystemValidationResult {
 
 /// Comprehensive hardware and environment profile
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HardwareProfile {
     pub id: String,
     pub profile_created_at: String,
