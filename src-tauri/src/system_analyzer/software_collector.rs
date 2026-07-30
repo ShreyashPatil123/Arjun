@@ -18,6 +18,13 @@ pub fn detect_software() -> SoftwareEnvironment {
     let cuda_toolkit = check_cuda_toolkit();
     let vc_redistributable = check_vc_redistributable();
 
+    let docker = check_executable("Docker", &["docker"], &["--version"]);
+    let rocm = check_executable("ROCm", &["rocm-smi"], &["--version"]);
+
+    let mut additional = Vec::new();
+    additional.push(docker);
+    additional.push(rocm);
+
     log::info!("[SYSTEM ANALYZER DEBUG] ✓ Software Detection Summary: Python={}, Rust={}, Git={}, Node={}, Ollama={}",
         python.installed, rust.installed, git.installed, nodejs.installed, ollama.installed);
 
@@ -32,7 +39,7 @@ pub fn detect_software() -> SoftwareEnvironment {
         ollama,
         cuda_toolkit,
         vc_redistributable,
-        additional: Vec::new(),
+        additional,
     }
 }
 

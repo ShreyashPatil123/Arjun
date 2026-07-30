@@ -336,19 +336,19 @@ export const SystemInfo: React.FC = () => {
                     <span className={styles.specLabel} style={{ marginBottom: '6px' }}>Acceleration API Support:</span>
                     <div className={styles.pillsGroup}>
                       <Badge variant={gpu.cudaSupported ? 'success' : 'default'}>
-                        CUDA: {gpu.cudaSupported ? 'Available' : 'No'}
+                        CUDA: {gpu.cudaSupported ? 'Available' : 'Not Supported'}
                       </Badge>
                       <Badge variant={gpu.vulkanSupported ? 'success' : 'default'}>
-                        Vulkan: {gpu.vulkanSupported ? 'Available' : 'No'}
+                        Vulkan: {gpu.vulkanSupported ? 'Available' : 'Not Supported'}
                       </Badge>
                       <Badge variant={gpu.directxSupported ? 'success' : 'default'}>
-                        DirectX: {gpu.directxSupported ? 'Available' : 'No'}
+                        DirectX: {gpu.directxSupported ? 'Available' : 'Not Supported'}
                       </Badge>
                       <Badge variant={gpu.openclSupported ? 'info' : 'default'}>
-                        OpenCL: {gpu.openclSupported ? 'Available' : 'No'}
+                        OpenCL: {gpu.openclSupported ? 'Available' : 'Not Supported'}
                       </Badge>
                       <Badge variant={gpu.rocmSupported ? 'success' : 'default'}>
-                        ROCm: {gpu.rocmSupported ? 'Available' : 'No'}
+                        ROCm: {gpu.rocmSupported ? 'Available' : 'Not Supported'}
                       </Badge>
                     </div>
                   </div>
