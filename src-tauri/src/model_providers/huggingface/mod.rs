@@ -1,7 +1,9 @@
-//! HuggingFace provider stub
+//! HuggingFace provider module
 
-use crate::model_providers::provider::{ModelProvider, ProviderType, ModelMetadata};
-use anyhow::Result;
+pub mod resolver;
+pub mod catalog_provider;
+
+use crate::model_providers::provider::{ModelProvider, ProviderType};
 
 pub struct HuggingFaceProvider;
 

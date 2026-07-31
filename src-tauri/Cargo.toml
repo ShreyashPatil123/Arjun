@@ -23,10 +23,11 @@ log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "fs", "io-util", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.30"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
+futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation"] }

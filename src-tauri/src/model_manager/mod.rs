@@ -1,6 +1,7 @@
-//! Model Manager Module (Phase 3)
-//! Handles model registry, compatibility checking, and recommendations.
+//! Model manager module
 
 pub mod traits;
+pub mod manager;
 
+pub use manager::ModelManager;
 pub use traits::*;

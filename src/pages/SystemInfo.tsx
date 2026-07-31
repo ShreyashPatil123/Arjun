@@ -78,6 +78,7 @@ const emptyOs: OsInfo = {
 };
 
 export const SystemInfo: React.FC = () => {
+  const navigate = useNavigate();
   const { addToast } = useToast();
   const [profile, setProfile] = useState<HardwareProfile | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -219,8 +220,6 @@ export const SystemInfo: React.FC = () => {
   const gpuVramPercentage = primaryGpu ? formatPercentage(gpuVramUsedBytes, primaryGpu.vramTotalBytes || 1) : 0;
 
   const isFieldOverridden = (fieldPath: string) => Boolean(overrides && overrides[fieldPath] !== undefined);
-
-  const navigate = useNavigate();
 
   return (
     <div className={styles.container}>

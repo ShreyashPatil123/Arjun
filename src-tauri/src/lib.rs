@@ -7,7 +7,7 @@ pub mod config;
 pub mod logging;
 pub mod commands;
 
-// Future phase modules & skeletons
+// Phase modules
 pub mod system_analyzer;
 pub mod model_recommendation;
 pub mod model_manager;
@@ -18,9 +18,12 @@ pub mod lora;
 pub mod installer;
 pub mod plugins;
 
+use std::sync::Arc;
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_sql::Builder as SqlBuilder;
 use log::info;
+
+use download_manager::DownloadManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -29,6 +32,7 @@ pub fn run() {
 
     // Initialize core
     let sarathi_core = core::init();
+    let download_manager = Arc::new(DownloadManager::new());
 
     // Configure SQL plugin with migrations
     let migrations = database::get_migrations();
@@ -51,6 +55,7 @@ pub fn run() {
         .plugin(sql_plugin)
         .plugin(log_plugin)
         .manage(sarathi_core)
+        .manage(download_manager)
         .setup(|_app| {
             info!("Sarathi application starting...");
 
@@ -90,6 +95,15 @@ pub fn run() {
 
             // Recommendation commands (Phase 3)
             commands::recommendation::get_model_recommendations,
+
+            // Download & Storage Management commands (Phase 4)
+            commands::download::start_model_download,
+            commands::download::pause_model_download,
+            commands::download::cancel_model_download,
+            commands::download::get_active_downloads,
+            commands::download::get_installed_models,
+            commands::download::delete_installed_model,
+            commands::download::get_storage_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

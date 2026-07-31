@@ -232,6 +232,7 @@ pub struct ModelRecommendation {
     pub run_mode: String,
 
     // ── Resource estimates ──
+    pub download_size_bytes: Option<u64>,
     pub estimated_vram_bytes: u64,
     pub estimated_ram_bytes: u64,
     pub estimated_shared_mem_bytes: u64,
@@ -269,6 +270,10 @@ pub struct EstimatorConfig {
     /// tensors, and allocator fragmentation.
     /// Default: 0.12 (12%). Configurable for future calibration.
     pub overhead_factor: f64,
+    /// Absolute minimum runtime overhead floor in bytes (default 384 MB).
+    /// Ensures CUDA context creation (300MB+) and GGUF graph buffers are covered
+    /// even for small 1B/2B models.
+    pub min_overhead_bytes: u64,
     /// Bytes per KV cache element (2 for FP16 KV cache, standard in
     /// llama.cpp / Ollama / vLLM)
     pub kv_cache_bytes_per_element: u32,
@@ -280,6 +285,7 @@ impl Default for EstimatorConfig {
     fn default() -> Self {
         Self {
             overhead_factor: 0.12,
+            min_overhead_bytes: 402_653_184, // 384 MB
             kv_cache_bytes_per_element: 2,
             batch_size: 1,
         }

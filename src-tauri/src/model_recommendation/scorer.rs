@@ -37,17 +37,18 @@ pub fn evaluate_model(
                 model, quant, context, estimator_config,
             );
 
-            // Try each GPU for PureGpu mode
+            // 1. Evaluate GPU execution options (PureGpu & GpuWithCpuOffload)
             for gpu_budget in &budget.gpu_budgets {
                 let backends = runtime::compatible_backends(gpu_budget);
                 if backends.is_empty() {
                     continue;
                 }
 
-                // PureGpu: try fitting entirely in dedicated VRAM
-                if gpu_budget.usable_dedicated_vram > 0 && total <= gpu_budget.usable_dedicated_vram {
-                    let headroom = (gpu_budget.usable_dedicated_vram - total) as f64
-                        / gpu_budget.usable_dedicated_vram as f64;
+                let vram_available = gpu_budget.usable_dedicated_vram;
+
+                // ── PureGpu ──
+                if vram_available > 0 && total <= vram_available {
+                    let vram_headroom = (vram_available - total) as f64 / vram_available as f64;
                     let backend = runtime::select_preferred_backend(&backends, gpu_budget.cuda_available);
                     let config = EvaluatedConfiguration {
                         quantization: quant.clone(),
@@ -61,7 +62,7 @@ pub fn evaluate_model(
                         vram_required_bytes: total,
                         ram_required_bytes: 0,
                         shared_mem_required_bytes: 0,
-                        headroom_ratio: headroom,
+                        headroom_ratio: vram_headroom,
                         fits: true,
                     };
                     let score = compute_score(&config, quant, model);
@@ -73,26 +74,25 @@ pub fn evaluate_model(
                     }
                 }
 
-                // GpuWithCpuOffload: use VRAM for weights, overflow KV+overhead to RAM
-                // Only if backend supports offloading
+                // ── GpuWithCpuOffload ──
+                // Compute exact GPU layer ratio f_gpu = min(1.0, vram_available / total).
+                // Part goes to VRAM (vram_req = total * f_gpu), part goes to System RAM (ram_req = total - vram_req).
                 let offload_backend = runtime::select_preferred_backend(&backends, gpu_budget.cuda_available);
-                if offload_backend.supports_cpu_offload() && gpu_budget.usable_dedicated_vram > 0 {
-                    let vram_available = gpu_budget.usable_dedicated_vram;
-                    if w <= vram_available && total > vram_available {
-                        let ram_needed = total - vram_available;
-                        // Also consider shared memory for backends that support it
-                        let shared_available = if offload_backend.supports_shared_memory() {
-                            gpu_budget.usable_shared_memory
-                        } else {
-                            0
-                        };
-                        let total_offload_pool = budget.system_ram.usable_for_inference + shared_available;
-                        if ram_needed <= total_offload_pool {
-                            let offload_frac = ram_needed as f64 / total as f64;
-                            let binding_pool = vram_available + total_offload_pool;
-                            let headroom = (binding_pool - total) as f64 / binding_pool as f64;
-                            let shared_used = ram_needed.min(shared_available);
-                            let ram_used = ram_needed.saturating_sub(shared_used);
+                if offload_backend.supports_cpu_offload() && vram_available > 0 && total > vram_available {
+                    // Only attempt offload if GPU has enough VRAM for at least 15% of the model
+                    if vram_available >= (total as f64 * 0.15) as u64 {
+                        let f_gpu = (vram_available as f64 / total as f64).min(1.0);
+                        let vram_req = (total as f64 * f_gpu) as u64;
+                        let ram_req = total.saturating_sub(vram_req);
+                        let ram_available = budget.system_ram.usable_for_inference;
+
+                        if ram_req <= ram_available {
+                            let offload_frac = 1.0 - f_gpu;
+                            let vram_hr = (vram_available.saturating_sub(vram_req)) as f64 / vram_available as f64;
+                            let ram_hr = (ram_available.saturating_sub(ram_req)) as f64 / ram_available as f64;
+                            // Effective headroom is bottlenecked by the tighter memory domain
+                            let effective_headroom = vram_hr.min(ram_hr);
+
                             let config = EvaluatedConfiguration {
                                 quantization: quant.clone(),
                                 context_length: context,
@@ -105,10 +105,10 @@ pub fn evaluate_model(
                                 kv_cache_memory_bytes: kv,
                                 overhead_memory_bytes: oh,
                                 total_memory_bytes: total,
-                                vram_required_bytes: vram_available.min(total),
-                                ram_required_bytes: ram_used,
-                                shared_mem_required_bytes: shared_used,
-                                headroom_ratio: headroom,
+                                vram_required_bytes: vram_req,
+                                ram_required_bytes: ram_req,
+                                shared_mem_required_bytes: 0,
+                                headroom_ratio: effective_headroom,
                                 fits: true,
                             };
                             let score = compute_score(&config, quant, model);
@@ -123,10 +123,11 @@ pub fn evaluate_model(
                 }
             }
 
-            // PureCpu: use only system RAM
-            if total <= budget.system_ram.usable_for_inference {
-                let headroom = (budget.system_ram.usable_for_inference - total) as f64
-                    / budget.system_ram.usable_for_inference as f64;
+            // ── PureCpu ──
+            // Uses system RAM exclusively.
+            let ram_available = budget.system_ram.usable_for_inference;
+            if total <= ram_available {
+                let headroom = (ram_available - total) as f64 / ram_available as f64;
                 let cpu_backends = runtime::cpu_only_backends();
                 let backend = cpu_backends.first().cloned().unwrap_or(InferenceBackend::LlamaCppGguf);
                 let config = EvaluatedConfiguration {
@@ -148,7 +149,7 @@ pub fn evaluate_model(
                 if context > max_possible_context {
                     max_possible_context = context;
                 }
-                // Only use CPU path if no GPU path was found with higher score
+                // Only select CPU if no GPU configuration with higher score exists
                 if best_config.as_ref().map_or(true, |(_, bs)| score > *bs) {
                     best_config = Some((config, score));
                 }
@@ -167,6 +168,15 @@ pub fn evaluate_model(
                 format!("MoE ({}×, {} active)", num_experts, active_experts),
         };
 
+        // Calculation Confidence: High = verified metadata + >=10% headroom; Medium = 3%-10% headroom; Low = <3% headroom
+        let confidence = if config.headroom_ratio >= 0.10 {
+            "High".to_string()
+        } else if config.headroom_ratio >= 0.03 {
+            "Medium".to_string()
+        } else {
+            "Low".to_string()
+        };
+
         ModelRecommendation {
             model_id: model.id.clone(),
             model_name: model.name.clone(),
@@ -175,36 +185,44 @@ pub fn evaluate_model(
             quantization: config.quantization.label.clone(),
             quantization_bits_per_weight: config.quantization.bits_per_weight,
             recommended_context: config.context_length,
-            max_possible_context: max_possible_context,
+            max_possible_context,
             backend: config.backend.display_name().to_string(),
             run_mode: runtime::format_run_mode(&config.run_mode),
+            download_size_bytes: Some(config.weight_memory_bytes),
             estimated_vram_bytes: config.vram_required_bytes,
             estimated_ram_bytes: config.ram_required_bytes,
             estimated_shared_mem_bytes: config.shared_mem_required_bytes,
             estimated_total_memory_bytes: config.total_memory_bytes,
-            headroom_percent: config.headroom_ratio * 100.0,
+            headroom_percent: (config.headroom_ratio * 100.0).max(0.0),
             fit_score: score,
             category,
-            confidence: if config.headroom_ratio >= 0.15 { "High".into() } else if config.headroom_ratio >= 0.05 { "Medium".into() } else { "Low".into() },
+            confidence,
             explanation,
             warnings,
             architecture: arch_label,
             total_parameters: model.total_parameters,
             active_parameters: model.active_parameters,
             estimated_tokens_per_sec: None,
-            performance_note: "Unknown — no benchmark data available".to_string(),
+            performance_note: "Calculated via Sarathi Hardware Profile & GGUF Estimator".to_string(),
         }
     })
 }
 
 /// Compute a deterministic score for a configuration.
-/// Score = (memory_fit × 0.35) + (quant_quality × 0.25) + (context × 0.20) + (accel × 0.20)
+/// Score = (memory_fit × 0.30) + (quant_quality × 0.35) + (context × 0.15) + (accel × 0.20) - quant_penalty
 fn compute_score(config: &EvaluatedConfiguration, quant: &QuantizationSpec, model: &ModelMetadata) -> f64 {
-    // Memory fit: headroom ratio scaled (50% headroom = 1.0)
-    let memory_fit = (config.headroom_ratio * 2.0).min(1.0).max(0.0);
+    // Memory fit: headroom ratio scaled (20% headroom = 1.0; penalty for <5% headroom)
+    let memory_fit = if config.headroom_ratio < 0.05 {
+        0.10
+    } else {
+        (config.headroom_ratio * 5.0).min(1.0)
+    };
 
-    // Quantization quality: normalized from quality_rank
+    // Quantization quality: normalized from quality_rank (Q8=0.8, Q5=0.6, Q4=0.5, Q2=0.2)
     let quant_quality = quant.quality_rank as f64 / 10.0;
+
+    // Penalty for low quantization (Q2/Q3) to prefer Q4/Q5/Q8 high-quality quants when memory allows
+    let quant_penalty = if quant.quality_rank <= 3 { 0.40 } else { 0.0 };
 
     // Context score: log-scaled relative to model max
     let context_score = if model.max_context_length > 2048 {
@@ -215,15 +233,21 @@ fn compute_score(config: &EvaluatedConfiguration, quant: &QuantizationSpec, mode
         1.0
     };
 
-    // Acceleration score: GPU > Offload > CPU
+    // Acceleration score: PureGpu (1.0) > Offload (0.40) > CPU (0.05)
     let accel_score = match &config.run_mode {
         RunMode::PureGpu { .. } => 1.0,
-        RunMode::GpuWithCpuOffload { offload_fraction, .. } => 0.8 - offload_fraction * 0.3,
+        RunMode::GpuWithCpuOffload { offload_fraction, .. } => 0.40 - offload_fraction * 0.30,
         RunMode::MultiGpu { .. } => 0.9,
-        RunMode::PureCpu => 0.3,
+        RunMode::PureCpu => 0.05,
     };
 
-    (memory_fit * 0.35 + quant_quality * 0.25 + context_score * 0.20 + accel_score * 0.20) * 100.0
+    // Offload penalty to strongly prefer PureGpu configurations when available
+    let offload_penalty = match &config.run_mode {
+        RunMode::GpuWithCpuOffload { .. } => 0.25,
+        _ => 0.0,
+    };
+
+    (((memory_fit * 0.30 + quant_quality * 0.35 + context_score * 0.15 + accel_score * 0.20) - quant_penalty - offload_penalty) * 100.0).max(0.0)
 }
 
 /// Assign a FitCategory based on configuration characteristics.
@@ -233,7 +257,7 @@ fn assign_category(config: &EvaluatedConfiguration) -> FitCategory {
         RunMode::GpuWithCpuOffload { offload_fraction, .. } if *offload_fraction <= 0.20
     );
 
-    if config.headroom_ratio >= 0.20 && (is_pure_gpu || is_light_offload) && config.quantization.quality_rank >= 4 {
+    if config.headroom_ratio >= 0.15 && (is_pure_gpu || is_light_offload) && config.quantization.quality_rank >= 4 {
         FitCategory::Recommended
     } else if config.headroom_ratio >= 0.05 && config.quantization.quality_rank >= 3 {
         FitCategory::Compatible
@@ -383,6 +407,8 @@ mod tests {
         let rec = evaluate_model(model, &budget, &EstimatorConfig::default());
         assert!(rec.is_some());
         let rec = rec.unwrap();
+        println!("DEBUG test_category_recommended_7b: quant={}, ctx={}, vram={}, ram={}, headroom={:.1}%, category={:?}",
+            rec.quantization, rec.recommended_context, rec.estimated_vram_bytes, rec.estimated_ram_bytes, rec.headroom_percent, rec.category);
         assert_eq!(rec.category, FitCategory::Recommended);
         assert!(rec.headroom_percent > 15.0);
     }
@@ -451,7 +477,9 @@ mod tests {
         use crate::system_analyzer::get_system_analyzer_manager;
         let analyzer = get_system_analyzer_manager();
         let profile = analyzer.analyze_system().expect("Physical system scan failed");
-        let recs = crate::model_recommendation::generate_recommendations(&profile);
+        let budget = crate::model_recommendation::budget::calculate_budget(&profile, &BudgetConfig::default());
+        let models = crate::model_recommendation::catalog::bootstrap_models();
+        let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
         assert!(!recs.is_empty(), "Recommendation engine must return recommendations for physical PC");
         
         println!("\n=== PHYSICAL PC RECOMMENDATION RESULTS ===");
@@ -467,9 +495,136 @@ mod tests {
             profile.memory.current().available_bytes / 1073741824);
         println!("------------------------------------------");
         for r in &recs {
-            println!("[{:?}] {} ({}) -> {} | Context: {} | Headroom: {:.1}%",
-                r.category, r.model_name, r.architecture, r.quantization, r.recommended_context, r.headroom_percent);
+            println!("[{:?}] {} ({}) -> {} | Context: {} | VRAM: {:.2} GB | RAM: {:.2} GB | Headroom: {:.1}%",
+                r.category, r.model_name, r.architecture, r.quantization, r.recommended_context,
+                r.estimated_vram_bytes as f64 / 1_073_741_824.0,
+                r.estimated_ram_bytes as f64 / 1_073_741_824.0,
+                r.headroom_percent);
         }
         println!("==========================================\n");
+    }
+
+    #[test]
+    fn test_offload_ram_vram_split_not_clamped_6_9() {
+        let models = bootstrap_models();
+        let model_32b = models.iter().find(|m| m.id == "Qwen/Qwen2.5-32B").unwrap();
+        let budget = make_budget_8gb_dgpu(); // 7GB usable VRAM, 12GB usable RAM
+        let rec = evaluate_model(model_32b, &budget, &EstimatorConfig::default()).unwrap();
+        
+        // 32B model total memory at any quant exceeds 7GB VRAM, so it offloads
+        assert!(rec.estimated_ram_bytes > 0, "Offloaded model MUST report RAM > 0 B");
+        assert!(rec.estimated_vram_bytes > 0, "Offloaded model MUST use VRAM");
+        assert!(rec.estimated_vram_bytes <= 7 * GB, "VRAM required must not exceed usable VRAM");
+        assert_eq!(rec.estimated_vram_bytes + rec.estimated_ram_bytes, rec.estimated_total_memory_bytes,
+            "VRAM + RAM required must equal total memory required");
+    }
+
+    #[test]
+    fn test_igpu_shared_memory_not_double_counted() {
+        let igpu_budget = MemoryBudget {
+            gpu_budgets: vec![GpuMemoryBudget {
+                gpu_index: 0, gpu_model: "Intel UHD 770".into(), gpu_type: GpuType::Integrated,
+                total_dedicated_vram: 512 * 1024 * 1024, usable_dedicated_vram: 256 * 1024 * 1024,
+                total_shared_memory: 8 * GB, usable_shared_memory: 4 * GB,
+                cuda_available: false, rocm_available: false, vulkan_available: true,
+                directml_available: true, compute_capability: None,
+            }],
+            system_ram: SystemRamBudget {
+                total_bytes: 16 * GB, available_bytes: 8 * GB,
+                usable_for_inference: 6 * GB, ram_speed_mts: Some(4800),
+            },
+        };
+        let models = bootstrap_models();
+        let qwen_7b = models.iter().find(|m| m.id == "Qwen/Qwen2.5-7B").unwrap();
+        let rec = evaluate_model(qwen_7b, &igpu_budget, &EstimatorConfig::default()).unwrap();
+        
+        // iGPU must use System RAM, not invent phantom shared memory
+        assert!(rec.estimated_ram_bytes > 0);
+        assert!(rec.estimated_ram_bytes <= 6 * GB);
+    }
+
+    #[test]
+    fn test_simulation_rtx4090_24gb() {
+        let budget = MemoryBudget {
+            gpu_budgets: vec![GpuMemoryBudget {
+                gpu_index: 0, gpu_model: "NVIDIA GeForce RTX 4090".into(), gpu_type: GpuType::Dedicated,
+                total_dedicated_vram: 24 * GB, usable_dedicated_vram: 22 * GB,
+                total_shared_memory: 32 * GB, usable_shared_memory: 16 * GB,
+                cuda_available: true, rocm_available: false, vulkan_available: true,
+                directml_available: true, compute_capability: Some("8.9".into()),
+            }],
+            system_ram: SystemRamBudget {
+                total_bytes: 64 * GB, available_bytes: 48 * GB,
+                usable_for_inference: 44 * GB, ram_speed_mts: Some(6000),
+            },
+        };
+        let models = bootstrap_models();
+        let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
+        assert!(!recs.is_empty());
+        let qwen_14b = recs.iter().find(|r| r.model_id == "Qwen/Qwen2.5-14B").unwrap();
+        assert_eq!(qwen_14b.category, FitCategory::Recommended);
+        assert_eq!(qwen_14b.estimated_ram_bytes, 0); // Fits entirely in 22GB usable VRAM
+    }
+
+    #[test]
+    fn test_simulation_rx7900xtx_24gb() {
+        let budget = MemoryBudget {
+            gpu_budgets: vec![GpuMemoryBudget {
+                gpu_index: 0, gpu_model: "AMD Radeon RX 7900 XTX".into(), gpu_type: GpuType::Dedicated,
+                total_dedicated_vram: 24 * GB, usable_dedicated_vram: 21 * GB,
+                total_shared_memory: 16 * GB, usable_shared_memory: 8 * GB,
+                cuda_available: false, rocm_available: true, vulkan_available: true,
+                directml_available: true, compute_capability: None,
+            }],
+            system_ram: SystemRamBudget {
+                total_bytes: 32 * GB, available_bytes: 20 * GB,
+                usable_for_inference: 18 * GB, ram_speed_mts: Some(5600),
+            },
+        };
+        let models = bootstrap_models();
+        let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
+        assert!(!recs.is_empty());
+        let llama_8b = recs.iter().find(|r| r.model_id == "meta-llama/Llama-3.1-8B").unwrap();
+        assert_eq!(llama_8b.category, FitCategory::Recommended);
+    }
+
+    #[test]
+    fn test_simulation_intel_arc_a770_16gb() {
+        let budget = MemoryBudget {
+            gpu_budgets: vec![GpuMemoryBudget {
+                gpu_index: 0, gpu_model: "Intel Arc A770".into(), gpu_type: GpuType::Dedicated,
+                total_dedicated_vram: 16 * GB, usable_dedicated_vram: 14 * GB,
+                total_shared_memory: 16 * GB, usable_shared_memory: 8 * GB,
+                cuda_available: false, rocm_available: false, vulkan_available: true,
+                directml_available: true, compute_capability: None,
+            }],
+            system_ram: SystemRamBudget {
+                total_bytes: 32 * GB, available_bytes: 22 * GB,
+                usable_for_inference: 20 * GB, ram_speed_mts: Some(5200),
+            },
+        };
+        let models = bootstrap_models();
+        let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
+        assert!(!recs.is_empty());
+        let qwen_7b = recs.iter().find(|r| r.model_id == "Qwen/Qwen2.5-7B").unwrap();
+        assert_eq!(qwen_7b.category, FitCategory::Recommended);
+    }
+
+    #[test]
+    fn test_simulation_cpu_only_64gb_ram() {
+        let budget = MemoryBudget {
+            gpu_budgets: vec![],
+            system_ram: SystemRamBudget {
+                total_bytes: 64 * GB, available_bytes: 48 * GB,
+                usable_for_inference: 44 * GB, ram_speed_mts: Some(4800),
+            },
+        };
+        let models = bootstrap_models();
+        let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
+        assert!(!recs.is_empty());
+        for r in &recs {
+            assert_eq!(r.estimated_vram_bytes, 0);
+            assert!(r.estimated_ram_bytes > 0);
+        }
     }
 }

@@ -19,6 +19,7 @@ export interface ModelRecommendation {
   runMode: string;
 
   // Resource estimates
+  downloadSizeBytes: number | null;
   estimatedVramBytes: number;
   estimatedRamBytes: number;
   estimatedSharedMemBytes: number;

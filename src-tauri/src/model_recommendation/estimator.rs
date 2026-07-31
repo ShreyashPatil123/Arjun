@@ -77,7 +77,8 @@ pub fn estimate_total_memory(
 ) -> (u64, u64, u64, u64) {
     let weight_bytes = estimate_weight_memory(model, quant);
     let kv_cache_bytes = estimate_kv_cache_memory(model, context_length, config);
-    let overhead_bytes = ((weight_bytes + kv_cache_bytes) as f64 * config.overhead_factor) as u64;
+    let proportional_overhead = ((weight_bytes + kv_cache_bytes) as f64 * config.overhead_factor) as u64;
+    let overhead_bytes = proportional_overhead.max(config.min_overhead_bytes);
     let total = weight_bytes + kv_cache_bytes + overhead_bytes;
     (weight_bytes, kv_cache_bytes, overhead_bytes, total)
 }
