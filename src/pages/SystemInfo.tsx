@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Cpu,
   Zap,
@@ -218,6 +219,8 @@ export const SystemInfo: React.FC = () => {
 
   const isFieldOverridden = (fieldPath: string) => Boolean(overrides && overrides[fieldPath] !== undefined);
 
+  const navigate = useNavigate();
+
   return (
     <div className={styles.container}>
       {/* Header Section */}
@@ -235,6 +238,13 @@ export const SystemInfo: React.FC = () => {
         </div>
 
         <div className={styles.headerActions}>
+          <Button
+            variant="primary"
+            icon={<Sparkles size={16} />}
+            onClick={() => navigate('/models')}
+          >
+            Find Models For My PC
+          </Button>
           <Button
             variant="secondary"
             icon={<RotateCcw size={16} className={isAnalyzing ? styles.spinningIcon : ''} />}

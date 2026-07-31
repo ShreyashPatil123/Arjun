@@ -9,6 +9,7 @@ pub mod commands;
 
 // Future phase modules & skeletons
 pub mod system_analyzer;
+pub mod model_recommendation;
 pub mod model_manager;
 pub mod model_providers;
 pub mod download_manager;
@@ -86,6 +87,9 @@ pub fn run() {
             commands::system::override_hardware_value,
             commands::system::revert_hardware_override,
             commands::system::validate_system,
+
+            // Recommendation commands (Phase 3)
+            commands::recommendation::get_model_recommendations,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
