@@ -23,16 +23,25 @@ const emptyHardwareProfile: HardwareProfile = {
     {
       vendor: 'Unknown',
       model: 'Unknown',
+      gpuType: 'Unknown',
       isDedicated: false,
+      dedicatedVideoMemoryBytes: 0,
+      dedicatedSystemMemoryBytes: 0,
+      sharedSystemMemoryBytes: 0,
+      totalAvailableGraphicsMemoryBytes: 0,
       vramTotalBytes: 0,
       vramFreeBytes: 0,
       driverVersion: undefined,
+      vendorId: undefined,
+      deviceId: undefined,
       computeCapability: undefined,
       cudaSupported: false,
       rocmSupported: false,
       directxSupported: false,
       vulkanSupported: false,
-      openclSupported: false
+      openclSupported: false,
+      detectionSource: 'Unknown',
+      confidence: 'Low'
     }
   ],
   memory: {
@@ -117,7 +126,6 @@ export async function getHardwareProfile(): Promise<HardwareProfile> {
     if (profile && profile.cpu && profile.cpu.model !== 'Unknown') {
       return profile;
     }
-    // If cached profile is null or un-analyzed, trigger fresh system analysis
     return await analyzeSystem();
   } catch (err) {
     console.debug('Tauri get_hardware_profile invoke fallback to analyzeSystem:', err);

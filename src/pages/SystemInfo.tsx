@@ -344,38 +344,70 @@ export const SystemInfo: React.FC = () => {
             </div>
           ) : (
             gpus.map((gpu, idx) => {
+              const isIntegrated = gpu.gpuType === 'Integrated' || (!gpu.isDedicated && gpu.gpuType !== 'Dedicated');
               const gpuVramAllocated = (gpu.vramTotalBytes || 0) - (gpu.vramFreeBytes || 0);
               const gpuPct = formatPercentage(gpuVramAllocated, gpu.vramTotalBytes || 1);
               return (
-                <div key={idx} className={styles.specList} style={{ marginBottom: idx > 0 ? '16px' : '0' }}>
+                <div key={idx} className={styles.specList} style={{ marginBottom: idx < gpus.length - 1 ? '20px' : '0' }}>
                   <div className={styles.specRow}>
                     <span className={styles.specLabel}>Device Model #{idx + 1}</span>
                     <span className={styles.specValue}>
                       {gpu.model || 'Unknown'} ({gpu.vendor || 'Unknown'})
-                      {gpu.isDedicated && <Badge variant="info">Dedicated</Badge>}
+                      <Badge variant={isIntegrated ? 'default' : 'info'}>
+                        {gpu.gpuType || (isIntegrated ? 'Integrated' : 'Dedicated')} GPU
+                      </Badge>
                     </span>
                   </div>
 
-                  <div className={styles.progressSection}>
-                    <div className={styles.progressHeader}>
-                      <span>VRAM Allocation</span>
-                      <span>
-                        {formatBytes(gpuVramAllocated)} used of {formatBytes(gpu.vramTotalBytes || 0)} ({gpuPct}%)
-                      </span>
+                  {isIntegrated ? (
+                    <div style={{ background: 'var(--bg-secondary)', padding: '12px', borderRadius: '6px', margin: '8px 0', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <div className={styles.specRow}>
+                        <span className={styles.specLabel}>Dedicated / Reserved VRAM</span>
+                        <span className={styles.specValue}>{formatBytes(gpu.dedicatedVideoMemoryBytes || 536870912)}</span>
+                      </div>
+                      <div className={styles.specRow}>
+                        <span className={styles.specLabel}>Shared System Memory</span>
+                        <span className={styles.specValue}>{formatBytes(gpu.sharedSystemMemoryBytes)}</span>
+                      </div>
+                      <div className={styles.specRow}>
+                        <span className={styles.specLabel}>Total Available Graphics Memory</span>
+                        <span className={styles.specValue} style={{ color: 'var(--accent)', fontWeight: 600 }}>
+                          {formatBytes(gpu.totalAvailableGraphicsMemoryBytes || (gpu.dedicatedVideoMemoryBytes + gpu.sharedSystemMemoryBytes))}
+                        </span>
+                      </div>
                     </div>
-                    <div className={styles.progressBarTrack}>
-                      <div className={styles.progressBarFill} style={{ width: `${gpuPct}%` }} />
+                  ) : (
+                    <div className={styles.progressSection}>
+                      <div className={styles.progressHeader}>
+                        <span>Dedicated VRAM Allocation</span>
+                        <span>
+                          {formatBytes(gpuVramAllocated)} used of {formatBytes(gpu.dedicatedVideoMemoryBytes || gpu.vramTotalBytes || 0)} ({gpuPct}%)
+                        </span>
+                      </div>
+                      <div className={styles.progressBarTrack}>
+                        <div className={styles.progressBarFill} style={{ width: `${gpuPct}%` }} />
+                      </div>
                     </div>
-                  </div>
+                  )}
 
                   <div className={styles.specRow}>
                     <span className={styles.specLabel}>Driver Version</span>
-                    <span className={styles.specValue}>{gpu.driverVersion || 'N/A'}</span>
+                    <span className={styles.specValue}>
+                      {gpu.driverVersion || 'N/A'} {gpu.vendorId ? `(Vendor ID: 0x${gpu.vendorId.toString(16).toUpperCase()})` : ''}
+                    </span>
                   </div>
                   {gpu.computeCapability && (
                     <div className={styles.specRow}>
                       <span className={styles.specLabel}>Compute Capability</span>
                       <span className={styles.specValue}>v{gpu.computeCapability}</span>
+                    </div>
+                  )}
+                  {gpu.detectionSource && (
+                    <div className={styles.specRow}>
+                      <span className={styles.specLabel}>Telemetry Source</span>
+                      <span className={styles.specValue}>
+                        {gpu.detectionSource} &bull; Confidence: {gpu.confidence || 'High'}
+                      </span>
                     </div>
                   )}
 

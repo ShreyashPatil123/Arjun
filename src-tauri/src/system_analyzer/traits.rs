@@ -70,16 +70,25 @@ pub struct CpuInfo {
 pub struct GpuInfo {
     pub vendor: String,
     pub model: String,
+    pub gpu_type: String,
     pub is_dedicated: bool,
+    pub dedicated_video_memory_bytes: u64,
+    pub dedicated_system_memory_bytes: u64,
+    pub shared_system_memory_bytes: u64,
+    pub total_available_graphics_memory_bytes: u64,
     pub vram_total_bytes: u64,
     pub vram_free_bytes: u64,
     pub driver_version: Option<String>,
+    pub vendor_id: Option<u32>,
+    pub device_id: Option<u32>,
     pub compute_capability: Option<String>,
     pub cuda_supported: bool,
     pub rocm_supported: bool,
     pub directx_supported: bool,
     pub vulkan_supported: bool,
     pub opencl_supported: bool,
+    pub detection_source: String,
+    pub confidence: String,
 }
 
 /// Information about system RAM

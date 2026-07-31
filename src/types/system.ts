@@ -22,16 +22,25 @@ export interface CpuInfo {
 export interface GpuInfo {
   vendor: string;
   model: string;
+  gpuType: string;
   isDedicated: boolean;
+  dedicatedVideoMemoryBytes: number;
+  dedicatedSystemMemoryBytes: number;
+  sharedSystemMemoryBytes: number;
+  totalAvailableGraphicsMemoryBytes: number;
   vramTotalBytes: number;
   vramFreeBytes: number;
   driverVersion?: string | null;
+  vendorId?: number | null;
+  deviceId?: number | null;
   computeCapability?: string | null;
   cudaSupported: boolean;
   rocmSupported: boolean;
   directxSupported: boolean;
   vulkanSupported: boolean;
   openclSupported: boolean;
+  detectionSource?: string;
+  confidence?: string;
 }
 
 export interface MemoryInfo {
