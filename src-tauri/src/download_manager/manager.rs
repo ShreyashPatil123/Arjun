@@ -790,7 +790,26 @@ mod tests {
         tokio::fs::rename(&temp_path, &destination_path).await.unwrap();
         assert!(!temp_path.exists(), ".part file must be removed after atomic rename");
         assert!(destination_path.exists(), "Final .gguf file must exist on disk");
-        println!("7. ATOMIC FINALIZATION: Renamed .part -> .gguf cleanly.");
+
+        // Write test manifest.json to package directory
+        let package_dir = storage_dir.parent().unwrap();
+        let manifest = ModelPackageManifest {
+            package_id: model_id.replace('/', "_"),
+            provider_id: "huggingface".to_string(),
+            base_model: BaseManifestInfo {
+                model_id: model_id.to_string(),
+                model_name: "Llama 3.2 1B".to_string(),
+                quantization: requested_quant.to_string(),
+                file_path: "base/".to_string(),
+                size_bytes: artifact.size_bytes,
+                checksum: None,
+            },
+            adapters: HashMap::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        AdapterRegistry::write_manifest(package_dir, &manifest).unwrap();
+        println!("7. ATOMIC FINALIZATION: Renamed .part -> .gguf cleanly & wrote manifest.json.");
 
         // STEP 11 & 12: Model Manager Scanning & Detection
         let installed = crate::model_manager::ModelManager::list_installed_models(&app_data_dir);
@@ -816,7 +835,7 @@ mod tests {
             .expect("Model deletion must succeed");
 
         assert!(!destination_path.exists(), "Model file must be deleted from disk");
-        assert!(!storage_dir.exists(), "Model directory must be removed from disk");
+        assert!(!package_dir.exists(), "Model package directory must be removed from disk");
 
         let post_delete_installed = crate::model_manager::ModelManager::list_installed_models(&app_data_dir);
         assert_eq!(post_delete_installed.len(), 0, "Installed models list must be empty after deletion");

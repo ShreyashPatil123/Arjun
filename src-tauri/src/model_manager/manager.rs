@@ -38,22 +38,35 @@ impl ModelManager {
                             if let Ok(meta) = fs::metadata(&path) {
                                 let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                 
-                                // Extract metadata from path hierarchy: models/<provider>/<clean_model_id>/<quantization>/filename.gguf
+                                // Extract metadata from path hierarchy or manifest.json: models/<provider>/<clean_model_id>/base/filename.gguf
                                 let components: Vec<String> = path
                                     .iter()
                                     .map(|c| c.to_string_lossy().to_string())
                                     .collect();
 
-                                let len = components.len();
-                                let (provider_id, model_id, quantization) = if len >= 4 {
-                                    (
-                                        components[len - 4].clone(),
-                                        components[len - 3].replace('_', "/"),
-                                        components[len - 2].clone(),
-                                    )
-                                } else {
-                                    ("huggingface".to_string(), file_name.clone(), "GGUF".to_string())
-                                };
+                                let mut provider_id = "huggingface".to_string();
+                                let mut model_id = file_name.clone();
+                                let mut quantization = "GGUF".to_string();
+
+                                if let Some(package_dir) = path.parent().and_then(|p| p.parent()) {
+                                    let manifest_path = package_dir.join("manifest.json");
+                                    if manifest_path.exists() {
+                                        if let Ok(content) = fs::read_to_string(&manifest_path) {
+                                            if let Ok(manifest) = serde_json::from_str::<crate::adapter_manager::ModelPackageManifest>(&content) {
+                                                provider_id = manifest.provider_id;
+                                                model_id = manifest.base_model.model_id;
+                                                quantization = manifest.base_model.quantization;
+                                            }
+                                        }
+                                    } else {
+                                        let len = components.len();
+                                        if len >= 4 {
+                                            provider_id = components[len - 4].clone();
+                                            model_id = components[len - 3].replace('_', "/");
+                                            quantization = components[len - 2].clone();
+                                        }
+                                    }
+                                }
 
                                 let model_name = model_id.split('/').last().unwrap_or(&model_id).to_string();
 
@@ -83,15 +96,19 @@ impl ModelManager {
     /// Deletes an installed model directory and files from disk
     pub fn delete_installed_model(app_data_dir: &Path, provider_id: &str, model_id: &str, quantization: &str) -> Result<()> {
         let clean_model_id = model_id.replace('/', "_");
-        let target_dir = app_data_dir
+        let package_dir = app_data_dir
             .join("models")
             .join(provider_id)
-            .join(clean_model_id)
-            .join(quantization);
+            .join(&clean_model_id);
 
-        if target_dir.exists() {
-            fs::remove_dir_all(&target_dir)?;
-            log::info!("[MODEL_MANAGER] ✓ Deleted model directory: {:?}", target_dir);
+        let legacy_quant_dir = package_dir.join(quantization);
+
+        if package_dir.exists() {
+            fs::remove_dir_all(&package_dir)?;
+            log::info!("[MODEL_MANAGER] ✓ Deleted model package directory: {:?}", package_dir);
+        } else if legacy_quant_dir.exists() {
+            fs::remove_dir_all(&legacy_quant_dir)?;
+            log::info!("[MODEL_MANAGER] ✓ Deleted model directory: {:?}", legacy_quant_dir);
         }
 
         Ok(())
