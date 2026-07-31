@@ -1,5 +1,6 @@
 //! Production-Grade Vendor-Agnostic GPU Collector
-//! Primary Source: Native Windows DXGI 1.4 APIs (windows crate)
+//! Primary Source: Native Windows DXGI 1.4 + Direct3D 12 Hardware Architecture Telemetry (windows crate)
+//! Classification: Authoritative D3D12 UMA Architecture Flag (`D3D12_FEATURE_DATA_ARCHITECTURE.UMA`)
 //! Enrichment: NVML (NVIDIA), CIM/WMI (AMD/Intel)
 //! Zero Machine-Specific Hardcoded Strings or Guesswork
 
@@ -7,21 +8,27 @@ use crate::system_analyzer::process_utils::create_hidden_command;
 use crate::system_analyzer::traits::GpuInfo;
 
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12CreateDevice, ID3D12Device, D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+};
+#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
 
-/// Detects all installed GPU devices using native DXGI 1.4 hardware telemetry
+/// Detects all installed GPU devices using native DXGI 1.4 and D3D12 hardware architecture APIs
 pub fn detect_gpus() -> Vec<GpuInfo> {
-    log::info!("[SYSTEM ANALYZER DEBUG] 🚀 Universal GPU Collector Started (DXGI 1.4 Primary)");
+    log::info!("[SYSTEM ANALYZER DEBUG] 🚀 Universal GPU Collector Started (DXGI 1.4 + D3D12 UMA Primary)");
     let mut gpus = Vec::new();
 
-    // 1. Enumerate via DXGI on Windows
+    // 1. Enumerate via DXGI & query D3D12 UMA hardware architecture on Windows
     #[cfg(target_os = "windows")]
     {
         if let Ok(dxgi_gpus) = query_dxgi_adapters() {
             if !dxgi_gpus.is_empty() {
-                log::info!("[SYSTEM ANALYZER DEBUG] ✓ DXGI 1.4 enumerated {} hardware GPU adapters", dxgi_gpus.len());
+                log::info!("[SYSTEM ANALYZER DEBUG] ✓ DXGI 1.4 & D3D12 enumerated {} hardware GPU adapters", dxgi_gpus.len());
                 gpus = dxgi_gpus;
             }
         } else {
@@ -44,7 +51,6 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
     if let Ok(nvidia_metrics) = query_nvidia_smi() {
         for gpu in &mut gpus {
             if gpu.vendor == "NVIDIA" || gpu.vendor_id == Some(0x10DE) {
-                // Find matching NVIDIA GPU metric by model or first NVIDIA GPU
                 if let Some(nv) = nvidia_metrics.iter().find(|m| m.model.eq_ignore_ascii_case(&gpu.model)).or_else(|| nvidia_metrics.first()) {
                     if gpu.vram_free_bytes == 0 && nv.vram_free_bytes > 0 {
                         gpu.vram_free_bytes = nv.vram_free_bytes;
@@ -58,7 +64,9 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
                     }
                     gpu.compute_capability = nv.compute_capability.clone();
                     gpu.cuda_supported = true;
-                    gpu.detection_source = "DXGI 1.4 + NVML".to_string();
+                    if !gpu.detection_source.contains("NVML") {
+                        gpu.detection_source = format!("{} + NVML", gpu.detection_source);
+                    }
                 }
             }
         }
@@ -94,7 +102,7 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 
     for (idx, gpu) in gpus.iter().enumerate() {
         log::info!(
-            "[SYSTEM ANALYZER DEBUG] ✓ GPU #{}: Vendor={} ({:X?}), Model={}, Type={}, Dedicated VRAM={} MB, Shared RAM={} MB, Source={}",
+            "[SYSTEM ANALYZER DEBUG] ✓ GPU #{}: Vendor={} ({:X?}), Model={}, Type={}, Dedicated VRAM={} MB, Shared RAM={} MB, Source={}, Confidence={}",
             idx + 1,
             gpu.vendor,
             gpu.vendor_id,
@@ -102,7 +110,8 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
             gpu.gpu_type,
             gpu.dedicated_video_memory_bytes / (1024 * 1024),
             gpu.shared_system_memory_bytes / (1024 * 1024),
-            gpu.detection_source
+            gpu.detection_source,
+            gpu.confidence
         );
     }
 
@@ -161,18 +170,47 @@ fn query_dxgi_adapters() -> Result<Vec<GpuInfo>, String> {
                 let shared_system = desc.SharedSystemMemory as u64;
                 let total_graphics = dedicated_video + dedicated_system + shared_system;
 
-                // Hardware Memory Classification Rule:
-                // Discrete GPUs have physical VRAM (> 1 GB DedicatedVideoMemory).
-                // Integrated GPUs (APUs) share main system RAM (DedicatedVideoMemory <= 512 MB, SharedSystemMemory > 1 GB).
-                let (gpu_type, is_dedicated, confidence) = if dedicated_video > 1_073_741_824 {
-                    ("Dedicated".to_string(), true, "High".to_string())
-                } else if shared_system > 1_073_741_824 && dedicated_video <= 536_870_912 {
-                    ("Integrated".to_string(), false, "High".to_string())
-                } else if dedicated_video > 0 {
-                    ("Dedicated".to_string(), true, "Medium".to_string())
-                } else {
-                    ("Integrated".to_string(), false, "Medium".to_string())
-                };
+                let mut gpu_type = "Unknown".to_string();
+                let mut is_dedicated = false;
+                let mut confidence = "Low".to_string();
+                let mut detection_source = "DXGI 1.4".to_string();
+
+                // Direct3D 12 Hardware UMA (Unified Memory Architecture) Flag Query
+                let mut d3d_device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d_device).is_ok() {
+                    if let Some(device) = d3d_device {
+                        let mut arch: D3D12_FEATURE_DATA_ARCHITECTURE = std::mem::zeroed();
+                        let size = std::mem::size_of::<D3D12_FEATURE_DATA_ARCHITECTURE>() as u32;
+                        if device.CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &mut arch as *mut _ as *mut _, size).is_ok() {
+                            if arch.UMA.as_bool() {
+                                gpu_type = "Integrated".to_string();
+                                is_dedicated = false;
+                                confidence = "High".to_string();
+                                detection_source = "DXGI 1.4 + D3D12 UMA Architecture API".to_string();
+                            } else {
+                                gpu_type = "Dedicated".to_string();
+                                is_dedicated = true;
+                                confidence = "High".to_string();
+                                detection_source = "DXGI 1.4 + D3D12 Discrete Architecture API".to_string();
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to DXGI memory allocation check if D3D12 query is unsupported
+                if gpu_type == "Unknown" {
+                    if dedicated_video > 1_073_741_824 {
+                        gpu_type = "Dedicated".to_string();
+                        is_dedicated = true;
+                        confidence = "Medium".to_string();
+                        detection_source = "DXGI 1.4 Memory Profile".to_string();
+                    } else if shared_system > 1_073_741_824 && dedicated_video <= 536_870_912 {
+                        gpu_type = "Integrated".to_string();
+                        is_dedicated = false;
+                        confidence = "Medium".to_string();
+                        detection_source = "DXGI 1.4 Memory Profile".to_string();
+                    }
+                }
 
                 let is_cuda = vendor == "NVIDIA";
                 let is_rocm = vendor == "AMD";
@@ -197,7 +235,7 @@ fn query_dxgi_adapters() -> Result<Vec<GpuInfo>, String> {
                     directx_supported: true,
                     vulkan_supported: true,
                     opencl_supported: true,
-                    detection_source: "DXGI 1.4".to_string(),
+                    detection_source,
                     confidence,
                 });
             }
@@ -334,7 +372,7 @@ fn query_cim_videocontroller() -> Result<Vec<GpuInfo>, String> {
                 vulkan_supported: true,
                 opencl_supported: true,
                 detection_source: "CIM Win32_VideoController".to_string(),
-                confidence: "Medium".to_string(),
+                confidence: "Low".to_string(),
             });
         }
     }

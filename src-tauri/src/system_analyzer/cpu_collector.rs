@@ -13,6 +13,7 @@ struct CimProcessorInfo {
     number_of_cores: Option<u32>,
     number_of_logical_processors: Option<u32>,
     max_clock_speed: Option<u32>,
+    virtualization_firmware_enabled: Option<bool>,
 }
 
 /// Detects system CPU details
@@ -40,6 +41,7 @@ pub fn detect_cpu() -> CpuInfo {
     let mut physical_cores = sys.physical_core_count().unwrap_or(logical_processors as usize) as u32;
     let mut base_frequency_mhz = if !cpus.is_empty() { cpus[0].frequency() } else { 0 };
     let mut boost_frequency_mhz = cpus.iter().map(|c| c.frequency()).max().unwrap_or(base_frequency_mhz);
+    let mut virtualization_supported = false;
 
     // Fallback/enrich via PowerShell Get-CimInstance on Windows
     #[cfg(target_os = "windows")]
@@ -73,6 +75,9 @@ pub fn detect_cpu() -> CpuInfo {
                         boost_frequency_mhz = spd as u64;
                     }
                 }
+            }
+            if let Some(virt) = cim_proc.virtualization_firmware_enabled {
+                virtualization_supported = virt;
             }
         } else {
             log::warn!("[SYSTEM ANALYZER DEBUG] ⚠️ CIM Processor query failed or empty");
@@ -126,11 +131,11 @@ pub fn detect_cpu() -> CpuInfo {
         cache_l1_kb: None,
         cache_l2_kb: None,
         cache_l3_kb: None,
-        virtualization_supported: true,
+        virtualization_supported,
         simd_capabilities,
     };
 
-    log::info!("[SYSTEM ANALYZER DEBUG] ✓ CPU Detection Finished: {}", model);
+    log::info!("[SYSTEM ANALYZER DEBUG] ✓ CPU Detection Finished: {}, Virtualization={}", model, virtualization_supported);
     info
 }
 
@@ -140,7 +145,7 @@ fn query_cim_processor() -> Result<CimProcessorInfo, String> {
         .args([
             "-NoProfile",
             "-Command",
-            "Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | ConvertTo-Json",
+            "Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, VirtualizationFirmwareEnabled | ConvertTo-Json",
         ])
         .output()
         .map_err(|e| format!("Failed to spawn powershell: {}", e))?;
@@ -154,7 +159,6 @@ fn query_cim_processor() -> Result<CimProcessorInfo, String> {
         return Err("powershell returned empty stdout".to_string());
     }
 
-    // ConvertTo-Json may return a single object or an array if multiple CPUs exist
     if let Ok(info) = serde_json::from_str::<CimProcessorInfo>(&stdout) {
         Ok(info)
     } else if let Ok(list) = serde_json::from_str::<Vec<CimProcessorInfo>>(&stdout) {
