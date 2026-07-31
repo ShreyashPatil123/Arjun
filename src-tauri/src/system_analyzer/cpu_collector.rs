@@ -1,7 +1,8 @@
 //! CPU specs collector using sysinfo and PowerShell CIM queries
 
-use crate::system_analyzer::process_utils::create_hidden_command;
+use crate::system_analyzer::process_utils::{create_hidden_command, run_command_with_timeout};
 use crate::system_analyzer::traits::CpuInfo;
+use std::time::Duration;
 use serde::Deserialize;
 use sysinfo::{CpuRefreshKind, System};
 
@@ -142,14 +143,15 @@ pub fn detect_cpu() -> CpuInfo {
 
 #[cfg(target_os = "windows")]
 fn query_cim_processor() -> Result<CimProcessorInfo, String> {
-    let output = create_hidden_command("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, VirtualizationFirmwareEnabled | ConvertTo-Json",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to spawn powershell: {}", e))?;
+    let mut cmd = create_hidden_command("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, VirtualizationFirmwareEnabled | ConvertTo-Json",
+    ]);
+
+    let output = run_command_with_timeout(cmd, Duration::from_secs(3))
+        .map_err(|e| format!("Failed powershell: {}", e))?;
 
     if !output.status.success() {
         return Err("powershell Get-CimInstance Win32_Processor returned non-zero status".to_string());

@@ -4,8 +4,9 @@
 //! Enrichment: NVML (NVIDIA), CIM/WMI (AMD/Intel)
 //! Zero Machine-Specific Hardcoded Strings or Guesswork
 
-use crate::system_analyzer::process_utils::create_hidden_command;
+use crate::system_analyzer::process_utils::{create_hidden_command, run_command_with_timeout};
 use crate::system_analyzer::traits::GpuInfo;
+use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -246,7 +247,9 @@ fn query_dxgi_adapters() -> Result<Vec<GpuInfo>, String> {
 }
 
 fn check_rocm_runtime() -> bool {
-    if let Ok(output) = create_hidden_command("rocm-smi").arg("--version").output() {
+    let mut cmd = create_hidden_command("rocm-smi");
+    cmd.arg("--version");
+    if let Ok(output) = run_command_with_timeout(cmd, Duration::from_secs(2)) {
         return output.status.success();
     }
     false
@@ -261,16 +264,17 @@ struct NvmlMetric {
 }
 
 fn query_nvidia_smi() -> Result<Vec<NvmlMetric>, String> {
-    let output = create_hidden_command("nvidia-smi")
-        .args([
-            "--query-gpu=gpu_name,driver_version,memory.total,memory.free,compute_cap",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .map_err(|e| format!("Failed nvidia-smi execution: {}", e))?;
+    let mut cmd = create_hidden_command("nvidia-smi");
+    cmd.args([
+        "--query-gpu=gpu_name,driver_version,memory.total,memory.free,compute_cap",
+        "--format=csv,noheader,nounits",
+    ]);
+
+    let output = run_command_with_timeout(cmd, Duration::from_millis(2500))
+        .map_err(|e| format!("nvidia-smi execution failed or timed out: {}", e))?;
 
     if !output.status.success() {
-        return Err("nvidia-smi non-zero exit code".to_string());
+        return Err("nvidia-smi returned non-zero status".to_string());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -308,13 +312,14 @@ struct CimGpuInfo {
 
 #[cfg(target_os = "windows")]
 fn query_cim_videocontroller() -> Result<Vec<GpuInfo>, String> {
-    let output = create_hidden_command("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | ConvertTo-Json",
-        ])
-        .output()
+    let mut cmd = create_hidden_command("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | ConvertTo-Json",
+    ]);
+
+    let output = run_command_with_timeout(cmd, Duration::from_secs(3))
         .map_err(|e| format!("Failed powershell: {}", e))?;
 
     if !output.status.success() {

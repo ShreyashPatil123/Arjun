@@ -1,6 +1,8 @@
-//! Developer software dependencies collector using PATH and registry checks
+//! Developer software dependencies collector using native PATH and registry checks
+//! Zero child process spawns for missing binaries (prevents mini terminal window popups).
 
-use crate::system_analyzer::process_utils::create_hidden_command;
+use std::time::Duration;
+use crate::system_analyzer::process_utils::{create_hidden_command, run_command_with_timeout, resolve_binary_path_natively};
 use crate::system_analyzer::traits::{SoftwareDetectorInfo, SoftwareEnvironment};
 
 /// Detects system software environment dependencies
@@ -45,22 +47,28 @@ pub fn detect_software() -> SoftwareEnvironment {
 
 fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&str]) -> SoftwareDetectorInfo {
     for bin in binary_names {
-        if let Ok(output) = create_hidden_command(bin).args(version_args).output() {
-            if output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let raw_out = if !stdout.trim().is_empty() { stdout } else { stderr };
-                let version = parse_version_string(&raw_out);
-                let path = resolve_binary_path(bin);
+        // First check natively in Rust if the binary exists on PATH.
+        // If it doesn't exist natively, do NOT spawn a child process!
+        if let Some(resolved_path) = resolve_binary_path_natively(bin) {
+            let mut cmd = create_hidden_command(&resolved_path);
+            cmd.args(version_args);
 
-                log::info!("[SYSTEM ANALYZER DEBUG] ✓ Found {}: version={:?}, path={:?}", display_name, version, path);
+            if let Ok(output) = run_command_with_timeout(cmd, Duration::from_secs(2)) {
+                if output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let raw_out = if !stdout.trim().is_empty() { stdout } else { stderr };
+                    let version = parse_version_string(&raw_out);
 
-                return SoftwareDetectorInfo {
-                    name: display_name.to_string(),
-                    installed: true,
-                    version: Some(version),
-                    path,
-                };
+                    log::info!("[SYSTEM ANALYZER DEBUG] ✓ Found {}: version={:?}, path={:?}", display_name, version, resolved_path);
+
+                    return SoftwareDetectorInfo {
+                        name: display_name.to_string(),
+                        installed: true,
+                        version: Some(version),
+                        path: Some(resolved_path),
+                    };
+                }
             }
         }
     }
@@ -75,56 +83,31 @@ fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&
     }
 }
 
-fn resolve_binary_path(bin: &str) -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = create_hidden_command("where").arg(bin).output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    return Some(first_line.trim().to_string());
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = create_hidden_command("which").arg(bin).output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    return Some(first_line.trim().to_string());
-                }
-            }
-        }
-    }
-
-    None
-}
-
 fn parse_version_string(raw: &str) -> String {
     let line = raw.lines().next().unwrap_or(raw).trim();
     line.to_string()
 }
 
 fn check_cuda_toolkit() -> SoftwareDetectorInfo {
-    if let Ok(output) = create_hidden_command("nvcc").arg("--version").output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let version = stdout
-                .lines()
-                .find(|l| l.contains("release"))
-                .unwrap_or("CUDA Toolkit")
-                .trim()
-                .to_string();
-            let path = resolve_binary_path("nvcc");
-            return SoftwareDetectorInfo {
-                name: "CUDA Toolkit".to_string(),
-                installed: true,
-                version: Some(version),
-                path,
-            };
+    if let Some(resolved_path) = resolve_binary_path_natively("nvcc") {
+        let mut cmd = create_hidden_command(&resolved_path);
+        cmd.arg("--version");
+        if let Ok(output) = run_command_with_timeout(cmd, Duration::from_secs(2)) {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let version = stdout
+                    .lines()
+                    .find(|l| l.contains("release"))
+                    .unwrap_or("CUDA Toolkit")
+                    .trim()
+                    .to_string();
+                return SoftwareDetectorInfo {
+                    name: "CUDA Toolkit".to_string(),
+                    installed: true,
+                    version: Some(version),
+                    path: Some(resolved_path),
+                };
+            }
         }
     }
 
