@@ -461,6 +461,10 @@ export const Models: React.FC = () => {
                       </div>
                     ) : downloadTask && downloadTask.status !== 'Cancelled' ? (
                       <div className={styles.progressContainer}>
+                        {/* Base Model Section */}
+                        <div style={{ fontWeight: 600, fontSize: '12px', color: 'var(--text-primary)', marginBottom: 4 }}>
+                          Base Model ({model.modelName} - {model.quantization})
+                        </div>
                         <div className={styles.progressStats}>
                           <span>Status: <strong>{downloadTask.status}</strong></span>
                           <span>{downloadTask.status === 'Resolving' ? 'Starting...' : `${downloadTask.progressPercent.toFixed(1)}%`}</span>
@@ -478,12 +482,59 @@ export const Models: React.FC = () => {
                           </span>
                           <span>{downloadTask.speedFormatted} {formatEta(downloadTask.etaSeconds)}</span>
                         </div>
+
+                        {/* Capability Adapters Section */}
+                        <div style={{ marginTop: 12, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                          <div style={{ fontWeight: 600, fontSize: '11px', color: 'var(--accent)', marginBottom: 6, display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <Layers size={12} /> Capability LoRA Adapters
+                          </div>
+                          
+                          {[
+                            { key: 'coding', label: 'Coding' },
+                            { key: 'reasoning', label: 'Reasoning' },
+                            { key: 'tool-calling', label: 'Tool Calling' },
+                            { key: 'mathematics', label: 'Mathematics' },
+                            { key: 'research', label: 'Research' },
+                          ].map((cap) => {
+                            const adapterTaskId = `dl_${model.modelId.replace(/\//g, '_')}_${model.quantization.toLowerCase()}_adapter_${cap.key}`;
+                            const adapterTask = activeTasks[adapterTaskId];
+
+                            const isUnavailable = adapterTask?.status === 'Completed' && Boolean(adapterTask.error?.includes('Unavailable'));
+                            const status = isUnavailable ? 'Unavailable' : adapterTask?.status || 'Searching...';
+                            const pct = adapterTask?.progressPercent ?? (adapterTask?.status === 'Completed' ? 100 : 0);
+
+                            return (
+                              <div key={cap.key} style={{ marginBottom: 6, fontSize: '11px', background: 'var(--surface-subtle)', padding: '6px 8px', borderRadius: '6px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 }}>
+                                  <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                                    ⚡ {cap.label}
+                                  </span>
+                                  <Badge variant={status === 'Completed' ? 'success' : isUnavailable ? 'default' : 'warning'}>
+                                    {isUnavailable ? 'Unavailable (Base Native)' : status}
+                                  </Badge>
+                                </div>
+                                {!isUnavailable && (
+                                  <>
+                                    <div className={styles.progressBarBg} style={{ height: '4px', marginTop: 4 }}>
+                                      <div className={styles.progressBarFill} style={{ width: `${Math.min(100, pct)}%` }} />
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-tertiary)', marginTop: 2 }}>
+                                      <span>{adapterTask && adapterTask.totalBytes > 0 ? `${formatBytes(adapterTask.downloadedBytes)} / ${formatBytes(adapterTask.totalBytes)}` : 'Resolving metadata...'}</span>
+                                      <span>{pct.toFixed(0)}%</span>
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+
                         {downloadTask.error && (
                           <div style={{ color: 'var(--error)', fontSize: '11px', marginTop: 4 }}>
                             {downloadTask.error}
                           </div>
                         )}
-                        <div style={{ display: 'flex', gap: '8px', marginTop: 6 }}>
+                        <div style={{ display: 'flex', gap: '8px', marginTop: 8 }}>
                           {downloadTask.status === 'Downloading' ? (
                             <Button variant="secondary" size="sm" onClick={() => handlePause(downloadTask.taskId)}>
                               <Pause size={14} style={{ marginRight: 4 }} /> Pause
