@@ -73,6 +73,7 @@ pub struct InstalledModel {
     pub installed_at: String,
     pub is_ready: bool,
     pub checksum: Option<String>,
+    pub adapters: Option<std::collections::HashMap<String, crate::adapter_manager::AdapterManifestInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -42,6 +42,9 @@ export interface DownloadProgressPayload {
   etaSeconds: number | null;
   status: DownloadStatus;
   error: string | null;
+  packageId?: string;
+  capability?: string;
+  itemType?: string;
 }
 
 export interface InstalledModel {
@@ -58,6 +61,7 @@ export interface InstalledModel {
   installedAt: string;
   isReady: boolean;
   checksum: string | null;
+  adapters?: Record<string, AdapterManifestInfo>;
 }
 
 export interface StorageSummary {

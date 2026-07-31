@@ -117,10 +117,12 @@ export const Models: React.FC = () => {
         ...prev,
         [payload.taskId]: payload,
       }));
-      if (payload.status === 'Completed') {
-        addToast('success', `${payload.modelId} (${payload.quantization}) downloaded successfully!`);
+
+      // Only emit single package completion success toast
+      if (payload.itemType === 'package_completed' && payload.status === 'Completed') {
+        addToast('success', 'Model package installed successfully');
         refreshStorageAndDownloads();
-      } else if (payload.status === 'Failed') {
+      } else if (payload.status === 'Failed' && !payload.itemType) {
         addToast('error', `Download failed for ${payload.modelId}: ${payload.error || 'Unknown error'}`);
         refreshStorageAndDownloads();
       }
@@ -322,11 +324,30 @@ export const Models: React.FC = () => {
                     </div>
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: 6, display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
                       <span style={{ fontWeight: 600, color: 'var(--accent)' }}>Capability Adapters:</span>
-                      {['Coding', 'Reasoning', 'Tool Calling', 'Mathematics', 'Research'].map((cap) => (
-                        <span key={cap} style={{ background: 'var(--surface-hover)', padding: '2px 6px', borderRadius: '4px', border: '1px solid var(--border)' }}>
-                          ⚡ {cap}: Base Native
-                        </span>
-                      ))}
+                      {[
+                        { key: 'coding', label: 'Coding' },
+                        { key: 'reasoning', label: 'Reasoning' },
+                        { key: 'tool-calling', label: 'Tool Calling' },
+                        { key: 'mathematics', label: 'Mathematics' },
+                        { key: 'research', label: 'Research' },
+                      ].map(({ key, label }) => {
+                        const adapter = m.adapters?.[key];
+                        const isInstalled = adapter?.status === 'Installed' && Boolean(adapter?.adapterFile);
+                        return (
+                          <span
+                            key={key}
+                            style={{
+                              background: isInstalled ? 'rgba(16,185,129,0.1)' : 'var(--surface-hover)',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              border: isInstalled ? '1px solid var(--success)' : '1px solid var(--border)',
+                              color: isInstalled ? 'var(--success)' : 'var(--text-secondary)',
+                            }}
+                          >
+                            ⚡ {label}: {isInstalled ? `Installed (${adapter?.repoId || 'LoRA'} - ${formatBytes(adapter?.sizeBytes || 0)})` : 'Base Native'}
+                          </span>
+                        );
+                      })}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
@@ -500,8 +521,10 @@ export const Models: React.FC = () => {
                             const adapterTask = activeTasks[adapterTaskId];
 
                             const isUnavailable = adapterTask?.status === 'Completed' && Boolean(adapterTask.error?.includes('Unavailable'));
-                            const status = isUnavailable ? 'Unavailable' : adapterTask?.status || 'Searching...';
-                            const pct = adapterTask?.progressPercent ?? (adapterTask?.status === 'Completed' ? 100 : 0);
+                            const isSearching = !adapterTask || adapterTask.status === 'Resolving' || adapterTask.speedFormatted === 'Searching...';
+                            const isCompleted = adapterTask?.status === 'Completed' && !isUnavailable;
+                            const isDownloading = adapterTask?.status === 'Downloading' || adapterTask?.status === 'Verifying';
+                            const pct = adapterTask?.progressPercent ?? (isCompleted ? 100 : 0);
 
                             return (
                               <div key={cap.key} style={{ marginBottom: 6, fontSize: '11px', background: 'var(--surface-subtle)', padding: '6px 8px', borderRadius: '6px' }}>
@@ -509,21 +532,25 @@ export const Models: React.FC = () => {
                                   <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
                                     ⚡ {cap.label}
                                   </span>
-                                  <Badge variant={status === 'Completed' ? 'success' : isUnavailable ? 'default' : 'warning'}>
-                                    {isUnavailable ? 'Unavailable (Base Native)' : status}
+                                  <Badge variant={isCompleted ? 'success' : isUnavailable ? 'default' : 'warning'}>
+                                    {isUnavailable ? 'Base Native' : isSearching ? 'Searching...' : isCompleted ? 'Ready' : adapterTask.status}
                                   </Badge>
                                 </div>
-                                {!isUnavailable && (
+                                {isDownloading || isCompleted ? (
                                   <>
                                     <div className={styles.progressBarBg} style={{ height: '4px', marginTop: 4 }}>
                                       <div className={styles.progressBarFill} style={{ width: `${Math.min(100, pct)}%` }} />
                                     </div>
                                     <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-tertiary)', marginTop: 2 }}>
-                                      <span>{adapterTask && adapterTask.totalBytes > 0 ? `${formatBytes(adapterTask.downloadedBytes)} / ${formatBytes(adapterTask.totalBytes)}` : 'Resolving metadata...'}</span>
+                                      <span>
+                                        {adapterTask.totalBytes > 0
+                                          ? `${formatBytes(adapterTask.downloadedBytes)} / ${formatBytes(adapterTask.totalBytes)}`
+                                          : 'Resolving weight size...'}
+                                      </span>
                                       <span>{pct.toFixed(0)}%</span>
                                     </div>
                                   </>
-                                )}
+                                ) : null}
                               </div>
                             );
                           })}

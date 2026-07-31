@@ -104,6 +104,10 @@ struct HfAdapterConfig {
 pub struct HuggingFaceAdapterProvider;
 
 impl HuggingFaceAdapterProvider {
+    pub fn all_capabilities() -> Vec<AdapterCapability> {
+        AdapterCapability::all()
+    }
+
     /// Extracts canonical aliases for a given base model ID
     pub fn extract_model_aliases(model_id: &str) -> Vec<String> {
         let mut aliases = Vec::new();
@@ -234,7 +238,7 @@ impl HuggingFaceAdapterProvider {
 
         let client = reqwest::Client::builder()
             .user_agent("Sarathi/0.1.0 (Windows; x64)")
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(8))
             .build()?;
 
         let mut req = client.get(&config_url);
@@ -263,7 +267,7 @@ impl HuggingFaceAdapterProvider {
         }
 
         let matches_base = aliases.iter().any(|alias| base_path.contains(alias) || alias.contains(&base_path));
-        if !matches_base && !base_path.contains(base_model_id) {
+        if !matches_base && !base_path.contains(&base_model_id.to_lowercase()) {
             return Err(anyhow!(
                 "Base model mismatch: adapter targets '{}', expected '{}'",
                 base_path,
@@ -291,17 +295,54 @@ impl HuggingFaceAdapterProvider {
             }
         }
 
-        // 4. Calculate score based on strict criteria
-        let mut confidence_score = 50.0; // Base score for passing strict config verification
+        // 4. Verify weight file existence and resolve exact Content-Length from HF
+        let candidate_files = vec!["adapter_model.safetensors", "adapter_model.bin"];
+        let mut selected_file: Option<(String, String, u64)> = None;
+
+        for fname in candidate_files {
+            let weight_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, fname);
+            let mut head_req = client.head(&weight_url);
+            if let Some(token) = hf_token {
+                if !token.trim().is_empty() {
+                    head_req = head_req.header("Authorization", format!("Bearer {}", token.trim()));
+                }
+            }
+
+            if let Ok(head_res) = head_req.send().await {
+                if head_res.status().is_success() {
+                    if let Some(cl_header) = head_res.headers().get(reqwest::header::CONTENT_LENGTH) {
+                        if let Ok(cl_str) = cl_header.to_str() {
+                            if let Ok(size_bytes) = cl_str.parse::<u64>() {
+                                // Must be real adapter weights (> 100 KB)
+                                if size_bytes >= 100_000 {
+                                    selected_file = Some((fname.to_string(), weight_url, size_bytes));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (adapter_file_name, download_url, size_bytes) = match selected_file {
+            Some(f) => f,
+            None => {
+                return Err(anyhow!(
+                    "No valid, non-placeholder adapter weight file (adapter_model.safetensors or adapter_model.bin >= 100KB) found in {}",
+                    repo_id
+                ));
+            }
+        };
+
+        // 5. Calculate score based on strict criteria
+        let mut confidence_score = 50.0;
         if base_path == base_model_id.to_lowercase() {
             confidence_score += 30.0;
         }
         if !target_modules.is_empty() {
             confidence_score += 10.0;
         }
-
-        let adapter_file_name = "adapter_model.safetensors".to_string();
-        let download_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, adapter_file_name);
 
         Ok(AdapterCandidate {
             repo_id: repo_id.to_string(),
@@ -311,7 +352,7 @@ impl HuggingFaceAdapterProvider {
             target_modules,
             adapter_file_name,
             download_url,
-            size_bytes: 45_000_000, // ~45 MB estimated LoRA overhead
+            size_bytes,
             downloads: 100,
             likes: 10,
             confidence_score,

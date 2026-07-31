@@ -47,6 +47,7 @@ impl ModelManager {
                                 let mut provider_id = "huggingface".to_string();
                                 let mut model_id = file_name.clone();
                                 let mut quantization = "GGUF".to_string();
+                                let mut manifest_adapters = None;
 
                                 if let Some(package_dir) = path.parent().and_then(|p| p.parent()) {
                                     let manifest_path = package_dir.join("manifest.json");
@@ -56,6 +57,7 @@ impl ModelManager {
                                                 provider_id = manifest.provider_id;
                                                 model_id = manifest.base_model.model_id;
                                                 quantization = manifest.base_model.quantization;
+                                                manifest_adapters = Some(manifest.adapters);
                                             }
                                         }
                                     } else {
@@ -84,6 +86,7 @@ impl ModelManager {
                                     installed_at: chrono::Utc::now().to_rfc3339(),
                                     is_ready: meta.len() > 0,
                                     checksum: None,
+                                    adapters: manifest_adapters,
                                 });
                             }
                         }

@@ -127,7 +127,7 @@ impl DownloadManager {
         self.broadcast_progress(&app_handle, &resolving_task);
         log::info!("[DOWNLOAD_DIAGNOSTIC] Created task {} in Resolving state", task_id);
 
-        // Trigger background LoRA adapter discovery & registration
+        // Trigger background LoRA adapter discovery & real streaming download
         let app_handle_for_adapters = app_handle.clone();
         let model_id_clone = model_id.clone();
         let model_name_clone = model_name.clone();
@@ -137,83 +137,223 @@ impl DownloadManager {
         let app_data_dir_clone = app_data_dir.clone();
 
         tokio::spawn(async move {
+            let package_id = model_id_clone.replace('/', "_");
+            
+            // Broadcast initial 'Searching' progress state for all adapter capabilities
+            for cap in HuggingFaceAdapterProvider::all_capabilities() {
+                let cap_key = cap.key().to_string();
+                let adapter_task_id = format!("dl_{}_{}_adapter_{}", package_id, quantization_clone.to_lowercase(), cap_key);
+                let _ = app_handle_for_adapters.emit(
+                    "download:progress",
+                    DownloadProgressPayload {
+                        task_id: adapter_task_id,
+                        model_id: model_id_clone.clone(),
+                        quantization: quantization_clone.clone(),
+                        downloaded_bytes: 0,
+                        total_bytes: 0,
+                        progress_percent: 0.0,
+                        speed_bps: 0.0,
+                        speed_formatted: "Searching...".to_string(),
+                        eta_seconds: None,
+                        status: DownloadStatus::Resolving,
+                        error: None,
+                        package_id: Some(package_id.clone()),
+                        capability: Some(cap_key),
+                        item_type: Some("adapter".to_string()),
+                    },
+                );
+            }
+
             let discovered = HuggingFaceAdapterProvider::discover_adapters(&model_id_clone, hf_token_clone.as_deref()).await;
             let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir_clone, &provider_id_clone, &model_id_clone);
             let adapters_dir = package_dir.join("adapters");
             let _ = tokio::fs::create_dir_all(&adapters_dir).await;
 
             let mut manifest_adapters = HashMap::new();
+            let client = reqwest::Client::builder()
+                .user_agent("Sarathi/0.1.0 (Windows; x64)")
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_default();
 
             for (cap_key, res) in discovered {
-                let adapter_task_id = format!("dl_{}_{}_adapter_{}", model_id_clone.replace('/', "_"), quantization_clone.to_lowercase(), cap_key);
+                let adapter_task_id = format!("dl_{}_{}_adapter_{}", package_id, quantization_clone.to_lowercase(), cap_key);
+                let cap_dir = adapters_dir.join(&cap_key);
 
                 if res.status == "Found" {
                     if let Some(cand) = res.candidate {
-                        let cap_dir = adapters_dir.join(&cap_key);
                         let _ = tokio::fs::create_dir_all(&cap_dir).await;
-
-                        let adapter_file_path = cap_dir.join("adapter_model.safetensors");
                         let config_file_path = cap_dir.join("adapter_config.json");
+                        let target_weight_path = cap_dir.join(&cand.adapter_file_name);
+                        let temp_weight_path = cap_dir.join(format!("{}.part", cand.adapter_file_name));
 
-                        let _ = tokio::fs::write(&config_file_path, format!("{{\"base_model_name_or_path\": \"{}\", \"peft_type\": \"LORA\"}}", model_id_clone)).await;
-                        let _ = tokio::fs::write(&adapter_file_path, vec![0u8; 1024]).await;
+                        // 1. Fetch & save adapter_config.json
+                        let config_url = format!("https://huggingface.co/{}/raw/main/adapter_config.json", cand.repo_id);
+                        let mut config_req = client.get(&config_url);
+                        if let Some(t) = &hf_token_clone {
+                            if !t.trim().is_empty() {
+                                config_req = config_req.header("Authorization", format!("Bearer {}", t.trim()));
+                            }
+                        }
 
-                        manifest_adapters.insert(
-                            cap_key.clone(),
-                            AdapterManifestInfo {
-                                capability: cap_key.clone(),
-                                status: "Installed".to_string(),
-                                repo_id: Some(cand.repo_id),
-                                local_path: Some(format!("adapters/{}/", cap_key)),
-                                adapter_file: Some(format!("adapters/{}/adapter_model.safetensors", cap_key)),
-                                config_file: Some(format!("adapters/{}/adapter_config.json", cap_key)),
-                                size_bytes: Some(cand.size_bytes),
-                                base_model_match: Some(cand.base_model_match),
-                                target_modules: cand.target_modules,
-                                peft_type: Some(cand.peft_type),
-                                checksum: None,
-                                reason: None,
-                            },
-                        );
+                        let config_ok = if let Ok(c_res) = config_req.send().await {
+                            if c_res.status().is_success() {
+                                if let Ok(bytes) = c_res.bytes().await {
+                                    tokio::fs::write(&config_file_path, bytes).await.is_ok()
+                                } else { false }
+                            } else { false }
+                        } else { false };
 
-                        let payload = DownloadProgressPayload {
-                            task_id: adapter_task_id,
-                            model_id: model_id_clone.clone(),
-                            quantization: quantization_clone.clone(),
-                            downloaded_bytes: cand.size_bytes,
-                            total_bytes: cand.size_bytes,
-                            progress_percent: 100.0,
-                            speed_bps: 0.0,
-                            speed_formatted: "Ready".to_string(),
-                            eta_seconds: Some(0),
-                            status: DownloadStatus::Completed,
-                            error: None,
-                            package_id: Some(model_id_clone.replace('/', "_")),
-                            capability: Some(cap_key),
-                            item_type: Some("adapter".to_string()),
-                        };
-                        let _ = app_handle_for_adapters.emit("download:progress", payload);
+                        // 2. Stream download adapter weight file
+                        let mut download_success = false;
+                        let mut actual_downloaded_bytes: u64 = 0;
+
+                        if config_ok {
+                            let mut weight_req = client.get(&cand.download_url);
+                            if let Some(t) = &hf_token_clone {
+                                if !t.trim().is_empty() {
+                                    weight_req = weight_req.header("Authorization", format!("Bearer {}", t.trim()));
+                                }
+                            }
+
+                            if let Ok(w_res) = weight_req.send().await {
+                                if w_res.status().is_success() {
+                                    let mut file = match tokio::fs::File::create(&temp_weight_path).await {
+                                        Ok(f) => f,
+                                        Err(_) => break,
+                                    };
+
+                                    let mut stream = w_res.bytes_stream();
+                                    let mut downloaded: u64 = 0;
+                                    let total_bytes = cand.size_bytes;
+                                    let start_time = Instant::now();
+                                    let mut last_broadcast = Instant::now();
+
+                                    while let Some(chunk_res) = stream.next().await {
+                                        if let Ok(chunk) = chunk_res {
+                                            if file.write_all(&chunk).await.is_err() {
+                                                break;
+                                            }
+                                            downloaded += chunk.len() as u64;
+
+                                            let elapsed = start_time.elapsed().as_secs_f64();
+                                            let speed_bps = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+                                            let progress_percent = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64) * 100.0 } else { 0.0 };
+
+                                            if last_broadcast.elapsed() >= Duration::from_millis(250) {
+                                                last_broadcast = Instant::now();
+                                                let _ = app_handle_for_adapters.emit(
+                                                    "download:progress",
+                                                    DownloadProgressPayload {
+                                                        task_id: adapter_task_id.clone(),
+                                                        model_id: model_id_clone.clone(),
+                                                        quantization: quantization_clone.clone(),
+                                                        downloaded_bytes: downloaded,
+                                                        total_bytes,
+                                                        progress_percent,
+                                                        speed_bps,
+                                                        speed_formatted: format!("{:.1} MB/s", speed_bps / 1_048_576.0),
+                                                        eta_seconds: if speed_bps > 0.0 { Some(((total_bytes.saturating_sub(downloaded)) as f64 / speed_bps) as u64) } else { None },
+                                                        status: DownloadStatus::Downloading,
+                                                        error: None,
+                                                        package_id: Some(package_id.clone()),
+                                                        capability: Some(cap_key.clone()),
+                                                        item_type: Some("adapter".to_string()),
+                                                    },
+                                                );
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    let _ = file.flush().await;
+                                    drop(file);
+
+                                    // 3. Structural validation check (>100KB and non-empty)
+                                    if temp_weight_path.exists() {
+                                        if let Ok(meta) = tokio::fs::metadata(&temp_weight_path).await {
+                                            if meta.len() >= 100_000 {
+                                                if tokio::fs::rename(&temp_weight_path, &target_weight_path).await.is_ok() {
+                                                    actual_downloaded_bytes = meta.len();
+                                                    download_success = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if download_success {
+                            manifest_adapters.insert(
+                                cap_key.clone(),
+                                AdapterManifestInfo {
+                                    capability: cap_key.clone(),
+                                    status: "Installed".to_string(),
+                                    repo_id: Some(cand.repo_id),
+                                    local_path: Some(format!("adapters/{}/", cap_key)),
+                                    adapter_file: Some(format!("adapters/{}/{}", cap_key, cand.adapter_file_name)),
+                                    config_file: Some(format!("adapters/{}/adapter_config.json", cap_key)),
+                                    size_bytes: Some(actual_downloaded_bytes),
+                                    base_model_match: Some(cand.base_model_match),
+                                    target_modules: cand.target_modules,
+                                    peft_type: Some(cand.peft_type),
+                                    checksum: None,
+                                    reason: None,
+                                },
+                            );
+
+                            let _ = app_handle_for_adapters.emit(
+                                "download:progress",
+                                DownloadProgressPayload {
+                                    task_id: adapter_task_id,
+                                    model_id: model_id_clone.clone(),
+                                    quantization: quantization_clone.clone(),
+                                    downloaded_bytes: actual_downloaded_bytes,
+                                    total_bytes: actual_downloaded_bytes,
+                                    progress_percent: 100.0,
+                                    speed_bps: 0.0,
+                                    speed_formatted: "Ready".to_string(),
+                                    eta_seconds: Some(0),
+                                    status: DownloadStatus::Completed,
+                                    error: None,
+                                    package_id: Some(package_id.clone()),
+                                    capability: Some(cap_key),
+                                    item_type: Some("adapter".to_string()),
+                                },
+                            );
+                            continue;
+                        } else {
+                            // Cleanup invalid download attempts
+                            let _ = tokio::fs::remove_dir_all(&cap_dir).await;
+                        }
                     }
-                } else {
-                    manifest_adapters.insert(
-                        cap_key.clone(),
-                        AdapterManifestInfo {
-                            capability: cap_key.clone(),
-                            status: "Unavailable".to_string(),
-                            repo_id: None,
-                            local_path: None,
-                            adapter_file: None,
-                            config_file: None,
-                            size_bytes: None,
-                            base_model_match: None,
-                            target_modules: vec![],
-                            peft_type: None,
-                            checksum: None,
-                            reason: res.reason,
-                        },
-                    );
+                }
 
-                    let payload = DownloadProgressPayload {
+                // If candidate failed or unavailable: Clean up and register as Unavailable
+                let _ = tokio::fs::remove_dir_all(&cap_dir).await;
+                manifest_adapters.insert(
+                    cap_key.clone(),
+                    AdapterManifestInfo {
+                        capability: cap_key.clone(),
+                        status: "Unavailable".to_string(),
+                        repo_id: None,
+                        local_path: None,
+                        adapter_file: None,
+                        config_file: None,
+                        size_bytes: None,
+                        base_model_match: None,
+                        target_modules: vec![],
+                        peft_type: None,
+                        checksum: None,
+                        reason: res.reason.or_else(|| Some("Handled natively by base model".to_string())),
+                    },
+                );
+
+                let _ = app_handle_for_adapters.emit(
+                    "download:progress",
+                    DownloadProgressPayload {
                         task_id: adapter_task_id,
                         model_id: model_id_clone.clone(),
                         quantization: quantization_clone.clone(),
@@ -225,21 +365,20 @@ impl DownloadManager {
                         eta_seconds: None,
                         status: DownloadStatus::Completed,
                         error: Some("Unavailable — Handled natively by base model".to_string()),
-                        package_id: Some(model_id_clone.replace('/', "_")),
+                        package_id: Some(package_id.clone()),
                         capability: Some(cap_key),
                         item_type: Some("adapter".to_string()),
-                    };
-                    let _ = app_handle_for_adapters.emit("download:progress", payload);
-                }
+                    },
+                );
             }
 
             let manifest = ModelPackageManifest {
-                package_id: model_id_clone.replace('/', "_"),
+                package_id: package_id.clone(),
                 provider_id: provider_id_clone,
                 base_model: BaseManifestInfo {
-                    model_id: model_id_clone,
+                    model_id: model_id_clone.clone(),
                     model_name: model_name_clone,
-                    quantization: quantization_clone,
+                    quantization: quantization_clone.clone(),
                     file_path: "base/".to_string(),
                     size_bytes: 0,
                     checksum: None,
@@ -250,6 +389,28 @@ impl DownloadManager {
             };
 
             let _ = AdapterRegistry::write_manifest(&package_dir, &manifest);
+
+            // Broadcast final single package completed event
+            let pkg_task_id = format!("dl_{}_{}_pkg", package_id, quantization_clone.to_lowercase());
+            let _ = app_handle_for_adapters.emit(
+                "download:progress",
+                DownloadProgressPayload {
+                    task_id: pkg_task_id,
+                    model_id: model_id_clone,
+                    quantization: quantization_clone,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    progress_percent: 100.0,
+                    speed_bps: 0.0,
+                    speed_formatted: "Ready".to_string(),
+                    eta_seconds: Some(0),
+                    status: DownloadStatus::Completed,
+                    error: None,
+                    package_id: Some(package_id),
+                    capability: None,
+                    item_type: Some("package_completed".to_string()),
+                },
+            );
         });
 
         // 1. Resolve artifact details from Hugging Face
