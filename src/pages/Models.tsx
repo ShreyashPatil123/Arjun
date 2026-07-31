@@ -320,6 +320,14 @@ export const Models: React.FC = () => {
                     <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: 2 }}>
                       Path: {m.filePath} · Size: {formatBytes(m.sizeBytes)}
                     </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: 6, display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <span style={{ fontWeight: 600, color: 'var(--accent)' }}>Capability Adapters:</span>
+                      {['Coding', 'Reasoning', 'Tool Calling', 'Mathematics', 'Research'].map((cap) => (
+                        <span key={cap} style={{ background: 'var(--surface-hover)', padding: '2px 6px', borderRadius: '4px', border: '1px solid var(--border)' }}>
+                          ⚡ {cap}: Base Native
+                        </span>
+                      ))}
+                    </div>
                   </div>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                     <Badge variant="success">Ready</Badge>

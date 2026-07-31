@@ -516,6 +516,9 @@ impl DownloadManager {
             eta_seconds: task.eta_seconds,
             status: task.status.clone(),
             error: task.error.clone(),
+            package_id: None,
+            capability: None,
+            item_type: Some("base_model".to_string()),
         }
     }
 }

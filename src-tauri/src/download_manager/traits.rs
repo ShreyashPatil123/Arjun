@@ -52,6 +52,9 @@ pub struct DownloadProgressPayload {
     pub eta_seconds: Option<u64>,
     pub status: DownloadStatus,
     pub error: Option<String>,
+    pub package_id: Option<String>,
+    pub capability: Option<String>,
+    pub item_type: Option<String>, // "base_model" | "adapter"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

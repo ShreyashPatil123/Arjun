@@ -13,6 +13,7 @@ pub mod model_recommendation;
 pub mod model_manager;
 pub mod model_providers;
 pub mod download_manager;
+pub mod adapter_manager;
 pub mod ai_engine;
 pub mod lora;
 pub mod installer;
@@ -104,6 +105,11 @@ pub fn run() {
             commands::download::get_installed_models,
             commands::download::delete_installed_model,
             commands::download::get_storage_summary,
+
+            // LoRA Capability Adapter commands
+            commands::adapter::discover_model_adapters,
+            commands::adapter::get_model_package_manifest,
+            commands::adapter::list_installed_model_packages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

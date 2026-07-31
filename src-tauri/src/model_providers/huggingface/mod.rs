@@ -2,6 +2,7 @@
 
 pub mod resolver;
 pub mod catalog_provider;
+pub mod adapter_provider;
 
 use crate::model_providers::provider::{ModelProvider, ProviderType};
 

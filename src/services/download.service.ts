@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, Event } from '@tauri-apps/api/event';
-import type { DownloadTask, DownloadProgressPayload, InstalledModel, StorageSummary } from '../types/download';
+import type { DownloadTask, DownloadProgressPayload, InstalledModel, StorageSummary, AdapterSearchResult, ModelPackageManifest } from '../types/download';
 
 export async function startModelDownload(params: {
   modelId: string;
@@ -20,6 +20,26 @@ export async function startModelDownload(params: {
     backend: params.backend || 'llama.cpp (GGUF)',
     hfToken: params.hfToken || null,
   });
+}
+
+export async function discoverModelAdapters(
+  modelId: string,
+  hfToken?: string
+): Promise<Record<string, AdapterSearchResult>> {
+  return invoke('discover_model_adapters', {
+    modelId,
+    hfToken: hfToken || null,
+  });
+}
+
+export async function getModelPackageManifest(
+  packageId: string
+): Promise<ModelPackageManifest> {
+  return invoke('get_model_package_manifest', { packageId });
+}
+
+export async function listInstalledModelPackages(): Promise<ModelPackageManifest[]> {
+  return invoke('list_installed_model_packages');
 }
 
 export async function pauseModelDownload(taskId: string): Promise<void> {
