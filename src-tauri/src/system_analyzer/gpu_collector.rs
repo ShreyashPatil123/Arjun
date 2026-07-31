@@ -213,7 +213,7 @@ fn query_dxgi_adapters() -> Result<Vec<GpuInfo>, String> {
                 }
 
                 let is_cuda = vendor == "NVIDIA";
-                let is_rocm = vendor == "AMD";
+                let is_rocm = check_rocm_runtime();
 
                 gpus.push(GpuInfo {
                     vendor,
@@ -243,6 +243,13 @@ fn query_dxgi_adapters() -> Result<Vec<GpuInfo>, String> {
     }
 
     Ok(gpus)
+}
+
+fn check_rocm_runtime() -> bool {
+    if let Ok(output) = create_hidden_command("rocm-smi").arg("--version").output() {
+        return output.status.success();
+    }
+    false
 }
 
 struct NvmlMetric {
@@ -349,7 +356,7 @@ fn query_cim_videocontroller() -> Result<Vec<GpuInfo>, String> {
             let gpu_type = if is_dedicated { "Dedicated".to_string() } else { "Integrated".to_string() };
 
             let is_cuda = vendor == "NVIDIA";
-            let is_rocm = vendor == "AMD";
+            let is_rocm = check_rocm_runtime();
 
             gpus.push(GpuInfo {
                 vendor,

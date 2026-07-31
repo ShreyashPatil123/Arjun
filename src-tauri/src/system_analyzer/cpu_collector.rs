@@ -71,10 +71,11 @@ pub fn detect_cpu() -> CpuInfo {
             if base_frequency_mhz == 0 {
                 if let Some(spd) = cim_proc.max_clock_speed {
                     base_frequency_mhz = spd as u64;
-                    if boost_frequency_mhz == 0 {
-                        boost_frequency_mhz = spd as u64;
-                    }
                 }
+            }
+            // Only set boost_frequency_mhz if it exceeds base_frequency_mhz from telemetry
+            if boost_frequency_mhz <= base_frequency_mhz {
+                boost_frequency_mhz = 0;
             }
             if let Some(virt) = cim_proc.virtualization_firmware_enabled {
                 virtualization_supported = virt;

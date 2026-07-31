@@ -586,6 +586,7 @@ export const SystemInfo: React.FC = () => {
               <div className={styles.cardTitleWrapper}>
                 <div className={styles.cardIcon}><Sparkles size={20} /></div>
                 <span className={styles.cardTitle}>AI Capability Profile & Inferred Limits</span>
+                <Badge variant="info">Sarathi-Calculated Capability Profile</Badge>
               </div>
             </div>
           }
