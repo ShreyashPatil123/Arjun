@@ -365,6 +365,66 @@
   animation: spin 1s linear infinite;
 }
 
+/* Bottom Primary Action Banner */
+.findModelsBanner {
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.12) 0%, rgba(99, 102, 241, 0.12) 100%);
+  border: 1px solid rgba(124, 58, 237, 0.35);
+  border-radius: 12px;
+  padding: 24px 28px;
+  margin-top: 8px;
+  box-shadow: 0 4px 20px rgba(124, 58, 237, 0.08);
+}
+
+.bannerContent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.bannerInfo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 800px;
+}
+
+.bannerTitleRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.bannerTitleRow h3 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.bannerInfo p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.bannerButton {
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px 24px;
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(124, 58, 237, 0.3);
+  transition: transform 150ms ease, box-shadow 150ms ease;
+}
+
+.bannerButton:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(124, 58, 237, 0.45);
+}
+
 @keyframes spin {
   from {
     transform: rotate(0deg);

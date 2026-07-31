@@ -19,7 +19,8 @@ import {
   Layers,
   Activity,
   ShieldCheck,
-  Box
+  Box,
+  ArrowRight
 } from 'lucide-react';
 import { Card, Button, Badge, Dialog, Input, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
@@ -700,6 +701,29 @@ export const SystemInfo: React.FC = () => {
             </div>
           )}
         </Card>
+      </div>
+
+      {/* Bottom Primary Action Banner */}
+      <div className={styles.findModelsBanner}>
+        <div className={styles.bannerContent}>
+          <div className={styles.bannerInfo}>
+            <div className={styles.bannerTitleRow}>
+              <Sparkles size={22} color="var(--accent)" />
+              <h3>Ready to Explore Local AI Models for Your PC</h3>
+            </div>
+            <p>
+              Based on your detected hardware profile, Sarathi's Recommendation Engine calculates the optimal LLMs your machine can run comfortably.
+            </p>
+          </div>
+          <Button
+            variant="primary"
+            onClick={() => navigate('/models')}
+            className={styles.bannerButton}
+          >
+            Find Models For My PC
+            <ArrowRight size={18} style={{ marginLeft: 8 }} />
+          </Button>
+        </div>
       </div>
 
       {/* Manual Override Controls Dialog */}

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Sparkles, AlertTriangle, CheckCircle2, Cpu, HardDrive, RefreshCw, Layers, Zap } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Sparkles, AlertTriangle, CheckCircle2, ArrowLeft, RefreshCw, Layers, Zap, ShieldAlert } from 'lucide-react';
 import { Card, Button, Badge, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
 import { getModelRecommendations } from '../services/recommendation.service';
@@ -7,22 +8,24 @@ import type { ModelRecommendation, FitCategory } from '../types/recommendation';
 import styles from './Models.module.css';
 
 export const Models: React.FC = () => {
+  const navigate = useNavigate();
   const [recommendations, setRecommendations] = useState<ModelRecommendation[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<FitCategory>('Recommended');
   const { addToast } = useToast();
 
   const loadRecommendations = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const data = await getModelRecommendations();
       setRecommendations(data);
     } catch (err) {
       console.error('Failed to load model recommendations:', err);
-      addToast(
-        'error',
-        err instanceof Error ? err.message : String(err)
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      addToast('error', `Failed to generate model recommendations: ${msg}`);
     } finally {
       setLoading(false);
     }
@@ -44,7 +47,7 @@ export const Models: React.FC = () => {
       : mayRunModels;
 
   const formatBytes = (bytes: number) => {
-    if (bytes === 0) return '0 B';
+    if (!bytes || bytes === 0) return '0 B';
     const gb = bytes / (1024 * 1024 * 1024);
     if (gb >= 1) return `${gb.toFixed(1)} GB`;
     const mb = bytes / (1024 * 1024);
@@ -56,6 +59,15 @@ export const Models: React.FC = () => {
       <header className={styles.header}>
         <div className={styles.headerInfo}>
           <div className={styles.titleRow}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => navigate('/system')}
+              style={{ marginRight: 8 }}
+            >
+              <ArrowLeft size={16} style={{ marginRight: 4 }} />
+              System Specs
+            </Button>
             <Sparkles size={24} color="var(--accent)" />
             <h1 className={styles.headerTitle}>AI Model Recommendations</h1>
           </div>
@@ -65,7 +77,7 @@ export const Models: React.FC = () => {
         </div>
         <div className={styles.headerActions}>
           <Button variant="secondary" onClick={loadRecommendations} disabled={loading}>
-            <RefreshCw size={14} className={loading ? styles.spinningIcon : ''} />
+            <RefreshCw size={14} className={loading ? styles.spinningIcon : ''} style={{ marginRight: 6 }} />
             {loading ? 'Analyzing...' : 'Refresh'}
           </Button>
         </div>
@@ -109,6 +121,20 @@ export const Models: React.FC = () => {
         </div>
       )}
 
+      {/* Error state */}
+      {error && (
+        <div className={styles.disclaimerBanner} style={{ borderColor: 'var(--error)', background: 'rgba(239,68,68,0.1)' }}>
+          <ShieldAlert size={20} color="var(--error)" />
+          <div style={{ flex: 1 }}>
+            <strong style={{ color: 'var(--error)' }}>Failed to calculate recommendations</strong>
+            <p style={{ margin: '4px 0 0 0', fontSize: '12px' }}>{error}</p>
+          </div>
+          <Button variant="secondary" size="sm" onClick={loadRecommendations}>
+            Retry Calculation
+          </Button>
+        </div>
+      )}
+
       {/* Cards Grid */}
       {loading ? (
         <div className={styles.emptyState}>
@@ -130,7 +156,12 @@ export const Models: React.FC = () => {
                   <span className={styles.modelName}>{model.modelName}</span>
                   <span className={styles.modelFamily}>{model.modelFamily}</span>
                 </div>
-                <span className={styles.archBadge}>{model.architecture}</span>
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                  <Badge variant={model.confidence === 'High' ? 'success' : model.confidence === 'Medium' ? 'warning' : 'default'}>
+                    {model.confidence} Confidence
+                  </Badge>
+                  <span className={styles.archBadge}>{model.architecture}</span>
+                </div>
               </div>
 
               <div className={styles.specsList}>
