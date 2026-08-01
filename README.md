@@ -24,34 +24,34 @@
 ```mermaid
 graph TD
     subgraph Hardware Telemetry & Scoring
-        A[DirectX 12 / DXGI / WMI / Vulkan] --> Profile[Hardware Telemetry]
-        Profile --> Scorer[Sarathi Local Memory Scorer]
-        HF[Hugging Face Hub API] --> Catalog[GGUF Catalog Provider]
+        A["DirectX 12 / DXGI / WMI / Vulkan"] --> Profile["Hardware Telemetry"]
+        Profile --> Scorer["Sarathi Local Memory Scorer"]
+        HF["Hugging Face Hub API"] --> Catalog["GGUF Catalog Provider"]
         Catalog --> Scorer
-        Scorer --> Categories[Recommended / Compatible / May Run]
+        Scorer --> Categories["Recommended / Compatible / May Run"]
     end
 
     subgraph Native Download & LoRA Pipeline
-        Categories --> Downloader[Async Resumable Downloader]
-        Downloader --> LoRA[5 Parallel LoRA Capability Handles]
-        LoRA --> Registry[Single Source of Truth Manifest]
+        Categories --> Downloader["Async Resumable Downloader"]
+        Downloader --> LoRA["5 Parallel LoRA Capability Handles"]
+        LoRA --> Registry["Single Source of Truth Manifest"]
     end
 
     subgraph Phase 6 Hybrid Memory Engine
-        Chat[User Interface Chat] --> MemMgr[Rust MemoryManager Facade]
-        MemMgr --> Stdio[SidecarAdapter: Stdio NDJSON-RPC]
-        Stdio -- Zero Sockets -- Sidecar[Python Memory Sidecar]
-        Sidecar --> Mem0[Mem0: Dynamic Fact Extraction]
-        Sidecar --> Letta[Letta: Working Memory Blocks]
-        Sidecar --> Zep[Zep: Temporal Decay & Summaries]
-        Sidecar --> LlamaIndex[LlamaIndex: RAG Chunking]
+        Chat["User Interface Chat"] --> MemMgr["Rust MemoryManager Facade"]
+        MemMgr --> Stdio["SidecarAdapter: Stdio NDJSON-RPC"]
+        Stdio -->|"Zero Sockets"| Sidecar["Python Memory Sidecar"]
+        Sidecar --> Mem0["Mem0: Dynamic Fact Extraction"]
+        Sidecar --> Letta["Letta: Working Memory Blocks"]
+        Sidecar --> Zep["Zep: Temporal Decay & Summaries"]
+        Sidecar --> LlamaIndex["LlamaIndex: RAG Chunking"]
         
-        Mem0 --> SQLite[(Single Source of Truth: SQLite sarathi.db)]
+        Mem0 --> SQLite[("Single Source of Truth: SQLite sarathi.db")]
         Letta --> SQLite
         Zep --> SQLite
         
-        SQLite --> Injector[Prompt Injection Engine]
-        Injector --> LLM[Llama.cpp Inference Engine]
+        SQLite --> Injector["Prompt Injection Engine"]
+        Injector --> LLM["Llama.cpp Inference Engine"]
     end
 ```
 
