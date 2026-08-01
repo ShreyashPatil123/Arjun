@@ -104,7 +104,8 @@ export interface BaseManifestInfo {
 
 export interface AdapterManifestInfo {
   capability: string;
-  status: 'Installed' | 'Unavailable' | 'Failed';
+  status: 'Installed' | 'READY' | 'Unavailable' | 'Failed' | string;
+  adapterRuntimeStatus?: 'compatible' | 'requires_conversion' | 'incompatible' | 'not_present' | null;
   repoId: string | null;
   localPath: string | null;
   adapterFile: string | null;

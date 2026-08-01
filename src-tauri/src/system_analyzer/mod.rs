@@ -23,9 +23,12 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Central manager for system analysis and hardware profile management
 pub struct SystemAnalyzerManager {
     profile: Arc<Mutex<Option<HardwareProfile>>>,
+    is_scanning: Arc<AtomicBool>,
 }
 
 impl SystemAnalyzerManager {
@@ -33,11 +36,35 @@ impl SystemAnalyzerManager {
     pub fn new() -> Self {
         Self {
             profile: Arc::new(Mutex::new(None)),
+            is_scanning: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Performs full system detection and updates stored profile & publishes events
+    /// Performs full system detection and updates stored profile & publishes events.
+    /// Thread-safe: If a scan is already running on another thread, waits for it to complete.
     pub fn analyze_system(&self) -> Result<HardwareProfile> {
+        // If a scan is already in progress, wait for it to complete instead of running duplicate scans
+        if self.is_scanning.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            log::info!("[SYSTEM_ANALYZER] System analysis already in progress on another thread. Waiting for completion...");
+            // Spin-wait briefly for the scan to finish
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !self.is_scanning.load(Ordering::SeqCst) {
+                    if let Some(profile) = self.get_profile() {
+                        return Ok(profile);
+                    }
+                }
+            }
+        }
+
+        // Ensure is_scanning is reset when function exits (even on panic/error)
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = Guard(self.is_scanning.clone());
         let event_bus = get_event_bus();
         event_bus.publish(SarathiEvent::SystemAnalysisStarted, None);
 

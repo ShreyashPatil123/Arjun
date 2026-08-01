@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Sparkles,
@@ -16,6 +16,9 @@ import {
   HardDrive,
   Trash2,
   FolderDown,
+  MessageSquare,
+  Power,
+  PlayCircle,
 } from 'lucide-react';
 import { Card, Button, Badge, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
@@ -30,6 +33,13 @@ import {
   getStorageSummary,
   listenDownloadProgress,
 } from '../services/download.service';
+import {
+  loadInstalledModel,
+  unloadActiveModel,
+  getInferenceStatus,
+  restoreLastSession,
+  listenInferenceStatus,
+} from '../services/ai.service';
 import type { ModelRecommendation, FitCategory } from '../types/recommendation';
 import type {
   DownloadProgressPayload,
@@ -37,9 +47,18 @@ import type {
   InstalledModel,
   StorageSummary,
 } from '../types/download';
+import type { LoadedModelInfo, InferenceStatusPayload } from '../types/ai';
 import styles from './Models.module.css';
+import { Chat } from './Chat';
 
-type ActiveTab = FitCategory | 'Storage';
+type ActiveTab = FitCategory | 'Storage' | 'Chat';
+
+const isSameModelId = (id1?: string | null, id2?: string | null): boolean => {
+  if (!id1 || !id2) return false;
+  const n1 = id1.toLowerCase().replace(/[\/_-]/g, '');
+  const n2 = id2.toLowerCase().replace(/[\/_-]/g, '');
+  return n1 === n2;
+};
 
 export const Models: React.FC = () => {
   const navigate = useNavigate();
@@ -98,16 +117,92 @@ export const Models: React.FC = () => {
           error: t.error,
         };
       }
-      setActiveTasks(tasksMap);
+      // Merge active download tasks, preserving completed adapter tasks from previous state
+      // so adapter cards don't flash back to unknown during refresh cycles
+      setActiveTasks((prev) => {
+        const merged: Record<string, DownloadProgressPayload> = {};
+        // Preserve previously completed/failed adapter tasks
+        for (const [id, task] of Object.entries(prev)) {
+          if (id.includes('_adapter_') && (task.status === 'Completed' || task.status === 'Failed')) {
+            merged[id] = task;
+          }
+        }
+        // Overlay active tasks from backend (these always take priority)
+        for (const [id, task] of Object.entries(tasksMap)) {
+          merged[id] = task;
+        }
+        return merged;
+      });
     } catch (err) {
       console.error('Failed to refresh storage/downloads:', err);
+    }
+  }, []);
+
+  const [loadedModelInfo, setLoadedModelInfo] = useState<LoadedModelInfo | null>(null);
+  const [loadingModelId, setLoadingModelId] = useState<string | null>(null);
+
+  const refreshInferenceStatus = useCallback(async () => {
+    try {
+      const statusPayload = await getInferenceStatus();
+      setLoadedModelInfo(statusPayload.model || null);
+    } catch (err) {
+      console.error('Failed to get inference status:', err);
     }
   }, []);
 
   useEffect(() => {
     loadRecommendations();
     refreshStorageAndDownloads();
-  }, [loadRecommendations, refreshStorageAndDownloads]);
+    refreshInferenceStatus().then(() => {
+      restoreLastSession().then((restored) => {
+        if (restored) {
+          setLoadedModelInfo(restored);
+        }
+      }).catch(() => {});
+    });
+  }, [loadRecommendations, refreshStorageAndDownloads, refreshInferenceStatus]);
+
+  useEffect(() => {
+    let unlistenFn: (() => void) | null = null;
+    listenInferenceStatus((payload) => {
+      setLoadedModelInfo(payload.model || null);
+      if (payload.status !== 'Loading') {
+        setLoadingModelId(null);
+      }
+    }).then((unlisten) => { unlistenFn = unlisten; });
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
+
+  const handleLoadModel = async (providerId: string, modelId: string, quantization: string) => {
+    console.log(`[STAGE 1 UI] handleLoadModel entered: providerId="${providerId}", modelId="${modelId}", quantization="${quantization}"`);
+    setLoadingModelId(modelId);
+    try {
+      addToast('info', `Loading ${modelId} (${quantization}) into local runtime...`);
+      const info = await loadInstalledModel(providerId, modelId, quantization);
+      console.log(`[STAGE 1 UI] loadInstalledModel SUCCESS:`, info);
+      setLoadedModelInfo(info);
+      addToast('success', `Model ${info.modelName} loaded into RAM/VRAM successfully!`);
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error(`[STAGE 1 UI] loadInstalledModel FAILED:`, err);
+      addToast('error', `Model Load Error: ${msg}`);
+    } finally {
+      setLoadingModelId(null);
+    }
+  };
+
+  const handleUnloadActiveModel = async () => {
+    try {
+      await unloadActiveModel();
+      setLoadedModelInfo(null);
+      addToast('info', 'Model unloaded from memory');
+    } catch (err) {
+      addToast('error', `Failed to unload model: ${String(err)}`);
+    }
+  };
 
   // Listen to native download progress events
   useEffect(() => {
@@ -228,6 +323,15 @@ export const Models: React.FC = () => {
     });
   };
 
+  const getInstalledModel = (modelId?: string, quant?: string): InstalledModel | null => {
+    if (!modelId || !quant) return null;
+    return (installedModels || []).find((m) => {
+      const id = m?.modelId || (m as any)?.model_id;
+      const q = m?.quantization;
+      return Boolean(id && q && id.toLowerCase() === modelId.toLowerCase() && q.toLowerCase() === quant.toLowerCase());
+    }) || null;
+  };
+
   return (
     <div className={styles.container}>
       <header className={styles.header}>
@@ -286,6 +390,17 @@ export const Models: React.FC = () => {
           Storage & Installed
           <span className={styles.tabBadge}>{installedModels.length}</span>
         </button>
+        <button
+          className={`${styles.tabBtn} ${activeTab === 'Chat' ? styles.activeTab : ''}`}
+          onClick={() => setActiveTab('Chat')}
+          style={{
+            color: loadedModelInfo ? 'var(--success)' : undefined,
+          }}
+        >
+          <MessageSquare size={16} />
+          Chat
+          {loadedModelInfo && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--success)', display: 'inline-block', marginLeft: 4 }} />}
+        </button>
       </div>
 
       {/* Storage Tab View */}
@@ -333,31 +448,88 @@ export const Models: React.FC = () => {
                       ].map(({ key, label }) => {
                         const adapter = m.adapters?.[key];
                         const isInstalled = adapter?.status === 'Installed' && Boolean(adapter?.adapterFile);
+                        const runtimeStatus = adapter?.adapterRuntimeStatus;
+                        const isGguf = runtimeStatus === 'compatible';
+                        const needsConversion = runtimeStatus === 'requires_conversion';
+
+                        let badgeColor = 'var(--text-secondary)';
+                        let badgeBg = 'var(--surface-hover)';
+                        let badgeBorder = 'var(--border)';
+                        let text = 'Base Native';
+
+                        if (isInstalled) {
+                          if (isGguf) {
+                            badgeColor = 'var(--success)';
+                            badgeBg = 'rgba(16,185,129,0.1)';
+                            badgeBorder = 'var(--success)';
+                            text = `✓ GGUF Ready (${adapter?.repoId || 'LoRA'})`;
+                          } else if (needsConversion) {
+                            badgeColor = 'var(--warning)';
+                            badgeBg = 'rgba(245,158,11,0.1)';
+                            badgeBorder = 'var(--warning)';
+                            text = `⚠ Needs GGUF Conversion (${adapter?.repoId || 'PEFT SafeTensors'})`;
+                          } else {
+                            badgeColor = 'var(--warning)';
+                            badgeBg = 'rgba(245,158,11,0.1)';
+                            badgeBorder = 'var(--warning)';
+                            text = `Installed (${adapter?.repoId || 'LoRA'})`;
+                          }
+                        }
+
                         return (
                           <span
                             key={key}
                             style={{
-                              background: isInstalled ? 'rgba(16,185,129,0.1)' : 'var(--surface-hover)',
+                              background: badgeBg,
                               padding: '2px 6px',
                               borderRadius: '4px',
-                              border: isInstalled ? '1px solid var(--success)' : '1px solid var(--border)',
-                              color: isInstalled ? 'var(--success)' : 'var(--text-secondary)',
+                              border: `1px solid ${badgeBorder}`,
+                              color: badgeColor,
                             }}
                           >
-                            ⚡ {label}: {isInstalled ? `Installed (${adapter?.repoId || 'LoRA'} - ${formatBytes(adapter?.sizeBytes || 0)})` : 'Base Native'}
+                            ⚡ {label}: {text}
                           </span>
                         );
                       })}
                     </div>
                   </div>
+
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                    <Badge variant="success">Ready</Badge>
+                    {loadedModelInfo && isSameModelId(loadedModelInfo.modelId, m.modelId) ? (
+                      <>
+                        <Badge variant="success">● Loaded & Ready</Badge>
+                        <Button variant="primary" size="sm" onClick={() => navigate('/chat')}>
+                          <MessageSquare size={14} style={{ marginRight: 4 }} /> Open Chat
+                        </Button>
+                        <Button variant="secondary" size="sm" onClick={handleUnloadActiveModel}>
+                          <Power size={14} style={{ marginRight: 4 }} /> Unload
+                        </Button>
+                      </>
+                    ) : loadingModelId === m.modelId ? (
+                      <Button variant="secondary" size="sm" disabled>
+                        <Spinner size="sm" /> Loading...
+                      </Button>
+                    ) : (
+                      <>
+                        <Badge variant="default">Not Loaded</Badge>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => handleLoadModel(m.providerId, m.modelId, m.quantization)}
+                        >
+                          <PlayCircle size={14} style={{ marginRight: 4 }} /> Load Model
+                        </Button>
+                      </>
+                    )}
+
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={Boolean(loadedModelInfo && isSameModelId(loadedModelInfo.modelId, m.modelId))}
+                      title={loadedModelInfo && isSameModelId(loadedModelInfo.modelId, m.modelId) ? 'Unload model first before deleting' : 'Delete installed model package'}
                       onClick={() => handleDeleteModel(m.providerId, m.modelId, m.quantization)}
                     >
-                      <Trash2 size={14} color="var(--error)" />
+                      <Trash2 size={14} color={loadedModelInfo && isSameModelId(loadedModelInfo.modelId, m.modelId) ? 'var(--text-tertiary)' : 'var(--error)'} />
                     </Button>
                   </div>
                 </div>
@@ -392,7 +564,14 @@ export const Models: React.FC = () => {
       )}
 
       {/* Cards Grid */}
-      {activeTab !== 'Storage' && (
+      {/* Chat Tab View */}
+      {activeTab === 'Chat' && (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: '500px' }}>
+          <Chat />
+        </div>
+      )}
+
+      {activeTab !== 'Storage' && activeTab !== 'Chat' && (
         loading ? (
           <div className={styles.emptyState}>
             <Spinner size="lg" />
@@ -474,11 +653,44 @@ export const Models: React.FC = () => {
                   {/* Phase 4 Download Footer */}
                   <div className={styles.cardFooter}>
                     {installed ? (
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-                        <Badge variant="success">✓ Installed & Ready</Badge>
-                        <Button variant="ghost" size="sm" onClick={() => setActiveTab('Storage')}>
-                          View in Storage
-                        </Button>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', width: '100%' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                          {loadedModelInfo && isSameModelId(loadedModelInfo.modelId, model.modelId) ? (
+                            <Badge variant="success">● Loaded & Ready</Badge>
+                          ) : (
+                            <Badge variant="success">✓ Installed</Badge>
+                          )}
+                          <Button variant="ghost" size="sm" onClick={() => setActiveTab('Storage')}>
+                            View in Storage
+                          </Button>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', width: '100%' }}>
+                          {loadedModelInfo && isSameModelId(loadedModelInfo.modelId, model.modelId) ? (
+                            <>
+                              <Button variant="primary" style={{ flex: 1 }} onClick={() => navigate('/chat')}>
+                                <MessageSquare size={16} style={{ marginRight: 6 }} /> Open Chat
+                              </Button>
+                              <Button variant="secondary" onClick={handleUnloadActiveModel}>
+                                <Power size={16} style={{ marginRight: 6 }} /> Unload
+                              </Button>
+                            </>
+                          ) : loadingModelId === model.modelId ? (
+                            <Button variant="secondary" style={{ flex: 1 }} disabled>
+                              <Spinner size="sm" /> Loading Model...
+                            </Button>
+                          ) : (
+                            <Button
+                              variant="primary"
+                              style={{ flex: 1 }}
+                              onClick={() => {
+                                const im = getInstalledModel(model.modelId, model.quantization);
+                                if (im) handleLoadModel(im.providerId, im.modelId, im.quantization);
+                              }}
+                            >
+                              <PlayCircle size={16} style={{ marginRight: 6 }} /> Load Model
+                            </Button>
+                          )}
+                        </div>
                       </div>
                     ) : downloadTask && downloadTask.status !== 'Cancelled' ? (
                       <div className={styles.progressContainer}>
@@ -520,11 +732,56 @@ export const Models: React.FC = () => {
                             const adapterTaskId = `dl_${model.modelId.replace(/\//g, '_')}_${model.quantization.toLowerCase()}_adapter_${cap.key}`;
                             const adapterTask = activeTasks[adapterTaskId];
 
-                            const isUnavailable = adapterTask?.status === 'Completed' && Boolean(adapterTask.error?.includes('Unavailable'));
-                            const isSearching = !adapterTask || adapterTask.status === 'Resolving' || adapterTask.speedFormatted === 'Searching...';
-                            const isCompleted = adapterTask?.status === 'Completed' && !isUnavailable;
-                            const isDownloading = adapterTask?.status === 'Downloading' || adapterTask?.status === 'Verifying';
-                            const pct = adapterTask?.progressPercent ?? (isCompleted ? 100 : 0);
+                            // === ADAPTER STATE MACHINE ===
+                            // Priority 1: Backend manifest (single source of truth for persisted state)
+                            const im = getInstalledModel(model.modelId, model.quantization);
+                            const manifestAdapter = im?.adapters?.[cap.key];
+                            const isInstalledInManifest = (manifestAdapter?.status === 'Installed' || manifestAdapter?.status === 'READY') && (Boolean(manifestAdapter?.adapterFile) || Boolean(manifestAdapter?.localPath));
+                            const isUnavailableInManifest = manifestAdapter?.status === 'Unavailable';
+                            const isFailedInManifest = manifestAdapter?.status === 'Failed';
+
+                            // Priority 2: Active download task (transient state)
+                            const taskIsUnavailable = adapterTask?.status === 'Completed' && Boolean(adapterTask.error?.includes('Unavailable'));
+                            const taskIsCompleted = adapterTask?.status === 'Completed' && !taskIsUnavailable;
+                            const taskIsDownloading = adapterTask?.status === 'Downloading';
+                            const taskIsVerifying = adapterTask?.status === 'Verifying';
+                            const taskIsSearching = adapterTask?.status === 'Resolving' || adapterTask?.speedFormatted === 'Searching...';
+                            const taskIsFailed = adapterTask?.status === 'Failed';
+
+                            // Derive final state (manifest takes priority over stale tasks)
+                            let adapterState: 'Installed' | 'Unavailable' | 'Searching' | 'Downloading' | 'Verifying' | 'Failed' | 'Unknown';
+                            if (isInstalledInManifest || taskIsCompleted) {
+                              adapterState = 'Installed';
+                            } else if (taskIsVerifying) {
+                              adapterState = 'Verifying';
+                            } else if (taskIsDownloading) {
+                              adapterState = 'Downloading';
+                            } else if (taskIsSearching) {
+                              adapterState = 'Searching';
+                            } else if (taskIsUnavailable || isUnavailableInManifest) {
+                              adapterState = 'Unavailable';
+                            } else if (taskIsFailed || isFailedInManifest) {
+                              adapterState = 'Failed';
+                            } else {
+                              // No active task AND no manifest record → unknown/pending
+                              adapterState = 'Unknown';
+                            }
+
+                            const badgeVariant = adapterState === 'Installed' ? 'success'
+                              : adapterState === 'Failed' ? 'error'
+                              : adapterState === 'Unavailable' ? 'default'
+                              : 'warning';
+
+                            const badgeText = adapterState === 'Installed' ? '✓ Ready'
+                              : adapterState === 'Unavailable' ? 'Base Native'
+                              : adapterState === 'Searching' ? 'Searching...'
+                              : adapterState === 'Downloading' ? 'Downloading'
+                              : adapterState === 'Verifying' ? 'Verifying...'
+                              : adapterState === 'Failed' ? 'Failed'
+                              : 'Base Native';
+
+                            const showProgress = adapterState === 'Downloading' || adapterState === 'Verifying' || adapterState === 'Installed';
+                            const pct = adapterTask?.progressPercent ?? (adapterState === 'Installed' ? 100 : 0);
 
                             return (
                               <div key={cap.key} style={{ marginBottom: 6, fontSize: '11px', background: 'var(--surface-subtle)', padding: '6px 8px', borderRadius: '6px' }}>
@@ -532,11 +789,11 @@ export const Models: React.FC = () => {
                                   <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
                                     ⚡ {cap.label}
                                   </span>
-                                  <Badge variant={isCompleted ? 'success' : isUnavailable ? 'default' : 'warning'}>
-                                    {isUnavailable ? 'Base Native' : isSearching ? 'Searching...' : isCompleted ? 'Ready' : adapterTask.status}
+                                  <Badge variant={badgeVariant}>
+                                    {badgeText}
                                   </Badge>
                                 </div>
-                                {isDownloading || isCompleted ? (
+                                {showProgress && adapterTask ? (
                                   <>
                                     <div className={styles.progressBarBg} style={{ height: '4px', marginTop: 4 }}>
                                       <div className={styles.progressBarFill} style={{ width: `${Math.min(100, pct)}%` }} />
@@ -548,6 +805,16 @@ export const Models: React.FC = () => {
                                           : 'Resolving weight size...'}
                                       </span>
                                       <span>{pct.toFixed(0)}%</span>
+                                    </div>
+                                  </>
+                                ) : adapterState === 'Installed' && !adapterTask ? (
+                                  <>
+                                    <div className={styles.progressBarBg} style={{ height: '4px', marginTop: 4 }}>
+                                      <div className={styles.progressBarFill} style={{ width: '100%' }} />
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-tertiary)', marginTop: 2 }}>
+                                      <span>{manifestAdapter?.repoId || 'LoRA Adapter'}</span>
+                                      <span>100%</span>
                                     </div>
                                   </>
                                 ) : null}

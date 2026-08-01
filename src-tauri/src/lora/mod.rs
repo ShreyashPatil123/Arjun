@@ -1,6 +1,8 @@
-//! LoRA Module (Phase 6)
-//! Manages LoRA adapters and multi-LoRA routing.
+//! LoRA Module (Phase 5+)
+//! Manages LoRA adapter validation, format detection, and future runtime integration.
 
 pub mod traits;
+pub mod validator;
 
 pub use traits::*;
+pub use validator::{AdapterRuntimeStatus, AdapterValidationResult};

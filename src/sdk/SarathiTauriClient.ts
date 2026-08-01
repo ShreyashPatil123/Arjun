@@ -65,9 +65,10 @@ export class SarathiTauriClient implements ISarathiClient {
 
   // Phase 5: AI Engine
   readonly aiEngine = {
-    loadModel: async (path: string) => aiService.loadModel(path),
+    loadModel: async (providerId: string, modelId?: string, quantization?: string) =>
+      aiService.loadModel(providerId, modelId, quantization),
     unloadModel: async () => aiService.unloadModel(),
-    chat: async (msgs?: unknown[]) => aiService.chat(msgs),
+    chat: async (msgs?: unknown[]) => aiService.chat(msgs as any),
   };
 
   // Phase 6: Dynamic LoRA Orchestration

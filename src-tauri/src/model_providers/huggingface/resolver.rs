@@ -15,14 +15,14 @@ pub struct ResolvedArtifact {
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct HfTreeItem {
     path: String,
     size: Option<u64>,
     lfs: Option<HfLfsInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct HfLfsInfo {
     oid: String,
     size: u64,
@@ -86,24 +86,39 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
     if let Ok(res) = resp {
         if res.status().is_success() {
             if let Ok(items) = res.json::<Vec<HfTreeItem>>().await {
+                // Collect all matching GGUF files for the requested quantization
+                let mut matches: Vec<HfTreeItem> = Vec::new();
                 for item in items {
                     let path_lower = item.path.to_lowercase();
                     if path_lower.ends_with(".gguf") {
                         let path_clean = path_lower.replace('_', "");
                         if path_clean.contains(&quant_clean) || path_lower.contains(&quant_lower) {
-                            let size = item.lfs.as_ref().map(|l| l.size).or(item.size).unwrap_or(0);
-                            let sha256 = item.lfs.map(|l| l.oid);
-                            let download_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, item.path);
-                            return Ok(ResolvedArtifact {
-                                repo_id,
-                                file_name: item.path,
-                                download_url,
-                                size_bytes: size,
-                                quantization: quantization.to_string(),
-                                sha256,
-                            });
+                            matches.push(item);
                         }
                     }
+                }
+
+                if !matches.is_empty() {
+                    // Prefer a single consolidated GGUF file (without "-00001-of-") over split shards
+                    let selected = matches
+                        .iter()
+                        .find(|m| !m.path.contains("-of-"))
+                        .cloned()
+                        .unwrap_or_else(|| matches[0].clone());
+
+                    let size = selected.lfs.as_ref().map(|l| l.size).or(selected.size).unwrap_or(0);
+                    let sha256 = selected.lfs.map(|l| l.oid);
+                    let download_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, selected.path);
+                    log::info!("[HF RESOLVER] Resolved artifact '{}' (size: {} bytes)", selected.path, size);
+
+                    return Ok(ResolvedArtifact {
+                        repo_id,
+                        file_name: selected.path,
+                        download_url,
+                        size_bytes: size,
+                        quantization: quantization.to_string(),
+                        sha256,
+                    });
                 }
             }
         }

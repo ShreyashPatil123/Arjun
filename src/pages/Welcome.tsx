@@ -87,7 +87,11 @@ export const Welcome: React.FC = () => {
       await new Promise(r => setTimeout(r, 250));
 
       updateStep('profile', 98, 'Normalizing metrics & compiling AI Capability Profile...');
-      const profile = await getSarathiClient().systemAnalyzer.analyzeSystem();
+      // Try cached profile first (startup scan may have completed), fallback to full scan
+      let profile = await getSarathiClient().systemAnalyzer.getHardwareProfile();
+      if (!profile || !profile.cpu || profile.cpu.model === 'Unknown') {
+        profile = await getSarathiClient().systemAnalyzer.analyzeSystem();
+      }
 
       setChecklist(prev => prev.map(item => ({ ...item, status: 'completed' })));
       setScanProgress(100);

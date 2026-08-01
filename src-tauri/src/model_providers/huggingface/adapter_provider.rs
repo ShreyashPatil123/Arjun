@@ -127,99 +127,114 @@ impl HuggingFaceAdapterProvider {
         aliases
     }
 
-    /// Dynamically discovers and strictly verifies compatible LoRA adapters for a base model
-    pub async fn discover_adapters(
+    /// Discovers and verifies compatible LoRA adapters for a SINGLE capability
+    pub async fn discover_single_capability(
         base_model_id: &str,
+        cap: AdapterCapability,
         hf_token: Option<&str>,
-    ) -> HashMap<String, AdapterSearchResult> {
-        let mut results = HashMap::new();
+    ) -> AdapterSearchResult {
         let aliases = Self::extract_model_aliases(base_model_id);
+        let cap_key = cap.key().to_string();
 
         log::info!(
-            "[LORA_DISCOVERY] Discovering capability adapters for model '{}' (aliases: {:?})",
-            base_model_id,
-            aliases
+            "[LORA_DISCOVERY] Discovering adapter for capability '{}' on model '{}'",
+            cap_key,
+            base_model_id
         );
 
-        for cap in AdapterCapability::all() {
-            let cap_key = cap.key().to_string();
-            let mut best_candidate: Option<AdapterCandidate> = None;
-            let mut highest_score: f64 = 0.0;
+        let mut best_candidate: Option<AdapterCandidate> = None;
+        let mut highest_score: f64 = 0.0;
 
-            // Search HuggingFace Hub for candidate repositories
-            for keyword in cap.search_keywords() {
-                let search_query = format!("{} {}", aliases.get(1).unwrap_or(&aliases[0]), keyword);
-                let api_url = format!(
-                    "https://huggingface.co/api/models?filter=lora&search={}&limit=10",
-                    search_query.replace(' ', "%20")
-                );
+        for keyword in cap.search_keywords() {
+            let search_query = format!("{} {}", aliases.get(1).unwrap_or(&aliases[0]), keyword);
+            let api_url = format!(
+                "https://huggingface.co/api/models?filter=lora&search={}&limit=10",
+                search_query.replace(' ', "%20")
+            );
 
-                let client = match reqwest::Client::builder()
-                    .user_agent("Sarathi/0.1.0 (Windows; x64)")
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
+            let client = match reqwest::Client::builder()
+                .user_agent("Sarathi/0.1.0 (Windows; x64)")
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
-                let mut req = client.get(&api_url);
-                if let Some(token) = hf_token {
-                    if !token.trim().is_empty() {
-                        req = req.header("Authorization", format!("Bearer {}", token.trim()));
-                    }
+            let mut req = client.get(&api_url);
+            if let Some(token) = hf_token {
+                if !token.trim().is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", token.trim()));
                 }
+            }
 
-                if let Ok(res) = req.send().await {
-                    if res.status().is_success() {
-                        if let Ok(items) = res.json::<Vec<HfSearchResultItem>>().await {
-                            for item in items {
-                                // Strictly verify candidate adapter_config.json
-                                if let Ok(cand) = Self::verify_candidate(&item.id, base_model_id, &aliases, cap.key(), hf_token).await {
-                                    if cand.confidence_score > highest_score {
-                                        highest_score = cand.confidence_score;
-                                        best_candidate = Some(cand);
-                                    }
+            if let Ok(res) = req.send().await {
+                if res.status().is_success() {
+                    if let Ok(items) = res.json::<Vec<HfSearchResultItem>>().await {
+                        for item in items {
+                            if let Ok(cand) = Self::verify_candidate(&item.id, base_model_id, &aliases, cap.key(), hf_token).await {
+                                if cand.confidence_score > highest_score {
+                                    highest_score = cand.confidence_score;
+                                    best_candidate = Some(cand);
                                 }
                             }
                         }
                     }
                 }
             }
+        }
 
-            if let Some(cand) = best_candidate {
-                log::info!(
-                    "[LORA_DISCOVERY] Verified adapter found for capability '{}': {} (score: {:.1})",
-                    cap_key,
-                    cand.repo_id,
-                    cand.confidence_score
-                );
-                results.insert(
-                    cap_key,
-                    AdapterSearchResult {
-                        capability: cap.key().to_string(),
-                        status: "Found".to_string(),
-                        candidate: Some(cand),
-                        reason: None,
-                    },
-                );
-            } else {
-                log::info!(
-                    "[LORA_DISCOVERY] No verified compatible adapter for capability '{}'. Handled natively by base model.",
-                    cap_key
-                );
-                results.insert(
-                    cap_key,
-                    AdapterSearchResult {
-                        capability: cap.key().to_string(),
-                        status: "Unavailable".to_string(),
-                        candidate: None,
-                        reason: Some(
-                            "No verified compatible LoRA adapter found for this exact model. Capability will be handled natively by base model."
-                                .to_string(),
-                        ),
-                    },
-                );
+        if let Some(cand) = best_candidate {
+            log::info!(
+                "[LORA_DISCOVERY] Verified adapter found for capability '{}': {} (score: {:.1})",
+                cap_key,
+                cand.repo_id,
+                cand.confidence_score
+            );
+            AdapterSearchResult {
+                capability: cap_key,
+                status: "Found".to_string(),
+                candidate: Some(cand),
+                reason: None,
+            }
+        } else {
+            log::info!(
+                "[LORA_DISCOVERY] No verified compatible adapter for capability '{}'. Handled natively by base model.",
+                cap_key
+            );
+            AdapterSearchResult {
+                capability: cap_key,
+                status: "Unavailable".to_string(),
+                candidate: None,
+                reason: Some(
+                    "No verified compatible LoRA adapter found for this exact model. Capability will be handled natively by base model."
+                        .to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Dynamically discovers and strictly verifies compatible LoRA adapters for a base model concurrently across all capabilities
+    pub async fn discover_adapters(
+        base_model_id: &str,
+        hf_token: Option<&str>,
+    ) -> HashMap<String, AdapterSearchResult> {
+        let mut results = HashMap::new();
+        let capabilities = Self::all_capabilities();
+        let mut tasks = Vec::new();
+
+        for cap in capabilities {
+            let model_id = base_model_id.to_string();
+            let token = hf_token.map(|t| t.to_string());
+            tasks.push(tokio::spawn(async move {
+                let res = Self::discover_single_capability(&model_id, cap.clone(), token.as_deref()).await;
+                (cap.key().to_string(), res)
+            }));
+        }
+
+        for task in tasks {
+            if let Ok((key, res)) = task.await {
+                results.insert(key, res);
             }
         }
 

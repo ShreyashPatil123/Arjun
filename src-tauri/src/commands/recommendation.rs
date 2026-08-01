@@ -17,12 +17,19 @@ pub async fn get_model_recommendations(
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve AppData directory: {}", e))?;
 
-    // Get fresh HardwareProfile from Phase 2 system analyzer
-    let analyzer = system_analyzer::get_system_analyzer_manager();
-    let profile = analyzer.analyze_system().map_err(|e| format!("System analysis failed: {}", e))?;
-
-    // Generate recommendations against live Hugging Face catalog
     let force = force_refresh.unwrap_or(false);
+
+    // Get HardwareProfile from Phase 2 system analyzer (use cached profile if available unless force_refresh is requested)
+    let analyzer = system_analyzer::get_system_analyzer_manager();
+    let profile = if !force {
+        if let Some(cached) = analyzer.get_profile() {
+            cached
+        } else {
+            analyzer.analyze_system().map_err(|e| format!("System analysis failed: {}", e))?
+        }
+    } else {
+        analyzer.analyze_system().map_err(|e| format!("System analysis failed: {}", e))?
+    };
     let recommendations = model_recommendation::generate_recommendations(&profile, Some(&app_data_dir), force).await;
 
     Ok(recommendations)

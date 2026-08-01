@@ -65,7 +65,7 @@ export interface ISarathiModelProviderService {
 }
 
 export interface ISarathiAIEngineService {
-  loadModel(modelPath: string): Promise<void>;
+  loadModel(providerId: string, modelId?: string, quantization?: string): Promise<unknown>;
   unloadModel(): Promise<void>;
   chat(messages?: unknown[]): Promise<unknown>;
 }

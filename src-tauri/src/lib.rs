@@ -15,25 +15,31 @@ pub mod model_providers;
 pub mod download_manager;
 pub mod adapter_manager;
 pub mod ai_engine;
+pub mod model_intelligence;
 pub mod lora;
 pub mod installer;
 pub mod plugins;
+pub mod memory_engine;
 
 use std::sync::Arc;
+use tauri::Manager;
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_sql::Builder as SqlBuilder;
 use log::info;
 
 use download_manager::DownloadManager;
+use ai_engine::InferenceManager;
+use memory_engine::MemoryManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Set up crash handler
     logging::setup_panic_handler();
 
-    // Initialize core
+    // Initialize core and managers
     let sarathi_core = core::init();
     let download_manager = Arc::new(DownloadManager::new());
+    let inference_manager = Arc::new(InferenceManager::new());
 
     // Configure SQL plugin with migrations
     let migrations = database::get_migrations();
@@ -57,15 +63,32 @@ pub fn run() {
         .plugin(log_plugin)
         .manage(sarathi_core)
         .manage(download_manager)
-        .setup(|_app| {
+        .manage(inference_manager)
+        .setup(|app| {
             info!("Sarathi application starting...");
+
+            // Resolve app_data_dir dynamically from Tauri app handle
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("./app_data"));
+            let memory_manager = Arc::new(MemoryManager::new(&app_data_dir));
+            app.manage(memory_manager);
 
             // Initial event publication
             let event_bus = core::event_bus::get_event_bus();
             event_bus.publish(core::event_bus::SarathiEvent::ApplicationStarted, None);
 
-            // Run initial system analysis task asynchronously on startup
-            tauri::async_runtime::spawn(async move {
+            // Startup scan for local model packages and LoRA adapters
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                std::thread::spawn(move || {
+                    adapter_manager::AdapterRegistry::perform_startup_scan(&app_data_dir);
+                });
+            }
+
+            // Run initial system analysis task on a blocking thread (not a tokio async worker)
+            // so it doesn't occupy the async runtime while running PowerShell/DXGI detection
+            std::thread::spawn(move || {
                 let analyzer = system_analyzer::get_system_analyzer_manager();
                 if let Err(e) = analyzer.analyze_system() {
                     log::error!("Initial system analysis failed: {}", e);
@@ -110,6 +133,31 @@ pub fn run() {
             commands::adapter::discover_model_adapters,
             commands::adapter::get_model_package_manifest,
             commands::adapter::list_installed_model_packages,
+
+            // Phase 5 Inference Commands
+            commands::inference::load_installed_model,
+            commands::inference::unload_active_model,
+            commands::inference::get_inference_status,
+            commands::inference::send_chat_message,
+            commands::inference::stop_chat_generation,
+            commands::inference::restore_last_session,
+
+            // Model Intelligence Layer Commands
+            commands::intelligence::get_model_profile,
+            commands::intelligence::update_model_profile,
+            commands::intelligence::refresh_model_profile,
+            commands::intelligence::route_prompt_capability,
+
+            // Phase 6 Memory Engine Commands
+            memory_engine::api::get_memory_health_status,
+            memory_engine::api::get_user_profile_memory,
+            memory_engine::api::update_user_profile_fact,
+            memory_engine::api::list_memory_projects,
+            memory_engine::api::create_memory_project,
+            memory_engine::api::switch_active_project,
+            memory_engine::api::get_active_project,
+            memory_engine::api::search_memory_nodes,
+            memory_engine::api::delete_memory_node_by_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -28,6 +28,9 @@ uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.30"
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 futures-util = "0.3"
+llama-cpp-2 = { version = "0.1", features = ["cuda"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation"] }

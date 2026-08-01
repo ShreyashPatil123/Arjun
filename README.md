@@ -2,82 +2,100 @@
 
 # 🪷 Sarathi (सारथी)
 
-### *Universal Local AI Orchestrator & Hardware-Matched LLM Recommendation Engine*
+### *Universal Local AI Orchestrator, Hardware-Matched LLM Engine & Hybrid Memory Platform*
 
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2.0-blue?style=for-the-badge&logo=tauri&logoColor=white)](https://tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-1.93-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![React](https://img.shields.io/badge/React-19.0-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Python Sidecar](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
 <p align="center">
-  <b>Sarathi</b> is an intelligent, hardware-aware desktop platform designed to discover, evaluate, recommend, and manage local Large Language Models (LLMs) tailored specifically to your PC's exact physical capabilities.
+  <b>Sarathi</b> is an intelligent, hardware-aware local AI desktop orchestrator. It combines real-time physical system profiling, deterministic memory budgeting, parallel LoRA capability adapter discovery, in-process GGUF inference via <code>llama.cpp</code>, and a production-grade <b>Hybrid Local Memory Engine</b>.
 </p>
 
 ---
 
 </div>
 
-## ✨ Key Features
-
-### 🔬 Deep Physical System Analyzer
-- **Native Hardware Profiling**: Hardware telemetry scanning via Windows WMI/CIM, DirectX 12 (DXGI), Vulkan, and System API.
-- **Memory Domain Separation**: Distinguishes Dedicated Video Memory (VRAM) from Shared System Memory and System RAM.
-- **Multi-GPU & iGPU Awareness**: Supports NVIDIA CUDA, AMD ROCm/Vulkan, Intel Arc/OneAPI, iGPU shared memory configurations, and CPU-only systems.
-
-### 🧠 Dynamic Local LLM Recommendation Engine
-- **Live Hugging Face Discovery**: Dynamically queries the Hugging Face Hub for popular open-weight GGUF models.
-- **Local Deterministic Memory Budgeting**: Calculates model weight memory ($W_{bytes} = \frac{N_{params} \times bpw}{8} \times 1.06$) and KV-cache overhead (accounting for MHA/GQA, layer depth, head dimensions, and context lengths up to 128k tokens).
-- **Privacy-First Compatibility Decision**: Your hardware specs are **never** uploaded to external servers. Recommendations are computed 100% locally.
-- **Clear Categorization**:
-  - 🟢 **Recommended**: Optimal performance with safe VRAM/RAM headroom ($\ge 15\%$).
-  - 🟡 **Compatible**: High quality models requiring slight offloading or memory trade-offs.
-  - 🟠 **May Run**: Featherweight or CPU-offloaded configurations for tight resource budgets.
-
-### ⚡ Native Async Model Download & Storage Manager
-- **Exact HF Artifact Resolution**: Resolves exact GGUF artifacts, quantizations, and size metadata directly from Hugging Face Hub.
-- **Resumable Downloads**: Supports pause, resume, cancel, and interrupted download recovery using `.part` temporary chunk buffers.
-- **Storage Management**: Integrated model registry tracking installed models, disk consumption, SHA-256 verification, and quick deletion.
-
----
-
-## 🏗 Architecture Overview
+## 🌟 Highlights & Architecture Matrix
 
 ```mermaid
-flowchart TD
-    subgraph Hardware Telemetry
-        A[DirectX 12 / DXGI] --> Profile[Hardware Profile]
-        B[WMI / System API] --> Profile
-        C[Vulkan API] --> Profile
+graph TD
+    subgraph Hardware Telemetry & Scoring
+        A[DirectX 12 / DXGI / WMI / Vulkan] --> Profile[Hardware Telemetry]
+        Profile --> Scorer[Sarathi Local Memory Scorer]
+        HF[Hugging Face Hub API] --> Catalog[GGUF Catalog Provider]
+        Catalog --> Scorer
+        Scorer --> Categories[Recommended / Compatible / May Run]
     end
 
-    subgraph Discovery & Scoring
-        Profile --> Scorer[Sarathi Local Scorer Engine]
-        HF[Live Hugging Face API] -->|Model Repositories| Catalog[Catalog Provider]
-        Cache[Disk Cache hf_catalog_cache.json] -.-> Catalog
-        Catalog -->|Model Metadata| Scorer
-        Scorer -->|Ranked Fit Scores| Categories[Recommended / Compatible / May Run]
+    subgraph Native Download & LoRA Pipeline
+        Categories --> Downloader[Async Resumable Downloader]
+        Downloader --> LoRA[5 Parallel LoRA Capability Handles]
+        LoRA --> Registry[Single Source of Truth Manifest]
     end
 
-    subgraph Native Download Manager
-        Categories -->|Download Action| Resolver[HF GGUF Artifact Resolver]
-        Resolver -->|Direct GGUF URL| Downloader[Async Chunk Downloader]
-        Downloader -->|.part Temp File| Disk[AppData Model Directory]
-        Disk -->|SHA-256 Integrity Check| Registry[Installed Model Registry]
+    subgraph Phase 6 Hybrid Memory Engine
+        Chat[User Interface Chat] --> MemMgr[Rust MemoryManager Facade]
+        MemMgr --> Stdio[SidecarAdapter: Stdio NDJSON-RPC]
+        Stdio -- Zero Sockets -- Sidecar[Python Memory Sidecar]
+        Sidecar --> Mem0[Mem0: Dynamic Fact Extraction]
+        Sidecar --> Letta[Letta: Working Memory Blocks]
+        Sidecar --> Zep[Zep: Temporal Decay & Summaries]
+        Sidecar --> LlamaIndex[LlamaIndex: RAG Chunking]
+        
+        Mem0 --> SQLite[(Single Source of Truth: SQLite sarathi.db)]
+        Letta --> SQLite
+        Zep --> SQLite
+        
+        SQLite --> Injector[Prompt Injection Engine]
+        Injector --> LLM[Llama.cpp Inference Engine]
     end
 ```
 
 ---
 
+## ✨ System Features
+
+### 🔬 1. Deep Physical System Telemetry
+- **Hardware Telemetry**: Scans Windows WMI/CIM, DirectX 12 (DXGI), Vulkan, and System APIs.
+- **Memory Domain Separation**: Distinguishes Dedicated Video RAM (VRAM) from Shared System Memory and Physical System RAM.
+- **Multi-GPU & iGPU Awareness**: Tailored offloading calculations across NVIDIA CUDA, AMD ROCm/Vulkan, Intel Arc/OneAPI, and CPU-only setups.
+
+### 🧠 2. Hardware-Matched Model Recommendation Engine
+- **Live Hugging Face Catalog**: Dynamic retrieval of open-weight GGUF architectures (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek, etc.).
+- **Deterministic Memory Budgeting**: Calculates model weight footprint ($W_{\text{bytes}} = \frac{N_{\text{params}} \times \text{bpw}}{8} \times 1.06$) and KV-cache overhead (accounting for MHA/GQA, layer depth, head dimensions, and context windows up to 128k).
+
+### ⚡ 3. Parallel Resumable Downloader & LoRA Adapter Pipeline
+- **Concurrent LoRA Capability Discovery**: Spawns 5 independent async `tokio::spawn` tasks for capabilities (`coding`, `reasoning`, `tool-calling`, `mathematics`, `research`) running in parallel with the base model GGUF download.
+- **HTTP Range Header Resume**: Automatic resume for interrupted `.part` weight files. Zero zero-byte resets.
+- **Single Source of Truth Manifest**: Prevents accidental adapter deletion or re-download loops.
+
+### 🔮 4. In-Process LLM Inference Engine (`llama-cpp-2`)
+- **Direct GPU Offloading**: Configurable GPU layer offloading and thread allocation.
+- **Dynamic Prompt Formatting**: Built-in Jinja/ChatML, Llama 3, Gemma, and Mistral template formatting.
+- **Leak-Proof Stream Parser**: Real-time filtering of special control tokens (`<|im_end|>`, `<|im_start|>`) and reasoning tags (`<think>...</think>`).
+
+### 🪷 5. Phase 6 Production Hybrid Local Memory Engine
+- **Direct Framework Integration**: Integrates proven open-source memory systems (**Mem0**, **Letta**, **Zep**, **LlamaIndex**) directly within a plugin-based Python sidecar.
+- **Zero-Firewall Stdio IPC**: Operates over newline-delimited JSON-RPC 2.0 via `stdin`/`stdout`. Zero listening ports, zero firewall authorization prompts, 100% child process lifetime coupling.
+- **Strict Storage Ownership**: Frameworks act strictly as pure processors. Sarathi owns 100% of storage, transactions, and schema migrations in `sqlite:sarathi.db`.
+- **Model-Switch Context Preservation**: User context, user profiles, project memories, and summaries persist across model switches (e.g. Qwen $\rightarrow$ Mistral) and application restarts.
+
+---
+
 ## 🛠 Tech Stack
 
-| Domain | Technology |
+| Component | Technologies Used |
 | :--- | :--- |
-| **Desktop Shell** | [Tauri v2](https://tauri.app/) (Native C++ / Rust Window Manager) |
-| **Backend Core** | [Rust](https://www.rust-lang.org/) (Async Tokio, Reqwest, Sysinfo, WinAPI, Serde) |
-| **Frontend UI** | [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/), [Vite](https://vitejs.dev/) |
-| **Styling** | Vanilla CSS Tokens (Dark Glassmorphism, Responsive Grid System) |
-| **LLM Catalog** | [Hugging Face Hub API](https://huggingface.co/docs/hub/api) |
+| **Desktop Core** | [Tauri v2](https://tauri.app/) (Native C++ / Rust Window Manager) |
+| **Backend Core** | [Rust 1.93](https://www.rust-lang.org/) (Async Tokio, Rusqlite, Reqwest, Sysinfo, WinAPI, Serde) |
+| **Inference Engine** | `llama-cpp-2` (CUDA / Vulkan / CPU native bindings) |
+| **Memory Sidecar** | [Python 3.11](https://www.python.org/) (Stdio NDJSON-RPC, Mem0, Letta, Zep, LlamaIndex) |
+| **Frontend UI** | [React 19](https://react.dev/), [TypeScript 5.7](https://www.typescriptlang.org/), [Vite](https://vitejs.dev/) |
+| **Database** | SQLite (`sqlite:sarathi.db` with Migration V2) |
 
 ---
 
@@ -85,11 +103,12 @@ flowchart TD
 
 ### Prerequisites
 
-- **Node.js** (v18 or higher)
-- **Rust Toolchain** (1.75 or higher)
-- **C++ Build Tools** (Visual Studio Build Tools for Windows)
+- **Node.js**: v18+
+- **Rust Toolchain**: 1.75+
+- **Python**: 3.10+ (for embedded memory sidecar)
+- **Build Tools**: Visual Studio 2022 Build Tools (with C++ and Windows SDK)
 
-### Installation & Development
+### Installation & Local Setup
 
 1. **Clone the repository**:
    ```bash
@@ -107,11 +126,15 @@ flowchart TD
    npm run tauri dev
    ```
 
-4. **Build Production Release Executable**:
+4. **Run Unit Tests**:
    ```bash
-   npm run build
    cd src-tauri
-   cargo build --release
+   cargo test --lib memory_engine::tests
+   ```
+
+5. **Build Release Binary**:
+   ```bash
+   npx tauri build
    ```
 
 ---

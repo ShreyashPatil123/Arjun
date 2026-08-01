@@ -51,9 +51,14 @@ pub async fn get_hardware_profile() -> Result<Option<HardwareProfile>, String> {
 /// Triggers full system analysis and updates cached profile
 #[tauri::command]
 pub async fn analyze_system() -> Result<HardwareProfile, String> {
-    get_system_analyzer_manager()
-        .analyze_system()
-        .map_err(|e| e.to_string())
+    // Run on a blocking thread since analyze_system() spawns child processes
+    tokio::task::spawn_blocking(move || {
+        get_system_analyzer_manager()
+            .analyze_system()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Applies a manual override to a hardware/software profile field
