@@ -9,7 +9,6 @@
 [![React](https://img.shields.io/badge/React-19.0-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Python Sidecar](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
 <p align="center">
   <b>Sarathi</b> is an intelligent, hardware-aware local AI desktop orchestrator. It combines real-time physical system profiling, deterministic memory budgeting, parallel LoRA capability adapter discovery, in-process GGUF inference via <code>llama.cpp</code>, and a production-grade <b>Hybrid Local Memory Engine</b>.
@@ -136,9 +135,3 @@ graph TD
    ```bash
    npx tauri build
    ```
-
----
-
-## 📄 License
-
-Distributed under the MIT License. See `LICENSE` for details.
