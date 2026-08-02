@@ -61,6 +61,7 @@ impl InferenceManager {
     /// - Consults the Phase 2 hardware profile for GPU/thread configuration
     /// - Auto-unloads any previously loaded model
     /// - Emits `inference:status` events during loading
+    /// Loads an installed model using its manifest and hardware profile.
     pub fn load_installed_model(
         &self,
         app_handle: &tauri::AppHandle,
@@ -69,18 +70,49 @@ impl InferenceManager {
         model_id: &str,
         quantization: &str,
     ) -> Result<LoadedModelInfo> {
+        let app_handle_clone = app_handle.clone();
+        let status_cb = move |status: &str, step: Option<&str>| {
+            let _ = app_handle_clone.emit("inference:status", InferenceStatusPayload {
+                status: status.to_string(),
+                step: step.map(|s| s.to_string()),
+                model: None,
+                error: None,
+            });
+        };
+
+        self.load_installed_model_internal(app_data_dir, provider_id, model_id, quantization, Some(status_cb))
+    }
+
+    /// Loads an installed model without requiring a Tauri AppHandle (for tests & backend validation).
+    pub fn load_installed_model_direct(
+        &self,
+        app_data_dir: &std::path::Path,
+        provider_id: &str,
+        model_id: &str,
+        quantization: &str,
+    ) -> Result<LoadedModelInfo> {
+        self.load_installed_model_internal::<fn(&str, Option<&str>)>(app_data_dir, provider_id, model_id, quantization, None)
+    }
+
+    fn load_installed_model_internal<F>(
+        &self,
+        app_data_dir: &std::path::Path,
+        provider_id: &str,
+        model_id: &str,
+        quantization: &str,
+        status_cb: Option<F>,
+    ) -> Result<LoadedModelInfo>
+    where
+        F: Fn(&str, Option<&str>),
+    {
         log::info!(
-            "[STAGE 3 MANAGER] load_installed_model entered: provider_id='{}', model_id='{}', quantization='{}', app_data_dir={:?}",
+            "[STAGE 3 MANAGER] load_installed_model_internal entered: provider_id='{}', model_id='{}', quantization='{}', app_data_dir={:?}",
             provider_id, model_id, quantization, app_data_dir
         );
 
-        // Emit loading status
-        let _ = app_handle.emit("inference:status", InferenceStatusPayload {
-            status: "Loading".to_string(),
-            step: Some("Reading model manifest...".to_string()),
-            model: None,
-            error: None,
-        });
+        if let Some(ref cb) = status_cb {
+            cb("Loading", Some("Reading model manifest..."));
+        }
 
         // Resolve package directory and read manifest
         let package_dir = AdapterRegistry::resolve_package_dir(app_data_dir, provider_id, model_id);
@@ -107,12 +139,9 @@ impl InferenceManager {
             .unwrap_or_else(|_| crate::model_intelligence::ModelProfile::new(&manifest.package_id, model_id, &manifest.base_model.model_name));
         log::info!("[STAGE 3 MANAGER] Loaded ModelProfile: family={:?}, chat_template='{}'", profile.model_family, profile.chat_template);
 
-        let _ = app_handle.emit("inference:status", InferenceStatusPayload {
-            status: "Loading".to_string(),
-            step: Some("Analyzing hardware configuration...".to_string()),
-            model: None,
-            error: None,
-        });
+        if let Some(ref cb) = status_cb {
+            cb("Loading", Some("Analyzing hardware configuration..."));
+        }
 
         // Build load configuration from hardware profile + manifest + profile
         let config = Self::build_load_config(
@@ -134,17 +163,10 @@ impl InferenceManager {
         );
 
         // Perform the actual load (auto-unloads previous model)
-        let app_handle_clone = app_handle.clone();
         let info_res = {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.load_model(&config, |step| {
                 log::info!("[STAGE 3 MANAGER PROGRESS] Step: {}", step);
-                let _ = app_handle_clone.emit("inference:status", InferenceStatusPayload {
-                    status: "Loading".to_string(),
-                    step: Some(step.to_string()),
-                    model: None,
-                    error: None,
-                });
             })
         };
 
@@ -158,15 +180,17 @@ impl InferenceManager {
         self.set_last_used_model_id(Some(model_id.to_string()));
         let _ = super::session::SessionManager::save_session(app_data_dir, provider_id, model_id, quantization);
 
-        // Emit ready status
-        let _ = app_handle.emit("inference:status", InferenceStatusPayload {
-            status: "Ready".to_string(),
-            step: None,
-            model: Some(info.clone()),
-            error: None,
-        });
+        if let Some(ref cb) = status_cb {
+            cb("Ready", None);
+        }
 
         Ok(info)
+    }
+
+    /// Direct unload without requiring Tauri AppHandle
+    pub fn unload_active_model_direct(&self) -> Result<()> {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.unload_model()
     }
 
     /// Unloads the currently active model
