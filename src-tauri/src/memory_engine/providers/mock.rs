@@ -28,16 +28,64 @@ impl MemoryProvider for MockProvider {
 
     async fn extract_facts(&self, text: &str, _context: Option<&str>) -> Result<Vec<ExtractedFact>> {
         let mut facts = Vec::new();
-        if text.contains("Rust") || text.contains("programming") {
+        let lower = text.to_lowercase();
+
+        if lower.contains("my name is") || lower.contains("i am ") || lower.contains("call me ") {
+            let name = text.split_whitespace().last().unwrap_or("User").trim_matches(&['.', ',', '!', '?'][..]);
             facts.push(ExtractedFact {
-                content: "User codes in Rust".to_string(),
+                content: format!("User's name is {}", name),
                 memory_type: "user_fact".to_string(),
-                key: Some("language".to_string()),
-                value: Some("Rust".to_string()),
-                importance_score: 0.9,
+                key: Some("name".to_string()),
+                value: Some(name.to_string()),
+                importance_score: 0.98,
+                confidence: 0.99,
+            });
+        }
+
+        if lower.contains("birthday") || lower.contains("born on") {
+            facts.push(ExtractedFact {
+                content: text.to_string(),
+                memory_type: "user_fact".to_string(),
+                key: Some("birthday".to_string()),
+                value: Some(text.to_string()),
+                importance_score: 0.95,
+                confidence: 0.98,
+            });
+        }
+
+        if lower.contains("study at") || lower.contains("college") || lower.contains("university") {
+            facts.push(ExtractedFact {
+                content: text.to_string(),
+                memory_type: "user_fact".to_string(),
+                key: Some("education".to_string()),
+                value: Some(text.to_string()),
+                importance_score: 0.92,
+                confidence: 0.96,
+            });
+        }
+
+        if lower.contains("laptop") || lower.contains("pc") || lower.contains("device") {
+            facts.push(ExtractedFact {
+                content: text.to_string(),
+                memory_type: "user_fact".to_string(),
+                key: Some("device".to_string()),
+                value: Some(text.to_string()),
+                importance_score: 0.90,
                 confidence: 0.95,
             });
         }
+
+        if lower.contains("like ") || lower.contains("love ") || lower.contains("prefer ") {
+            facts.push(ExtractedFact {
+                content: text.to_string(),
+                memory_type: "preference".to_string(),
+                key: Some("preference".to_string()),
+                value: Some(text.to_string()),
+                importance_score: 0.88,
+                confidence: 0.94,
+            });
+        }
+
         Ok(facts)
     }
 

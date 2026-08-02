@@ -168,6 +168,7 @@ pub fn run() {
             memory_engine::api::get_active_project,
             memory_engine::api::search_memory_nodes,
             memory_engine::api::delete_memory_node_by_id,
+            memory_engine::api::get_memory_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

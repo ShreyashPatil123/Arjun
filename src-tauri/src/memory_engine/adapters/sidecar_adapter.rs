@@ -33,9 +33,11 @@ impl SidecarAdapter {
             .ok_or_else(|| anyhow!("Memory sidecar main.py script not found in any candidate path from CWD '{:?}'", cwd))?;
 
         log::info!("[SIDECAR] Spawning Python sidecar from {:?}", target_script);
+        let script_dir = target_script.parent().unwrap_or(&cwd);
 
         let mut command = Command::new("python");
         command.arg(&target_script);
+        command.env("PYTHONPATH", script_dir);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::inherit());

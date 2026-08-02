@@ -81,3 +81,31 @@ pub fn delete_memory_node_by_id(
 ) -> Result<(), String> {
     memory_mgr.delete_memory(&id).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn get_memory_diagnostics(
+    memory_mgr: State<'_, Arc<MemoryManager>>,
+) -> Result<serde_json::Value, String> {
+    let health = memory_mgr.check_health().await.unwrap_or_else(|_| crate::memory_engine::traits::ProviderHealthStatus {
+        status: "degraded".to_string(),
+        registered_providers: vec![],
+        capabilities: serde_json::json!({}),
+    });
+
+    let (nodes_cnt, profile_cnt, projects_cnt) = memory_mgr.get_counts().unwrap_or((0, 0, 0));
+    let active_proj = memory_mgr.get_active_project_id();
+
+    Ok(serde_json::json!({
+        "memory_provider": memory_mgr.provider_id(),
+        "sidecar_status": if health.status == "healthy" { "online" } else { "offline" },
+        "database_status": "connected",
+        "memory_counts": {
+            "memory_nodes": nodes_cnt,
+            "user_profile": profile_cnt,
+            "projects": projects_cnt
+        },
+        "active_project": active_proj,
+        "health_status": health,
+        "last_error": null
+    }))
+}

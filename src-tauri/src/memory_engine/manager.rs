@@ -133,4 +133,12 @@ impl MemoryManager {
     pub fn delete_memory(&self, id: &str) -> Result<()> {
         self.persistence.delete_memory_node(id)
     }
+
+    pub fn provider_id(&self) -> &str {
+        self.provider.provider_id()
+    }
+
+    pub fn get_counts(&self) -> Result<(usize, usize, usize)> {
+        self.persistence.get_memory_counts()
+    }
 }

@@ -265,4 +265,12 @@ impl PersistenceManager {
         conn.execute("DELETE FROM memory_nodes WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    pub fn get_memory_counts(&self) -> Result<(usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let nodes: usize = conn.query_row("SELECT COUNT(*) FROM memory_nodes", [], |r| r.get(0)).unwrap_or(0);
+        let profile: usize = conn.query_row("SELECT COUNT(*) FROM user_profile", [], |r| r.get(0)).unwrap_or(0);
+        let projects: usize = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap_or(0);
+        Ok((nodes, profile, projects))
+    }
 }

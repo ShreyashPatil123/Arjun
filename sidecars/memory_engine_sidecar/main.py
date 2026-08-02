@@ -5,6 +5,13 @@ Processes requests with zero network sockets or firewall prompts.
 """
 
 import sys
+import os
+
+# Ensure sidecar directory is on sys.path for absolute imports
+sidecar_dir = os.path.dirname(os.path.abspath(__file__))
+if sidecar_dir not in sys.path:
+    sys.path.insert(0, sidecar_dir)
+
 import json
 import traceback
 from router import MemoryActionRouter

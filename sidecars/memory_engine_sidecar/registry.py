@@ -5,8 +5,7 @@ Manages discovery, capability mapping, health monitoring, and fallback execution
 
 from typing import Dict, Any, List, Optional
 from providers.base_provider import BaseMemoryProvider
-from providers.mem0.provider import Mem0Provider
-from providers.letta.provider import LettaProvider
+from providers.rule_extractor.provider import RuleExtractorProvider
 from providers.zep.provider import ZepProvider
 from providers.llamaindex.provider import LlamaIndexProvider
 
@@ -19,8 +18,7 @@ class CapabilityRegistry:
     def _register_default_providers(self):
         """Discovers and registers built-in provider plugins."""
         defaults = [
-            Mem0Provider(),
-            LettaProvider(),
+            RuleExtractorProvider(),
             ZepProvider(),
             LlamaIndexProvider()
         ]
