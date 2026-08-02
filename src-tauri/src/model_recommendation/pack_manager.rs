@@ -29,11 +29,15 @@ impl PackManager {
     /// Loads all certification packs from sidecars/packs and app_data_dir/packs
     pub fn reload_all_packs(&self) -> Result<()> {
         let cwd = std::env::current_dir().unwrap_or_default();
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
+
         let candidate_dirs = vec![
             self.app_data_dir.join("packs"),
             cwd.join("sidecars").join("packs"),
             cwd.join("src-tauri").join("sidecars").join("packs"),
             cwd.parent().map(|p| p.join("sidecars").join("packs")).unwrap_or_default(),
+            exe_dir.join("sidecars").join("packs"),
+            exe_dir.join("packs"),
         ];
 
         let mut loaded_packs = Vec::new();
@@ -46,12 +50,33 @@ impl PackManager {
                             if let Ok(content) = fs::read_to_string(&path) {
                                 if let Ok(pack) = serde_json::from_str::<CertificationPack>(&content) {
                                     log::info!("[PACK_MANAGER] Loaded certification pack '{}' from {:?}", pack.name, path);
-                                    loaded_packs.push(pack);
+                                    if !loaded_packs.iter().any(|p: &CertificationPack| p.pack_id == pack.pack_id) {
+                                        loaded_packs.push(pack);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Always ensure app_data_dir/packs contains official_pack.json for cross-restart state persistence
+        let target_dir = self.app_data_dir.join("packs");
+        let target_file = target_dir.join("official_pack.json");
+        if !target_file.exists() {
+            let embedded = include_str!("../../../sidecars/packs/official_pack.json");
+            let _ = fs::create_dir_all(&target_dir);
+            let _ = fs::write(&target_file, embedded);
+            log::info!("[PACK_MANAGER] Seeded official_pack.json into app_data_dir/packs");
+        }
+
+        // Fallback: If no packs found on disk, parse embedded official_pack.json
+        if loaded_packs.is_empty() {
+            let embedded = include_str!("../../../sidecars/packs/official_pack.json");
+            if let Ok(pack) = serde_json::from_str::<CertificationPack>(embedded) {
+                log::info!("[PACK_MANAGER] Loaded fallback embedded certification pack '{}'", pack.name);
+                loaded_packs.push(pack);
             }
         }
 

@@ -740,10 +740,13 @@ export const Models: React.FC = () => {
                       <span className={styles.modelFamily}>{model.modelFamily}</span>
                     </div>
                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
-                      {model.certification ? (
+                      <Badge variant={model.confidence === 'High' ? 'success' : model.confidence === 'Medium' ? 'warning' : 'default'}>
+                        {model.confidence} Confidence
+                      </Badge>
+                      {model.certification && model.certification.tier === 'Certified' && (
                         <span style={{
                           background: 'linear-gradient(135deg, rgba(245,158,11,0.2) 0%, rgba(217,119,6,0.3) 100%)',
-                          border: '1px solid var(--accent)',
+                          border: '1px solid #f59e0b',
                           color: '#fbbf24',
                           padding: '3px 8px',
                           borderRadius: '6px',
@@ -753,12 +756,8 @@ export const Models: React.FC = () => {
                           alignItems: 'center',
                           gap: '4px'
                         }}>
-                          ⭐⭐⭐⭐⭐ Saarthi Certified ({model.certification.confidenceScore}/100)
+                          🪷 Sarathi Certified ({model.certification.confidenceScore}/100)
                         </span>
-                      ) : (
-                        <Badge variant={model.confidence === 'High' ? 'success' : model.confidence === 'Medium' ? 'warning' : 'default'}>
-                          {model.confidence} Confidence
-                        </Badge>
                       )}
                       <span className={styles.archBadge}>{model.architecture}</span>
                     </div>
