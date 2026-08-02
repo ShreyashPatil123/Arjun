@@ -78,6 +78,7 @@ pub async fn route_prompt_capability(
     prompt: String,
     user_override: Option<String>,
 ) -> Result<AdapterRouteResult, String> {
+    let start_time = std::time::Instant::now();
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
@@ -86,10 +87,17 @@ pub async fn route_prompt_capability(
     let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
     let manifest = AdapterRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
 
-    Ok(AdapterRouter::select_adapter_for_prompt(
+    let route = AdapterRouter::select_adapter_for_prompt(
         &package_dir,
         &manifest,
         &prompt,
         user_override.as_deref(),
-    ))
+    );
+
+    log::info!(
+        "[INTENT_ROUTER] Prompt Intent Analysis complete in {}ms | Intent: {:?} | Target Capability: '{}' | Selected Adapter: {:?}",
+        start_time.elapsed().as_millis(), route.intent, route.target_capability, route.selected_adapter_name
+    );
+
+    Ok(route)
 }

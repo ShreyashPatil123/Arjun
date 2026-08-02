@@ -111,16 +111,36 @@ pub async fn send_chat_message(
     let mgr = inference_mgr.inner().clone();
     let mem = memory_mgr.inner().clone();
 
+    log::info!("[MEMORY_PIPELINE] send_chat_message invoked with {} message(s)", messages.len());
+
     // Extract facts from last user turn & prepare memory-injected messages
     let mut final_messages = messages.clone();
     if let Some(last_msg) = messages.last() {
         if last_msg.role == "user" {
-            let _ = mem.process_user_turn(&last_msg.content, None).await;
-            if let Ok(injected) = mem.prepare_injected_messages(&messages, &last_msg.content).await {
-                final_messages = injected;
+            log::info!("[MEMORY_PIPELINE] Processing user turn for extraction: \"{}\"", &last_msg.content[..last_msg.content.len().min(100)]);
+
+            match mem.process_user_turn(&last_msg.content, None).await {
+                Ok(count) => log::info!("[MEMORY_PIPELINE] ✓ Extracted {} fact(s) from user turn", count),
+                Err(e) => log::warn!("[MEMORY_PIPELINE] ⚠ Extraction failed (non-fatal): {:?}", e),
+            }
+
+            match mem.prepare_injected_messages(&messages, &last_msg.content).await {
+                Ok(injected) => {
+                    let sys_msgs: Vec<&ChatMessage> = injected.iter().filter(|m| m.role == "system").collect();
+                    if let Some(sys) = sys_msgs.first() {
+                        let preview = &sys.content[..sys.content.len().min(300)];
+                        log::info!("[MEMORY_PIPELINE] ✓ Prompt injection complete ({} messages). System prompt preview: \"{}...\"", injected.len(), preview);
+                    } else {
+                        log::warn!("[MEMORY_PIPELINE] ⚠ No system message in injected messages");
+                    }
+                    final_messages = injected;
+                }
+                Err(e) => log::warn!("[MEMORY_PIPELINE] ⚠ Injection failed (using raw messages): {:?}", e),
             }
         }
     }
+
+    log::info!("[MEMORY_PIPELINE] Dispatching {} final message(s) to inference runtime", final_messages.len());
 
     tokio::task::spawn_blocking(move || {
         mgr.send_chat_message(&app_handle, final_messages, params)

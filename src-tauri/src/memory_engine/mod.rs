@@ -35,9 +35,13 @@ mod tests {
         let health = mock.check_health().await.unwrap();
         assert_eq!(health.status, "healthy");
 
-        let facts = mock.extract_facts("I build apps in Rust", None).await.unwrap();
+        let facts = mock.extract_facts("I like building apps in Rust", None).await.unwrap();
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].value.as_deref(), Some("Rust"));
+        assert_eq!(facts[0].memory_type, "preference");
+
+        let name_facts = mock.extract_facts("My name is Shreyash Patil", None).await.unwrap();
+        assert_eq!(name_facts.len(), 1);
+        assert_eq!(name_facts[0].value.as_deref(), Some("Shreyash Patil"));
     }
 
     #[test]
@@ -94,7 +98,7 @@ mod tests {
 
         assert_eq!(injected.len(), 2);
         assert_eq!(injected[0].role, "system");
-        assert!(injected[0].content.contains("[SARATHI MEMORY ENGINE - ACTIVE PROJECT: TRACKOCEAN]"));
+        assert!(injected[0].content.contains("User Workspace & Project Context: TrackOcean"));
         assert!(injected[0].content.contains("language: Rust"));
         assert!(injected[0].content.contains("User prefers Rust for performance"));
     }

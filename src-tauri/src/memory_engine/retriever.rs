@@ -23,7 +23,17 @@ impl Retriever {
 
     /// Retrieves relevant memory nodes scoped strictly to project_id
     pub async fn retrieve(&self, query: &str, project_id: Option<&str>, limit: usize) -> Result<Vec<ScoredCandidate>> {
+        let start_time = std::time::Instant::now();
+        log::info!(
+            "[MEMORY_RETRIEVAL] Query entered: \"{}\" | Project Scope: {:?} | Limit: {}",
+            query, project_id, limit
+        );
+
         let records = self.persistence.get_memories_by_project(project_id, 50)?;
+        log::info!(
+            "[MEMORY_RETRIEVAL] Fetched {} raw candidate(s) from SQLite persistence for project scope {:?}",
+            records.len(), project_id
+        );
 
         let candidates: Vec<ScoredCandidate> = records
             .into_iter()
@@ -44,16 +54,44 @@ impl Retriever {
             .collect();
 
         if candidates.is_empty() {
+            log::info!("[MEMORY_RETRIEVAL] No candidates found in database. Returning empty set. Latency: {}ms", start_time.elapsed().as_millis());
             return Ok(Vec::new());
+        }
+
+        for (i, c) in candidates.iter().enumerate().take(10) {
+            log::info!(
+                "[MEMORY_RETRIEVAL_CANDIDATE] [{}] ID='{}' | Type='{}' | Sim={:.3} | Imp={:.2} | Content=\"{}\"",
+                i + 1, c.id, c.memory_type, c.similarity, c.importance_score, &c.content[..c.content.len().min(60)]
+            );
         }
 
         // Attempt provider ranking with fallback to pure Rust RankingEngine
         let ranked = match self.provider.calculate_rankings(&candidates, query).await {
-            Ok(res) if !res.is_empty() => res,
-            _ => RankingEngine::rank_candidates(&candidates, query),
+            Ok(res) if !res.is_empty() => {
+                log::info!("[MEMORY_RETRIEVAL] Provider '{}' calculated candidate rankings successfully", self.provider.provider_id());
+                res
+            }
+            _ => {
+                log::info!("[MEMORY_RETRIEVAL_FALLBACK] Provider ranking unavailable/empty, using Rust RankingEngine fallback");
+                RankingEngine::rank_candidates(&candidates, query)
+            }
         };
 
-        Ok(ranked.into_iter().take(limit).collect())
+        let selected: Vec<ScoredCandidate> = ranked.into_iter().take(limit).collect();
+        let latency_ms = start_time.elapsed().as_millis();
+
+        log::info!(
+            "[MEMORY_RETRIEVAL_SUCCESS] Selected Top-{} ranked memory candidate(s) in {}ms:",
+            selected.len(), latency_ms
+        );
+        for (i, s) in selected.iter().enumerate() {
+            log::info!(
+                "[MEMORY_RETRIEVAL_SELECTED] #{} ID='{}' | Score={:.3} | Type='{}' | Content=\"{}\"",
+                i + 1, s.id, s.final_score.unwrap_or(s.similarity), s.memory_type, &s.content[..s.content.len().min(80)]
+            );
+        }
+
+        Ok(selected)
     }
 
     fn calculate_text_similarity(query: &str, text: &str) -> f64 {

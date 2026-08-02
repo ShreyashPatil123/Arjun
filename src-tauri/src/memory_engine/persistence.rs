@@ -121,6 +121,7 @@ impl PersistenceManager {
 
     /// Inserts or updates a memory node
     pub fn save_memory_node(&self, record: &MemoryNodeRecord) -> Result<()> {
+        let start_time = std::time::Instant::now();
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO memory_nodes (id, memory_type, project_id, session_id, content, importance_score, recency_timestamp, metadata, created_at, updated_at)
@@ -143,6 +144,10 @@ impl PersistenceManager {
                 record.updated_at
             ],
         )?;
+        log::info!(
+            "[MEMORY_PERSISTENCE] Table 'memory_nodes' INSERT/UPDATE succeeded in {}ms: ID='{}', Type='{}', Project={:?}, Importance={:.2}",
+            start_time.elapsed().as_millis(), record.id, record.memory_type, record.project_id, record.importance_score
+        );
         Ok(())
     }
 
@@ -192,6 +197,7 @@ impl PersistenceManager {
 
     /// User profile CRUD
     pub fn save_user_profile_fact(&self, key: &str, value: &str, category: &str) -> Result<()> {
+        let start_time = std::time::Instant::now();
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -200,6 +206,10 @@ impl PersistenceManager {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             params![key, value, category, now],
         )?;
+        log::info!(
+            "[MEMORY_PERSISTENCE] Table 'user_profile' UPSERT succeeded in {}ms: Key='{}', Value='{}', Category='{}'",
+            start_time.elapsed().as_millis(), key, value, category
+        );
         Ok(())
     }
 

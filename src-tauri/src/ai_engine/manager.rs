@@ -269,9 +269,23 @@ impl InferenceManager {
                     model: self.get_loaded_model_info(),
                     error: Some(err_msg.clone()),
                 });
-                Err(anyhow!("Generation failed: {}", err_msg))
+                Err(e)
             }
         }
+    }
+
+    /// Direct generation without requiring a Tauri AppHandle (for test scripts & backend execution)
+    pub fn generate_direct<F>(
+        &self,
+        messages: &[ChatMessage],
+        params: &GenerationParams,
+        token_cb: F,
+    ) -> Result<String>
+    where
+        F: FnMut(StreamChunk),
+    {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.generate(messages, params, token_cb)
     }
 
     /// Stops the current token generation

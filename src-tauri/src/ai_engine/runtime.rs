@@ -370,33 +370,33 @@ impl LlamaCppRuntime {
         }
 
         // Decode the prompt (prefill)
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow!("Failed to decode initial prompt batch: {:?}", e))?;
+
         let eos_token = model.token_eos();
 
         // Build effective template-driven stop sequences list
         let mut effective_stop_tokens = config.stop_tokens.clone();
-        match config.chat_template.to_lowercase().as_str() {
-            "chatml" => {
-                for st in &["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
-                    if !effective_stop_tokens.iter().any(|s| s == st) {
-                        effective_stop_tokens.push(st.to_string());
-                    }
+        let lower_temp = config.chat_template.to_lowercase();
+
+        if lower_temp.contains("chatml") || lower_temp.contains("qwen") {
+            for st in &["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
+                if !effective_stop_tokens.iter().any(|s| s == st) {
+                    effective_stop_tokens.push(st.to_string());
                 }
             }
-            "gemma" => {
-                for st in &["<end_of_turn>", "<start_of_turn>"] {
-                    if !effective_stop_tokens.iter().any(|s| s == st) {
-                        effective_stop_tokens.push(st.to_string());
-                    }
+        } else if lower_temp.contains("gemma") {
+            for st in &["<end_of_turn>", "<start_of_turn>"] {
+                if !effective_stop_tokens.iter().any(|s| s == st) {
+                    effective_stop_tokens.push(st.to_string());
                 }
             }
-            "llama3" | "llama" => {
-                for st in &["<|eot_id|>", "<|end_of_text|>", "</s>"] {
-                    if !effective_stop_tokens.iter().any(|s| s == st) {
-                        effective_stop_tokens.push(st.to_string());
-                    }
+        } else if lower_temp.contains("llama3") || lower_temp.contains("llama-3") || lower_temp.contains("llama") {
+            for st in &["<|eot_id|>", "<|end_of_text|>", "</s>"] {
+                if !effective_stop_tokens.iter().any(|s| s == st) {
+                    effective_stop_tokens.push(st.to_string());
                 }
             }
-            _ => {}
         }
 
         // Log complete runtime generation parameters & provenance immediately before generation
@@ -582,49 +582,38 @@ fn format_chat_prompt(messages: &[ChatMessage]) -> String {
 
 pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name: &str) -> String {
     let mut prompt = String::new();
+    let lower_temp = template_name.to_lowercase();
 
-    match template_name.to_lowercase().as_str() {
-        "chatml" => {
-            for msg in messages {
-                prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
-            }
-            prompt.push_str("<|im_start|>assistant\n");
+    if lower_temp.contains("chatml") || lower_temp.contains("qwen") {
+        for msg in messages {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
         }
-        "gemma" => {
-            for msg in messages {
-                let role = if msg.role == "assistant" { "model" } else { &msg.role };
-                prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
-            }
-            prompt.push_str("<start_of_turn>model\n");
+        prompt.push_str("<|im_start|>assistant\n");
+    } else if lower_temp.contains("llama3") || lower_temp.contains("llama-3") || lower_temp.contains("llama_3") {
+        for msg in messages {
+            prompt.push_str(&format!("<|start_header_id|>{}\n<|end_header_id|>\n\n{}<|eot_id|>\n", msg.role, msg.content));
         }
-        "mistral" => {
-            for msg in messages {
-                if msg.role == "user" {
-                    prompt.push_str(&format!("[INST] {} [/INST]", msg.content));
-                } else if msg.role == "assistant" {
-                    prompt.push_str(&format!(" {}\n", msg.content));
-                }
+        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    } else if lower_temp.contains("gemma") {
+        for msg in messages {
+            let role = if msg.role == "assistant" { "model" } else { &msg.role };
+            prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
+        }
+        prompt.push_str("<start_of_turn>model\n");
+    } else if lower_temp.contains("mistral") {
+        for msg in messages {
+            if msg.role == "user" {
+                prompt.push_str(&format!("[INST] {} [/INST]", msg.content));
+            } else if msg.role == "assistant" {
+                prompt.push_str(&format!(" {}\n", msg.content));
             }
         }
-        _ => {
-            for msg in messages {
-                match msg.role.as_str() {
-                    "system" => {
-                        prompt.push_str(&format!("### System:\n{}\n\n", msg.content));
-                    }
-                    "user" => {
-                        prompt.push_str(&format!("### User:\n{}\n\n", msg.content));
-                    }
-                    "assistant" => {
-                        prompt.push_str(&format!("### Assistant:\n{}\n\n", msg.content));
-                    }
-                    _ => {
-                        prompt.push_str(&format!("### {}:\n{}\n\n", msg.role, msg.content));
-                    }
-                }
-            }
-            prompt.push_str("### Assistant:\n");
+    } else {
+        // Fallback to ChatML structure for unknown models
+        for msg in messages {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
         }
+        prompt.push_str("<|im_start|>assistant\n");
     }
 
     prompt

@@ -16,11 +16,13 @@ impl PromptInjector {
         retrieved_memories: &[ScoredCandidate],
         rolling_summary: Option<&str>,
     ) -> Vec<ChatMessage> {
+        let start_time = std::time::Instant::now();
         let mut memory_section = String::new();
 
         memory_section.push_str(&format!("User Workspace & Project Context: {}\n", project_name));
 
-        if !user_profile_summary.is_empty() && !user_profile_summary.contains("No prior user preferences recorded.") {
+        let has_profile = !user_profile_summary.is_empty() && !user_profile_summary.contains("No prior user preferences recorded.");
+        if has_profile {
             memory_section.push_str("\nKnown User Information & Preferences:\n");
             memory_section.push_str(user_profile_summary);
             memory_section.push('\n');
@@ -67,6 +69,19 @@ impl PromptInjector {
                     content: format!("{}\n{}", memory_section, memory_directive),
                     timestamp: None,
                 },
+            );
+        }
+
+        let latency_ms = start_time.elapsed().as_millis();
+        log::info!(
+            "[PROMPT_INJECTION] Successfully injected Sarathi Memory into prompt in {}ms | Project: '{}' | Has Profile: {} | Recalled Memories: {} | Total Messages: {}",
+            latency_ms, project_name, has_profile, retrieved_memories.len(), final_messages.len()
+        );
+
+        if let Some(sys_msg) = final_messages.iter().find(|m| m.role == "system") {
+            log::info!(
+                "[PROMPT_INJECTION_SYSTEM_PAYLOAD] Final System Prompt ({}) bytes):\n{}",
+                sys_msg.content.len(), sys_msg.content
             );
         }
 

@@ -31,12 +31,21 @@ impl MemoryProvider for MockProvider {
         let lower = text.to_lowercase();
 
         if lower.contains("my name is") || lower.contains("i am ") || lower.contains("call me ") {
-            let name = text.split_whitespace().last().unwrap_or("User").trim_matches(&['.', ',', '!', '?'][..]);
+            // Extract the name after the trigger phrase
+            let name = if let Some(pos) = lower.find("my name is") {
+                text[pos + "my name is".len()..].trim().trim_matches(&['.', ',', '!', '?'][..]).to_string()
+            } else if let Some(pos) = lower.find("call me ") {
+                text[pos + "call me ".len()..].trim().trim_matches(&['.', ',', '!', '?'][..]).to_string()
+            } else if let Some(pos) = lower.find("i am ") {
+                text[pos + "i am ".len()..].trim().trim_matches(&['.', ',', '!', '?'][..]).to_string()
+            } else {
+                text.split_whitespace().last().unwrap_or("User").to_string()
+            };
             facts.push(ExtractedFact {
                 content: format!("User's name is {}", name),
                 memory_type: "user_fact".to_string(),
                 key: Some("name".to_string()),
-                value: Some(name.to_string()),
+                value: Some(name),
                 importance_score: 0.98,
                 confidence: 0.99,
             });
