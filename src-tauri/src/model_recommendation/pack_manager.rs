@@ -100,9 +100,13 @@ impl PackManager {
 
     pub fn get_package_certification(&self, model_id: &str) -> Option<PackageCertification> {
         let packs = self.packs.lock().unwrap();
+        let target_norm = model_id.to_lowercase().replace(['/', '-', '_', ' '], "");
+        
         for pack in packs.iter() {
             for pkg in &pack.certified_packages {
-                if pkg.model_id.to_lowercase() == model_id.to_lowercase() || pkg.package_id.to_lowercase().contains(&model_id.to_lowercase()) {
+                let pkg_model_norm = pkg.model_id.to_lowercase().replace(['/', '-', '_', ' '], "");
+                let pkg_id_norm = pkg.package_id.to_lowercase().replace(['/', '-', '_', ' '], "");
+                if pkg_model_norm == target_norm || target_norm.contains(&pkg_model_norm) || pkg_model_norm.contains(&target_norm) || pkg_id_norm.contains(&target_norm) {
                     return Some(pkg.clone());
                 }
             }

@@ -703,7 +703,31 @@ export const Models: React.FC = () => {
             <p>Try checking the other tabs to see compatible models for your hardware configuration.</p>
           </div>
         ) : (
-          <div className={styles.cardsGrid}>
+          <div>
+            {activeTab === 'Recommended' && (
+              <div style={{
+                background: 'linear-gradient(135deg, rgba(245,158,11,0.12) 0%, rgba(217,119,6,0.06) 100%)',
+                border: '1px solid var(--accent)',
+                borderRadius: '8px',
+                padding: '12px 16px',
+                marginBottom: '16px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}>
+                <div>
+                  <h3 style={{ margin: 0, color: '#fbbf24', fontSize: '15px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    🪷 Saarthi Officially Certified Base Models
+                  </h3>
+                  <p style={{ margin: '2px 0 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                    Production-tested base models certified for accuracy, stability, zero reasoning token leakage, and dynamic LoRA adapter switching.
+                  </p>
+                </div>
+                <Badge variant="success">⭐⭐⭐⭐⭐ Officially Recommended</Badge>
+              </div>
+            )}
+
+            <div className={styles.cardsGrid}>
             {currentModels.map((model) => {
               const downloadTask = getTaskForModel(model.modelId, model.quantization);
               const installed = isModelInstalled(model.modelId, model.quantization);
@@ -1033,6 +1057,7 @@ export const Models: React.FC = () => {
               );
             })}
           </div>
+        </div>
         )
       )}
     </div>
