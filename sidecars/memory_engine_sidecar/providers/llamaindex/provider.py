@@ -26,14 +26,14 @@ class LlamaIndexProvider(BaseMemoryProvider):
         if not text or len(text.strip()) == 0:
             return []
 
-        paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 0]
+        raw_units = [p.strip() for p in re.split(r'\n\n|\. ', text) if len(p.strip()) > 0]
         chunks = []
         chunk_idx = 0
 
         current_chunk = ""
-        for p in paragraphs:
-            if len(current_chunk) + len(p) <= chunk_size:
-                current_chunk += ("\n\n" if current_chunk else "") + p
+        for u in raw_units:
+            if len(current_chunk) + len(u) <= chunk_size:
+                current_chunk += (". " if current_chunk else "") + u
             else:
                 if current_chunk:
                     chunks.append({
@@ -42,7 +42,7 @@ class LlamaIndexProvider(BaseMemoryProvider):
                         "token_count": len(current_chunk) // 4
                     })
                     chunk_idx += 1
-                current_chunk = p
+                current_chunk = u
 
         if current_chunk:
             chunks.append({

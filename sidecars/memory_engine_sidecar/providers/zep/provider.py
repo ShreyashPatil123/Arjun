@@ -1,6 +1,6 @@
 """
-Zep Provider Plugin — Rolling Summarization & Exponential Recency Decay Ranking
-Calculates temporal decay scores and summarizes long chat sessions.
+Zep Provider Plugin — Rolling Summarization, Context Compression & Exponential Recency Decay Ranking
+Calculates temporal decay scores, compresses context windows, and summarizes long chat sessions.
 """
 
 import math
@@ -15,7 +15,7 @@ class ZepProvider(BaseMemoryProvider):
 
     @property
     def capabilities(self) -> List[str]:
-        return ["summarization", "ranking"]
+        return ["summarization", "ranking", "compression"]
 
     def initialize(self) -> bool:
         return True
@@ -40,6 +40,25 @@ class ZepProvider(BaseMemoryProvider):
 
         summary = f"User discussed: {'; '.join(user_topics[:3])}. Assistant provided guidance on key queries."
         return {"summary": summary}
+
+    def compress_context(self, messages: List[Dict[str, Any]], max_tokens: int = 4096) -> Dict[str, Any]:
+        """
+        Compresses conversation turns into a high-density working context block.
+        """
+        if not messages:
+            return {"compressed_text": "", "tokens_used": 0, "evicted_turns": 0, "retained_turns": 0}
+
+        retained = messages[-4:] if len(messages) >= 4 else messages
+        evicted_count = max(0, len(messages) - len(retained))
+        compressed_text = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in retained])
+        tokens_used = max(1, len(compressed_text) // 4)
+
+        return {
+            "compressed_text": compressed_text,
+            "tokens_used": tokens_used,
+            "evicted_turns": evicted_count,
+            "retained_turns": len(retained)
+        }
 
     def calculate_rankings(self, candidates: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
         """
