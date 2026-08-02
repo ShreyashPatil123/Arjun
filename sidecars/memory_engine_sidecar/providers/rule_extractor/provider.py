@@ -167,4 +167,15 @@ class RuleExtractorProvider(BaseMemoryProvider):
                 "confidence": 0.90
             })
 
+        # Pattern 8: Generic Turn Memory Node (Ensures 100+ turn conversations persist memory nodes)
+        if not facts and len(clean_text) > 5:
+            facts.append({
+                "content": clean_text,
+                "memory_type": "conversation_fact",
+                "key": None,
+                "value": None,
+                "importance_score": 0.60,
+                "confidence": 0.80
+            })
+
         return facts
