@@ -19,6 +19,33 @@ export async function getAllPackageCertifications(): Promise<PackageCertificatio
   }
 }
 
+export async function getRecommendedModels(): Promise<PackageCertification[]> {
+  try {
+    return await invoke<PackageCertification[]>('get_recommended_packages');
+  } catch (err) {
+    console.error('Failed to get recommended packages:', err);
+    return [];
+  }
+}
+
+export async function getCompatibleModels(): Promise<PackageCertification[]> {
+  try {
+    return await invoke<PackageCertification[]>('get_compatible_packages');
+  } catch (err) {
+    console.error('Failed to get compatible packages:', err);
+    return [];
+  }
+}
+
+export async function getExperimentalModels(): Promise<PackageCertification[]> {
+  try {
+    return await invoke<PackageCertification[]>('get_experimental_packages');
+  } catch (err) {
+    console.error('Failed to get experimental packages:', err);
+    return [];
+  }
+}
+
 export async function getRuntimeProfile(profileId: string): Promise<RuntimeProfile | null> {
   try {
     return await invoke<RuntimeProfile | null>('get_runtime_profile', { profileId });

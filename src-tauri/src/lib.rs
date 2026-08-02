@@ -124,6 +124,9 @@ pub fn run() {
             commands::recommendation::get_model_recommendations,
             commands::recommendation::get_package_certification,
             commands::recommendation::get_all_package_certifications,
+            commands::recommendation::get_recommended_packages,
+            commands::recommendation::get_compatible_packages,
+            commands::recommendation::get_experimental_packages,
             commands::recommendation::get_runtime_profile,
             commands::recommendation::reload_certification_packs,
 

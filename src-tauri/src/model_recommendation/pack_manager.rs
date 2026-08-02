@@ -123,4 +123,25 @@ impl PackManager {
         }
         list
     }
+
+    pub fn get_recommended_models(&self) -> Vec<PackageCertification> {
+        self.get_all_certifications()
+            .into_iter()
+            .filter(|c| c.tier == CertificationTier::Certified)
+            .collect()
+    }
+
+    pub fn get_compatible_models(&self) -> Vec<PackageCertification> {
+        self.get_all_certifications()
+            .into_iter()
+            .filter(|c| c.tier == CertificationTier::Compatible)
+            .collect()
+    }
+
+    pub fn get_experimental_models(&self) -> Vec<PackageCertification> {
+        self.get_all_certifications()
+            .into_iter()
+            .filter(|c| c.tier == CertificationTier::Experimental)
+            .collect()
+    }
 }

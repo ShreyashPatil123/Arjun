@@ -288,9 +288,18 @@ export const Models: React.FC = () => {
     }
   };
 
-  const recommendedModels = recommendations.filter((r) => r.category === 'Recommended');
-  const compatibleModels = recommendations.filter((r) => r.category === 'Compatible');
-  const mayRunModels = recommendations.filter((r) => r.category === 'MayRun');
+  const rawRecommended = recommendations.filter((r) => r.category === 'Recommended');
+  const rawCompatible = recommendations.filter((r) => r.category === 'Compatible');
+  const rawMayRun = recommendations.filter((r) => r.category === 'MayRun');
+
+  const filterExperimental = (list: ModelRecommendation[]) => {
+    if (showExperimental) return list;
+    return list.filter((item) => item.certification?.tier !== 'Experimental');
+  };
+
+  const recommendedModels = filterExperimental(rawRecommended);
+  const compatibleModels = filterExperimental(rawCompatible);
+  const mayRunModels = filterExperimental(rawMayRun);
 
   const currentModels =
     activeTab === 'Recommended'
@@ -366,50 +375,64 @@ export const Models: React.FC = () => {
       </header>
 
       {/* Navigation Tabs */}
-      <div className={styles.tabsRow}>
-        <button
-          className={`${styles.tabBtn} ${activeTab === 'Recommended' ? styles.activeTab : ''}`}
-          onClick={() => setActiveTab('Recommended')}
-        >
-          <CheckCircle2 size={16} color={activeTab === 'Recommended' ? 'var(--accent)' : undefined} />
-          Recommended
-          <span className={styles.tabBadge}>{recommendedModels.length}</span>
-        </button>
-        <button
-          className={`${styles.tabBtn} ${activeTab === 'Compatible' ? styles.activeTab : ''}`}
-          onClick={() => setActiveTab('Compatible')}
-        >
-          <Zap size={16} />
-          Compatible
-          <span className={styles.tabBadge}>{compatibleModels.length}</span>
-        </button>
-        <button
-          className={`${styles.tabBtn} ${activeTab === 'MayRun' ? styles.activeTab : ''}`}
-          onClick={() => setActiveTab('MayRun')}
-        >
-          <AlertTriangle size={16} />
-          May Run
-          <span className={styles.tabBadge}>{mayRunModels.length}</span>
-        </button>
-        <button
-          className={`${styles.tabBtn} ${activeTab === 'Storage' ? styles.activeTab : ''}`}
-          onClick={() => setActiveTab('Storage')}
-        >
-          <HardDrive size={16} />
-          Storage & Installed
-          <span className={styles.tabBadge}>{installedModels.length}</span>
-        </button>
-        <button
-          className={`${styles.tabBtn} ${activeTab === 'Chat' ? styles.activeTab : ''}`}
-          onClick={() => setActiveTab('Chat')}
-          style={{
-            color: loadedModelInfo ? 'var(--success)' : undefined,
-          }}
-        >
-          <MessageSquare size={16} />
-          Chat
-          {loadedModelInfo && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--success)', display: 'inline-block', marginLeft: 4 }} />}
-        </button>
+      <div className={styles.tabsRow} style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <button
+            className={`${styles.tabBtn} ${activeTab === 'Recommended' ? styles.activeTab : ''}`}
+            onClick={() => setActiveTab('Recommended')}
+            title="Saarthi Officially Certified & Verified Packages"
+          >
+            <CheckCircle2 size={16} color={activeTab === 'Recommended' ? 'var(--accent)' : undefined} />
+            🪷 Saarthi Recommended
+            <span className={styles.tabBadge}>{recommendedModels.length}</span>
+          </button>
+          <button
+            className={`${styles.tabBtn} ${activeTab === 'Compatible' ? styles.activeTab : ''}`}
+            onClick={() => setActiveTab('Compatible')}
+          >
+            <Zap size={16} />
+            Compatible
+            <span className={styles.tabBadge}>{compatibleModels.length}</span>
+          </button>
+          <button
+            className={`${styles.tabBtn} ${activeTab === 'MayRun' ? styles.activeTab : ''}`}
+            onClick={() => setActiveTab('MayRun')}
+          >
+            <AlertTriangle size={16} />
+            May Run
+            <span className={styles.tabBadge}>{mayRunModels.length}</span>
+          </button>
+          <button
+            className={`${styles.tabBtn} ${activeTab === 'Storage' ? styles.activeTab : ''}`}
+            onClick={() => setActiveTab('Storage')}
+          >
+            <HardDrive size={16} />
+            Storage & Installed
+            <span className={styles.tabBadge}>{installedModels.length}</span>
+          </button>
+          <button
+            className={`${styles.tabBtn} ${activeTab === 'Chat' ? styles.activeTab : ''}`}
+            onClick={() => setActiveTab('Chat')}
+            style={{
+              color: loadedModelInfo ? 'var(--success)' : undefined,
+            }}
+          >
+            <MessageSquare size={16} />
+            Chat
+            {loadedModelInfo && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--success)', display: 'inline-block', marginLeft: 4 }} />}
+          </button>
+        </div>
+
+        {/* Experimental Models Filter Toggle */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={showExperimental}
+            onChange={(e) => setShowExperimental(e.target.checked)}
+            style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+          />
+          Show Experimental Packages ⚠️
+        </label>
       </div>
 
       {/* Storage Tab View */}
@@ -692,13 +715,70 @@ export const Models: React.FC = () => {
                       <span className={styles.modelName}>{model.modelName}</span>
                       <span className={styles.modelFamily}>{model.modelFamily}</span>
                     </div>
-                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                      <Badge variant={model.confidence === 'High' ? 'success' : model.confidence === 'Medium' ? 'warning' : 'default'}>
-                        {model.confidence} Confidence
-                      </Badge>
+                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      {model.certification ? (
+                        <span style={{
+                          background: 'linear-gradient(135deg, rgba(245,158,11,0.2) 0%, rgba(217,119,6,0.3) 100%)',
+                          border: '1px solid var(--accent)',
+                          color: '#fbbf24',
+                          padding: '3px 8px',
+                          borderRadius: '6px',
+                          fontWeight: 'bold',
+                          fontSize: '11px',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '4px'
+                        }}>
+                          ⭐⭐⭐⭐⭐ Saarthi Certified ({model.certification.confidenceScore}/100)
+                        </span>
+                      ) : (
+                        <Badge variant={model.confidence === 'High' ? 'success' : model.confidence === 'Medium' ? 'warning' : 'default'}>
+                          {model.confidence} Confidence
+                        </Badge>
+                      )}
                       <span className={styles.archBadge}>{model.architecture}</span>
                     </div>
                   </div>
+
+                  {/* Why Recommended / Certification Rationale Callout */}
+                  {model.certification && (
+                    <div style={{
+                      background: 'rgba(59,130,246,0.08)',
+                      borderLeft: '3px solid var(--accent)',
+                      padding: '8px 12px',
+                      borderRadius: '4px',
+                      marginBottom: '12px',
+                      fontSize: '12px',
+                      color: 'var(--text-primary)'
+                    }}>
+                      <div style={{ fontWeight: '600', color: 'var(--accent)', marginBottom: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <Sparkles size={13} /> Why Saarthi Recommends This Base Model:
+                      </div>
+                      <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+                        {model.certification.quirksAndNotes || 'Verified instruction following, stable outputs, zero reasoning tag leakage, correct chat template & stop tokens, production-tested runtime.'}
+                      </p>
+
+                      {/* Supported LoRA Capabilities Chips */}
+                      {model.certification.loraCapabilityMatrix && (
+                        <div style={{ marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
+                          <span style={{ fontSize: '11px', fontWeight: 'bold', color: 'var(--text-tertiary)' }}>LoRA Ecosystem:</span>
+                          {Object.entries(model.certification.loraCapabilityMatrix).map(([cap, tier]) => (
+                            <span key={cap} style={{
+                              fontSize: '10px',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              background: tier === 'Certified' ? 'rgba(16,185,129,0.15)' : 'rgba(245,158,11,0.15)',
+                              border: `1px solid ${tier === 'Certified' ? 'var(--success)' : 'var(--warning)'}`,
+                              color: tier === 'Certified' ? 'var(--success)' : 'var(--warning)',
+                              textTransform: 'capitalize'
+                            }}>
+                              ⚡ {cap.replace('_', ' ')}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div className={styles.specsList}>
                     <div className={styles.specItem}>

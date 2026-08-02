@@ -59,6 +59,27 @@ pub async fn get_runtime_profile(
 }
 
 #[tauri::command]
+pub async fn get_recommended_packages(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+) -> Result<Vec<model_recommendation::certified_catalog::PackageCertification>, String> {
+    Ok(pack_mgr.get_recommended_models())
+}
+
+#[tauri::command]
+pub async fn get_compatible_packages(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+) -> Result<Vec<model_recommendation::certified_catalog::PackageCertification>, String> {
+    Ok(pack_mgr.get_compatible_models())
+}
+
+#[tauri::command]
+pub async fn get_experimental_packages(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+) -> Result<Vec<model_recommendation::certified_catalog::PackageCertification>, String> {
+    Ok(pack_mgr.get_experimental_models())
+}
+
+#[tauri::command]
 pub async fn reload_certification_packs(
     pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
 ) -> Result<(), String> {
