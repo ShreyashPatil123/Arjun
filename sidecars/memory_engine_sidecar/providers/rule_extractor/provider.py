@@ -135,7 +135,25 @@ class RuleExtractorProvider(BaseMemoryProvider):
                     })
                 break
 
-        # Pattern 6: General Fallback Fact ("remember that X", "note that X")
+        # Pattern 6: Project & Goal Extraction ("my project is X", "my active project is X", "working on X")
+        proj_patterns = [
+            r"(?:my project is|my active project is|working on|building)\s+([A-Za-z0-9\s]+)",
+        ]
+        for pat in proj_patterns:
+            m = re.search(pat, clean_text, re.IGNORECASE)
+            if m and not facts:
+                val = m.group(1).strip().rstrip(".,!")
+                facts.append({
+                    "content": f"User's project is {val}",
+                    "memory_type": "project_goal",
+                    "key": "project_goal",
+                    "value": val,
+                    "importance_score": 0.90,
+                    "confidence": 0.95
+                })
+                break
+
+        # Pattern 7: General Fallback Fact ("remember that X", "note that X")
         remember_pattern = r"(?:remember that|note that|keep in mind that)\s+(.+)"
         m_rem = re.search(remember_pattern, clean_text, re.IGNORECASE)
         if m_rem and not facts:
