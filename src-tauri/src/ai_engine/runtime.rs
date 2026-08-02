@@ -773,7 +773,7 @@ mod tests {
         println!("Resolved GGUF path: {}", gguf_path);
 
         let profile = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest).expect("Failed to get profile");
-        let config = InferenceManager::build_load_config(&gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
+        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
         println!("Built ModelLoadConfig: path='{}', ctx={}, gpu_layers={}, threads={}", config.model_path, config.context_length, config.gpu_layers, config.threads);
 
         let mut runtime = LlamaCppRuntime::new();
@@ -812,7 +812,7 @@ mod tests {
         println!("Resolved GGUF path: {}", gguf_path);
 
         let profile = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest).expect("Failed to get profile");
-        let config = InferenceManager::build_load_config(&gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
+        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
 
         let mut runtime = LlamaCppRuntime::new();
         let res = runtime.load_model(&config, |step| println!("Step: {}", step));
@@ -842,7 +842,7 @@ mod tests {
             let manifest1 = AdapterRegistry::read_manifest(&pkg1).unwrap();
             if let Ok(path1) = InferenceManager::resolve_gguf_path(&pkg1, &manifest1) {
             let profile1 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg1, &manifest1).unwrap();
-            let cfg1 = InferenceManager::build_load_config(&path1, "meta-llama/Llama-3.2-1B", &manifest1, "Q8_0", &profile1).unwrap();
+            let cfg1 = InferenceManager::build_load_config(&app_data_dir, &path1, "meta-llama/Llama-3.2-1B", &manifest1, "Q8_0", &profile1).unwrap();
 
             println!("\n=== [SEQUENTIAL LOAD TEST 1] Loading Llama-3.2-1B ===");
             let res1 = runtime.load_model(&cfg1, |s| println!("Load step: {}", s));
@@ -860,7 +860,7 @@ mod tests {
             let manifest2 = AdapterRegistry::read_manifest(&pkg2).unwrap();
             if let Ok(path2) = InferenceManager::resolve_gguf_path(&pkg2, &manifest2) {
             let profile2 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg2, &manifest2).unwrap();
-            let cfg2 = InferenceManager::build_load_config(&path2, "Qwen/Qwen2.5-Coder-7B", &manifest2, "Q4_0", &profile2).unwrap();
+            let cfg2 = InferenceManager::build_load_config(&app_data_dir, &path2, "Qwen/Qwen2.5-Coder-7B", &manifest2, "Q4_0", &profile2).unwrap();
 
             println!("\n=== [SEQUENTIAL LOAD TEST 2] Loading Qwen2.5-Coder-7B into SAME session ===");
             let res2 = runtime.load_model(&cfg2, |s| println!("Load step: {}", s));
