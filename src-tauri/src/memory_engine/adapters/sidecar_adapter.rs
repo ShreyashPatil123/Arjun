@@ -81,7 +81,7 @@ impl SidecarAdapter {
         let mut response_line = String::new();
         {
             let mut reader = self.reader.lock().unwrap();
-            reader.read_line(&response_line)?;
+            reader.read_line(&mut response_line)?;
         }
 
         if response_line.trim().is_empty() {

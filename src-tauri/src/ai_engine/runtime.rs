@@ -357,8 +357,7 @@ impl LlamaCppRuntime {
         }
 
         // Decode the prompt (prefill)
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow!("Prompt decode failed: {:?}", e))?;
+        let eos_token = model.token_eos();
 
         // Build effective template-driven stop sequences list
         let mut effective_stop_tokens = config.stop_tokens.clone();

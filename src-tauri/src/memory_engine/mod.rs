@@ -6,7 +6,6 @@ pub mod providers;
 pub mod persistence;
 pub mod profile;
 pub mod project;
-pub mod session;
 pub mod ranking;
 pub mod extractor;
 pub mod retriever;

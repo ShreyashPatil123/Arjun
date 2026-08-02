@@ -161,42 +161,32 @@ impl PersistenceManager {
             )?
         };
 
-        let rows = if let Some(pid) = project_id {
-            stmt.query_map(params![pid, limit as i64], |row| {
-                Ok(MemoryNodeRecord {
-                    id: row.get(0)?,
-                    memory_type: row.get(1)?,
-                    project_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    content: row.get(4)?,
-                    importance_score: row.get(5)?,
-                    recency_timestamp: row.get(6)?,
-                    metadata: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            })?
-        } else {
-            stmt.query_map(params![limit as i64], |row| {
-                Ok(MemoryNodeRecord {
-                    id: row.get(0)?,
-                    memory_type: row.get(1)?,
-                    project_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    content: row.get(4)?,
-                    importance_score: row.get(5)?,
-                    recency_timestamp: row.get(6)?,
-                    metadata: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            })?
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<MemoryNodeRecord> {
+            Ok(MemoryNodeRecord {
+                id: row.get(0)?,
+                memory_type: row.get(1)?,
+                project_id: row.get(2)?,
+                session_id: row.get(3)?,
+                content: row.get(4)?,
+                importance_score: row.get(5)?,
+                recency_timestamp: row.get(6)?,
+                metadata: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
         };
 
         let mut list = Vec::new();
-        for r in rows {
-            list.push(r?);
-        }
+        if let Some(pid) = project_id {
+            for r in stmt.query_map(params![pid, limit as i64], map_row)? {
+                list.push(r?);
+            }
+        } else {
+            for r in stmt.query_map(params![limit as i64], map_row)? {
+                list.push(r?);
+            }
+        };
+
         Ok(list)
     }
 

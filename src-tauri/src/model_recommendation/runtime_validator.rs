@@ -71,7 +71,7 @@ impl RuntimeValidator {
 
         // Stage 3: Runtime Version Compatibility Check
         let min_sarathi_ver = "0.1.0";
-        if profile.pinned_versions.sarathi_version < min_sarathi_ver {
+        if profile.pinned_versions.sarathi_version.as_str() < min_sarathi_ver {
             return Err(anyhow!("Stage 3 Failed: Profile sarathi version '{}' incompatible with minimum '{}'", profile.pinned_versions.sarathi_version, min_sarathi_ver));
         }
 
