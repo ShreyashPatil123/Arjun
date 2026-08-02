@@ -28,7 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.30"
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 futures-util = "0.3"
-llama-cpp-2 = { version = "0.1", features = ["cuda"] }
+llama-cpp-2 = { version = "0.1" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 

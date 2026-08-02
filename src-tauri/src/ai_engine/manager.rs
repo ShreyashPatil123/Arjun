@@ -116,6 +116,7 @@ impl InferenceManager {
 
         // Build load configuration from hardware profile + manifest + profile
         let config = Self::build_load_config(
+            app_data_dir,
             &gguf_path,
             model_id,
             &manifest,
@@ -261,6 +262,7 @@ impl InferenceManager {
     /// is calculated dynamically from available RAM/VRAM.
     /// GPU layers and thread count come from the Phase 2 hardware profile.
     pub(crate) fn build_load_config(
+        app_data_dir: &std::path::Path,
         gguf_path: &str,
         model_id: &str,
         manifest: &ModelPackageManifest,
@@ -318,12 +320,36 @@ impl InferenceManager {
             0
         };
 
-        // Determine context length from profile or hardware profile calculation
-        let context_length = profile.effective_params().context_length;
+        // Check for authoritative certified RuntimeProfile from PackManager
+        let app_data = app_data_dir.to_path_buf();
+        let certified_profile = crate::model_recommendation::pack_manager::PackManager::new(&app_data)
+            .ok()
+            .and_then(|pm| pm.get_package_certification(model_id).and_then(|c| pm.get_runtime_profile(&c.runtime_profile_id)));
+
+        let (chat_template, stop_tokens, context_length, gpu_layers, threads) = if let Some(ref cert_prof) = certified_profile {
+            log::info!(
+                "[INFERENCE_MGR] Applying Authoritative Saarthi Certified RuntimeProfile '{}' for model '{}'",
+                cert_prof.profile_id, model_id
+            );
+            let cfg = &cert_prof.execution_config;
+            (
+                cfg.chat_template.clone(),
+                cfg.stop_tokens.clone(),
+                cfg.context_length,
+                if gpu_layers > 0 { std::cmp::max(gpu_layers, cfg.gpu_layers) } else { 0 },
+                cfg.threads,
+            )
+        } else {
+            (
+                profile.chat_template.clone(),
+                profile.tokens.stop_tokens.clone(),
+                profile.effective_params().context_length,
+                gpu_layers,
+                threads,
+            )
+        };
 
         let model_name = manifest.base_model.model_name.clone();
-        let chat_template = profile.chat_template.clone();
-        let stop_tokens = profile.tokens.stop_tokens.clone();
 
         Ok(ModelLoadConfig {
             model_path: gguf_path.to_string(),
