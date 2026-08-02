@@ -136,7 +136,20 @@ impl LlamaCppRuntime {
         );
 
         match std::fs::File::open(&clean_path) {
-            Ok(_) => log::info!("[STAGE 4 RUNTIME AUDIT] std::fs::File::open succeeded for '{}'", clean_path),
+            Ok(mut f) => {
+                let mut header_buf = [0u8; 8];
+                use std::io::Read;
+                if f.read_exact(&mut header_buf).is_err() || &header_buf[0..4] != b"GGUF" {
+                    let err = anyhow!(
+                        "[STAGE 4 RUNTIME ERROR] Corrupted/Invalid GGUF header at '{}': Expected magic bytes 'GGUF' (0x46554747), found {:?}",
+                        clean_path, String::from_utf8_lossy(&header_buf[0..4])
+                    );
+                    log::error!("{}", err);
+                    return Err(err);
+                }
+                let gguf_ver = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+                log::info!("[STAGE 4 RUNTIME AUDIT] std::fs::File::open & GGUF header check succeeded for '{}' (Magic='GGUF', Version={})", clean_path, gguf_ver);
+            }
             Err(e) => {
                 let err = anyhow!("[STAGE 4 RUNTIME ERROR] std::fs::File::open failed for '{}': {:?}", clean_path, e);
                 log::error!("{}", err);

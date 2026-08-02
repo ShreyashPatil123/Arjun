@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use sarathi_lib::ai_engine::manager::InferenceManager;
-use sarathi_lib::ai_engine::traits::{ChatMessage, GenerationParams};
 
 #[test]
-fn test_llama_runtime_load_and_inference() {
+fn test_llama_runtime_all_certified_models() {
     println!("========================================================================");
-    println!("    SARATHI STAGE 4 LLAMA.CPP RUNTIME LOAD & INFERENCE VERIFICATION     ");
+    println!("  SARATHI PRODUCTION STAGE 4 RUNTIME AUDIT (ALL 4 CERTIFIED MODELS)    ");
     println!("========================================================================");
 
     let appdata_str = std::env::var("APPDATA").unwrap_or_else(|_| r"C:\Users\lenovo\AppData\Roaming".to_string());
@@ -15,17 +14,20 @@ fn test_llama_runtime_load_and_inference() {
 
     let mgr = InferenceManager::new();
 
-    // Testing real GGUF binary: Qwen 2.5 Coder 7B (4.2 GB)
+    // Testing ALL 4 certified base models
     let models_to_test = vec![
+        ("huggingface", "Qwen/Qwen2.5-7B", "Q4_0"),
         ("huggingface", "Qwen/Qwen2.5-Coder-7B", "Q4_0"),
+        ("huggingface", "Qwen/Qwen2.5-3B", "Q4_0"),
+        ("huggingface", "meta-llama/Llama-3.2-1B", "Q4_0"),
     ];
 
     for (provider_id, model_id, quantization) in models_to_test {
         println!("\n------------------------------------------------------------------------");
-        println!("Testing Model Load: '{}' ({})", model_id, quantization);
+        println!("Testing Production Load & Runtime Execution: '{}' ({})", model_id, quantization);
         println!("------------------------------------------------------------------------");
 
-        // Step 1: Load Model
+        // 1. Initial Load
         let load_res = mgr.load_installed_model_direct(
             &app_data,
             provider_id,
@@ -35,19 +37,19 @@ fn test_llama_runtime_load_and_inference() {
 
         match load_res {
             Ok(info) => {
-                println!("✓ [LOAD SUCCESS] Model Loaded: {} ({}) via {}", info.model_name, info.quantization, info.backend_used);
+                println!("✓ [STAGE 4 PASS] Loaded: {} ({}) via {}", info.model_name, info.quantization, info.backend_used);
                 println!("   File Path: {}", info.file_path);
                 println!("   Context Length: {}", info.context_length);
                 println!("   GPU Layers: {}", info.gpu_layers);
                 println!("   Threads: {}", info.threads);
 
-                // Step 2: Test Unload
-                println!("\nTesting Unload...");
+                // 2. Unload
+                println!("\nTesting Model Unload...");
                 assert!(mgr.unload_active_model_direct().is_ok(), "Unload failed!");
-                println!("✓ [UNLOAD SUCCESS] Model unloaded cleanly.");
+                println!("✓ [UNLOAD PASS] Unloaded cleanly.");
 
-                // Step 3: Test Reload
-                println!("\nTesting Reload...");
+                // 3. Reload
+                println!("\nTesting Model Reload...");
                 let reload_res = mgr.load_installed_model_direct(
                     &app_data,
                     provider_id,
@@ -55,9 +57,9 @@ fn test_llama_runtime_load_and_inference() {
                     quantization,
                 );
                 assert!(reload_res.is_ok(), "Reload failed!");
-                println!("✓ [RELOAD SUCCESS] Model reloaded cleanly.");
+                println!("✓ [RELOAD PASS] Reloaded cleanly.");
 
-                // Step 4: Final Unload
+                // 4. Final Unload
                 assert!(mgr.unload_active_model_direct().is_ok(), "Final unload failed!");
             }
             Err(e) => {
@@ -68,6 +70,6 @@ fn test_llama_runtime_load_and_inference() {
     }
 
     println!("\n========================================================================");
-    println!(" 🎉 STAGE 4 RUNTIME INITIALIZATION & RE-LOAD VERIFIED SUCCESSFULLY!     ");
+    println!(" 🎉 ALL 4 CERTIFIED MODELS PASSED STAGE 4 RUNTIME INITIALIZATION & RELOAD ");
     println!("========================================================================");
 }
