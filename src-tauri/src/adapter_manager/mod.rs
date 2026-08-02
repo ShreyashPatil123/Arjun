@@ -75,6 +75,90 @@ impl AdapterRegistry {
         Ok(manifest)
     }
 
+    /// Self-healing manifest validator and repair function.
+    /// Ensures manifest exists, points to a valid primary GGUF file, and reports true size_bytes > 0.
+    pub fn ensure_valid_manifest(package_dir: &Path, provider_id: &str, model_id: &str) -> Result<ModelPackageManifest> {
+        let existing = Self::read_manifest(package_dir).ok();
+        let base_dir = package_dir.join("base");
+
+        let mut primary_gguf_rel: Option<String> = None;
+        let mut total_gguf_bytes: u64 = 0;
+
+        if base_dir.exists() && base_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&base_dir) {
+                let mut gguf_files = Vec::new();
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() && p.extension().map_or(false, |ext| ext == "gguf") {
+                        if let Ok(meta) = fs::metadata(&p) {
+                            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            total_gguf_bytes += meta.len();
+                            gguf_files.push((fname, meta.len()));
+                        }
+                    }
+                }
+
+                if !gguf_files.is_empty() {
+                    gguf_files.sort_by(|a, b| a.0.cmp(&b.0));
+                    let first_part = gguf_files.iter().find(|(name, _)| name.contains("-00001-of-")).map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| gguf_files[0].0.clone());
+                    primary_gguf_rel = Some(format!("base/{}", first_part));
+                }
+            }
+        }
+
+        let rel_file_path = primary_gguf_rel.unwrap_or_else(|| "base/".to_string());
+
+        if let Some(mut manifest) = existing {
+            let file_valid = !manifest.base_model.file_path.is_empty() 
+                && manifest.base_model.file_path != "base/" 
+                && package_dir.join(&manifest.base_model.file_path).is_file();
+
+            if file_valid && manifest.base_model.size_bytes > 0 {
+                return Ok(manifest);
+            }
+
+            // Repair manifest values
+            manifest.base_model.file_path = rel_file_path;
+            manifest.base_model.size_bytes = if total_gguf_bytes > 0 { total_gguf_bytes } else { manifest.base_model.size_bytes };
+            manifest.updated_at = chrono::Utc::now().to_rfc3339();
+
+            let _ = Self::write_manifest(package_dir, &manifest);
+            return Ok(manifest);
+        }
+
+        // Generate brand new manifest if missing
+        let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+        let quant = if rel_file_path.contains("q4_k_m") {
+            "Q4_K_M"
+        } else if rel_file_path.contains("q4_0") {
+            "Q4_0"
+        } else if rel_file_path.contains("q8_0") {
+            "Q8_0"
+        } else {
+            "GGUF"
+        }.to_string();
+
+        let new_manifest = ModelPackageManifest {
+            package_id: format!("{}::{}::llama.cpp", model_id, quant),
+            provider_id: provider_id.to_string(),
+            base_model: BaseManifestInfo {
+                model_id: model_id.to_string(),
+                model_name,
+                quantization: quant,
+                file_path: rel_file_path,
+                size_bytes: total_gguf_bytes,
+                checksum: None,
+            },
+            adapters: HashMap::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let _ = Self::write_manifest(package_dir, &new_manifest);
+        Ok(new_manifest)
+    }
+
     /// Verifies if adapter files exist on disk and meet minimum structural size requirements (>100KB for weights, >10B for config)
     pub fn verify_adapter_files(cap_dir: &Path) -> Option<(String, u64)> {
         if !cap_dir.exists() || !cap_dir.is_dir() {

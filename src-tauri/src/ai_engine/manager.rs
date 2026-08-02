@@ -86,9 +86,9 @@ impl InferenceManager {
         let package_dir = AdapterRegistry::resolve_package_dir(app_data_dir, provider_id, model_id);
         log::info!("[STAGE 3 MANAGER] Resolved package_dir: {:?} (exists: {})", package_dir, package_dir.exists());
 
-        let manifest = AdapterRegistry::read_manifest(&package_dir)
+        let manifest = AdapterRegistry::ensure_valid_manifest(&package_dir, provider_id, model_id)
             .map_err(|e| {
-                let err = anyhow!("[STAGE 3 MANAGER ERROR] Failed to read manifest for model '{}' in {:?}: {:#}", model_id, package_dir, e);
+                let err = anyhow!("[STAGE 3 MANAGER ERROR] Failed to read or repair manifest for model '{}' in {:?}: {:#}", model_id, package_dir, e);
                 log::error!("{}", err);
                 err
             })?;
@@ -364,7 +364,7 @@ impl InferenceManager {
         })
     }
 
-    /// Resolves the absolute path to the GGUF file from manifest
+    /// Resolves the absolute path to the primary GGUF file from manifest
     pub(crate) fn resolve_gguf_path(
         package_dir: &std::path::Path,
         manifest: &ModelPackageManifest,
@@ -379,26 +379,24 @@ impl InferenceManager {
             return Ok(clean);
         }
 
-        log::warn!("[INFERENCE_MGR] Manifest filePath '{:?}' is not a file (exists={}, is_file={}). Scanning base/ directory for .gguf...", gguf_path, gguf_path.exists(), gguf_path.is_file());
+        log::warn!("[INFERENCE_MGR] Manifest filePath '{:?}' is not a file. Scanning base/ directory for .gguf...", gguf_path);
 
-        // Fallback: scan base/ directory for any .gguf file
+        // Fallback: scan base/ directory for any .gguf file, prioritizing -00001-of-
         let base_dir = package_dir.join("base");
         if base_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&base_dir) {
+                let mut found_files = Vec::new();
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.is_file() {
-                        if let Some(ext) = p.extension() {
-                            if ext == "gguf" {
-                                let found = p.to_string_lossy().replace('/', "\\");
-                                log::info!(
-                                    "[INFERENCE_MGR] GGUF file found via directory scan: {}",
-                                    found
-                                );
-                                return Ok(found);
-                            }
-                        }
+                    if p.is_file() && p.extension().map_or(false, |ext| ext == "gguf") {
+                        found_files.push(p.to_string_lossy().replace('/', "\\"));
                     }
+                }
+                if !found_files.is_empty() {
+                    found_files.sort();
+                    let primary = found_files.iter().find(|f| f.contains("-00001-of-")).cloned().unwrap_or_else(|| found_files[0].clone());
+                    log::info!("[INFERENCE_MGR] GGUF file found via base directory scan: {}", primary);
+                    return Ok(primary);
                 }
             }
         }

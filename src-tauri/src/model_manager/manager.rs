@@ -13,7 +13,7 @@ use crate::download_manager::traits::{InstalledModel, StorageSummary};
 pub struct ModelManager;
 
 impl ModelManager {
-    /// Recursively scans <app_data_dir>/models/ for completed .gguf models
+    /// Recursively scans <app_data_dir>/models/ for model packages
     pub fn list_installed_models(app_data_dir: &Path) -> Vec<InstalledModel> {
         let mut installed = Vec::new();
         let models_dir = app_data_dir.join("models");
@@ -22,78 +22,58 @@ impl ModelManager {
             return installed;
         }
 
-        Self::scan_dir_for_gguf(&models_dir, &mut installed);
-        installed
-    }
+        // Iterate over provider directories: models/<provider>/<sanitized_model_id>/
+        if let Ok(providers) = fs::read_dir(&models_dir) {
+            for provider_entry in providers.flatten() {
+                let provider_path = provider_entry.path();
+                if provider_path.is_dir() {
+                    let provider_id = provider_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-    fn scan_dir_for_gguf(dir: &Path, results: &mut Vec<InstalledModel>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    Self::scan_dir_for_gguf(&path, results);
-                } else if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext == "gguf" {
-                            if let Ok(meta) = fs::metadata(&path) {
-                                let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                
-                                // Extract metadata from path hierarchy or manifest.json: models/<provider>/<clean_model_id>/base/filename.gguf
-                                let components: Vec<String> = path
-                                    .iter()
-                                    .map(|c| c.to_string_lossy().to_string())
-                                    .collect();
+                    if let Ok(packages) = fs::read_dir(&provider_path) {
+                        for pkg_entry in packages.flatten() {
+                            let pkg_path = pkg_entry.path();
+                            if pkg_path.is_dir() {
+                                let folder_name = pkg_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                let inferred_model_id = folder_name.replace('_', "/");
 
-                                let mut provider_id = "huggingface".to_string();
-                                let mut model_id = file_name.clone();
-                                let mut quantization = "GGUF".to_string();
-                                let mut manifest_adapters = None;
+                                if let Ok(manifest) = crate::adapter_manager::AdapterRegistry::ensure_valid_manifest(
+                                    &pkg_path,
+                                    &provider_id,
+                                    &inferred_model_id,
+                                ) {
+                                    let full_gguf_path = pkg_path.join(&manifest.base_model.file_path);
+                                    if full_gguf_path.exists() && full_gguf_path.is_file() {
+                                        let file_name = full_gguf_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        let model_id = manifest.base_model.model_id.clone();
+                                        let model_name = manifest.base_model.model_name.clone();
+                                        let quantization = manifest.base_model.quantization.clone();
+                                        let size_bytes = manifest.base_model.size_bytes;
 
-                                if let Some(package_dir) = path.parent().and_then(|p| p.parent()) {
-                                    let manifest_path = package_dir.join("manifest.json");
-                                    if manifest_path.exists() {
-                                        if let Ok(content) = fs::read_to_string(&manifest_path) {
-                                            if let Ok(manifest) = serde_json::from_str::<crate::adapter_manager::ModelPackageManifest>(&content) {
-                                                provider_id = manifest.provider_id;
-                                                model_id = manifest.base_model.model_id;
-                                                quantization = manifest.base_model.quantization;
-                                                manifest_adapters = Some(manifest.adapters);
-                                            }
-                                        }
-                                    } else {
-                                        let len = components.len();
-                                        if len >= 4 {
-                                            provider_id = components[len - 4].clone();
-                                            model_id = components[len - 3].replace('_', "/");
-                                            quantization = components[len - 2].clone();
-                                        }
+                                        installed.push(InstalledModel {
+                                            id: format!("{}_{}", model_id.replace('/', "_"), quantization),
+                                            model_id,
+                                            model_name,
+                                            provider_id: manifest.provider_id,
+                                            quantization,
+                                            format: "GGUF".to_string(),
+                                            backend: "llama.cpp (GGUF)".to_string(),
+                                            file_name,
+                                            file_path: full_gguf_path.to_string_lossy().to_string(),
+                                            size_bytes,
+                                            installed_at: chrono::Utc::now().to_rfc3339(),
+                                            is_ready: size_bytes > 0,
+                                            checksum: None,
+                                            adapters: Some(manifest.adapters),
+                                        });
                                     }
                                 }
-
-                                let model_name = model_id.split('/').last().unwrap_or(&model_id).to_string();
-
-                                results.push(InstalledModel {
-                                    id: format!("{}_{}", model_id.replace('/', "_"), quantization),
-                                    model_id,
-                                    model_name,
-                                    provider_id,
-                                    quantization,
-                                    format: "GGUF".to_string(),
-                                    backend: "llama.cpp (GGUF)".to_string(),
-                                    file_name,
-                                    file_path: path.to_string_lossy().to_string(),
-                                    size_bytes: meta.len(),
-                                    installed_at: chrono::Utc::now().to_rfc3339(),
-                                    is_ready: meta.len() > 0,
-                                    checksum: None,
-                                    adapters: manifest_adapters,
-                                });
                             }
                         }
                     }
                 }
             }
         }
+        installed
     }
 
     /// Deletes an installed model directory and files from disk
