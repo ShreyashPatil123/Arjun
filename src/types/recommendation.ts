@@ -1,16 +1,86 @@
-// Phase 3: Model Recommendation Types
-// Mirrors Rust model_recommendation::traits structs
+// Phase 3 & Certified Ecosystem: Model Recommendation & Certification Types
 
 export type FitCategory = 'Recommended' | 'Compatible' | 'MayRun';
+export type CertificationTier = 'Certified' | 'Compatible' | 'Experimental';
+
+export interface NumericScores {
+  instructionFollowing: number;
+  reasoningQuality: number;
+  hallucinationRate: number;
+  codingAbility: number;
+  mathematicalReasoning: number;
+  jsonReliability: number;
+  toolCallingAccuracy: number;
+  memoryEngineCompatibility: number;
+  loraAdapterSwitching: number;
+  contextWindowRetention: number;
+  responseStability: number;
+  chatTemplateCorrectness: number;
+  bosEosStopTokenCompliance: number;
+  reasoningTagLeakageFilter: number;
+  streamingParserStability: number;
+  runtimeProcessStability: number;
+  restartStatePersistence: number;
+}
+
+export interface Provenance {
+  createdBy: string;
+  certifiedBy: string;
+  generatedWith: string;
+  runnerVersion: string;
+  profileHash: string;
+  signature: string;
+  generatedAt: string;
+}
+
+export interface PackageCertification {
+  packageId: string;
+  modelId: string;
+  modelName: string;
+  quantLabel: string;
+  backend: string;
+  tier: CertificationTier;
+  confidenceScore: number;
+  runtimeProfileId: string;
+  numericScores: NumericScores;
+  loraCapabilityMatrix: Record<string, CertificationTier>;
+  provenance: Provenance;
+  quirksAndNotes: string;
+}
+
+export interface RuntimeProfile {
+  profileId: string;
+  name: string;
+  pinnedVersions: {
+    sarathiVersion: string;
+    profileSchemaVersion: string;
+    llamacppVersion: string;
+    llamacpp2RustVersion: string;
+    certificationSpecVersion: string;
+  };
+  executionConfig: {
+    chatTemplate: string;
+    stopTokens: string[];
+    contextLength: number;
+    gpuLayers: number;
+    threads: number;
+    samplingDefaults: {
+      temperature: number;
+      topP: number;
+      topK: number;
+      minP: number;
+      repeatPenalty: number;
+      maxTokens: number;
+    };
+  };
+}
 
 export interface ModelRecommendation {
-  // Identity (Phase 4 uses these to locate the model)
   modelId: string;
   modelName: string;
   modelFamily: string;
   providerId: string | null;
 
-  // Selected configuration (highest quality safe fit)
   quantization: string;
   quantizationBitsPerWeight: number;
   recommendedContext: number;
@@ -18,7 +88,6 @@ export interface ModelRecommendation {
   backend: string;
   runMode: string;
 
-  // Resource estimates
   downloadSizeBytes: number | null;
   estimatedVramBytes: number;
   estimatedRamBytes: number;
@@ -26,21 +95,19 @@ export interface ModelRecommendation {
   estimatedTotalMemoryBytes: number;
   headroomPercent: number;
 
-  // Scoring
   fitScore: number;
   category: FitCategory;
   confidence: string;
 
-  // Explainability
   explanation: string;
   warnings: string[];
 
-  // Architecture info
   architecture: string;
   totalParameters: number;
   activeParameters: number | null;
 
-  // Performance (Phase 3: always null)
+  certification?: PackageCertification | null;
+
   estimatedTokensPerSec: number | null;
   performanceNote: string;
 }

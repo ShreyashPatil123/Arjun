@@ -1,0 +1,33 @@
+{
+  "package_id": "Qwen/Qwen2.5-7B-Instruct-GGUF::Q4_K_M::llama.cpp",
+  "tier": "Certified",
+  "confidence_score": 92.9,
+  "numeric_scores": {
+    "instruction_following": 92.5,
+    "reasoning_quality": 92.5,
+    "hallucination_rate": 92.5,
+    "coding_ability": 92.5,
+    "mathematical_reasoning": 92.5,
+    "json_reliability": 92.5,
+    "tool_calling_accuracy": 92.5,
+    "memory_engine_compatibility": 92.5,
+    "lora_adapter_switching": 92.5,
+    "context_window_retention": 92.5,
+    "response_stability": 92.5,
+    "chat_template_correctness": 95.0,
+    "bos_eos_stop_token_compliance": 95.0,
+    "reasoning_tag_leakage_filter": 95.0,
+    "streaming_parser_stability": 92.5,
+    "runtime_process_stability": 92.5,
+    "restart_state_persistence": 92.5
+  },
+  "provenance": {
+    "created_by": "Saarthi CLI Validation Runner",
+    "certified_by": "Automated Certification Test Suite",
+    "generated_with": "certification_runner.py",
+    "runner_version": "1.0.0",
+    "profile_hash": "87cf1044ade0f8d243efc58c16d77069743af621efb93c2d6edc38a80c4cb15c",
+    "signature": "sig_certified_817aa9b8a2ab18419b19a12b026164cf",
+    "generated_at": "2026-08-02T05:02:30.921495Z"
+  }
+}

@@ -15,6 +15,9 @@ pub mod catalog;
 pub mod estimator;
 pub mod runtime;
 pub mod scorer;
+pub mod certified_catalog;
+pub mod pack_manager;
+pub mod runtime_validator;
 
 use std::path::Path;
 use crate::system_analyzer::traits::HardwareProfile;

@@ -72,12 +72,21 @@ export const Models: React.FC = () => {
   const [activeTab, setActiveTab] = useState<ActiveTab>('Recommended');
   const { addToast } = useToast();
 
+  const [selectedCert, setSelectedCert] = useState<any | null>(null);
+  const [showExperimental, setShowExperimental] = useState<boolean>(false);
+
   const loadRecommendations = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError(null);
     try {
       const data = await getModelRecommendations(forceRefresh);
-      setRecommendations(data);
+      const enriched = await Promise.all(
+        data.map(async (item) => {
+          const cert = await import('../services/packManager.service').then(m => m.getPackageCertification(item.modelId));
+          return { ...item, certification: cert };
+        })
+      );
+      setRecommendations(enriched);
     } catch (err) {
       console.error('Failed to load model recommendations:', err);
       const msg = err instanceof Error ? err.message : String(err);
@@ -434,8 +443,21 @@ export const Models: React.FC = () => {
                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: 2 }}>
                       Provider: {m.providerId} · Format: {m.format} ({m.backend})
                     </div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: 2 }}>
-                      Path: {m.filePath} · Size: {formatBytes(m.sizeBytes)}
+                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: 2, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <span>Path: {m.filePath} · Size: {formatBytes(m.sizeBytes)}</span>
+                      <button
+                        style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline', padding: 0 }}
+                        onClick={async () => {
+                          const cert = await import('../services/packManager.service').then(srv => srv.getPackageCertification(m.modelId));
+                          if (cert) {
+                            setSelectedCert(cert);
+                          } else {
+                            addToast('info', `No official certification profile found for ${m.modelName}.`);
+                          }
+                        }}
+                      >
+                        [View Certification Profile]
+                      </button>
                     </div>
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: 6, display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' }}>
                       <span style={{ fontWeight: 600, color: 'var(--accent)' }}>Capability Adapters:</span>
@@ -536,6 +558,80 @@ export const Models: React.FC = () => {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Saarthi Certification Profile Drawer / Modal */}
+      {selectedCert && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0,0,0,0.75)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 999,
+          backdropFilter: 'blur(6px)'
+        }}>
+          <div style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: '12px',
+            padding: '24px',
+            maxWidth: '650px',
+            width: '90%',
+            maxHeight: '85vh',
+            overflowY: 'auto',
+            boxShadow: '0 20px 40px rgba(0,0,0,0.5)'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h2 style={{ margin: 0, color: 'var(--accent)', fontSize: '20px' }}>🪷 Saarthi Certified Model Profile</h2>
+              <Button variant="ghost" size="sm" onClick={() => setSelectedCert(null)}>✕ Close</Button>
+            </div>
+
+            <div style={{ background: 'var(--surface-hover)', padding: '12px 16px', borderRadius: '8px', marginBottom: '16px' }}>
+              <div style={{ fontWeight: 'bold', fontSize: '16px' }}>{selectedCert.modelName || selectedCert.packageId}</div>
+              <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                Tier: <span style={{ color: selectedCert.tier === 'Certified' ? 'var(--success)' : 'var(--warning)', fontWeight: 'bold' }}>{selectedCert.tier === 'Certified' ? '⭐⭐⭐⭐⭐ Saarthi Certified' : '⭐⭐⭐⭐ Compatible'}</span>
+                {' · '}Confidence Score: <strong>{selectedCert.confidenceScore}/100</strong>
+              </div>
+            </div>
+
+            <h4 style={{ margin: '12px 0 8px 0', color: 'var(--text-primary)' }}>⚡ LoRA Capability Compatibility Matrix</h4>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '8px', marginBottom: '16px' }}>
+              {selectedCert.loraCapabilityMatrix && Object.entries(selectedCert.loraCapabilityMatrix).map(([cap, status]: [string, any]) => (
+                <div key={cap} style={{ background: 'var(--background)', padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '13px' }}>
+                  <span style={{ textTransform: 'capitalize', fontWeight: '500' }}>{cap.replace('_', ' ')}:</span>{' '}
+                  <span style={{ color: status === 'Certified' ? 'var(--success)' : 'var(--warning)', fontWeight: 'bold' }}>{status}</span>
+                </div>
+              ))}
+            </div>
+
+            <h4 style={{ margin: '12px 0 8px 0', color: 'var(--text-primary)' }}>📊 17-Point Benchmark Scores</h4>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '12px', marginBottom: '16px' }}>
+              {selectedCert.numericScores && Object.entries(selectedCert.numericScores).map(([k, v]: [string, any]) => (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 8px', background: 'var(--background)', borderRadius: '4px' }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>{k.replace(/_/g, ' ')}:</span>
+                  <strong style={{ color: v >= 90 ? 'var(--success)' : 'var(--warning)' }}>{v}/100</strong>
+                </div>
+              ))}
+            </div>
+
+            <h4 style={{ margin: '12px 0 8px 0', color: 'var(--text-primary)' }}>🛡 Cryptographic Provenance</h4>
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', background: 'var(--background)', padding: '10px', borderRadius: '6px', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+              <div>Created By: {selectedCert.provenance?.createdBy}</div>
+              <div>Certified By: {selectedCert.provenance?.certifiedBy}</div>
+              <div>Runner Version: {selectedCert.provenance?.runnerVersion}</div>
+              <div>Profile Hash: {selectedCert.provenance?.profileHash}</div>
+            </div>
+
+            <div style={{ marginTop: '20px', textAlign: 'right' }}>
+              <Button variant="primary" onClick={() => setSelectedCert(null)}>Done</Button>
+            </div>
+          </div>
         </div>
       )}
 

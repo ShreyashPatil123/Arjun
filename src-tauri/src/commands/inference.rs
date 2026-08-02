@@ -33,6 +33,17 @@ pub async fn load_installed_model(
 
     log::info!("[STAGE 2 IPC] AppData directory resolved: {:?}", app_data_dir);
 
+    let pack_mgr = app_handle.state::<std::sync::Arc<crate::model_recommendation::pack_manager::PackManager>>();
+    let validation = crate::model_recommendation::runtime_validator::RuntimeValidator::validate_before_load(
+        &pack_mgr,
+        &model_id,
+        false, // Developer override default false
+    ).map_err(|e| format!("[PRE-LOAD VALIDATION FAILED] Safe Abort: {}", e))?;
+
+    if let Some(warn) = &validation.warning {
+        log::warn!("[PRE-LOAD VALIDATION WARNING] {}", warn);
+    }
+
     let mgr = inference_mgr.inner().clone();
     let res = tokio::task::spawn_blocking(move || {
         mgr.load_installed_model(

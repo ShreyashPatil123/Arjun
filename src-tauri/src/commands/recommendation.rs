@@ -34,3 +34,33 @@ pub async fn get_model_recommendations(
 
     Ok(recommendations)
 }
+
+#[tauri::command]
+pub async fn get_package_certification(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+    model_id: String,
+) -> Result<Option<model_recommendation::certified_catalog::PackageCertification>, String> {
+    Ok(pack_mgr.get_package_certification(&model_id))
+}
+
+#[tauri::command]
+pub async fn get_all_package_certifications(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+) -> Result<Vec<model_recommendation::certified_catalog::PackageCertification>, String> {
+    Ok(pack_mgr.get_all_certifications())
+}
+
+#[tauri::command]
+pub async fn get_runtime_profile(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+    profile_id: String,
+) -> Result<Option<model_recommendation::certified_catalog::RuntimeProfile>, String> {
+    Ok(pack_mgr.get_runtime_profile(&profile_id))
+}
+
+#[tauri::command]
+pub async fn reload_certification_packs(
+    pack_mgr: tauri::State<'_, std::sync::Arc<model_recommendation::pack_manager::PackManager>>,
+) -> Result<(), String> {
+    pack_mgr.reload_all_packs().map_err(|e| e.to_string())
+}

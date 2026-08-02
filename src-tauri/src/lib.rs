@@ -75,6 +75,9 @@ pub fn run() {
             let memory_manager = Arc::new(MemoryManager::new(&app_data_dir));
             app.manage(memory_manager);
 
+            let pack_manager = Arc::new(crate::model_recommendation::pack_manager::PackManager::new(&app_data_dir).expect("Failed to initialize PackManager"));
+            app.manage(pack_manager);
+
             // Initial event publication
             let event_bus = core::event_bus::get_event_bus();
             event_bus.publish(core::event_bus::SarathiEvent::ApplicationStarted, None);
@@ -117,8 +120,12 @@ pub fn run() {
             commands::system::revert_hardware_override,
             commands::system::validate_system,
 
-            // Recommendation commands (Phase 3)
+            // Recommendation & Certification commands (Phase 3 & Ecosystem)
             commands::recommendation::get_model_recommendations,
+            commands::recommendation::get_package_certification,
+            commands::recommendation::get_all_package_certifications,
+            commands::recommendation::get_runtime_profile,
+            commands::recommendation::reload_certification_packs,
 
             // Download & Storage Management commands (Phase 4)
             commands::download::start_model_download,
