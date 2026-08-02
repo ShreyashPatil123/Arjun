@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -324,7 +325,27 @@ impl LlamaCppRuntime {
 
         // Format messages into a prompt string dynamically using model's chat_template
         let prompt = format_chat_prompt_with_template(messages, &config.chat_template);
-        log::info!("[RUNTIME] Generating for prompt using template '{}' ({} chars)", config.chat_template, prompt.len());
+
+        // Compute SHA-256 digest of final prompt sent to llama.cpp
+        let mut hasher = Sha256::new();
+        hasher.update(prompt.as_bytes());
+        let prompt_sha256 = format!("{:x}", hasher.finalize());
+
+        let has_memory_injection = prompt.contains("Known User Information & Preferences")
+            || prompt.contains("Recalled Context & Facts")
+            || prompt.contains("Shreyash")
+            || prompt.contains("User Workspace & Project Context");
+
+        log::info!(
+            "\n==================== [LLAMA.CPP RUNTIME PROMPT TRACE] ====================\n\
+             - Prompt SHA-256 Hash:   {}\n\
+             - Prompt Total Length:   {} chars\n\
+             - Memory Injected:       {}\n\
+             - Template Format:       {}\n\
+             - Input Message Count:   {}\n\
+             ==========================================================================",
+            prompt_sha256, prompt.len(), has_memory_injection, config.chat_template, messages.len()
+        );
 
         // Tokenize the prompt (use AddBos::Never if template already includes BOS/header tags)
         let add_bos = if config.chat_template == "chatml" || config.chat_template == "gemma" {
