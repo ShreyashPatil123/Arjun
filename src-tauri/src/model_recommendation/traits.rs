@@ -253,6 +253,9 @@ pub struct ModelRecommendation {
     pub total_parameters: u64,
     pub active_parameters: Option<u64>,
 
+    // ── Certification Metadata ──
+    pub certification: Option<crate::model_recommendation::certified_catalog::PackageCertification>,
+
     // ── Performance (Phase 3: always None) ──
     pub estimated_tokens_per_sec: Option<f64>,
     pub performance_note: String,

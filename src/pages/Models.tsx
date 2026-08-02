@@ -82,6 +82,7 @@ export const Models: React.FC = () => {
       const data = await getModelRecommendations(forceRefresh);
       const enriched = await Promise.all(
         data.map(async (item) => {
+          if (item.certification) return item;
           const cert = await import('../services/packManager.service').then(m => m.getPackageCertification(item.modelId));
           return { ...item, certification: cert };
         })

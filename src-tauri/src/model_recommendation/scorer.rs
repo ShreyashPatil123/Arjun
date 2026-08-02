@@ -202,6 +202,7 @@ pub fn evaluate_model(
             architecture: arch_label,
             total_parameters: model.total_parameters,
             active_parameters: model.active_parameters,
+            certification: None,
             estimated_tokens_per_sec: None,
             performance_note: "Calculated via Sarathi Hardware Profile & GGUF Estimator".to_string(),
         }

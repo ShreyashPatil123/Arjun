@@ -47,12 +47,32 @@ pub async fn generate_recommendations(
 
     // 3. Evaluate all models against budget and score
     let estimator_config = EstimatorConfig::default();
-    let recommendations = scorer::generate_all_recommendations(
+    let mut recommendations = scorer::generate_all_recommendations(
         &models,
         &memory_budget,
         &estimator_config,
     );
 
+    // 4. Enrich recommendations with certification metadata from PackManager
+    if let Some(data_dir) = app_data_dir {
+        if let Ok(pack_mgr) = pack_manager::PackManager::new(data_dir) {
+            for rec in &mut recommendations {
+                rec.certification = pm_cert_lookup(&pack_mgr, &rec.model_id);
+            }
+        }
+    } else {
+        let temp_dir = std::env::temp_dir().join("sarathi_pack_tmp");
+        if let Ok(pack_mgr) = pack_manager::PackManager::new(&temp_dir) {
+            for rec in &mut recommendations {
+                rec.certification = pm_cert_lookup(&pack_mgr, &rec.model_id);
+            }
+        }
+    }
+
     log::info!("[RECOMMENDATION] ✓ Engine complete: {} recommendations generated", recommendations.len());
     recommendations
+}
+
+fn pm_cert_lookup(pack_mgr: &pack_manager::PackManager, model_id: &str) -> Option<certified_catalog::PackageCertification> {
+    pack_mgr.get_package_certification(model_id)
 }
