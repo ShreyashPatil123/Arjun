@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🪷 Sarathi (सारथी)
+# <img src="assets/sarathi-logo.png" alt="Sarathi Logo" width="40" height="40" style="vertical-align: middle;" /> Sarathi (सारथी)
 
 ### *Universal Local AI Orchestrator, Hardware-Matched LLM Engine & Hybrid Memory Platform*
 
