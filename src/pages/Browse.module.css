@@ -1,0 +1,767 @@
+/* Model browser — category sidebar beside a card grid.
+ *
+ * Monochrome throughout, using theme tokens only. "Fits" and "too large" are
+ * distinguished by weight and an explicit word, never by shade alone. */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: var(--space-6);
+  gap: var(--space-4);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.title {
+  font-size: var(--text-2xl);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.subtitle {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin: var(--space-1) 0 0;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  position: relative;
+}
+
+.searchIcon {
+  position: absolute;
+  left: 10px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.searchInput {
+  padding: var(--space-2) var(--space-3) var(--space-2) 32px;
+  min-width: 260px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.searchInput:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.notice,
+.error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: 8px;
+  font-size: var(--text-sm);
+  border: 1px solid var(--border-default);
+}
+
+.notice {
+  background: var(--warning-bg);
+  color: var(--text-secondary);
+  border-left: 3px solid var(--warning);
+}
+
+.error {
+  background: var(--error-bg);
+  color: var(--text-primary);
+  border-left: 3px solid var(--error);
+}
+
+/* Layout ----------------------------------------------------------------- */
+
+.body {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: var(--space-5);
+  flex: 1;
+  min-height: 0;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  padding-right: var(--space-2);
+}
+
+.catBtn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--duration-fast, 150ms) ease;
+}
+
+.catBtn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.catActive {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.count {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: var(--space-4);
+  align-content: start;
+  overflow-y: auto;
+  padding-right: var(--space-2);
+}
+
+.centered {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-6);
+  color: var(--text-secondary);
+}
+
+/* Cards ------------------------------------------------------------------ */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+}
+
+.card:hover {
+  border-color: var(--text-tertiary);
+}
+
+/* The card whose details are open, so it is obvious which one the drawer is
+ * describing once several have been looked at. */
+.cardOpen {
+  border-color: var(--tag-fit);
+  box-shadow: inset 2px 0 0 var(--tag-fit);
+}
+
+.cardTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.publisher {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.badges {
+  display: flex;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.badge,
+.badgeStrong {
+  font-size: var(--text-xs);
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  white-space: nowrap;
+}
+
+/* Licence — informational, so the quietest of the accents. */
+.badge {
+  color: var(--tag-license);
+  background: var(--tag-license-bg);
+  border-color: transparent;
+}
+
+/* What the entry is — base model, fine-tune, quantization. All runnable, so
+ * they share one calm treatment; only the adapter breaks out. */
+.badgeKind {
+  font-size: var(--text-xs);
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--tag-type);
+  background: var(--tag-type-bg);
+  border: 1px solid transparent;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.kindNote {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin: 0;
+  line-height: var(--leading-snug);
+}
+
+.datasets {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* An adapter cannot be run on its own. This is the single most important thing
+ * to notice on the card, so it gets the strongest treatment — and still says
+ * "LoRA adapter" in words, never relying on the colour alone. */
+.badgeStrong {
+  color: var(--tag-lora);
+  background: var(--tag-lora-bg);
+  border-color: var(--tag-lora);
+  font-weight: 600;
+}
+
+.cardName {
+  font-size: var(--text-base);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.summary {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: var(--leading-snug);
+}
+
+.cats {
+  display: flex;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.cat {
+  font-size: var(--text-xs);
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  text-transform: capitalize;
+}
+
+.stats {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.base {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.base code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Expander and download sit on one line at the foot of the card, so every card
+ * ends with the same two choices in the same place. */
+.cardFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: auto;
+  padding-top: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.expand {
+  padding: var(--space-1) 0;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.expand:hover {
+  color: var(--text-primary);
+}
+
+/* The primary action on a card. Filled rather than outlined, because it is the
+ * one thing most people came to this page to do. */
+.downloadBtn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--tag-fit);
+  background: var(--tag-fit);
+  color: var(--bg-primary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity var(--duration-fast, 150ms) ease;
+}
+
+.downloadBtn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.downloadBtn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* Same action, lower promise. A model that does not fit is still downloadable,
+ * but it should not look like the recommended choice — so it is outlined
+ * rather than filled, and the label says "anyway". */
+.downloadBtnWarn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.downloadBtnWarn:hover:not(:disabled) {
+  border-color: var(--text-tertiary);
+  color: var(--text-primary);
+}
+
+.downloadBtnWarn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* Per-size download, inside the sizes table. Quieter than the card's main
+ * button — this is the deliberate choice, not the default one. */
+.qAction {
+  text-align: right;
+  width: 1%;
+}
+
+.rowBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.rowBtn:hover:not(:disabled) {
+  border-color: var(--tag-fit);
+  color: var(--tag-fit);
+}
+
+.rowBtn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.quants {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.quants td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.quants tr:last-child td {
+  border-bottom: none;
+}
+
+.qLabel {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-primary);
+}
+
+.qNote {
+  color: var(--text-tertiary);
+}
+
+.qFit {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Whether a 5 GB download will actually run is the most consequential thing on
+ * this card, so it is carried by colour *and* the words "fits" / "too large".
+ * Neither alone. */
+.fits td {
+  color: var(--text-primary);
+}
+
+.fits .qFit {
+  color: var(--tag-fit);
+  font-weight: 600;
+}
+
+.tooBig td {
+  color: var(--text-tertiary);
+}
+
+/* ── LoRA adapters for a model ─────────────────────────────────────────── */
+
+.adapters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-default);
+}
+
+.adapterNotice {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-snug);
+  margin: 0;
+}
+
+/* ── Detail drawer ─────────────────────────────────────────────────────────
+ *
+ * Details used to expand inside the card. Cards live in a grid, and grid rows
+ * share a height, so one card growing stretched every card beside it into a
+ * tall empty box. Moving the detail out of the grid removes that by
+ * construction, and gives the tables room to be read. */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 45%);
+  z-index: 40;
+  animation: fade 160ms ease;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(560px, 92vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-default);
+  box-shadow: -12px 0 32px rgb(0 0 0 / 28%);
+  z-index: 41;
+  animation: slideIn 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scrim,
+  .drawer {
+    animation: none;
+  }
+}
+
+.drawerHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.drawerTitle {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.closeBtn {
+  display: flex;
+  padding: 6px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.closeBtn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.drawerBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-4);
+  overflow-y: auto;
+}
+
+.drawerSection {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Column headers for both tables. Quiet, uppercase, so they read as labels
+ * rather than competing with the data underneath. */
+.quantHead th {
+  text-align: left;
+  padding: 2px 6px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.sizeNote {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: var(--leading-snug);
+}
+
+/* Adapters get the same tabular treatment as sizes, so the two lists read the
+ * same way instead of one being a table and the other a loose stack. */
+.adapterTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.adapterTable td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-default);
+  vertical-align: middle;
+}
+
+.adapterTable tr:last-child td {
+  border-bottom: none;
+}
+
+.adapterAuthor {
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* The name is the control that opens the explanation, so it looks clickable. */
+.adapterNameBtn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  text-align: left;
+}
+
+.adapterNameBtn:hover .adapterFocus {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.adapterDetailCell {
+  padding: 0 6px var(--space-3) !important;
+}
+
+.adapterDetail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+}
+
+.effects {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.effect {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.effectSkill {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.effectText {
+  color: var(--text-secondary);
+  line-height: var(--leading-snug);
+}
+
+/* Declared by the author versus inferred from the name. These must never look
+ * alike — one is evidence, the other is a guess. */
+.stated {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--tag-fit-bg);
+  color: var(--tag-fit);
+  white-space: nowrap;
+}
+
+.suggested {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px dashed var(--border-default);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.detailLine {
+  margin: 0;
+  color: var(--text-tertiary);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+.detailLine strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.adapterFocus {
+  color: var(--text-primary);
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+/* Ready to load as-is versus needing conversion first — the practical
+ * difference between "this works" and "this silently fails to load". */
+.ready {
+  color: var(--tag-fit);
+  white-space: nowrap;
+}
+
+.needsConversion {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  cursor: help;
+  border-bottom: 1px dotted var(--border-default);
+}
+
+.getBtn {
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--tag-fit);
+  background: var(--tag-fit-bg);
+  color: var(--tag-fit);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.getBtn:hover:not(:disabled) {
+  background: var(--tag-fit);
+  color: var(--bg-primary);
+}
+
+.getBtn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  border-color: var(--border-default);
+  background: transparent;
+  color: var(--text-tertiary);
+}
+
+.adapterError {
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  background: var(--error-bg);
+  border-left: 2px solid var(--error);
+  padding: var(--space-2);
+  border-radius: 4px;
+  margin: 0;
+  line-height: var(--leading-snug);
+}

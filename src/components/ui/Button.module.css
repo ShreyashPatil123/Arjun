@@ -15,7 +15,7 @@
 .button:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
 .button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
-.primary { background: var(--accent-primary); color: white; }
+.primary { background: var(--accent-primary); color: var(--accent-foreground); }
 .primary:hover:not(:disabled) { background: var(--accent-hover); }
 
 .secondary { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-default); }
@@ -24,8 +24,8 @@
 .ghost { background: transparent; color: var(--text-primary); }
 .ghost:hover:not(:disabled) { background: var(--bg-tertiary); }
 
-.danger { background: var(--error); color: white; }
-.danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.8); }
+.danger { background: var(--error); color: var(--accent-foreground); }
+.danger:hover:not(:disabled) { background: var(--error-bg); color: var(--text-primary); }
 
 .sm { padding: var(--space-1) var(--space-3); font-size: var(--text-xs); }
 .md { padding: var(--space-2) var(--space-4); font-size: var(--text-sm); }

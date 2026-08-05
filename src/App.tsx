@@ -9,8 +9,10 @@ import { Welcome } from './pages/Welcome';
 import { Settings } from './pages/Settings';
 import { SystemInfo } from './pages/SystemInfo';
 import { Models } from './pages/Models';
-import { Chat } from './pages/Chat';
 import { LoRA } from './pages/LoRA';
+import { Launch } from './pages/Launch';
+import { Browse } from './pages/Browse';
+import { Storage } from './pages/Storage';
 
 function App() {
   return (
@@ -22,10 +24,15 @@ function App() {
               <Routes>
                 <Route path="/" element={<AppShell />}>
                   <Route index element={<Welcome />} />
+                  <Route path="launch" element={<Launch />} />
+                  <Route path="browse" element={<Browse />} />
                   <Route path="settings" element={<Settings />} />
                   <Route path="system" element={<SystemInfo />} />
-                  <Route path="models" element={<Models />} />
-                  <Route path="chat" element={<Chat />} />
+                  {/* Storage manages what is on disk; Discover finds new models.
+                    * The old combined page is kept at /models-legacy while its
+                    * download flow is folded into Discover. */}
+                  <Route path="models" element={<Storage />} />
+                  <Route path="models-legacy" element={<Models />} />
                   <Route path="lora" element={<LoRA />} />
                 </Route>
               </Routes>

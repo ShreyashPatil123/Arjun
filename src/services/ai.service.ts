@@ -6,6 +6,7 @@ import type {
   StreamChunkPayload,
   ChatMessage,
   GenerationParams,
+  CapabilityPayload,
 } from '../types/ai';
 
 export async function loadInstalledModel(
@@ -32,13 +33,22 @@ export async function restoreLastSession(): Promise<LoadedModelInfo | null> {
   return invoke<LoadedModelInfo | null>('restore_last_session');
 }
 
+/**
+ * Sends a turn for generation.
+ *
+ * The backend classifies intent, applies switch hysteresis, and binds the
+ * resulting capability before generating — pass `manualCapability` only to pin
+ * a specific one. `'auto'`, `'none'`, and `null` all mean "classify normally".
+ */
 export async function sendChatMessage(
   messages: ChatMessage[],
-  params?: GenerationParams
+  params?: GenerationParams,
+  manualCapability?: string | null
 ): Promise<void> {
   return invoke('send_chat_message', {
     messages,
     params: params || null,
+    manualCapability: manualCapability || null,
   });
 }
 
@@ -66,6 +76,20 @@ export async function listenInferenceError(
   callback: (payload: { error: string }) => void
 ) {
   return listen<{ error: string }>('inference:error', (event: Event<{ error: string }>) => {
+    callback(event.payload);
+  });
+}
+
+/**
+ * Subscribes to capability changes.
+ *
+ * Fires once per turn, after the capability has actually been applied — so the
+ * UI reports what the model is doing, not what was merely intended.
+ */
+export async function listenCapabilityChanged(
+  callback: (payload: CapabilityPayload) => void
+) {
+  return listen<CapabilityPayload>('capability:changed', (event: Event<CapabilityPayload>) => {
     callback(event.payload);
   });
 }

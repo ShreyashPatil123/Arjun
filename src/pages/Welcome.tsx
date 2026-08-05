@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Compass, Cpu, HardDrive, Monitor, CheckCircle2, AlertTriangle, ArrowRight, RefreshCw, Edit3, ShieldAlert, CpuIcon } from 'lucide-react';
+import { SarathiLogo } from '../components/ui/SarathiLogo';
 import { Button, Card, Input, Toggle } from '../components/ui';
 import { getSarathiClient } from '../sdk';
 import { useToast } from '../hooks/useToast';
@@ -151,7 +152,7 @@ export const Welcome: React.FC = () => {
       {step === 'welcome' && (
         <div className={styles.welcomeCard}>
           <div className={styles.logoWrapper}>
-            <Compass size={64} strokeWidth={1.8} className={styles.logoIcon} />
+            <SarathiLogo size={96} strokeWidth={1.2} className={styles.logoIcon} />
           </div>
           <h1 className={styles.title}>Welcome to Sarathi</h1>
           <p className={styles.subtitle}>A Local-First LoRA Orchestration System</p>

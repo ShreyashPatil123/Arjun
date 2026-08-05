@@ -15,6 +15,9 @@ pub mod model_providers;
 pub mod download_manager;
 pub mod adapter_manager;
 pub mod ai_engine;
+pub mod capability;
+pub mod gateway;
+pub mod launcher;
 pub mod model_intelligence;
 pub mod lora;
 pub mod installer;
@@ -77,6 +80,111 @@ pub fn run() {
 
             let pack_manager = Arc::new(crate::model_recommendation::pack_manager::PackManager::new(&app_data_dir).expect("Failed to initialize PackManager"));
             app.manage(pack_manager);
+
+            // Serialize all model access behind one worker, then start the local
+            // gateway so external tools (Claude Code, opencode, openclaw) can use
+            // whichever model this app has loaded.
+            let inference_for_gateway = app.state::<Arc<InferenceManager>>().inner().clone();
+            let scheduler = Arc::new(ai_engine::scheduler::GenerationScheduler::start(
+                inference_for_gateway.clone(),
+            ));
+            app.manage(scheduler.clone());
+
+            let gateway_state = Arc::new(gateway::GatewayState::new(
+                scheduler,
+                inference_for_gateway,
+                gateway::GatewayConfig::default(),
+            ));
+            app.manage(gateway_state.clone());
+
+            // Tracks tools the Launch screen started, so cards can show Running.
+            app.manage(Arc::new(launcher::LaunchedProcesses::default()));
+
+            let app_for_gateway = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match gateway::start_gateway(gateway_state).await {
+                    Ok(handle) => {
+                        info!(
+                            "Sarathi gateway ready on http://127.0.0.1:{} — point Claude Code at /v1/messages, opencode at /v1/chat/completions",
+                            handle.port
+                        );
+                        // Hand the handle to Tauri so it lives as long as the
+                        // app. Letting it drop here would drop the shutdown
+                        // sender, resolving the graceful-shutdown future and
+                        // closing the server immediately after it announced
+                        // itself — the logs would claim it was listening while
+                        // every connection was refused.
+                        app_for_gateway.manage(handle);
+                    }
+                    // A busy port must not stop the desktop app from opening;
+                    // the user needs the UI to change the port.
+                    Err(e) => log::error!("Gateway failed to start: {e:#}"),
+                }
+            });
+
+            // Bring a model up on launch so the gateway can answer immediately.
+            //
+            // Sarathi serves other tools rather than hosting its own chat, so
+            // nothing in the UI would otherwise trigger a load — a user could
+            // install a model, point Claude Code at the gateway, and get
+            // "no model loaded" with no obvious way to fix it.
+            //
+            // Prefers the last model used. Falls back to the only installed one.
+            // With several installed and no previous session it loads nothing,
+            // because guessing which model someone wants resident in VRAM is
+            // worse than letting them choose.
+            {
+                let inference = app.state::<Arc<InferenceManager>>().inner().clone();
+                let app_data = app.path().app_data_dir().ok();
+
+                tauri::async_runtime::spawn(async move {
+                    let Some(dir) = app_data else { return };
+
+                    let restore = ai_engine::session::SessionManager::load_session(&dir)
+                        .ok()
+                        .flatten()
+                        .filter(|s| s.auto_restore_enabled)
+                        .map(|s| (s.provider_id, s.model_id, s.quantization));
+
+                    let target = restore.or_else(|| {
+                        let packages = adapter_manager::AdapterRegistry::list_installed_packages(&dir);
+                        match packages.len() {
+                            1 => {
+                                let p = &packages[0];
+                                Some((
+                                    p.provider_id.clone(),
+                                    p.base_model.model_id.clone(),
+                                    p.base_model.quantization.clone(),
+                                ))
+                            }
+                            0 => None,
+                            n => {
+                                info!("{n} models installed — select one to load; not guessing.");
+                                None
+                            }
+                        }
+                    });
+
+                    let Some((provider, model, quant)) = target else { return };
+                    info!("Auto-loading '{model}' ({quant}) so the gateway can serve requests");
+
+                    let res = tokio::task::spawn_blocking(move || {
+                        inference.load_installed_model_direct(&dir, &provider, &model, &quant)
+                    })
+                    .await;
+
+                    match res {
+                        Ok(Ok(info)) => info!(
+                            "Model ready: {} via {} — gateway can now serve requests",
+                            info.model_name, info.backend_used
+                        ),
+                        // A load failure must not take the app down; the UI still
+                        // needs to open so the user can pick a different model.
+                        Ok(Err(e)) => log::error!("Auto-load failed: {e:#}"),
+                        Err(e) => log::error!("Auto-load task panicked: {e}"),
+                    }
+                });
+            }
 
             // Initial event publication
             let event_bus = core::event_bus::get_event_bus();
@@ -157,6 +265,25 @@ pub fn run() {
             commands::intelligence::update_model_profile,
             commands::intelligence::refresh_model_profile,
             commands::intelligence::route_prompt_capability,
+
+            // Launch section — start coding tools already connected
+            commands::launcher::get_launch_overview,
+            commands::launcher::preview_tool_install,
+            commands::launcher::install_tool,
+            commands::launcher::launch_tool,
+            commands::launcher::forget_tool_process,
+            commands::launcher::user_tools_file,
+
+            // Model browsing by category
+            commands::catalog::browse_model_cards,
+            commands::catalog::list_model_categories,
+            commands::catalog::find_model_adapters,
+
+            // Adapter downloads and management
+            commands::adapters::list_installed_adapters,
+            commands::adapters::download_adapter,
+            commands::adapters::remove_adapter,
+            commands::adapter_details::get_adapter_details,
 
             // Phase 6 Memory Engine Commands
             memory_engine::api::get_memory_health_status,

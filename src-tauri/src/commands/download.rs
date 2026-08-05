@@ -51,10 +51,11 @@ pub fn pause_model_download(
 
 #[tauri::command]
 pub fn cancel_model_download(
+    app_handle: AppHandle,
     download_mgr: State<'_, Arc<DownloadManager>>,
     task_id: String,
 ) -> Result<(), String> {
-    download_mgr.cancel_download(&task_id).map_err(|e| e.to_string())
+    download_mgr.cancel_download(&app_handle, &task_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

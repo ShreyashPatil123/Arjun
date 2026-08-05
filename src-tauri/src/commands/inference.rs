@@ -106,6 +106,7 @@ pub async fn send_chat_message(
     memory_mgr: State<'_, Arc<crate::memory_engine::MemoryManager>>,
     messages: Vec<ChatMessage>,
     params: Option<GenerationParams>,
+    manual_capability: Option<String>,
 ) -> Result<(), String> {
     let params = params.unwrap_or_default();
     let mgr = inference_mgr.inner().clone();
@@ -143,7 +144,7 @@ pub async fn send_chat_message(
     log::info!("[MEMORY_PIPELINE] Dispatching {} final message(s) to inference runtime", final_messages.len());
 
     tokio::task::spawn_blocking(move || {
-        mgr.send_chat_message(&app_handle, final_messages, params)
+        mgr.send_chat_message(&app_handle, final_messages, params, manual_capability)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?

@@ -3,7 +3,9 @@
 //! Provides package manifest generation, storage, single source of truth verification,
 //! state machine logging, and startup scans for LoRA capability adapters.
 
+pub mod gguf;
 pub mod state_machine;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, anyhow};

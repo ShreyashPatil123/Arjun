@@ -9,6 +9,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use crate::model_recommendation::traits::{ModelMetadata, ModelArchitecture};
 use crate::model_recommendation::catalog::bootstrap_models;
+use crate::model_providers::huggingface::live_catalog;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CatalogCache {
@@ -32,6 +33,31 @@ struct HfModelSearchResult {
 pub struct HuggingFaceCatalogProvider;
 
 impl HuggingFaceCatalogProvider {
+    /// Serialises catalog sweeps so concurrent callers share one network fetch.
+    ///
+    /// Without this, two simultaneous requests both miss the cache — it is only
+    /// written once a sweep finishes — and each runs a full 500-repository
+    /// fetch. React's StrictMode double-invokes effects in development, so this
+    /// happened on every launch: twice the API calls and twice the wait, for
+    /// identical results.
+    fn catalog_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Reads the cache when it is present, parseable, non-empty, and fresh.
+    ///
+    /// `min_timestamp` rejects anything older than the given epoch second, which
+    /// is how a caller ignores a stale entry it has already decided to refresh.
+    fn read_cache(cache_file: &Path, min_timestamp: u64) -> Option<Vec<ModelMetadata>> {
+        let content = fs::read_to_string(cache_file).ok()?;
+        let cached = serde_json::from_str::<CatalogCache>(&content).ok()?;
+        if cached.models.is_empty() || cached.timestamp < min_timestamp {
+            return None;
+        }
+        Some(cached.models)
+    }
+
     pub async fn fetch_catalog(app_data_dir: &Path, force_refresh: bool) -> Vec<ModelMetadata> {
         let cache_file = app_data_dir.join("hf_catalog_cache.json");
         let now = std::time::SystemTime::now()
@@ -39,22 +65,40 @@ impl HuggingFaceCatalogProvider {
             .unwrap_or_default()
             .as_secs();
 
-        // 1. Check local disk cache (valid if < 24 hours and !force_refresh)
-        if !force_refresh && cache_file.exists() {
-            if let Ok(content) = fs::read_to_string(&cache_file) {
-                if let Ok(cached) = serde_json::from_str::<CatalogCache>(&content) {
-                    if now.saturating_sub(cached.timestamp) < 86400 && !cached.models.is_empty() {
-                        log::info!("[HF_CATALOG] Loaded {} models from fresh local cache ({:?})", 
-                            cached.models.len(), cache_file);
-                        return cached.models;
-                    }
-                }
+        // Cache entries older than this are considered stale.
+        const CACHE_TTL_SECS: u64 = 86_400;
+        let freshness_floor = now.saturating_sub(CACHE_TTL_SECS);
+
+        // 1. Fast path — a fresh cache satisfies the request with no lock held.
+        if !force_refresh {
+            if let Some(models) = Self::read_cache(&cache_file, freshness_floor) {
+                log::info!(
+                    "[HF_CATALOG] Loaded {} models from fresh local cache ({:?})",
+                    models.len(),
+                    cache_file
+                );
+                return models;
             }
         }
 
-        // 2. Fetch live catalog from Hugging Face Hub API
+        // 2. Only one sweep at a time. Others queue here.
+        let _guard = Self::catalog_lock().lock().await;
+
+        // 3. Re-check after waiting: whoever held the lock may have just
+        //    finished the exact sweep we were about to start. Accept only a
+        //    result produced after we began waiting, so an explicit refresh is
+        //    still honoured rather than served from the entry it meant to replace.
+        if let Some(models) = Self::read_cache(&cache_file, now) {
+            log::info!(
+                "[HF_CATALOG] Reusing {} models from a concurrent refresh",
+                models.len()
+            );
+            return models;
+        }
+
+        // 4. Fetch live catalog from Hugging Face Hub API
         log::info!("[HF_CATALOG] Querying live Hugging Face Hub API for GGUF model repositories...");
-        match Self::query_hf_api().await {
+        match Self::query_hf_api(Self::resolve_token().as_deref()).await {
             Ok(live_models) if !live_models.is_empty() => {
                 log::info!("[HF_CATALOG] Successfully discovered {} models from Hugging Face API", live_models.len());
                 let cache_data = CatalogCache {
@@ -90,38 +134,79 @@ impl HuggingFaceCatalogProvider {
         }
     }
 
-    async fn query_hf_api() -> Result<Vec<ModelMetadata>, anyhow::Error> {
-        let client = reqwest::Client::builder()
-            .user_agent("Sarathi/0.1.0 (Windows; x64)")
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+    /// Number of search pages to sweep (100 repositories each).
+    const DISCOVERY_PAGES: u32 = 5;
 
-        // Query Hugging Face API for top GGUF repositories sorted by downloads
-        let search_url = "https://huggingface.co/api/models?filter=gguf&sort=downloads&direction=-1&limit=35";
-        let resp = client.get(search_url).send().await?;
+    /// Resolves an optional HuggingFace token from the environment.
+    ///
+    /// Browsing needs no token — search and metadata reads work anonymously,
+    /// including for gated repositories. A token only raises anonymous rate
+    /// limits and unlocks *downloads* from gated repos (`meta-llama/*`,
+    /// `google/gemma-*`), so it is never required to reach this code path.
+    ///
+    /// Reads the same variable names the official `huggingface_hub` tooling
+    /// uses, so an existing setup is picked up automatically.
+    fn resolve_token() -> Option<String> {
+        ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    }
 
-        let mut discovered = Vec::new();
-        if resp.status().is_success() {
-            if let Ok(results) = resp.json::<Vec<HfModelSearchResult>>().await {
-                for item in results {
-                    if let Some(metadata) = Self::parse_hf_repo_to_metadata(&item.id) {
-                        if !discovered.iter().any(|m: &ModelMetadata| m.id == metadata.id) {
-                            discovered.push(metadata);
-                        }
-                    }
-                }
-            }
+    /// Discovers models from the live Hub.
+    ///
+    /// Previously this asked for 35 repositories and then passed each through a
+    /// hand-written `if repo.contains("llama-3.2-1b")` chain, **discarding any
+    /// result that did not match**. Only models typed into the source by hand
+    /// could ever appear, so the catalog was pinned at 16 entries and no
+    /// fine-tune or new release could ever surface.
+    ///
+    /// Metadata now comes from the API itself — parameter counts, architecture,
+    /// context length, and exact per-quantization file sizes — so any GGUF
+    /// repository on the Hub is understood without being known in advance.
+    async fn query_hf_api(token: Option<&str>) -> Result<Vec<ModelMetadata>, anyhow::Error> {
+        // Sweep breadth depends on whether a token is present: HuggingFace
+        // rate-limits anonymous callers by IP, and each repository costs a
+        // detail request on top of the search.
+        let pages = live_catalog::pages_for(token);
+        if token.is_none() {
+            log::info!(
+                "[HF_CATALOG] No HuggingFace token — sweeping {} page(s). Add a free token in \
+                 Settings to browse the full library.",
+                pages
+            );
         }
 
-        // Always merge canonical open-weight model families so discovery is comprehensive
-        let bootstrap = bootstrap_models();
-        for b_model in bootstrap {
+        let mut discovered = live_catalog::discover(None, pages, token).await?;
+
+        // Keep the curated families as a floor. They carry hand-verified
+        // architecture details, and guarantee a usable catalog if the Hub is
+        // unreachable or a sweep comes back thin.
+        for b_model in bootstrap_models() {
             if !discovered.iter().any(|m| m.id == b_model.id) {
                 discovered.push(b_model);
             }
         }
 
         Ok(discovered)
+    }
+
+    /// Free-text search across the Hub, for the model browser.
+    ///
+    /// Bypasses the cache: the user is looking for something specific, and the
+    /// cached listing only holds the popular sweep.
+    pub async fn search(query: &str, token: Option<&str>) -> Vec<ModelMetadata> {
+        match live_catalog::discover(Some(query), 1, token).await {
+            Ok(models) => {
+                log::info!("[HF_CATALOG] Search '{}' matched {} models", query, models.len());
+                models
+            }
+            Err(e) => {
+                log::warn!("[HF_CATALOG] Search '{}' failed: {}", query, e);
+                Vec::new()
+            }
+        }
     }
 
     fn parse_hf_repo_to_metadata(repo_id: &str) -> Option<ModelMetadata> {

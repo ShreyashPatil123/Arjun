@@ -49,9 +49,8 @@ import type {
 } from '../types/download';
 import type { LoadedModelInfo, InferenceStatusPayload } from '../types/ai';
 import styles from './Models.module.css';
-import { Chat } from './Chat';
 
-type ActiveTab = FitCategory | 'Storage' | 'Chat';
+type ActiveTab = FitCategory | 'Storage';
 
 const isSameModelId = (id1?: string | null, id2?: string | null): boolean => {
   if (!id1 || !id2) return false;
@@ -411,17 +410,6 @@ export const Models: React.FC = () => {
             Storage & Installed
             <span className={styles.tabBadge}>{installedModels.length}</span>
           </button>
-          <button
-            className={`${styles.tabBtn} ${activeTab === 'Chat' ? styles.activeTab : ''}`}
-            onClick={() => setActiveTab('Chat')}
-            style={{
-              color: loadedModelInfo ? 'var(--success)' : undefined,
-            }}
-          >
-            <MessageSquare size={16} />
-            Chat
-            {loadedModelInfo && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--success)', display: 'inline-block', marginLeft: 4 }} />}
-          </button>
         </div>
 
         {/* Experimental Models Filter Toggle */}
@@ -543,10 +531,7 @@ export const Models: React.FC = () => {
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                     {loadedModelInfo && isSameModelId(loadedModelInfo.modelId, m.modelId) ? (
                       <>
-                        <Badge variant="success">● Loaded & Ready</Badge>
-                        <Button variant="primary" size="sm" onClick={() => navigate('/chat')}>
-                          <MessageSquare size={14} style={{ marginRight: 4 }} /> Open Chat
-                        </Button>
+                        <Badge variant="success">● Serving on the gateway</Badge>
                         <Button variant="secondary" size="sm" onClick={handleUnloadActiveModel}>
                           <Power size={14} style={{ marginRight: 4 }} /> Unload
                         </Button>
@@ -684,14 +669,7 @@ export const Models: React.FC = () => {
       )}
 
       {/* Cards Grid */}
-      {/* Chat Tab View */}
-      {activeTab === 'Chat' && (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: '500px' }}>
-          <Chat />
-        </div>
-      )}
-
-      {activeTab !== 'Storage' && activeTab !== 'Chat' && (
+      {activeTab !== 'Storage' && (
         loading ? (
           <div className={styles.emptyState}>
             <Spinner size="lg" />
@@ -867,9 +845,9 @@ export const Models: React.FC = () => {
                         <div style={{ display: 'flex', gap: '8px', width: '100%' }}>
                           {loadedModelInfo && isSameModelId(loadedModelInfo.modelId, model.modelId) ? (
                             <>
-                              <Button variant="primary" style={{ flex: 1 }} onClick={() => navigate('/chat')}>
-                                <MessageSquare size={16} style={{ marginRight: 6 }} /> Open Chat
-                              </Button>
+                              <div style={{ flex: 1, textAlign: 'center' }}>
+                                <Badge variant="success">● Serving on the gateway</Badge>
+                              </div>
                               <Button variant="secondary" onClick={handleUnloadActiveModel}>
                                 <Power size={16} style={{ marginRight: 6 }} /> Unload
                               </Button>

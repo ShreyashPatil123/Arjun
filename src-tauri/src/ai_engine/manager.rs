@@ -3,6 +3,7 @@
 //! Manages model loading/unloading with hardware-aware configuration,
 //! provides streaming generation via Tauri events, and tracks the last used model.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -12,7 +13,18 @@ use tauri::Emitter;
 use crate::adapter_manager::{AdapterRegistry, ModelPackageManifest};
 use crate::ai_engine::runtime::LlamaCppRuntime;
 use crate::ai_engine::traits::*;
+use crate::capability::{self, CapabilityLayer, CapabilityPayload};
 use crate::system_analyzer;
+
+/// The installed package backing the currently loaded model.
+///
+/// Captured at load time so each turn can resolve capabilities without
+/// re-reading and re-parsing `manifest.json` from disk.
+#[derive(Clone)]
+pub struct ActivePackage {
+    pub package_dir: PathBuf,
+    pub manifest: ModelPackageManifest,
+}
 
 /// Thread-safe inference state manager.
 ///
@@ -21,6 +33,10 @@ use crate::system_analyzer;
 pub struct InferenceManager {
     runtime: Arc<Mutex<LlamaCppRuntime>>,
     last_used_model_id: Arc<Mutex<Option<String>>>,
+    /// Package context for the loaded model, used to resolve LoRA adapters.
+    active_package: Arc<Mutex<Option<ActivePackage>>>,
+    /// Intent classification, switch hysteresis, and capability resolution.
+    capability: Arc<CapabilityLayer>,
 }
 
 impl InferenceManager {
@@ -29,7 +45,22 @@ impl InferenceManager {
         Self {
             runtime: Arc::new(Mutex::new(LlamaCppRuntime::new())),
             last_used_model_id: Arc::new(Mutex::new(None)),
+            active_package: Arc::new(Mutex::new(None)),
+            capability: Arc::new(CapabilityLayer::default()),
         }
+    }
+
+    /// The capability layer, for status queries and manual overrides.
+    pub fn capability_layer(&self) -> Arc<CapabilityLayer> {
+        self.capability.clone()
+    }
+
+    /// The package backing the loaded model, if any.
+    pub fn active_package(&self) -> Option<ActivePackage> {
+        self.active_package
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Returns the current runtime status
@@ -177,6 +208,17 @@ impl InferenceManager {
         })?;
 
         log::info!("[STAGE 3 MANAGER SUCCESS] Model loaded cleanly: {:?}", info);
+
+        // Record package context for per-turn capability resolution, and clear
+        // any capability stickiness carried over from the previous model.
+        if let Ok(mut guard) = self.active_package.lock() {
+            *guard = Some(ActivePackage {
+                package_dir: package_dir.clone(),
+                manifest: manifest.clone(),
+            });
+        }
+        self.capability.reset();
+
         self.set_last_used_model_id(Some(model_id.to_string()));
         let _ = super::session::SessionManager::save_session(app_data_dir, provider_id, model_id, quantization);
 
@@ -189,8 +231,20 @@ impl InferenceManager {
 
     /// Direct unload without requiring Tauri AppHandle
     pub fn unload_active_model_direct(&self) -> Result<()> {
+        self.clear_package_context();
         let mut runtime = self.runtime.lock().unwrap();
         runtime.unload_model()
+    }
+
+    /// Drops package context and capability stickiness.
+    ///
+    /// Called on every unload path so a newly loaded model never inherits the
+    /// previous model's active capability or adapter bindings.
+    fn clear_package_context(&self) {
+        if let Ok(mut guard) = self.active_package.lock() {
+            *guard = None;
+        }
+        self.capability.reset();
     }
 
     /// Unloads the currently active model
@@ -198,6 +252,8 @@ impl InferenceManager {
         if let Ok(app_dir) = app_handle.path().app_data_dir() {
             let _ = super::session::SessionManager::clear_session(&app_dir);
         }
+
+        self.clear_package_context();
 
         let _ = app_handle.emit("inference:status", InferenceStatusPayload {
             status: "Unloading".to_string(),
@@ -230,6 +286,7 @@ impl InferenceManager {
         app_handle: &tauri::AppHandle,
         messages: Vec<ChatMessage>,
         params: GenerationParams,
+        manual_capability: Option<String>,
     ) -> Result<()> {
         // Emit generating status
         let _ = app_handle.emit("inference:status", InferenceStatusPayload {
@@ -239,12 +296,23 @@ impl InferenceManager {
             error: None,
         });
 
+        // Resolve the capability for this turn and apply it to the prompt and
+        // sampler. Previously the routing result was computed in the UI purely
+        // to render a badge, and generation ran on the unmodified base model.
+        let (final_messages, final_params, capability_backend) =
+            self.prepare_capability_turn(app_handle, &messages, &params, manual_capability.as_deref());
+
         let app_handle_clone = app_handle.clone();
         let result = {
             let mut runtime = self.runtime.lock().unwrap();
-            runtime.generate(&messages, &params, |chunk| {
-                let _ = app_handle_clone.emit("inference:token", &chunk);
-            })
+            runtime.generate_with_capability(
+                &final_messages,
+                &final_params,
+                capability_backend.as_ref(),
+                |chunk| {
+                    let _ = app_handle_clone.emit("inference:token", &chunk);
+                },
+            )
         };
 
         match result {
@@ -274,6 +342,73 @@ impl InferenceManager {
         }
     }
 
+    /// Classifies the turn, resolves a capability backend, and layers it onto
+    /// the prompt and sampling parameters.
+    ///
+    /// Returns the messages and params to generate with, plus the backend to
+    /// bind. Falls back to the untouched inputs whenever no package context is
+    /// available or the turn resolves to general conversation.
+    fn prepare_capability_turn(
+        &self,
+        app_handle: &tauri::AppHandle,
+        messages: &[ChatMessage],
+        params: &GenerationParams,
+        manual_capability: Option<&str>,
+    ) -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
+        // Explicitly typed: a bare `None` here would be ambiguous to infer.
+        let untouched = || -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
+            (messages.to_vec(), params.clone(), None)
+        };
+
+        let Some(package) = self.active_package() else {
+            log::debug!("[CAPABILITY] No active package context — generating on base model");
+            return untouched();
+        };
+
+        // Classify on the latest user turn only; earlier turns describe past
+        // intent, not the request being answered now.
+        let Some(prompt) = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+        else {
+            return untouched();
+        };
+
+        let turn = self.capability.resolve_turn(
+            prompt,
+            &package.package_dir,
+            &package.manifest,
+            manual_capability,
+        );
+
+        let is_base = matches!(turn.resolution.backend, capability::CapabilityBackend::Base);
+
+        let final_messages = capability::apply_directive(messages, &turn.resolution.spec);
+        let final_params = capability::apply_sampling(params, &turn.resolution.spec);
+
+        // Tell the UI what is actually in force — emitted after resolution and
+        // parameter merging, so the badge and diagnostics reflect a real binding
+        // rather than an intention.
+        let payload: CapabilityPayload = turn.payload(if is_base { params } else { &final_params });
+        let _ = app_handle.emit("capability:changed", &payload);
+
+        if is_base {
+            return untouched();
+        }
+
+        log::info!(
+            "[CAPABILITY] Applied '{}' via {} (temp {:.2} -> {:.2})",
+            turn.resolution.capability,
+            turn.resolution.backend.label(),
+            params.temperature,
+            final_params.temperature
+        );
+
+        (final_messages, final_params, Some(turn.resolution.backend))
+    }
+
     /// Direct generation without requiring a Tauri AppHandle (for test scripts & backend execution)
     pub fn generate_direct<F>(
         &self,
@@ -292,6 +427,21 @@ impl InferenceManager {
     pub fn stop_generation(&self) {
         let runtime = self.runtime.lock().unwrap();
         runtime.stop_generation();
+    }
+
+    /// Clones the runtime's cancellation flag, if a model is loaded.
+    ///
+    /// Callers that need to interrupt a generation already in flight must obtain
+    /// this *before* generation starts: the runtime mutex is held for the whole
+    /// of `generate_direct`, so `stop_generation` would deadlock if called from
+    /// inside a token callback.
+    pub fn cancel_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        let runtime = self.runtime.lock().unwrap();
+        if runtime.loaded_model_info().is_some() {
+            Some(runtime.cancel_flag())
+        } else {
+            None
+        }
     }
 
     /// Builds a `ModelLoadConfig` from the manifest and hardware profile.
@@ -323,32 +473,26 @@ impl InferenceManager {
             std::cmp::max(1, std::cmp::min(cpus / 2, 8))
         };
 
-        // Determine GPU layers from hardware profile dynamically
-        let gpu_layers = if let Some(ref profile) = hw_profile {
-            let gpus = profile.gpus.current();
-            // Find any GPU (dedicated or integrated) with CUDA or Vulkan acceleration
-            if let Some(gpu) = gpus.iter().find(|g| g.cuda_supported || g.vulkan_supported) {
-                let vram_gb = gpu.vram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                let model_size_gb = manifest.base_model.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                log::info!(
-                    "[INFERENCE_MGR] Detected GPU '{}' ({:.2} GB VRAM) for model '{:.2} GB'",
-                    gpu.model, vram_gb, model_size_gb
-                );
+        // Provisional context length, needed to size the KV cache before the
+        // certified profile is consulted below.
+        let planned_context = profile.effective_params().context_length;
 
-                if vram_gb < 1.5 {
-                    log::info!("[INFERENCE_MGR] Low VRAM (<1.5 GB), defaulting to CPU mode");
-                    0
-                } else if vram_gb >= model_size_gb + 1.0 || vram_gb >= 6.0 {
-                    // Full GPU offload when VRAM comfortably fits model + KV cache
-                    log::info!("[INFERENCE_MGR] Full GPU offload selected (999 layers)");
-                    999
-                } else {
-                    // Partial layer offload proportional to available VRAM
-                    let ratio = (vram_gb / (model_size_gb + 0.5)).clamp(0.1, 0.9);
-                    let layers = (ratio * 32.0).round() as u32;
-                    log::info!("[INFERENCE_MGR] Partial GPU offload calculated: {} layers", layers);
-                    layers
-                }
+        // Determine GPU layers from the hardware profile, accounting for KV
+        // cache and OS reserve rather than comparing raw VRAM to file size.
+        let gpu_layers = if let Some(ref hw) = hw_profile {
+            let gpus = hw.gpus.current();
+            if let Some(gpu) = gpus.iter().find(|g| g.cuda_supported || g.vulkan_supported) {
+                let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
+                    gpu.vram_total_bytes,
+                    manifest.base_model.size_bytes,
+                    planned_context,
+                    None, // GGUF layer count not parsed at load time
+                );
+                log::info!(
+                    "[INFERENCE_MGR] GPU '{}': {}",
+                    gpu.model, plan.reason
+                );
+                plan.gpu_layers
             } else {
                 log::info!("[INFERENCE_MGR] No CUDA/Vulkan capable GPU detected, using CPU mode (0 layers)");
                 0
@@ -370,12 +514,54 @@ impl InferenceManager {
                 cert_prof.profile_id, model_id
             );
             let cfg = &cert_prof.execution_config;
+
+            // A certified profile is static per-model JSON shipped with the app.
+            // It describes the MODEL (template, stop tokens, maximum context) and
+            // is authoritative for those. It cannot know anything about the machine
+            // it lands on, so every hardware-dependent value stays measured here.
+            let detected_vram = hw_profile
+                .as_ref()
+                .and_then(|hw| {
+                    hw.gpus
+                        .current()
+                        .iter()
+                        .find(|g| g.cuda_supported || g.vulkan_supported)
+                        .map(|g| g.vram_total_bytes)
+                })
+                .unwrap_or(0);
+
+            // The model's advertised context is an upper bound, not an entitlement.
+            let affordable_context = crate::ai_engine::vram_planner::max_affordable_context(
+                detected_vram,
+                manifest.base_model.size_bytes,
+                cfg.context_length,
+            );
+            if affordable_context < cfg.context_length {
+                log::info!(
+                    "[INFERENCE_MGR] Context reduced {} -> {} to fit {:.2} GB VRAM",
+                    cfg.context_length,
+                    affordable_context,
+                    detected_vram as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+
+            if cfg.threads != threads {
+                log::info!(
+                    "[INFERENCE_MGR] Using {} detected CPU threads, not the profile's {}",
+                    threads, cfg.threads
+                );
+            }
+
             (
                 cfg.chat_template.clone(),
                 cfg.stop_tokens.clone(),
-                cfg.context_length,
-                if gpu_layers > 0 { std::cmp::max(gpu_layers, cfg.gpu_layers) } else { 0 },
-                cfg.threads,
+                affordable_context,
+                // The profile may lower the offload but never raise it — taking
+                // `max` here let a profile's 999 override a hardware plan of ~12
+                // layers on a 4 GB card and run out of memory.
+                if gpu_layers > 0 { std::cmp::min(gpu_layers, cfg.gpu_layers) } else { 0 },
+                // Detected physical cores, never the profile's fixed number.
+                threads,
             )
         } else {
             (

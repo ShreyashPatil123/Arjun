@@ -9,6 +9,5 @@ export const ROUTES = {
   SETTINGS: '/settings',
   SYSTEM: '/system',
   MODELS: '/models',
-  CHAT: '/chat',
   LORA: '/lora'
 };

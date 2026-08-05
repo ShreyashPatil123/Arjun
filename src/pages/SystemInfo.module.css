@@ -167,7 +167,7 @@
 
 .progressBarFill {
   height: 100%;
-  background: linear-gradient(90deg, #7C3AED 0%, #6366F1 100%);
+  background: linear-gradient(90deg, var(--accent-primary) 0%, var(--accent-secondary) 100%);
   border-radius: 4px;
   transition: width 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -180,9 +180,9 @@
 }
 
 .badgeTag {
-  background: rgba(124, 58, 237, 0.12);
-  color: #A78BFA;
-  border: 1px solid rgba(124, 58, 237, 0.25);
+  background: var(--accent-glow);
+  color: var(--accent-secondary);
+  border: 1px solid var(--accent-glow);
   font-size: 11px;
   font-weight: 600;
   padding: 3px 8px;
@@ -191,9 +191,9 @@
 }
 
 .overrideBadge {
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--warning-bg);
   color: var(--warning);
-  border: 1px solid rgba(245, 158, 11, 0.3);
+  border: 1px solid var(--warning-bg);
   font-size: 10px;
   font-weight: 600;
   padding: 1px 6px;
@@ -279,18 +279,18 @@
 }
 
 .warningBox {
-  background: rgba(245, 158, 11, 0.08);
-  border: 1px solid rgba(245, 158, 11, 0.25);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-bg);
 }
 
 .errorBox {
-  background: rgba(239, 68, 68, 0.08);
-  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: var(--error-bg);
+  border: 1px solid var(--error-bg);
 }
 
 .recBox {
-  background: rgba(99, 102, 241, 0.08);
-  border: 1px solid rgba(99, 102, 241, 0.25);
+  background: var(--accent-glow);
+  border: 1px solid var(--accent-glow);
 }
 
 .diagTitle {
@@ -302,15 +302,15 @@
 }
 
 .warningBox .diagTitle {
-  color: #FBBF24;
+  color: var(--warning);
 }
 
 .errorBox .diagTitle {
-  color: #F87171;
+  color: var(--error);
 }
 
 .recBox .diagTitle {
-  color: #818CF8;
+  color: var(--accent-secondary);
 }
 
 .diagList {
@@ -367,12 +367,12 @@
 
 /* Bottom Primary Action Banner */
 .findModelsBanner {
-  background: linear-gradient(135deg, rgba(124, 58, 237, 0.12) 0%, rgba(99, 102, 241, 0.12) 100%);
-  border: 1px solid rgba(124, 58, 237, 0.35);
+  background: linear-gradient(135deg, var(--accent-glow) 0%, var(--accent-glow) 100%);
+  border: 1px solid var(--accent-glow);
   border-radius: 12px;
   padding: 24px 28px;
   margin-top: 8px;
-  box-shadow: 0 4px 20px rgba(124, 58, 237, 0.08);
+  box-shadow: 0 4px 20px var(--accent-glow);
 }
 
 .bannerContent {
@@ -416,13 +416,13 @@
   font-weight: 600;
   padding: 12px 24px;
   border-radius: 8px;
-  box-shadow: 0 4px 14px rgba(124, 58, 237, 0.3);
+  box-shadow: 0 4px 14px var(--accent-glow);
   transition: transform 150ms ease, box-shadow 150ms ease;
 }
 
 .bannerButton:hover {
   transform: translateY(-1px);
-  box-shadow: 0 6px 20px rgba(124, 58, 237, 0.45);
+  box-shadow: 0 6px 20px var(--accent-glow);
 }
 
 @keyframes spin {

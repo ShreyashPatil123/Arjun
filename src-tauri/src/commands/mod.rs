@@ -5,3 +5,7 @@ pub mod download;
 pub mod adapter;
 pub mod inference;
 pub mod intelligence;
+pub mod launcher;
+pub mod catalog;
+pub mod adapter_details;
+pub mod adapters;

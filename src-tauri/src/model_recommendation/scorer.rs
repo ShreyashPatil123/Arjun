@@ -14,6 +14,31 @@ use crate::model_recommendation::runtime;
 /// Context checkpoints to evaluate (in tokens)
 const CONTEXT_CHECKPOINTS: &[u32] = &[2048, 4096, 8192, 16384, 32768, 65536, 131072];
 
+/// Below this share of free memory a configuration is considered unsafe —
+/// allocator fragmentation and transient buffers can push it over the edge.
+const MIN_SAFE_HEADROOM: f64 = 0.05;
+
+/// Headroom at which a configuration is comfortably safe, and the bar
+/// [`assign_category`] uses for `Recommended`.
+///
+/// Single source of truth on purpose. When the scorer and the grader defined
+/// "comfortable" separately, the scorer optimised straight to the grader's
+/// threshold and then landed a hair under it, so its own best pick was graded
+/// down to `Compatible`.
+const COMFORTABLE_HEADROOM: f64 = 0.15;
+
+/// Scoring target, deliberately above [`COMFORTABLE_HEADROOM`].
+///
+/// The scorer maximises until the memory term saturates, so saturating exactly
+/// at the grading threshold guarantees decisions on the boundary. Saturating a
+/// little above keeps chosen configurations clear of the cliff edge.
+const HEADROOM_SCORING_TARGET: f64 = 0.20;
+
+/// Smallest context that can serve a real coding request. Below this, a model
+/// cannot hold a typical system prompt plus a file, so it is penalised even
+/// when it fits memory easily.
+const MIN_USEFUL_CONTEXT: u32 = 4096;
+
 /// Evaluate all configurations for a single model against the memory budget.
 /// Returns the best ModelRecommendation, or None if the model cannot fit at all.
 pub fn evaluate_model(
@@ -212,11 +237,22 @@ pub fn evaluate_model(
 /// Compute a deterministic score for a configuration.
 /// Score = (memory_fit × 0.30) + (quant_quality × 0.35) + (context × 0.15) + (accel × 0.20) - quant_penalty
 fn compute_score(config: &EvaluatedConfiguration, quant: &QuantizationSpec, model: &ModelMetadata) -> f64 {
-    // Memory fit: headroom ratio scaled (20% headroom = 1.0; penalty for <5% headroom)
-    let memory_fit = if config.headroom_ratio < 0.05 {
+    // Headroom is a safety requirement, not a prize.
+    //
+    // This previously scored `headroom * 5.0`, so emptier VRAM always scored
+    // higher. Since a larger context costs memory, the smallest context won
+    // every time — the engine recommended 2048 tokens on cards that could
+    // comfortably hold 8192. Coding tools routinely send prompts longer than
+    // 2048 tokens, so those recommendations were unusable in practice.
+    //
+    // Headroom now saturates: once a configuration is comfortably safe, extra
+    // unused VRAM earns nothing, because unused capacity is not a benefit.
+    let memory_fit = if config.headroom_ratio < MIN_SAFE_HEADROOM {
         0.10
     } else {
-        (config.headroom_ratio * 5.0).min(1.0)
+        ((config.headroom_ratio - MIN_SAFE_HEADROOM)
+            / (HEADROOM_SCORING_TARGET - MIN_SAFE_HEADROOM))
+            .min(1.0)
     };
 
     // Quantization quality: normalized from quality_rank (Q8=0.8, Q5=0.6, Q4=0.5, Q2=0.2)
@@ -248,7 +284,35 @@ fn compute_score(config: &EvaluatedConfiguration, quant: &QuantizationSpec, mode
         _ => 0.0,
     };
 
-    (((memory_fit * 0.30 + quant_quality * 0.35 + context_score * 0.15 + accel_score * 0.20) - quant_penalty - offload_penalty) * 100.0).max(0.0)
+    // A context this small cannot hold a realistic request. Claude Code,
+    // opencode, and similar tools send system prompts plus file content that
+    // routinely exceed 2048 tokens, so such a configuration would fail on the
+    // first real use no matter how comfortably it fits in memory.
+    let short_context_penalty = if config.context_length < MIN_USEFUL_CONTEXT {
+        0.30
+    } else {
+        0.0
+    };
+
+    // Dropping under the bar the grader uses for `Recommended` must cost more
+    // than a context step can win back. Without this the scorer trades headroom
+    // for context until it lands just below the threshold, producing its own
+    // highest-scoring configuration and then having it graded `Compatible`.
+    let below_recommended_penalty = if config.headroom_ratio < COMFORTABLE_HEADROOM {
+        0.15
+    } else {
+        0.0
+    };
+
+    // Context carries the same weight as memory fit: a model that fits but
+    // cannot hold a prompt is not actually usable.
+    (((memory_fit * 0.20 + quant_quality * 0.30 + context_score * 0.30 + accel_score * 0.20)
+        - quant_penalty
+        - offload_penalty
+        - short_context_penalty
+        - below_recommended_penalty)
+        * 100.0)
+        .max(0.0)
 }
 
 /// Assign a FitCategory based on configuration characteristics.
@@ -258,9 +322,13 @@ fn assign_category(config: &EvaluatedConfiguration) -> FitCategory {
         RunMode::GpuWithCpuOffload { offload_fraction, .. } if *offload_fraction <= 0.20
     );
 
-    if config.headroom_ratio >= 0.15 && (is_pure_gpu || is_light_offload) && config.quantization.quality_rank >= 4 {
+    // Same constants the scorer optimises against — see COMFORTABLE_HEADROOM.
+    if config.headroom_ratio >= COMFORTABLE_HEADROOM
+        && (is_pure_gpu || is_light_offload)
+        && config.quantization.quality_rank >= 4
+    {
         FitCategory::Recommended
-    } else if config.headroom_ratio >= 0.05 && config.quantization.quality_rank >= 3 {
+    } else if config.headroom_ratio >= MIN_SAFE_HEADROOM && config.quantization.quality_rank >= 3 {
         FitCategory::Compatible
     } else {
         FitCategory::MayRun
@@ -388,6 +456,119 @@ mod tests {
                 usable_for_inference: 12 * GB, ram_speed_mts: Some(5600),
             },
         }
+    }
+
+    /// A 4 GB RTX 3050 Laptop — the machine that surfaced the 2048-token bug.
+    fn make_budget_4gb_laptop() -> MemoryBudget {
+        MemoryBudget {
+            gpu_budgets: vec![GpuMemoryBudget {
+                gpu_index: 0, gpu_model: "RTX 3050 Laptop".into(), gpu_type: GpuType::Dedicated,
+                total_dedicated_vram: 4 * GB, usable_dedicated_vram: 3400 * 1024 * 1024,
+                total_shared_memory: 8 * GB, usable_shared_memory: 4 * GB,
+                cuda_available: true, rocm_available: false, vulkan_available: true,
+                directml_available: true, compute_capability: Some("8.6".into()),
+            }],
+            system_ram: SystemRamBudget {
+                total_bytes: 16 * GB, available_bytes: 8 * GB,
+                usable_for_inference: 6 * GB, ram_speed_mts: Some(3200),
+            },
+        }
+    }
+
+    #[test]
+    fn regression_small_models_are_not_pinned_to_a_2048_context() {
+        // The scorer used to reward free VRAM linearly, so the smallest context
+        // always won: a 4 GB card was told to run a ~2 B model at 2048 tokens
+        // while several GB sat unused. Coding tools send longer prompts than
+        // that, so the recommendation was unusable.
+        let budget = make_budget_4gb_laptop();
+        let config = EstimatorConfig::default();
+
+        let small: Vec<_> = bootstrap_models()
+            .into_iter()
+            .filter(|m| m.total_parameters <= 4_000_000_000 && m.max_context_length >= 8192)
+            .collect();
+        assert!(!small.is_empty(), "need a small model to exercise this");
+
+        for model in small {
+            if let Some(rec) = evaluate_model(&model, &budget, &config) {
+                assert!(
+                    rec.recommended_context >= MIN_USEFUL_CONTEXT,
+                    "{} recommended only {} tokens on a 4 GB card (max {})",
+                    rec.model_name,
+                    rec.recommended_context,
+                    rec.max_possible_context
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extra_headroom_beyond_comfortable_stops_adding_score() {
+        // Unused VRAM is not a benefit. Two configurations that are both
+        // comfortably safe should score identically on the memory dimension,
+        // so the decision falls to quantization and context instead.
+        let quant = estimator::quantization_hierarchy()
+            .into_iter()
+            .find(|q| q.label == "Q4_K_M")
+            .expect("Q4_K_M exists");
+        let model = bootstrap_models().into_iter().next().expect("catalog non-empty");
+
+        let make = |headroom: f64| EvaluatedConfiguration {
+            quantization: quant.clone(),
+            context_length: 8192,
+            run_mode: RunMode::PureGpu { gpu_index: 0 },
+            backend: InferenceBackend::LlamaCppGguf,
+            weight_memory_bytes: GB,
+            kv_cache_memory_bytes: GB / 2,
+            overhead_memory_bytes: GB / 8,
+            total_memory_bytes: 2 * GB,
+            vram_required_bytes: 2 * GB,
+            ram_required_bytes: 0,
+            shared_mem_required_bytes: 0,
+            headroom_ratio: headroom,
+            fits: true,
+        };
+
+        let at_target = compute_score(&make(HEADROOM_SCORING_TARGET), &quant, &model);
+        let very_empty = compute_score(&make(0.60), &quant, &model);
+
+        assert_eq!(
+            at_target, very_empty,
+            "60% free VRAM must not outrank {:.0}% — that bias caused the 2048-token bug",
+            HEADROOM_SCORING_TARGET * 100.0
+        );
+    }
+
+    #[test]
+    fn an_unsafe_configuration_still_scores_poorly() {
+        // Saturating headroom must not remove the safety floor.
+        let quant = estimator::quantization_hierarchy()
+            .into_iter()
+            .find(|q| q.label == "Q4_K_M")
+            .expect("Q4_K_M exists");
+        let model = bootstrap_models().into_iter().next().expect("catalog non-empty");
+
+        let make = |headroom: f64| EvaluatedConfiguration {
+            quantization: quant.clone(),
+            context_length: 8192,
+            run_mode: RunMode::PureGpu { gpu_index: 0 },
+            backend: InferenceBackend::LlamaCppGguf,
+            weight_memory_bytes: GB,
+            kv_cache_memory_bytes: GB / 2,
+            overhead_memory_bytes: GB / 8,
+            total_memory_bytes: 2 * GB,
+            vram_required_bytes: 2 * GB,
+            ram_required_bytes: 0,
+            shared_mem_required_bytes: 0,
+            headroom_ratio: headroom,
+            fits: true,
+        };
+
+        assert!(
+            compute_score(&make(0.02), &quant, &model) < compute_score(&make(0.15), &quant, &model),
+            "a 2% headroom configuration is risky and must score below a safe one"
+        );
     }
 
     fn make_budget_cpu_only_8gb() -> MemoryBudget {
@@ -586,7 +767,16 @@ mod tests {
         let recs = generate_all_recommendations(&models, &budget, &EstimatorConfig::default());
         assert!(!recs.is_empty());
         let llama_8b = recs.iter().find(|r| r.model_id == "meta-llama/Llama-3.1-8B").unwrap();
-        assert_eq!(llama_8b.category, FitCategory::Recommended);
+        assert_eq!(
+            llama_8b.category,
+            FitCategory::Recommended,
+            "8B on a 24 GB card should be a comfortable fit — chose {} @ {} tokens, \
+             {:.1}% headroom, {:.2} GB total",
+            llama_8b.quantization,
+            llama_8b.recommended_context,
+            llama_8b.headroom_percent,
+            llama_8b.estimated_total_memory_bytes as f64 / 1_073_741_824.0
+        );
     }
 
     #[test]

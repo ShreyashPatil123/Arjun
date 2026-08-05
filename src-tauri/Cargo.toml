@@ -9,6 +9,42 @@ edition = "2021"
 name = "sarathi_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Default is CPU-only so the project builds without a CUDA/Vulkan SDK present.
+#
+# GPU acceleration is OPT-IN. `llama-cpp-sys-2` compiles llama.cpp with
+# `GGML_CUDA=OFF` unless the `cuda` feature is set (build.rs:910) — there is no
+# autodetection. Without one of these features every `--n-gpu-layers` value is
+# silently ignored and inference runs entirely on CPU.
+#
+#   cargo build --features cuda     # requires the full CUDA Toolkit (nvcc)
+#   cargo build --features vulkan   # requires the Vulkan SDK
+# GPU acceleration is OPT-IN. Without it llama.cpp silently ignores every
+# `n_gpu_layers` request and runs entirely on CPU — the runtime logs a warning
+# saying so rather than pretending otherwise.
+#
+#   cargo build --features cuda     # needs the CUDA Toolkit (nvcc)
+#   cargo build --features vulkan   # needs the Vulkan SDK
+#
+# CUDA has a host-compiler constraint that is easy to trip over: nvcc rejects
+# MSVC newer than Visual Studio 2022. On a machine with VS 18 (MSVC 19.51) and
+# CUDA 12.6 the build fails with:
+#
+#   nvcc fatal: unsupported Microsoft Visual Studio version! Only the versions
+#   between 2017 and 2022 (inclusive) are supported!
+#
+# Fixes, in order of preference:
+#   1. Install VS 2022 Build Tools alongside, and point CMake at that host
+#      compiler via CMAKE_CUDA_HOST_COMPILER.
+#   2. Use `--features vulkan` instead — no host-compiler version constraint.
+#
+# `-allow-unsupported-compiler` also silences the check, but nvcc warns it may
+# cause "incorrect run time execution". Wrong GPU kernels mean silently wrong
+# model output, so it is not used here.
+default = []
+cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -23,7 +59,9 @@ log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "fs", "io-util", "macros"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "fs", "io-util", "macros", "net"] }
+tokio-stream = "0.1"
+axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.30"
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }

@@ -91,19 +91,19 @@
 }
 
 .activeTab .tabBadge {
-  background: rgba(124, 58, 237, 0.2);
-  color: #A78BFA;
+  background: var(--accent-glow);
+  color: var(--accent-secondary);
 }
 
 .disclaimerBanner {
-  background: rgba(245, 158, 11, 0.08);
-  border: 1px solid rgba(245, 158, 11, 0.25);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-bg);
   border-radius: 8px;
   padding: 12px 16px;
   display: flex;
   align-items: center;
   gap: 10px;
-  color: #FBBF24;
+  color: var(--warning);
   font-size: 13px;
 }
 
@@ -138,9 +138,9 @@
 }
 
 .archBadge {
-  background: rgba(124, 58, 237, 0.12);
-  color: #A78BFA;
-  border: 1px solid rgba(124, 58, 237, 0.25);
+  background: var(--accent-glow);
+  color: var(--accent-secondary);
+  border: 1px solid var(--accent-glow);
   font-size: 11px;
   font-weight: 600;
   padding: 3px 8px;
@@ -191,7 +191,7 @@
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  color: #FBBF24;
+  color: var(--warning);
   font-size: 11px;
   margin-top: 6px;
 }
@@ -224,7 +224,7 @@
 
 .progressBarFill {
   height: 100%;
-  background: linear-gradient(90deg, #A78BFA 0%, #3B82F6 100%);
+  background: linear-gradient(90deg, var(--accent-secondary) 0%, var(--info) 100%);
   transition: width 200ms linear;
 }
 

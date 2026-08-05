@@ -16,7 +16,9 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
+use crate::ai_engine::lora_binding::LoraAdapterCache;
 use crate::ai_engine::traits::*;
+use crate::capability::CapabilityBackend;
 
 /// Core inference runtime wrapping llama.cpp via safe Rust bindings.
 ///
@@ -27,6 +29,9 @@ pub struct LlamaCppRuntime {
     model: Option<LlamaModel>,
     loaded_info: Option<LoadedModelInfo>,
     is_generating: Arc<AtomicBool>,
+    /// LoRA adapters initialised against the currently loaded model.
+    /// Cleared on unload — entries are only valid for the model they were built from.
+    adapter_cache: LoraAdapterCache,
 }
 
 impl LlamaCppRuntime {
@@ -37,6 +42,7 @@ impl LlamaCppRuntime {
             model: None,
             loaded_info: None,
             is_generating: Arc::new(AtomicBool::new(false)),
+            adapter_cache: LoraAdapterCache::new(),
         }
     }
 
@@ -114,9 +120,25 @@ impl LlamaCppRuntime {
             config.gpu_layers, config.threads
         );
 
+        // GPU offload only takes effect when llama.cpp was compiled with a GPU
+        // backend. Requesting layers without one is a silent no-op inside
+        // llama.cpp, which previously made CPU-only builds appear GPU-accelerated
+        // in the logs and the UI. Surface the mismatch instead of hiding it.
+        let gpu_backend_compiled = cfg!(any(feature = "cuda", feature = "vulkan"));
+        if config.gpu_layers > 0 && !gpu_backend_compiled {
+            log::warn!(
+                "[STAGE 4 RUNTIME WARN] {} GPU layers requested, but this binary was built \
+                 without a GPU backend — llama.cpp will ignore the request and run on CPU. \
+                 Rebuild with `--features cuda` (needs the CUDA Toolkit) or `--features vulkan`.",
+                config.gpu_layers
+            );
+        }
+
+        let effective_gpu_layers = if gpu_backend_compiled { config.gpu_layers } else { 0 };
+
         let model_params = {
             let mut params = LlamaModelParams::default();
-            params = params.with_n_gpu_layers(config.gpu_layers);
+            params = params.with_n_gpu_layers(effective_gpu_layers);
             params
         };
 
@@ -211,8 +233,10 @@ impl LlamaCppRuntime {
 
         let (model, actual_backend) = match model_result {
             Ok(m) => {
-                let desc = if config.gpu_layers > 0 {
-                    format!("llama.cpp (GPU offload: {} layers)", config.gpu_layers)
+                let desc = if effective_gpu_layers > 0 {
+                    format!("llama.cpp (GPU offload: {} layers)", effective_gpu_layers)
+                } else if config.gpu_layers > 0 {
+                    "llama.cpp (CPU — built without GPU backend)".to_string()
                 } else {
                     "llama.cpp (CPU)".to_string()
                 };
@@ -255,7 +279,8 @@ impl LlamaCppRuntime {
             quantization: config.quantization.clone(),
             file_path: config.model_path.clone(),
             context_length: config.context_length,
-            gpu_layers: config.gpu_layers,
+            // Report what was actually applied, not what was requested.
+            gpu_layers: effective_gpu_layers,
             threads: config.threads,
             backend_used: backend_desc,
             loaded_at: chrono::Utc::now().to_rfc3339(),
@@ -285,6 +310,11 @@ impl LlamaCppRuntime {
             log::info!("[RUNTIME] Unloading model: {} ({})", info.model_name, info.quantization);
         }
 
+        // Release adapter handles BEFORE dropping the model. Each adapter was
+        // initialised against this model; using one after the model is freed
+        // would dereference a dangling pointer.
+        self.adapter_cache.clear();
+
         // Drop model to free RAM/VRAM tensors
         self.model = None;
         self.loaded_info = None;
@@ -302,26 +332,55 @@ impl LlamaCppRuntime {
         &mut self,
         messages: &[ChatMessage],
         params: &GenerationParams,
+        token_cb: F,
+    ) -> Result<String>
+    where
+        F: FnMut(StreamChunk),
+    {
+        self.generate_with_capability(messages, params, None, token_cb)
+    }
+
+    /// Generates tokens with an optional capability backend applied.
+    ///
+    /// When `capability_backend` is [`CapabilityBackend::LoraAdapter`], the
+    /// adapter is bound to the freshly created context *before* the prompt is
+    /// decoded, so prefill and generation both run against adapted weights.
+    ///
+    /// A LoRA binding failure is never fatal: it is logged and generation
+    /// proceeds on the base model, matching the graceful-degradation contract
+    /// in [`crate::capability`].
+    pub fn generate_with_capability<F>(
+        &mut self,
+        messages: &[ChatMessage],
+        params: &GenerationParams,
+        capability_backend: Option<&CapabilityBackend>,
         mut token_cb: F,
     ) -> Result<String>
     where
         F: FnMut(StreamChunk),
     {
-        let model = self
-            .model
+        // Destructured so `adapter_cache` can be borrowed mutably while `model`
+        // is borrowed immutably — these are disjoint fields.
+        let Self {
+            backend,
+            model,
+            loaded_info,
+            is_generating,
+            adapter_cache,
+        } = self;
+
+        let model = model
             .as_ref()
             .ok_or_else(|| anyhow!("No model loaded"))?;
-        let backend = self
-            .backend
+        let backend = backend
             .as_ref()
             .ok_or_else(|| anyhow!("Backend not initialized"))?;
-        let config = self
-            .loaded_info
+        let config = loaded_info
             .as_ref()
             .ok_or_else(|| anyhow!("No model info available"))?;
 
-        self.is_generating.store(true, Ordering::Relaxed);
-        let cancel_flag = self.is_generating.clone();
+        is_generating.store(true, Ordering::Relaxed);
+        let cancel_flag = is_generating.clone();
 
         // Format messages into a prompt string dynamically using model's chat_template
         let prompt = format_chat_prompt_with_template(messages, &config.chat_template);
@@ -362,7 +421,7 @@ impl LlamaCppRuntime {
         log::info!("[RUNTIME] Prompt tokenized: {} tokens", n_prompt_tokens);
 
         if n_prompt_tokens == 0 {
-            self.is_generating.store(false, Ordering::Relaxed);
+            is_generating.store(false, Ordering::Relaxed);
             return Err(anyhow!("Empty prompt after tokenization"));
         }
 
@@ -377,6 +436,35 @@ impl LlamaCppRuntime {
         let mut ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow!("Failed to create inference context: {:?}", e))?;
+
+        // Bind the capability's LoRA adapter, if one was resolved.
+        //
+        // This must happen before the prefill decode below so the prompt is
+        // processed against the adapted weights. Because the context is created
+        // fresh for every generation, there is no stale binding to clear first.
+        let mut active_adapter_label: Option<String> = None;
+        if let Some(CapabilityBackend::LoraAdapter { path, scale }) = capability_backend {
+            match adapter_cache.get_or_init(model, path) {
+                Ok(adapter) => match crate::ai_engine::lora_binding::bind_adapter(&mut ctx, adapter, *scale) {
+                    Ok(()) => {
+                        let label = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "adapter".to_string());
+                        log::info!("[RUNTIME] Generating with LoRA adapter '{}' at scale {:.2}", label, scale);
+                        active_adapter_label = Some(label);
+                    }
+                    Err(e) => log::warn!(
+                        "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
+                        e
+                    ),
+                },
+                Err(e) => log::warn!(
+                    "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
+                    e
+                ),
+            }
+        }
 
         // Create batch and fill with prompt tokens
         let max_batch = (n_prompt_tokens + 1).max(512);
@@ -450,13 +538,26 @@ impl LlamaCppRuntime {
             effective_stop_tokens
         );
 
-        // Set up sampler chain directly consumed by llama.cpp
+        // Set up sampler chain directly consumed by llama.cpp.
+        //
+        // `penalties` must come first so repetition suppression applies to the
+        // full distribution before truncation. It was previously absent from the
+        // chain entirely, so `repeat_penalty` was logged above but never took
+        // effect — capability sampling profiles depend on it being real.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(1234);
+
         let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::penalties(64, params.repeat_penalty, 0.0, 0.0),
             LlamaSampler::temp(params.temperature),
             LlamaSampler::top_k(params.top_k as i32),
             LlamaSampler::top_p(params.top_p, 1),
             LlamaSampler::min_p(params.min_p, 1),
-            LlamaSampler::dist(1234),
+            // Previously a hardcoded seed, which made every regeneration of the
+            // same prompt byte-identical regardless of temperature.
+            LlamaSampler::dist(seed),
         ]);
 
         // Autoregressive generation loop
@@ -579,11 +680,12 @@ impl LlamaCppRuntime {
                 .map_err(|e| anyhow!("Decode failed at token {}: {:?}", n_generated, e))?;
         }
 
-        self.is_generating.store(false, Ordering::Relaxed);
+        is_generating.store(false, Ordering::Relaxed);
         log::info!(
-            "[RUNTIME] Generation complete: {} tokens, {} chars",
+            "[RUNTIME] Generation complete: {} tokens, {} chars, adapter={}",
             n_generated,
-            generated_text.len()
+            generated_text.len(),
+            active_adapter_label.as_deref().unwrap_or("none")
         );
 
         Ok(generated_text)
@@ -597,10 +699,6 @@ impl LlamaCppRuntime {
 }
 
 /// Formats chat messages into a prompt string based on Model Profile template.
-fn format_chat_prompt(messages: &[ChatMessage]) -> String {
-    format_chat_prompt_with_template(messages, "llama3")
-}
-
 pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name: &str) -> String {
     let mut prompt = String::new();
     let lower_temp = template_name.to_lowercase();
@@ -651,9 +749,8 @@ mod tests {
         assert!(runtime.loaded_model_info().is_none());
     }
 
-    #[test]
-    fn test_format_chat_prompt() {
-        let messages = vec![
+    fn sample_messages() -> Vec<ChatMessage> {
+        vec![
             ChatMessage {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
@@ -664,13 +761,47 @@ mod tests {
                 content: "Hello".to_string(),
                 timestamp: None,
             },
-        ];
-        let prompt = format_chat_prompt(&messages);
-        assert!(prompt.contains("### System:"));
+        ]
+    }
+
+    #[test]
+    fn chatml_template_uses_im_start_markers() {
+        let prompt = format_chat_prompt_with_template(&sample_messages(), "chatml");
+
+        assert!(prompt.contains("<|im_start|>system"));
         assert!(prompt.contains("You are helpful."));
-        assert!(prompt.contains("### User:"));
+        assert!(prompt.contains("<|im_start|>user"));
         assert!(prompt.contains("Hello"));
-        assert!(prompt.ends_with("### Assistant:\n"));
+        // Must end primed for the assistant turn, or the model continues the
+        // user's message instead of replying.
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn llama3_template_uses_header_markers() {
+        let prompt = format_chat_prompt_with_template(&sample_messages(), "llama3");
+
+        assert!(prompt.contains("<|start_header_id|>"));
+        assert!(prompt.contains("<|eot_id|>"));
+        assert!(prompt.contains("You are helpful."));
+        assert!(prompt.contains("Hello"));
+    }
+
+    #[test]
+    fn qwen_is_treated_as_chatml() {
+        let qwen = format_chat_prompt_with_template(&sample_messages(), "qwen");
+        let chatml = format_chat_prompt_with_template(&sample_messages(), "chatml");
+        assert_eq!(qwen, chatml);
+    }
+
+    #[test]
+    fn an_unknown_template_still_produces_a_usable_prompt() {
+        // Must never return empty: an empty prompt tokenizes to nothing and the
+        // runtime rejects the request outright.
+        let prompt = format_chat_prompt_with_template(&sample_messages(), "not-a-real-template");
+
+        assert!(!prompt.trim().is_empty());
+        assert!(prompt.contains("Hello"));
     }
 
     #[test]

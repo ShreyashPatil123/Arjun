@@ -892,17 +892,26 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub fn cancel_download(&self, task_id: &str) -> Result<()> {
+    /// Cancels a download and tells the UI it happened.
+    ///
+    /// The announcement matters: without it the only thing that removed the
+    /// progress bar was the clicking page hiding it optimistically, so a cancel
+    /// triggered any other way left a bar on screen for a download that no
+    /// longer existed — and a cancel that failed still cleared the bar.
+    pub fn cancel_download(&self, app_handle: &tauri::AppHandle, task_id: &str) -> Result<()> {
         log::info!("[DOWNLOAD_DIAGNOSTIC] Cancelling download for task {}", task_id);
         if let Some(sender) = self.cancel_senders.lock().unwrap().get(task_id) {
             let _ = sender.send(true);
         }
-        if let Some(task) = self.tasks.lock().unwrap().remove(task_id) {
+        if let Some(mut task) = self.tasks.lock().unwrap().remove(task_id) {
             let temp_path = PathBuf::from(&task.temp_path);
             if temp_path.exists() {
                 let _ = std::fs::remove_file(&temp_path);
                 log::info!("[DOWNLOAD_DIAGNOSTIC] Removed temporary .part file {:?}", temp_path);
             }
+
+            task.status = DownloadStatus::Cancelled;
+            self.broadcast_progress(app_handle, &task);
         }
         Ok(())
     }
