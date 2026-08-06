@@ -84,10 +84,40 @@ fn looks_like_full_model(filenames: &[String]) -> bool {
 /// check is [`crate::adapter_manager::gguf::verify_is_lora_adapter`], which
 /// reads what the downloaded file declares itself to be.
 pub fn check_installable(filenames: &[String]) -> Result<String> {
+    let sized: Vec<(String, u64)> = filenames.iter().map(|f| (f.clone(), 0)).collect();
+    check_installable_sized(&sized)
+}
+
+/// Largest a GGUF LoRA adapter is plausibly allowed to be.
+///
+/// An adapter stores low-rank deltas for a subset of layers — tens to a few
+/// hundred megabytes even for large bases. Anything of model scale is a merged
+/// checkpoint that happens to live in an adapter repository.
+const MAX_ADAPTER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// As [`check_installable`], but able to reject files too large to be adapters.
+///
+/// Sizes come from the Hub's blob listing. A size of `0` means unknown and the
+/// ceiling is not applied, so callers without sizes lose nothing.
+///
+/// Size matters because names and configs both lie in the same direction.
+/// `sandepaAI/sandepaAI_gemma4_coder_12b` is a real LoRA — `adapter_config.json`
+/// and `adapter_model.safetensors` — that also ships a 9.1 GB *merged* GGUF for
+/// people who want the whole thing. Vouching for its GGUF on the strength of the
+/// PEFT config offered that merged model as a "ready" 9.1 GB adapter. The right
+/// answer is that its only real adapter is safetensors, which needs converting.
+pub fn check_installable_sized(files: &[(String, u64)]) -> Result<String> {
+    let filenames: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let size_of = |name: &str| files.iter().find(|(n, _)| n == name).map(|(_, s)| *s).unwrap_or(0);
+    let adapter_sized = |name: &str| {
+        let s = size_of(name);
+        s == 0 || s <= MAX_ADAPTER_BYTES
+    };
+
     let ggufs: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".gguf")).collect();
 
     if !ggufs.is_empty() {
-        if looks_like_full_model(filenames) {
+        if looks_like_full_model(&filenames) {
             return Err(anyhow!(
                 "This page is labelled as an adapter, but it contains a complete model \
                  rather than an add-on skill. Install it from the Discover page as a \
@@ -97,19 +127,56 @@ pub fn check_installable(filenames: &[String]) -> Result<String> {
 
         // Repositories can hold several GGUFs. One named for LoRA is the
         // adapter; picking the first alphabetically could grab something else.
-        let chosen = ggufs
-            .iter()
-            .find(|f| {
-                let lower = f.to_ascii_lowercase();
-                lower.contains("lora") || lower.contains("adapter")
-            })
-            .copied()
-            .unwrap_or(ggufs[0]);
+        if let Some(named) = ggufs.iter().find(|f| {
+            let lower = f.to_ascii_lowercase();
+            (lower.contains("lora") || lower.contains("adapter")) && adapter_sized(f)
+        }) {
+            return Ok((*named).clone());
+        }
 
-        return Ok(chosen.clone());
+        // No GGUF names itself an adapter. A real one still declares itself
+        // through its PEFT config, so that is the last thing worth accepting —
+        // and only for a file small enough to be one.
+        let has_peft_config = filenames
+            .iter()
+            .any(|f| f.rsplit('/').next().unwrap_or(f).eq_ignore_ascii_case("adapter_config.json"));
+
+        if has_peft_config {
+            if let Some(small) = ggufs.iter().find(|f| adapter_sized(f)) {
+                return Ok((*small).clone());
+            }
+
+            // Its GGUFs are all model-sized. If the genuine adapter is here in
+            // PEFT form, say so rather than reporting no adapter at all.
+            if filenames.iter().any(|f| f.ends_with(".safetensors")) {
+                return Err(anyhow!(
+                    "This adapter is in PEFT safetensors format, which llama.cpp cannot load. \
+                     It needs converting to GGUF first — Sarathi cannot do that yet. \
+                     (The GGUF on this page is a merged model, not the adapter.)"
+                ));
+            }
+
+            return Err(anyhow!(
+                "The GGUF on this page is a merged model rather than the adapter itself. \
+                 Install it from the Discover page as a model instead."
+            ));
+        }
+
+        // Nothing here claims to be an adapter.
+        //
+        // Falling back to the first GGUF is what listed a 9 GB quantized
+        // fine-tune as a ready LoRA: repos that publish only GGUFs carry no
+        // safetensors for `looks_like_full_model` to catch, so a whole model
+        // slipped through as an "adapter" and its size was shown as the
+        // adapter's. A fine-tune is a model, and belongs on the Discover page.
+        return Err(anyhow!(
+            "This page publishes model files, not an add-on skill — none of its GGUFs \
+             is a LoRA adapter and it has no adapter_config.json. If it is a fine-tune, \
+             install it from the Discover page as a model instead."
+        ));
     }
 
-    let has_safetensors = filenames.iter().any(|f| f.ends_with(".safetensors"));
+    let has_safetensors = filenames.iter().any(|f: &String| f.ends_with(".safetensors"));
     if has_safetensors {
         return Err(anyhow!(
             "This adapter is in PEFT safetensors format, which llama.cpp cannot load. \
@@ -280,6 +347,77 @@ mod tests {
         ];
 
         assert_eq!(check_installable(&files).unwrap(), "my-adapter-lora-f16.gguf");
+    }
+
+    #[test]
+    fn a_gguf_only_finetune_is_not_offered_as_an_adapter() {
+        // The shape that produced a "9.1 GB LoRA adapter" in the browser: a
+        // fine-tune published only as quantized GGUFs. There are no safetensors
+        // for the full-model check to notice, and nothing names itself an
+        // adapter — so the old fallback to the first GGUF took the whole model.
+        let files = vec![
+            "README.md".to_string(),
+            "gemma4-coder-12b-Q6_K.gguf".to_string(),
+            "gemma4-coder-12b-Q4_K_M.gguf".to_string(),
+        ];
+
+        let err = check_installable(&files).unwrap_err().to_string();
+        assert!(err.contains("not an add-on skill"), "should say what it really is: {err}");
+        assert!(err.contains("Discover"), "should point at the right page: {err}");
+    }
+
+    #[test]
+    fn a_merged_model_beside_a_real_adapter_is_not_offered_as_the_adapter() {
+        // sandepaAI/sandepaAI_gemma4_coder_12b: a genuine LoRA that also ships
+        // the merged result. Its PEFT config vouched for the 9.1 GB GGUF, which
+        // the browser then listed as a "ready" adapter of that size.
+        let files = vec![
+            ("adapter_config.json".to_string(), 700),
+            ("adapter_model.safetensors".to_string(), 400_000_000),
+            ("sandepaAI_gemma4_coder_12b_Q6_K.gguf".to_string(), 9_100_000_000),
+        ];
+
+        let err = check_installable_sized(&files).unwrap_err().to_string();
+        assert!(err.contains("safetensors"), "should name the real adapter's format: {err}");
+        assert!(err.contains("merged model"), "should explain the GGUF: {err}");
+    }
+
+    #[test]
+    fn an_adapter_sized_gguf_beside_a_peft_config_is_still_accepted() {
+        let files = vec![
+            ("adapter_config.json".to_string(), 700),
+            ("gemma-heretic-f16.gguf".to_string(), 120_000_000),
+        ];
+        assert_eq!(check_installable_sized(&files).unwrap(), "gemma-heretic-f16.gguf");
+    }
+
+    #[test]
+    fn a_lora_named_file_of_model_scale_is_refused() {
+        // The name says adapter, the size says merged checkpoint.
+        let files = vec![
+            ("adapter_config.json".to_string(), 700),
+            ("my-model-lora-merged.gguf".to_string(), 8_000_000_000),
+        ];
+        assert!(check_installable_sized(&files).is_err());
+    }
+
+    #[test]
+    fn unknown_sizes_leave_the_name_rules_in_charge() {
+        // Callers without a blob listing must behave exactly as before.
+        let files = vec!["adapter_config.json".to_string(), "sql-lora-f16.gguf".to_string()];
+        assert_eq!(check_installable(&files).unwrap(), "sql-lora-f16.gguf");
+    }
+
+    #[test]
+    fn a_peft_config_still_vouches_for_an_oddly_named_gguf() {
+        // Some genuine adapters name their weights after the task rather than
+        // after LoRA. adapter_config.json is the author saying what it is.
+        let files = vec![
+            "adapter_config.json".to_string(),
+            "gemma-heretic-f16.gguf".to_string(),
+        ];
+
+        assert_eq!(check_installable(&files).unwrap(), "gemma-heretic-f16.gguf");
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::gateway::state::{GatewayState, GatewayStats};
 use crate::launcher::{
@@ -90,9 +90,18 @@ pub async fn get_launch_overview(
     let model = gateway.inference.get_loaded_model_info();
     let can_launch = model.is_some();
 
+    // Reported from whether the server is actually up, not assumed.
+    //
+    // The handle is only managed once a listener is bound, so its presence is
+    // the fact rather than an inference. Passing `true` unconditionally meant
+    // the dashboard read "Running" while nothing was listening — which is
+    // exactly the state a client sees as ConnectionRefused, with the one screen
+    // that could have explained it insisting the server was fine.
+    let gateway_running = app.try_state::<crate::gateway::GatewayHandle>().is_some();
+
     Ok(LaunchOverview {
         tools,
-        gateway: gateway.stats(true),
+        gateway: gateway.stats(gateway_running),
         warnings: reg.warnings,
         can_launch,
         blocked_reason: (!can_launch)
@@ -139,10 +148,22 @@ pub async fn install_tool(app: AppHandle, tool_id: String) -> Result<(), String>
         .ok_or_else(|| format!("no tool called '{tool_id}'"))?
         .clone();
 
-    // Installs are slow and run an external program.
-    tokio::task::spawn_blocking(move || launcher::install(&spec))
-        .await
-        .map_err(|e| format!("install task failed: {e}"))?
+    // Installs are slow and run an external program. Each line the package
+    // manager prints is forwarded to the UI as it arrives, so the card can show
+    // what is actually happening instead of a spinner with no end in sight.
+    let emitter = app.clone();
+    let progress_id = tool_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        launcher::install(&spec, |line| {
+            let _ = emitter.emit(
+                "tool:install-progress",
+                serde_json::json!({ "toolId": progress_id, "line": line }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("install task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -152,9 +173,9 @@ pub async fn launch_tool(
     procs: State<'_, Arc<LaunchedProcesses>>,
     tool_id: String,
 ) -> Result<u32, String> {
-    if gateway.inference.get_loaded_model_info().is_none() {
+    let Some(model) = gateway.inference.get_loaded_model_info() else {
         return Err("Load a model first — the tool would connect but get no answer.".into());
-    }
+    };
 
     let reg = resolve_registry(&app);
     let spec = reg
@@ -164,15 +185,38 @@ pub async fn launch_tool(
         .ok_or_else(|| format!("no tool called '{tool_id}'"))?
         .clone();
 
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not locate the Sarathi data directory: {e}"))?;
+
+    // One workspace shared by every tool, and a private config directory per
+    // tool. Two tools launched together therefore open on the same files while
+    // keeping their own provider state isolated from each other and from the
+    // user's own installs.
+    let workspace = data_dir.join("workspace");
+    let client_dir = data_dir.join("clients").join(&tool_id);
+
     // The live port, not the configured one: they differ if the configured
-    // port was taken and the gateway bound elsewhere.
+    // port was taken and the gateway bound elsewhere. Model likewise comes from
+    // what is loaded right now, so the tool cannot open on a stale one.
     let port = gateway.port();
-    let pid = tokio::task::spawn_blocking(move || launcher::launch(&spec, port))
+    let ctx = launcher::spec::LaunchContext {
+        port,
+        model_id: model.model_id.clone(),
+        model_name: model.model_name.clone(),
+        client_dir: client_dir.to_string_lossy().to_string(),
+    };
+    let model_label = model.model_name.clone();
+
+    let pid = tokio::task::spawn_blocking(move || launcher::launch(&spec, &ctx, &workspace))
         .await
         .map_err(|e| format!("launch task failed: {e}"))??;
 
     procs.record(&tool_id, pid);
-    log::info!("[LAUNCH] Started '{tool_id}' (pid {pid}) connected to port {port}");
+    log::info!(
+        "[LAUNCH] Started '{tool_id}' (pid {pid}) as a Sarathi client on port {port}, serving '{model_label}'"
+    );
     Ok(pid)
 }
 

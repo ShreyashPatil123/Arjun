@@ -48,8 +48,46 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
         }
     }
 
+    let nvidia_metrics = query_nvidia_smi().unwrap_or_default();
+
+    // 2.5 Non-Windows primary detection: DXGI/CIM are Windows-only, so on
+    // Linux/WSL2/macOS nvidia-smi is the primary source, not just an enricher.
+    let mut built_from_nvidia_smi = false;
+    if cfg!(not(target_os = "windows")) && gpus.is_empty() && !nvidia_metrics.is_empty() {
+        log::info!(
+            "[SYSTEM ANALYZER DEBUG] ✓ nvidia-smi enumerated {} NVIDIA GPU(s) (non-Windows primary source)",
+            nvidia_metrics.len()
+        );
+        for nv in &nvidia_metrics {
+            gpus.push(GpuInfo {
+                vendor: "NVIDIA".to_string(),
+                model: nv.model.clone(),
+                gpu_type: "Dedicated".to_string(),
+                is_dedicated: true,
+                dedicated_video_memory_bytes: nv.vram_total_bytes,
+                dedicated_system_memory_bytes: 0,
+                shared_system_memory_bytes: 0,
+                total_available_graphics_memory_bytes: nv.vram_total_bytes,
+                vram_total_bytes: nv.vram_total_bytes,
+                vram_free_bytes: nv.vram_free_bytes,
+                driver_version: nv.driver_version.clone(),
+                vendor_id: Some(0x10DE),
+                device_id: None,
+                compute_capability: nv.compute_capability.clone(),
+                cuda_supported: true,
+                rocm_supported: false,
+                directx_supported: false,
+                vulkan_supported: true,
+                opencl_supported: true,
+                detection_source: "nvidia-smi".to_string(),
+                confidence: "High".to_string(),
+            });
+        }
+        built_from_nvidia_smi = true;
+    }
+
     // 3. Vendor Enrichment: Enrich NVIDIA GPUs with NVML / nvidia-smi telemetry
-    if let Ok(nvidia_metrics) = query_nvidia_smi() {
+    if !nvidia_metrics.is_empty() && !built_from_nvidia_smi {
         for gpu in &mut gpus {
             if gpu.vendor == "NVIDIA" || gpu.vendor_id == Some(0x10DE) {
                 if let Some(nv) = nvidia_metrics.iter().find(|m| m.model.eq_ignore_ascii_case(&gpu.model)).or_else(|| nvidia_metrics.first()) {

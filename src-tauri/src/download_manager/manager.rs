@@ -20,6 +20,57 @@ use crate::model_providers::huggingface::resolver;
 use crate::model_providers::huggingface::adapter_provider::HuggingFaceAdapterProvider;
 use crate::adapter_manager::{AdapterRegistry, ModelPackageManifest, BaseManifestInfo, AdapterManifestInfo, AdapterState, log_adapter_transition};
 
+/// How many times a dropped connection is retried before the task fails.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
+
+/// Result of a single streaming attempt.
+enum StreamOutcome {
+    /// The stream reached its end.
+    Finished { downloaded: u64, expected: u64 },
+    /// Pause or cancel was signalled; the partial file is left in place.
+    Interrupted,
+}
+
+/// Distinguishes failures worth retrying from failures worth reporting.
+enum StreamError {
+    /// Connection-level problem — resume and try again.
+    Transient(anyhow::Error),
+    /// Will not improve on retry (bad URL, auth failure, disk error).
+    Fatal(anyhow::Error),
+}
+
+impl StreamError {
+    fn transient(e: impl Into<anyhow::Error>) -> Self {
+        Self::Transient(e.into())
+    }
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(e) | Self::Fatal(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+/// Extracts the first byte offset from a `Content-Range: bytes <start>-<end>/<total>` header.
+///
+/// Used to confirm a 206 actually resumes where we asked; a server may return
+/// partial content from a different offset than requested.
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 pub struct DownloadManager {
     tasks: Arc<Mutex<HashMap<String, DownloadTask>>>,
     cancel_senders: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
@@ -604,10 +655,13 @@ impl DownloadManager {
         let destination_path = storage_dir.join(&file_name);
         let temp_path = storage_dir.join(format!("{}.part", file_name));
 
-        // Check if final ready file already exists
+        // Check if final ready file already exists.
+        //
+        // An unknown artifact size is not evidence that whatever is on disk is
+        // complete — treating it as such marked truncated files as ready.
         if destination_path.exists() {
             let metadata = tokio::fs::metadata(&destination_path).await?;
-            if artifact.size_bytes == 0 || metadata.len() == artifact.size_bytes {
+            if artifact.size_bytes > 0 && metadata.len() == artifact.size_bytes {
                 log::info!("[DOWNLOAD_DIAGNOSTIC] Model artifact already downloaded & verified at {:?}", destination_path);
                 let completed_task = DownloadTask {
                     id: task_id.clone(),
@@ -675,11 +729,15 @@ impl DownloadManager {
             status: DownloadStatus::Downloading,
             speed_bps: 0.0,
             eta_seconds: None,
-            checksum: artifact.sha256,
+            checksum: artifact.sha256.clone(),
             error: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
+
+        // HuggingFace's LFS object id is the file's SHA-256, so it doubles as the
+        // integrity check the downloader never previously performed.
+        let expected_sha256 = artifact.sha256;
 
         self.tasks.lock().unwrap().insert(task_id.clone(), task.clone());
         self.broadcast_progress(&app_handle, &task);
@@ -705,6 +763,7 @@ impl DownloadManager {
                 total_bytes,
                 initial_bytes,
                 hf_token,
+                expected_sha256,
                 cancel_rx,
                 tasks_map.clone(),
             )
@@ -737,107 +796,85 @@ impl DownloadManager {
         expected_total_bytes: u64,
         initial_bytes: u64,
         hf_token: Option<String>,
-        mut cancel_rx: watch::Receiver<bool>,
+        expected_sha256: Option<String>,
+        cancel_rx: watch::Receiver<bool>,
         tasks: Arc<Mutex<HashMap<String, DownloadTask>>>,
     ) -> Result<()> {
         let client = reqwest::Client::builder()
             .user_agent("Sarathi/0.1.0 (Windows; x64)")
             .build()?;
 
-        let mut req = client.get(url);
-        if let Some(token) = &hf_token {
-            if !token.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", token.trim()));
-            }
-        }
+        let mut expected_total = expected_total_bytes;
+        let mut resume_from = initial_bytes;
+        let mut attempt: u32 = 0;
 
-        if initial_bytes > 0 {
-            req = req.header("Range", format!("bytes={}-", initial_bytes));
-            log::info!("[DOWNLOAD_DIAGNOSTIC] Requesting Range: bytes={}- for task {}", initial_bytes, task_id);
-        }
+        // A dropped connection mid-transfer is ordinary on a multi-gigabyte
+        // download and used to fail the whole task outright. Each retry resumes
+        // from whatever actually reached disk.
+        let downloaded = loop {
+            attempt += 1;
 
-        let resp = req.send().await?;
-        log::info!("[DOWNLOAD_DIAGNOSTIC] HTTP response received: status={}, Content-Length={:?}", 
-            resp.status(), resp.headers().get(reqwest::header::CONTENT_LENGTH));
-
-        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(anyhow!("HTTP error response: {}", resp.status()));
-        }
-
-        // Open temp file for appending
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(temp_path)
-            .await?;
-
-        let mut stream = resp.bytes_stream();
-        let mut downloaded = initial_bytes;
-        let mut last_sample_time = Instant::now();
-        let mut last_sample_bytes = initial_bytes;
-        let mut last_broadcast = Instant::now();
-
-        // Broadcast initial progress immediately upon connection
-        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = downloaded;
-            if expected_total_bytes > 0 {
-                task.total_bytes = expected_total_bytes;
-            }
-            let _ = app_handle.emit("download:progress", Self::make_payload(task));
-        }
-
-        while let Some(chunk_res) = stream.next().await {
-            // Check cancellation / pause
-            if *cancel_rx.borrow() {
-                file.flush().await?;
-                log::info!("[DOWNLOAD_DIAGNOSTIC] Pause/Cancel signal received for task {}", task_id);
-                return Ok(());
-            }
-
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(e) => return Err(anyhow!("Network error while streaming chunks: {}", e)),
-            };
-
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-
-            let now = Instant::now();
-            let sample_elapsed = now.duration_since(last_sample_time).as_secs_f64();
-
-            if sample_elapsed >= 0.25 {
-                let bytes_diff = downloaded.saturating_sub(last_sample_bytes);
-                let speed_bps = if sample_elapsed > 0.0 { bytes_diff as f64 / sample_elapsed } else { 0.0 };
-                let remaining_bytes = expected_total_bytes.saturating_sub(downloaded);
-                let eta_seconds = if speed_bps > 0.0 {
-                    Some((remaining_bytes as f64 / speed_bps) as u64)
-                } else {
-                    None
-                };
-
-                last_sample_time = now;
-                last_sample_bytes = downloaded;
-
-                if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-                    task.downloaded_bytes = downloaded;
-                    if expected_total_bytes > 0 {
-                        task.total_bytes = expected_total_bytes;
+            match Self::stream_once(
+                app_handle,
+                &client,
+                task_id,
+                url,
+                temp_path,
+                expected_total,
+                resume_from,
+                hf_token.as_deref(),
+                &cancel_rx,
+                &tasks,
+            )
+            .await
+            {
+                Ok(StreamOutcome::Interrupted) => {
+                    log::info!("[DOWNLOAD_DIAGNOSTIC] Pause/Cancel signal received for task {}", task_id);
+                    return Ok(());
+                }
+                Ok(StreamOutcome::Finished { downloaded, expected }) => {
+                    if expected > 0 {
+                        expected_total = expected;
                     }
-                    task.speed_bps = if speed_bps.is_nan() || speed_bps.is_infinite() { 0.0 } else { speed_bps };
-                    task.eta_seconds = eta_seconds;
-                    task.updated_at = chrono::Utc::now().to_rfc3339();
+                    break downloaded;
+                }
+                Err(StreamError::Fatal(e)) => return Err(e),
+                Err(StreamError::Transient(e)) => {
+                    if attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                        return Err(anyhow!(
+                            "Download failed after {} attempts. Last error: {}",
+                            attempt, e
+                        ));
+                    }
 
-                    if now.duration_since(last_broadcast) >= Duration::from_millis(250) {
+                    // Re-read from disk rather than trusting an in-memory count:
+                    // buffered bytes may not have landed when the stream broke.
+                    resume_from = tokio::fs::metadata(temp_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    let backoff = Duration::from_secs(2u64.pow(attempt.min(4)));
+                    log::warn!(
+                        "[DOWNLOAD_DIAGNOSTIC] Task {} attempt {}/{} failed ({}). Resuming from byte {} in {:?}",
+                        task_id, attempt, MAX_DOWNLOAD_ATTEMPTS, e, resume_from, backoff
+                    );
+
+                    if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+                        task.speed_bps = 0.0;
+                        task.error = Some(format!("Connection lost — retrying ({}/{})", attempt, MAX_DOWNLOAD_ATTEMPTS));
+                        task.updated_at = chrono::Utc::now().to_rfc3339();
                         let _ = app_handle.emit("download:progress", Self::make_payload(task));
-                        last_broadcast = now;
+                    }
+
+                    tokio::time::sleep(backoff).await;
+
+                    if *cancel_rx.borrow() {
+                        return Ok(());
                     }
                 }
             }
-        }
-
-        file.flush().await?;
-        drop(file);
+        };
 
         // Verification step
         log::info!("[DOWNLOAD_DIAGNOSTIC] Streaming finished for task {}. Updating status to Verifying...", task_id);
@@ -845,17 +882,41 @@ impl DownloadManager {
             task.downloaded_bytes = downloaded;
             task.status = DownloadStatus::Verifying;
             task.speed_bps = 0.0;
+            task.error = None;
             task.updated_at = chrono::Utc::now().to_rfc3339();
             let _ = app_handle.emit("download:progress", Self::make_payload(task));
         }
 
         let final_size = tokio::fs::metadata(temp_path).await?.len();
-        if expected_total_bytes > 0 && final_size != expected_total_bytes {
+        if expected_total > 0 && final_size != expected_total {
             return Err(anyhow!(
                 "Integrity verification failed: expected {} bytes, actual {} bytes",
-                expected_total_bytes,
+                expected_total,
                 final_size
             ));
+        }
+
+        // Refuse to finalize something that was never checked. A model file that
+        // is silently short still loads far enough to produce fluent nonsense,
+        // which is much harder to diagnose than a failed download.
+        if expected_total == 0 && expected_sha256.is_none() {
+            return Err(anyhow!(
+                "Cannot verify this download: the server reported neither a size nor a checksum. \
+                 Refusing to install an unverified model file."
+            ));
+        }
+
+        if let Some(expected_hash) = &expected_sha256 {
+            let actual = Self::hash_file_sha256(temp_path).await?;
+            if !actual.eq_ignore_ascii_case(expected_hash) {
+                let _ = tokio::fs::remove_file(temp_path).await;
+                return Err(anyhow!(
+                    "Checksum verification failed: expected SHA-256 {}, got {}. \
+                     The partial file has been discarded; start the download again.",
+                    expected_hash, actual
+                ));
+            }
+            log::info!("[DOWNLOAD_DIAGNOSTIC] ✓ SHA-256 verified for task {}: {}", task_id, actual);
         }
 
         // Atomic rename .part -> final file
@@ -877,6 +938,204 @@ impl DownloadManager {
         }
 
         Ok(())
+    }
+
+    /// Streams the artifact once, appending to `temp_path`.
+    ///
+    /// Returns [`StreamOutcome::Interrupted`] on pause/cancel, and distinguishes
+    /// transient failures (worth resuming) from fatal ones (worth reporting).
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_once(
+        app_handle: &tauri::AppHandle,
+        client: &reqwest::Client,
+        task_id: &str,
+        url: &str,
+        temp_path: &Path,
+        expected_total_bytes: u64,
+        resume_from: u64,
+        hf_token: Option<&str>,
+        cancel_rx: &watch::Receiver<bool>,
+        tasks: &Arc<Mutex<HashMap<String, DownloadTask>>>,
+    ) -> std::result::Result<StreamOutcome, StreamError> {
+        let mut req = client.get(url);
+        if let Some(token) = hf_token {
+            if !token.trim().is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", token.trim()));
+            }
+        }
+
+        if resume_from > 0 {
+            req = req.header("Range", format!("bytes={}-", resume_from));
+            log::info!("[DOWNLOAD_DIAGNOSTIC] Requesting Range: bytes={}- for task {}", resume_from, task_id);
+        }
+
+        let resp = req.send().await.map_err(StreamError::transient)?;
+        let status = resp.status();
+        log::info!(
+            "[DOWNLOAD_DIAGNOSTIC] HTTP response received: status={}, Content-Length={:?}, Content-Range={:?}",
+            status,
+            resp.headers().get(reqwest::header::CONTENT_LENGTH),
+            resp.headers().get(reqwest::header::CONTENT_RANGE)
+        );
+
+        if status.is_client_error() {
+            return Err(StreamError::Fatal(anyhow!("HTTP error response: {}", status)));
+        }
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(StreamError::transient(anyhow!("HTTP error response: {}", status)));
+        }
+
+        // Decide whether the server actually honoured the resume before writing
+        // a single byte.
+        //
+        // A server is free to answer a Range request with the *whole* file and a
+        // plain 200. Appending that to an existing partial produces a file that
+        // is both too long and internally garbage, and because the partial was
+        // never truncated every subsequent retry appended again — the download
+        // could never succeed once it entered this state.
+        let honoured_range = status == reqwest::StatusCode::PARTIAL_CONTENT
+            && content_range_start(resp.headers()) == Some(resume_from);
+
+        let start_offset = if resume_from > 0 && !honoured_range {
+            log::warn!(
+                "[DOWNLOAD_DIAGNOSTIC] Server did not honour the resume for task {} \
+                 (status {}, Content-Range {:?}); restarting the file from zero",
+                task_id, status, resp.headers().get(reqwest::header::CONTENT_RANGE)
+            );
+            0
+        } else {
+            resume_from
+        };
+
+        // Truncate when starting over so leftover bytes cannot be prepended to a
+        // fresh body; append only when the resume was genuinely accepted.
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(start_offset > 0)
+            .truncate(start_offset == 0)
+            .open(temp_path)
+            .await
+            .map_err(|e| StreamError::Fatal(e.into()))?;
+
+        // Content-Length describes the remaining bytes, so the full size is that
+        // plus wherever we resumed from. This is the authoritative total even
+        // when the resolver could not determine one up front.
+        let expected_total = match resp.content_length() {
+            Some(len) => start_offset + len,
+            None => expected_total_bytes,
+        };
+
+        let mut stream = resp.bytes_stream();
+        let mut downloaded = start_offset;
+        let mut last_sample_time = Instant::now();
+        let mut last_sample_bytes = downloaded;
+        let mut last_broadcast = Instant::now();
+
+        // Broadcast initial progress immediately upon connection
+        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+            task.downloaded_bytes = downloaded;
+            if expected_total > 0 {
+                task.total_bytes = expected_total;
+            }
+            task.status = DownloadStatus::Downloading;
+            let _ = app_handle.emit("download:progress", Self::make_payload(task));
+        }
+
+        while let Some(chunk_res) = stream.next().await {
+            // Check cancellation / pause
+            if *cancel_rx.borrow() {
+                let _ = file.flush().await;
+                return Ok(StreamOutcome::Interrupted);
+            }
+
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    // Flush before surfacing the error: tokio buffers writes, and
+                    // dropping the handle discards whatever has not landed yet,
+                    // so an unflushed tail would silently rewind the resume point.
+                    let _ = file.flush().await;
+                    return Err(StreamError::transient(anyhow!(
+                        "Network error while streaming chunks: {}",
+                        e
+                    )));
+                }
+            };
+
+            if let Err(e) = file.write_all(&chunk).await {
+                let _ = file.flush().await;
+                return Err(StreamError::Fatal(e.into()));
+            }
+            downloaded += chunk.len() as u64;
+
+            let now = Instant::now();
+            let sample_elapsed = now.duration_since(last_sample_time).as_secs_f64();
+
+            if sample_elapsed >= 0.25 {
+                let bytes_diff = downloaded.saturating_sub(last_sample_bytes);
+                let speed_bps = if sample_elapsed > 0.0 { bytes_diff as f64 / sample_elapsed } else { 0.0 };
+                let remaining_bytes = expected_total.saturating_sub(downloaded);
+                let eta_seconds = if speed_bps > 0.0 {
+                    Some((remaining_bytes as f64 / speed_bps) as u64)
+                } else {
+                    None
+                };
+
+                last_sample_time = now;
+                last_sample_bytes = downloaded;
+
+                if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+                    task.downloaded_bytes = downloaded;
+                    if expected_total > 0 {
+                        task.total_bytes = expected_total;
+                    }
+                    task.speed_bps = if speed_bps.is_nan() || speed_bps.is_infinite() { 0.0 } else { speed_bps };
+                    task.eta_seconds = eta_seconds;
+                    task.updated_at = chrono::Utc::now().to_rfc3339();
+
+                    if now.duration_since(last_broadcast) >= Duration::from_millis(250) {
+                        let _ = app_handle.emit("download:progress", Self::make_payload(task));
+                        last_broadcast = now;
+                    }
+                }
+            }
+        }
+
+        file.flush().await.map_err(|e| StreamError::Fatal(e.into()))?;
+        drop(file);
+
+        // A stream that ends early looks exactly like one that ends on time, so
+        // treat a short read as a dropped connection and let the retry resume it.
+        if expected_total > 0 && downloaded < expected_total {
+            return Err(StreamError::transient(anyhow!(
+                "Connection closed after {} of {} bytes",
+                downloaded, expected_total
+            )));
+        }
+
+        Ok(StreamOutcome::Finished { downloaded, expected: expected_total })
+    }
+
+    /// Hashes a file in fixed-size blocks so a multi-gigabyte model does not
+    /// have to be held in memory to be verified.
+    async fn hash_file_sha256(path: &Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     pub fn pause_download(&self, task_id: &str) -> Result<()> {
@@ -906,14 +1165,74 @@ impl DownloadManager {
         if let Some(mut task) = self.tasks.lock().unwrap().remove(task_id) {
             let temp_path = PathBuf::from(&task.temp_path);
             if temp_path.exists() {
-                let _ = std::fs::remove_file(&temp_path);
-                log::info!("[DOWNLOAD_DIAGNOSTIC] Removed temporary .part file {:?}", temp_path);
+                // The streaming task only notices the cancel between chunks, so
+                // it may still hold the file open. Windows refuses to delete an
+                // open file, and the failure is silent — leaving a stale partial
+                // that the next download would resume from. Retry briefly
+                // instead of deleting once and hoping.
+                let task_id_owned = task_id.to_string();
+                tokio::spawn(async move {
+                    for _ in 0..10 {
+                        if !temp_path.exists() {
+                            return;
+                        }
+                        if tokio::fs::remove_file(&temp_path).await.is_ok() {
+                            log::info!("[DOWNLOAD_DIAGNOSTIC] Removed temporary .part file {:?}", temp_path);
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    log::warn!(
+                        "[DOWNLOAD_DIAGNOSTIC] Could not remove {:?} for cancelled task {}; \
+                         it will be resumed or overwritten on the next attempt",
+                        temp_path, task_id_owned
+                    );
+                });
             }
 
             task.status = DownloadStatus::Cancelled;
             self.broadcast_progress(app_handle, &task);
         }
         Ok(())
+    }
+
+    /// Restarts a paused or failed task from whatever is already on disk.
+    ///
+    /// `start_download` resumes from the `.part` file on its own, so this just
+    /// replays the task's stored parameters — sparing the UI from having to
+    /// remember them in order to offer a retry.
+    pub async fn resume_download(
+        &self,
+        app_handle: tauri::AppHandle,
+        app_data_dir: PathBuf,
+        task_id: &str,
+        hf_token: Option<String>,
+    ) -> Result<String> {
+        let task = self
+            .tasks
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("No download task named '{}' to resume", task_id))?;
+
+        log::info!(
+            "[DOWNLOAD_DIAGNOSTIC] Resuming task {} from status {:?} ({} bytes already on disk)",
+            task_id, task.status, task.downloaded_bytes
+        );
+
+        self.start_download(
+            app_handle,
+            app_data_dir,
+            task.model_id,
+            task.model_name,
+            task.provider_id,
+            task.quantization,
+            task.format,
+            task.backend,
+            hf_token,
+        )
+        .await
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<DownloadTask> {
@@ -988,6 +1307,86 @@ impl DownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a header map carrying just what the range check reads.
+    fn headers_with(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn content_range_start_reads_the_first_offset() {
+        let headers = headers_with(&[("content-range", "bytes 1024-2047/4096")]);
+        assert_eq!(content_range_start(&headers), Some(1024));
+    }
+
+    #[test]
+    fn content_range_start_is_none_when_the_header_is_absent() {
+        // A 200 carries no Content-Range. Treating that as "resumed from 0"
+        // rather than "no answer" is what let a full body be appended onto a
+        // partial file, corrupting it and growing it past its expected size.
+        let headers = headers_with(&[("content-length", "4096")]);
+        assert_eq!(content_range_start(&headers), None);
+    }
+
+    #[test]
+    fn content_range_start_rejects_a_malformed_header() {
+        let headers = headers_with(&[("content-range", "chunks 5-9/20")]);
+        assert_eq!(content_range_start(&headers), None);
+    }
+
+    #[test]
+    fn a_range_answered_from_the_wrong_offset_is_not_honoured() {
+        // Asking for bytes 5000- and being handed bytes 0- is the case that
+        // previously wedged a download: the body was appended to the partial
+        // regardless, so every retry made the file longer and more wrong.
+        let headers = headers_with(&[("content-range", "bytes 0-4095/8192")]);
+        assert_ne!(content_range_start(&headers), Some(5000));
+    }
+
+    #[tokio::test]
+    async fn hash_file_sha256_matches_a_known_digest() {
+        let path = std::env::temp_dir().join(format!(
+            "sarathi_hash_{}.bin",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        tokio::fs::write(&path, b"abc").await.unwrap();
+
+        let digest = DownloadManager::hash_file_sha256(&path).await.unwrap();
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn hash_file_sha256_reads_past_a_single_buffer() {
+        // The hasher reads in 1 MB blocks; a file larger than one block would
+        // hash only its first megabyte if the read loop were wrong.
+        let path = std::env::temp_dir().join(format!(
+            "sarathi_hash_big_{}.bin",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let data = vec![7u8; 3 * 1024 * 1024 + 17];
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let digest = DownloadManager::hash_file_sha256(&path).await.unwrap();
+
+        use sha2::Digest;
+        let mut expected = sha2::Sha256::new();
+        expected.update(&data);
+        assert_eq!(digest, format!("{:x}", expected.finalize()));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
 
     #[test]
     fn test_storage_dir_construction() {

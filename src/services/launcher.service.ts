@@ -5,6 +5,7 @@
 // replaced with a generic message.
 
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type Event, type UnlistenFn } from '@tauri-apps/api/event';
 
 /** Which gateway endpoint a tool speaks. */
 export type ToolProtocol = 'openai' | 'anthropic';
@@ -71,6 +72,25 @@ export function previewToolInstall(toolId: string): Promise<string> {
 
 export function installTool(toolId: string): Promise<void> {
   return invoke<void>('install_tool', { toolId });
+}
+
+export interface ToolInstallProgress {
+  toolId: string;
+  line: string;
+}
+
+/**
+ * Each line the package manager prints, as it prints it.
+ *
+ * An install pulls megabytes and takes a minute; without this the button sits
+ * on "Installing…" long enough to look hung.
+ */
+export function listenToolInstallProgress(
+  callback: (progress: ToolInstallProgress) => void
+): Promise<UnlistenFn> {
+  return listen<ToolInstallProgress>('tool:install-progress', (event: Event<ToolInstallProgress>) => {
+    callback(event.payload);
+  });
 }
 
 /** Starts the tool already connected. Returns its process id. */

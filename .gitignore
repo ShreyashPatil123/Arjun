@@ -29,3 +29,7 @@ Thumbs.db
 # Temporary / Scratch
 tmp/
 *.tmp
+
+# Python bytecode from the sidecars — regenerated on every run.
+__pycache__/
+*.pyc

@@ -13,7 +13,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::ai_engine::lora_binding::LoraAdapterCache;
@@ -28,6 +28,14 @@ pub struct LlamaCppRuntime {
     backend: Option<LlamaBackend>,
     model: Option<LlamaModel>,
     loaded_info: Option<LoadedModelInfo>,
+    /// The chat template baked into the loaded GGUF, when it ships one.
+    ///
+    /// Rendering through llama.cpp's own template engine is the only way to be
+    /// sure the prompt matches what the model was trained on. The hand-written
+    /// templates in `format_chat_prompt_with_template` are guesses keyed off a
+    /// family name, and guessing wrong produces confident nonsense rather than
+    /// an error — so they are only a fallback for GGUFs that carry no template.
+    native_template: Option<NativeChatTemplate>,
     is_generating: Arc<AtomicBool>,
     /// LoRA adapters initialised against the currently loaded model.
     /// Cleared on unload — entries are only valid for the model they were built from.
@@ -41,6 +49,7 @@ impl LlamaCppRuntime {
             backend: None,
             model: None,
             loaded_info: None,
+            native_template: None,
             is_generating: Arc::new(AtomicBool::new(false)),
             adapter_cache: LoraAdapterCache::new(),
         }
@@ -142,7 +151,9 @@ impl LlamaCppRuntime {
             params
         };
 
-        let clean_path = config.model_path.replace('/', "\\");
+        // Use the path exactly as resolved upstream. Rewriting separators here
+        // corrupts absolute paths on every non-Windows platform.
+        let clean_path = config.model_path.clone();
         let path_obj = Path::new(&clean_path);
         let exists = path_obj.exists();
         let size = std::fs::metadata(&clean_path).map(|m| m.len()).unwrap_or(0);
@@ -270,6 +281,55 @@ impl LlamaCppRuntime {
 
         let backend_desc = actual_backend;
 
+        // Read the chat template out of the GGUF itself. The profile's
+        // `chat_template` is only a family-name guess derived from the model id,
+        // and it has been wrong in practice (a Gemma model profiled with Llama-3
+        // tokens), so the model's own template wins whenever it has one.
+        let native_template = match model.chat_template(None) {
+            Ok(handle) => {
+                let source = model.meta_val_str("tokenizer.chat_template").ok();
+                log::info!(
+                    "[RUNTIME] ✓ Using chat template embedded in the GGUF (profile guessed '{}', Jinja source {})",
+                    config.chat_template,
+                    if source.is_some() { "available" } else { "unavailable" }
+                );
+                let piece = |t| {
+                    model
+                        .token_to_str(t, llama_cpp_2::model::Special::Tokenize)
+                        .unwrap_or_default()
+                };
+                Some(NativeChatTemplate {
+                    source,
+                    handle,
+                    bos_token: piece(model.token_bos()),
+                    eos_token: piece(model.token_eos()),
+                })
+            }
+            Err(e) => {
+                log::warn!(
+                    "[RUNTIME] GGUF ships no chat template ({e:?}); falling back to the hand-written '{}' template. \
+                     If output looks malformed, this is the first thing to suspect.",
+                    config.chat_template
+                );
+                None
+            }
+        };
+
+        let template_source = if native_template.is_some() {
+            "gguf".to_string()
+        } else {
+            format!("fallback:{}", config.chat_template)
+        };
+
+        // Now that llama.cpp has parsed the GGUF, write the real architecture and
+        // token metadata back to profile.json. Profiles are generated at download
+        // time, before the `.part` file is finalized, so the extractor finds no
+        // GGUF to read and the profile keeps whatever defaults it started with.
+        // This is the first moment the truth is available.
+        let runtime_meta = Self::extract_runtime_metadata(&model, native_template.is_some());
+        let effective_stop_tokens = Self::sync_profile_metadata(&clean_path, &runtime_meta)
+            .unwrap_or_else(|| config.stop_tokens.clone());
+
         // Step 4: Store state
         status_cb("Model loaded and ready for inference");
         let fam_str = format!("{:?}", crate::model_intelligence::MetadataExtractor::infer_family_from_string(&config.model_id));
@@ -285,12 +345,14 @@ impl LlamaCppRuntime {
             backend_used: backend_desc,
             loaded_at: chrono::Utc::now().to_rfc3339(),
             chat_template: config.chat_template.clone(),
-            stop_tokens: config.stop_tokens.clone(),
+            template_source,
+            stop_tokens: effective_stop_tokens,
             model_family: fam_str,
             active_adapter: None,
         };
 
         self.model = Some(model);
+        self.native_template = native_template;
         self.loaded_info = Some(info.clone());
 
         log::info!(
@@ -300,6 +362,74 @@ impl LlamaCppRuntime {
         );
 
         Ok(info)
+    }
+
+    /// Reads architecture and token facts out of a model llama.cpp has loaded.
+    fn extract_runtime_metadata(
+        model: &LlamaModel,
+        has_native_chat_template: bool,
+    ) -> crate::model_intelligence::profile::RuntimeGgufMetadata {
+        let piece = |t| {
+            model
+                .token_to_str(t, llama_cpp_2::model::Special::Tokenize)
+                .ok()
+                .filter(|s| !s.is_empty())
+        };
+
+        let architecture = model.meta_val_str("general.architecture").ok();
+
+        // A model's end-of-turn token is often distinct from its EOS — Gemma
+        // ends turns with `<end_of_turn>` while `<eos>` barely appears in chat
+        // data — so record it separately when the GGUF declares one.
+        let eot_token = model
+            .meta_val_str("tokenizer.ggml.eot_token_id")
+            .ok()
+            .and_then(|id| id.trim().parse::<i32>().ok())
+            .and_then(|id| piece(llama_cpp_2::token::LlamaToken(id)));
+
+        crate::model_intelligence::profile::RuntimeGgufMetadata {
+            architecture,
+            bos_token: piece(model.token_bos()),
+            eos_token: piece(model.token_eos()),
+            eot_token,
+            context_length: model.n_ctx_train(),
+            has_native_chat_template,
+        }
+    }
+
+    /// Writes runtime-read metadata back to the package's `profile.json`.
+    ///
+    /// Returns the corrected stop tokens when the profile was updated, so the
+    /// current session uses them too rather than waiting for the next load.
+    /// Best-effort: a model still runs fine if its profile cannot be written.
+    fn sync_profile_metadata(
+        gguf_path: &str,
+        meta: &crate::model_intelligence::profile::RuntimeGgufMetadata,
+    ) -> Option<Vec<String>> {
+        // <package_dir>/base/<file>.gguf — the profile lives beside `base/`.
+        let package_dir = Path::new(gguf_path).parent()?.parent()?;
+        let profile_path = package_dir.join("profile.json");
+
+        let content = std::fs::read_to_string(&profile_path).ok()?;
+        let mut profile =
+            serde_json::from_str::<crate::model_intelligence::ModelProfile>(&content).ok()?;
+
+        let changed = profile.apply_runtime_metadata(meta);
+        let stop_tokens = profile.tokens.stop_tokens.clone();
+
+        if changed {
+            log::info!(
+                "[RUNTIME] Corrected profile from GGUF metadata: architecture={}, eos={:?}, stop_tokens={:?}",
+                profile.architecture, profile.tokens.eos_token, stop_tokens
+            );
+            if let Err(e) =
+                crate::model_intelligence::ModelIntelligenceManager::write_profile(package_dir, &profile)
+            {
+                log::warn!("[RUNTIME] Could not persist corrected profile: {e:#}");
+            }
+        }
+
+        Some(stop_tokens)
     }
 
     /// Unloads the current model, freeing all RAM/VRAM
@@ -317,6 +447,7 @@ impl LlamaCppRuntime {
 
         // Drop model to free RAM/VRAM tensors
         self.model = None;
+        self.native_template = None;
         self.loaded_info = None;
         // Keep self.backend alive for process lifetime
 
@@ -365,6 +496,7 @@ impl LlamaCppRuntime {
             backend,
             model,
             loaded_info,
+            native_template,
             is_generating,
             adapter_cache,
         } = self;
@@ -382,8 +514,28 @@ impl LlamaCppRuntime {
         is_generating.store(true, Ordering::Relaxed);
         let cancel_flag = is_generating.clone();
 
-        // Format messages into a prompt string dynamically using model's chat_template
-        let prompt = format_chat_prompt_with_template(messages, &config.chat_template);
+        // Render the prompt with the model's own template when it has one, and
+        // only fall back to the hand-written approximations otherwise.
+        let (prompt, template_source) = match native_template.as_ref() {
+            Some(tmpl) => match render_with_native_template(model, tmpl, messages) {
+                Ok(p) => (p, "gguf"),
+                Err(e) => {
+                    log::warn!(
+                        "[RUNTIME] The GGUF's own chat template failed to render ({e:#}); \
+                         falling back to the hand-written '{}' template.",
+                        config.chat_template
+                    );
+                    (
+                        format_chat_prompt_with_template(messages, &config.chat_template),
+                        "fallback",
+                    )
+                }
+            },
+            None => (
+                format_chat_prompt_with_template(messages, &config.chat_template),
+                "fallback",
+            ),
+        };
 
         // Compute SHA-256 digest of final prompt sent to llama.cpp
         let mut hasher = Sha256::new();
@@ -400,14 +552,26 @@ impl LlamaCppRuntime {
              - Prompt SHA-256 Hash:   {}\n\
              - Prompt Total Length:   {} chars\n\
              - Memory Injected:       {}\n\
-             - Template Format:       {}\n\
+             - Template Format:       {} (rendered via: {})\n\
              - Input Message Count:   {}\n\
              ==========================================================================",
-            prompt_sha256, prompt.len(), has_memory_injection, config.chat_template, messages.len()
+            prompt_sha256, prompt.len(), has_memory_injection, config.chat_template, template_source, messages.len()
         );
 
-        // Tokenize the prompt (use AddBos::Never if template already includes BOS/header tags)
-        let add_bos = if config.chat_template == "chatml" || config.chat_template == "gemma" {
+        // Decide BOS from what the rendered prompt actually starts with, rather
+        // than from the template name.
+        //
+        // `AddBos::Always` does not blindly prepend a token — it sets llama.cpp's
+        // `add_special`, which honours the model's own `add_bos_token` metadata.
+        // The previous rule forced `Never` for every "gemma" and "chatml"
+        // template, which left Gemma running with no BOS at all; Gemma degrades
+        // into multilingual noise without it. The only case that genuinely needs
+        // `Never` is a template that already emitted BOS itself (some Jinja
+        // templates interpolate `{{ bos_token }}`), which we detect directly.
+        let bos_str = model
+            .token_to_str(model.token_bos(), llama_cpp_2::model::Special::Tokenize)
+            .unwrap_or_default();
+        let add_bos = if !bos_str.is_empty() && prompt.starts_with(bos_str.as_str()) {
             AddBos::Never
         } else {
             AddBos::Always
@@ -428,6 +592,30 @@ impl LlamaCppRuntime {
         // Create context for this generation
         let ctx_size = std::num::NonZeroU32::new(config.context_length)
             .unwrap_or(std::num::NonZeroU32::new(2048).unwrap());
+
+        // Refused before a context is allocated: a prompt at or over the window
+        // is one of the ways llama.cpp aborts the process, and an error the user
+        // can read beats the window disappearing.
+        if n_prompt_tokens >= ctx_size.get() as usize {
+            is_generating.store(false, Ordering::Relaxed);
+            return Err(anyhow!(
+                "Prompt is {} tokens but the model is loaded with a {}-token context. \
+                 Load the model with a larger context, or send a shorter prompt.",
+                n_prompt_tokens,
+                ctx_size.get()
+            ));
+        }
+
+        // Batch size is left at whatever this llama.cpp build considers sane and
+        // the prefill below is chunked to match, rather than inflated to cover
+        // the whole prompt in one decode.
+        //
+        // Both matter. llama.cpp *aborts the process* — it does not return an
+        // error — when a single decode carries more tokens than n_batch, which
+        // is how the app vanished (0xc0000409, FAST_FAIL_FATAL_APP_EXIT) the
+        // moment a real client connected. Sizing n_batch up to the prompt fixed
+        // that but allocated buffers proportional to the largest prompt seen,
+        // which on a 32k certified context is memory no short turn uses.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(ctx_size))
             .with_n_threads(config.threads as i32)
@@ -466,29 +654,61 @@ impl LlamaCppRuntime {
             }
         }
 
-        // Create batch and fill with prompt tokens
-        let max_batch = (n_prompt_tokens + 1).max(512);
-        let mut batch = LlamaBatch::new(max_batch, 1);
+        // Prefill in chunks the size of this context's own batch.
+        //
+        // Prefill is the dominant cost of a request — on a CPU-only build a
+        // coding agent's system prompt measured ~98s — and decoding it as one
+        // call meant a client that had already hung up was discovered only
+        // after all of it had been paid for. Chunking gives a cancellation
+        // point between batches, so an abandoned request stops within one
+        // chunk instead of running to completion.
+        let prefill_chunk = (ctx.n_batch().max(1)) as usize;
+        let mut batch = LlamaBatch::new(prefill_chunk, 1);
 
-        // Add prompt tokens to batch
-        for (i, &token) in prompt_tokens.iter().enumerate() {
-            let is_last = i == n_prompt_tokens - 1;
-            batch
-                .add(token, i as i32, &[0], is_last)
-                .map_err(|e| anyhow!("Failed to add token to batch: {:?}", e))?;
+        for (chunk_index, chunk) in prompt_tokens.chunks(prefill_chunk).enumerate() {
+            // The flag is cleared by the canceller, so "not generating" here
+            // means someone asked us to stop.
+            if !cancel_flag.load(Ordering::Relaxed) {
+                let done = chunk_index * prefill_chunk;
+                log::info!(
+                    "[RUNTIME] Prefill cancelled after {}/{} prompt tokens",
+                    done, n_prompt_tokens
+                );
+                is_generating.store(false, Ordering::Relaxed);
+                return Err(anyhow!("Generation cancelled during prompt prefill"));
+            }
+
+            batch.clear();
+            let base = chunk_index * prefill_chunk;
+            for (offset, &token) in chunk.iter().enumerate() {
+                let pos = base + offset;
+                // Only the final prompt token needs logits — that is the one the
+                // first sampled token is drawn from.
+                let wants_logits = pos == n_prompt_tokens - 1;
+                batch
+                    .add(token, pos as i32, &[0], wants_logits)
+                    .map_err(|e| anyhow!("Failed to add token to batch: {:?}", e))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow!("Failed to decode prompt batch: {:?}", e))?;
         }
-
-        // Decode the prompt (prefill)
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow!("Failed to decode initial prompt batch: {:?}", e))?;
 
         let eos_token = model.token_eos();
 
-        // Build effective template-driven stop sequences list
+        // Build effective template-driven stop sequences list.
+        //
+        // These additions are guesses derived from the family name, so they are
+        // only appropriate when the hand-written template is what produced the
+        // prompt. When the GGUF's own template is in use, the vocab's
+        // end-of-generation tokens are authoritative and guessing here would
+        // just reintroduce mismatched tokens.
         let mut effective_stop_tokens = config.stop_tokens.clone();
         let lower_temp = config.chat_template.to_lowercase();
 
-        if lower_temp.contains("chatml") || lower_temp.contains("qwen") {
+        if template_source != "fallback" {
+            // Nothing to add — `is_eog_token` handles termination.
+        } else if lower_temp.contains("chatml") || lower_temp.contains("qwen") {
             for st in &["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
                 if !effective_stop_tokens.iter().any(|s| s == st) {
                     effective_stop_tokens.push(st.to_string());
@@ -605,9 +825,12 @@ impl LlamaCppRuntime {
             // Sample next token
             let new_token_id = sampler.sample(&ctx, -1);
 
-            // Check for EOS token ID match
-            if new_token_id == eos_token {
-                log::info!("[RUNTIME] EOS token ID {} reached after {} tokens", eos_token, n_generated);
+            // Stop on any end-of-generation token the model itself declares.
+            // `token_eos()` is only one of them — Gemma, for instance, ends turns
+            // with `<end_of_turn>` rather than `<eos>` — and asking the vocab is
+            // reliable where string matching on detokenized text is not.
+            if new_token_id == eos_token || model.is_eog_token(new_token_id) {
+                log::info!("[RUNTIME] End-of-generation token {} reached after {} tokens", new_token_id, n_generated);
                 token_cb(StreamChunk {
                     text: String::new(),
                     is_final: true,
@@ -622,16 +845,18 @@ impl LlamaCppRuntime {
                 .token_to_str(new_token_id, llama_cpp_2::model::Special::Tokenize)
                 .unwrap_or_default();
 
-            // Check if token matches stop token sequences or ChatML/control token sequences
+            // Match only the stop strings this model actually declares.
+            //
+            // Two previous rules made this fire far too eagerly: any token
+            // beginning with `<|` was treated as a stop token whenever *some*
+            // configured stop string happened to begin with `<|`, and ChatML's
+            // control tokens were hardcoded regardless of the model's family.
+            // Between them, a model could be cut off mid-answer by ordinary
+            // output. End-of-generation is handled by the vocab check above.
             let combined_check = format!("{}{}", generated_text, token_str);
-            let is_stop_str = effective_stop_tokens.iter().any(|st| {
-                !st.is_empty() && (
-                    token_str.contains(st) || 
-                    combined_check.ends_with(st) || 
-                    (st.starts_with("<|") && token_str.starts_with("<|")) ||
-                    (token_str == "<|im_end|>" || token_str == "<|im_start|>" || token_str == "<|endoftext|>")
-                )
-            });
+            let is_stop_str = effective_stop_tokens
+                .iter()
+                .any(|st| !st.is_empty() && (token_str.contains(st) || combined_check.ends_with(st)));
 
             if is_stop_str {
                 log::info!("[RUNTIME] Stop token sequence '{}' (Token ID: {}) detected after {} tokens", token_str, new_token_id, n_generated);
@@ -698,7 +923,165 @@ impl LlamaCppRuntime {
     }
 }
 
+/// Everything needed to frame a prompt the way a given model expects.
+///
+/// Held together because the two rendering routes need different things: the
+/// Jinja source drives the faithful path, and llama.cpp's handle drives the
+/// built-in path used when that source will not render.
+pub struct NativeChatTemplate {
+    /// Raw Jinja from the GGUF's `tokenizer.chat_template` key, when present.
+    source: Option<String>,
+    /// llama.cpp's own handle on the same template.
+    handle: LlamaChatTemplate,
+    bos_token: String,
+    eos_token: String,
+}
+
+/// Renders messages through the chat template baked into the GGUF.
+///
+/// Two routes, tried in order of faithfulness:
+///
+/// 1. The template's actual Jinja, rendered with minijinja. This is the same
+///    thing HuggingFace evaluates, so it reproduces the exact framing a model
+///    was trained on — including custom formats nothing else knows about.
+/// 2. llama.cpp's `apply_chat_template`, which recognises a fixed set of
+///    well-known formats and rejects anything outside it.
+///
+/// Falling through both leaves the hand-written family templates, which are
+/// approximations and can be badly wrong for an unusual model.
+fn render_with_native_template(
+    model: &LlamaModel,
+    tmpl: &NativeChatTemplate,
+    messages: &[ChatMessage],
+) -> Result<String> {
+    if let Some(src) = &tmpl.source {
+        match render_jinja_chat_template(src, messages, &tmpl.bos_token, &tmpl.eos_token) {
+            Ok(prompt) if !prompt.trim().is_empty() => return Ok(prompt),
+            Ok(_) => log::warn!("[RUNTIME] Jinja chat template rendered an empty prompt; trying llama.cpp's engine"),
+            Err(e) => log::warn!("[RUNTIME] Jinja chat template failed to render ({e:#}); trying llama.cpp's engine"),
+        }
+    }
+
+    let chat: Vec<LlamaChatMessage> = messages
+        .iter()
+        .map(|m| {
+            LlamaChatMessage::new(m.role.clone(), m.content.clone())
+                .map_err(|e| anyhow!("Message rejected by chat template: {e:?}"))
+        })
+        .collect::<Result<_>>()?;
+
+    // `add_ass = true` leaves the assistant tag open so the model completes a
+    // reply instead of generating a fresh turn header of its own.
+    let prompt = model
+        .apply_chat_template(&tmpl.handle, &chat, true)
+        .map_err(|e| anyhow!("apply_chat_template failed: {e:?}"))?;
+
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("chat template rendered an empty prompt"));
+    }
+
+    Ok(prompt)
+}
+
+/// A chat message as a chat template expects to see it.
+///
+/// Templates are written against Python dicts, so they reach for `.get(...)`
+/// on optional fields like `reasoning` and `tool_calls`. A plain map value has
+/// no such method and rendering aborts, so this supplies dict semantics:
+/// subscripting known keys, and `.get` returning a default instead of raising.
+#[derive(Debug)]
+struct TemplateMessage {
+    role: String,
+    content: String,
+}
+
+impl minijinja::value::Object for TemplateMessage {
+    fn get_value(self: &std::sync::Arc<Self>, key: &minijinja::value::Value) -> Option<minijinja::value::Value> {
+        match key.as_str()? {
+            "role" => Some(minijinja::value::Value::from(self.role.clone())),
+            "content" => Some(minijinja::value::Value::from(self.content.clone())),
+            _ => None,
+        }
+    }
+
+    fn call_method(
+        self: &std::sync::Arc<Self>,
+        _state: &minijinja::State<'_, '_>,
+        method: &str,
+        args: &[minijinja::value::Value],
+    ) -> std::result::Result<minijinja::value::Value, minijinja::Error> {
+        match method {
+            // Python's `dict.get(key[, default])`: absent keys yield the
+            // default (None when unspecified) rather than erroring.
+            "get" => {
+                let none = minijinja::value::Value::from(());
+                let default = args.get(1).cloned().unwrap_or(none.clone());
+                Ok(args
+                    .first()
+                    .and_then(|k| self.get_value(k))
+                    .unwrap_or(default))
+            }
+            _ => Err(minijinja::Error::new(
+                minijinja::ErrorKind::UnknownMethod,
+                format!("chat message has no method named {method}"),
+            )),
+        }
+    }
+}
+
+/// Renders a HuggingFace-style Jinja chat template.
+///
+/// The context mirrors what `tokenizer.apply_chat_template` provides, since
+/// templates are written against it: a `messages` list of role/content maps,
+/// the special tokens as variables, and `add_generation_prompt` set so the
+/// template leaves the assistant turn open for the model to complete.
+pub fn render_jinja_chat_template(
+    template_src: &str,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+) -> Result<String> {
+    use minijinja::{context, Environment};
+
+    let mut env = Environment::new();
+    // Chat templates are whitespace-sensitive; keeping blocks and newlines
+    // verbatim is what makes the output match the training format.
+    env.set_keep_trailing_newline(true);
+    env.add_template("chat", template_src)
+        .map_err(|e| anyhow!("chat template is not valid Jinja: {e}"))?;
+
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| anyhow!("chat template unavailable: {e}"))?;
+
+    let msgs: Vec<_> = messages
+        .iter()
+        .map(|m| {
+            minijinja::value::Value::from_object(TemplateMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+        })
+        .collect();
+
+    tmpl.render(context! {
+        messages => msgs,
+        bos_token => bos_token,
+        eos_token => eos_token,
+        add_generation_prompt => true,
+        // Declared so templates that branch on them take the plain-chat path
+        // rather than failing on an undefined name.
+        tools => Vec::<minijinja::value::Value>::new(),
+        enable_thinking => false,
+    })
+    .map_err(|e| anyhow!("chat template failed to render: {e}"))
+}
+
 /// Formats chat messages into a prompt string based on Model Profile template.
+///
+/// Fallback only — used when a GGUF ships no chat template of its own. These are
+/// approximations of each family's real format, so prefer the model's embedded
+/// template (see [`render_with_native_template`]) wherever one exists.
 pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name: &str) -> String {
     let mut prompt = String::new();
     let lower_temp = template_name.to_lowercase();
@@ -709,8 +1092,10 @@ pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name:
         }
         prompt.push_str("<|im_start|>assistant\n");
     } else if lower_temp.contains("llama3") || lower_temp.contains("llama-3") || lower_temp.contains("llama_3") {
+        // The role must sit between the header tags with no newline of its own;
+        // a stray one here does not match how Llama-3 was trained.
         for msg in messages {
-            prompt.push_str(&format!("<|start_header_id|>{}\n<|end_header_id|>\n\n{}<|eot_id|>\n", msg.role, msg.content));
+            prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content));
         }
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     } else if lower_temp.contains("gemma") {
@@ -788,6 +1173,68 @@ mod tests {
     }
 
     #[test]
+    fn llama3_role_sits_inside_the_header_tags() {
+        let prompt = format_chat_prompt_with_template(&sample_messages(), "llama3");
+
+        // A newline between the role and `<|end_header_id|>` is not the format
+        // Llama-3 was trained on, and the closing tag never had one — so the
+        // opening tags disagreed with the assistant tag the prompt ends with.
+        assert!(prompt.contains("<|start_header_id|>system<|end_header_id|>\n\n"));
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\n"));
+        assert!(!prompt.contains("<|start_header_id|>system\n"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn gemma_template_maps_assistant_onto_model_turns() {
+        let prompt = format_chat_prompt_with_template(&sample_messages(), "gemma");
+
+        // Gemma names the assistant role "model"; emitting "assistant" would put
+        // a token the model never saw in training at the start of every reply.
+        assert!(prompt.contains("<start_of_turn>user\n"));
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
+        assert!(!prompt.contains("<start_of_turn>assistant"));
+    }
+
+    #[test]
+    fn jinja_template_renders_roles_and_generation_prompt() {
+        let src = "{{- bos_token -}}\
+                   {%- for m in messages -%}<|turn>{{ m['role'] }}\n{{ m['content'] }}<turn|>\n{%- endfor -%}\
+                   {%- if add_generation_prompt -%}<|turn>model\n{%- endif -%}";
+
+        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>").unwrap();
+
+        // `{%-` trims the preceding newline, so the turns run together — which
+        // is exactly the whitespace handling a chat template depends on.
+        assert_eq!(
+            out,
+            "<bos><|turn>system\nYou are helpful.<turn|><|turn>user\nHello<turn|><|turn>model"
+        );
+    }
+
+    #[test]
+    fn jinja_messages_support_python_dict_get() {
+        // Real templates probe optional fields with `.get(...)`. Without dict
+        // semantics minijinja aborts with "map has no method named get", and
+        // the whole template silently falls back to a guessed format.
+        let src = "{%- for m in messages -%}\
+                   {{ m.get('role') }}:{{ m.get('tool_calls', 'none') }};\
+                   {%- endfor -%}";
+
+        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>").unwrap();
+
+        assert_eq!(out, "system:none;user:none;");
+    }
+
+    #[test]
+    fn a_broken_jinja_template_errors_rather_than_panicking() {
+        // Callers fall back to a hand-written template on error, so this must
+        // surface as Err rather than taking the process down.
+        let out = render_jinja_chat_template("{% for %}", &sample_messages(), "<bos>", "<eos>");
+        assert!(out.is_err());
+    }
+
+    #[test]
     fn qwen_is_treated_as_chatml() {
         let qwen = format_chat_prompt_with_template(&sample_messages(), "qwen");
         let chatml = format_chat_prompt_with_template(&sample_messages(), "chatml");
@@ -824,6 +1271,64 @@ mod tests {
     }
 
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Loads a real installed model and reports what the fix actually reads
+    /// from it: the embedded chat template, the true BOS/EOS tokens, and the
+    /// prompt that now gets sent.
+    ///
+    /// Ignored by default because it loads several gigabytes of weights.
+    /// Run with: `cargo test --lib gguf_metadata_matches_the_model -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gguf_metadata_matches_the_model() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let gguf_path = r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app\models\huggingface\yuxinlu1_gemma-4-12B-coder-fable5-composer2.5-v1-GGUF\base\gemma4-coding-Q2_K.gguf";
+        if !std::path::Path::new(gguf_path).exists() {
+            println!("Skipping: {gguf_path} not present");
+            return;
+        }
+
+        let backend = LlamaBackend::init().expect("backend init");
+        let params = LlamaModelParams::default().with_n_gpu_layers(0);
+        let model = LlamaModel::load_from_file(&backend, gguf_path, &params).expect("model load");
+
+        let meta = LlamaCppRuntime::extract_runtime_metadata(&model, model.chat_template(None).is_ok());
+        println!("architecture      : {:?}", meta.architecture);
+        println!("bos_token         : {:?}", meta.bos_token);
+        println!("eos_token         : {:?}", meta.eos_token);
+        println!("eot_token         : {:?}", meta.eot_token);
+        println!("n_ctx_train       : {}", meta.context_length);
+        println!("native template   : {}", meta.has_native_chat_template);
+
+        // The profile on disk claimed architecture "llama" with `<|eot_id|>`;
+        // the model itself must say otherwise.
+        assert!(meta.has_native_chat_template, "GGUF should carry its own chat template");
+        assert_ne!(meta.eos_token.as_deref(), Some("<|eot_id|>"), "EOS must not be Llama-3's");
+
+        println!(
+            "--- embedded template source ---\n{}\n--------------------------------",
+            model.meta_val_str("tokenizer.chat_template").unwrap_or_else(|e| format!("<unreadable: {e:?}>"))
+        );
+
+        let piece = |t| model.token_to_str(t, llama_cpp_2::model::Special::Tokenize).unwrap_or_default();
+        let tmpl = NativeChatTemplate {
+            source: model.meta_val_str("tokenizer.chat_template").ok(),
+            handle: model.chat_template(None).unwrap(),
+            bos_token: piece(model.token_bos()),
+            eos_token: piece(model.token_eos()),
+        };
+
+        let rendered = render_with_native_template(&model, &tmpl, &sample_messages())
+            .expect("the model's own template must render");
+        println!("--- rendered prompt ---\n{rendered}\n-----------------------");
+
+        assert!(rendered.contains("Hello"));
+        // This model frames turns as `<|turn>role … <turn|>`. The hand-written
+        // "gemma" fallback emits `<start_of_turn>`, which this model was never
+        // trained on — that mismatch is what produced the garbled output.
+        assert!(rendered.contains("<|turn>user"), "expected the model's own turn markers");
+        assert!(!rendered.contains("<start_of_turn>"), "must not use the guessed Gemma framing");
+    }
 
     #[test]
     fn test_load_real_installed_gguf() {

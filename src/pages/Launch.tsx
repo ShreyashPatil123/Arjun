@@ -17,6 +17,7 @@ import {
   getLaunchOverview,
   installTool,
   launchTool,
+  listenToolInstallProgress,
   previewToolInstall,
   userToolsFile,
   type LaunchOverview,
@@ -51,6 +52,8 @@ export const Launch: React.FC = () => {
    * the app behind them.
    */
   const [pollError, setPollError] = useState<string | null>(null);
+  /** Latest line the package manager printed, per tool, while installing. */
+  const [installLine, setInstallLine] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
@@ -68,6 +71,15 @@ export const Launch: React.FC = () => {
     refresh(true);
     userToolsFile().then(setToolsPath).catch(() => {});
   }, [refresh]);
+
+  useEffect(() => {
+    const pending = listenToolInstallProgress(({ toolId, line }) => {
+      setInstallLine((prev) => ({ ...prev, [toolId]: line }));
+    });
+    return () => {
+      void pending.then((unlisten) => unlisten());
+    };
+  }, []);
 
   // Keep the server panel live. Detection runs external programs, so this is
   // deliberately a poll rather than something faster.
@@ -95,6 +107,11 @@ export const Launch: React.FC = () => {
       addToast('error', String(err));
     } finally {
       setBusyTool(null);
+      setInstallLine((prev) => {
+        const next = { ...prev };
+        delete next[tool.id];
+        return next;
+      });
     }
   };
 
@@ -210,13 +227,20 @@ export const Launch: React.FC = () => {
             <div className={styles.cardFoot}>
               {tool.state === 'notInstalled' && (
                 tool.installCommand ? (
-                  <Button
-                    size="sm"
-                    onClick={() => handleInstall(tool)}
-                    disabled={busyTool === tool.id}
-                  >
-                    {busyTool === tool.id ? <Spinner /> : <Download size={14} />} Install
-                  </Button>
+                  <div className={styles.installing}>
+                    <Button
+                      size="sm"
+                      onClick={() => handleInstall(tool)}
+                      disabled={busyTool === tool.id}
+                    >
+                      {busyTool === tool.id ? <Spinner /> : <Download size={14} />} Install
+                    </Button>
+                    {busyTool === tool.id && installLine[tool.id] && (
+                      <span className={styles.installLine} title={installLine[tool.id]}>
+                        {installLine[tool.id]}
+                      </span>
+                    )}
+                  </div>
                 ) : (
                   // No usable install route: say so rather than offering a
                   // button that cannot work.

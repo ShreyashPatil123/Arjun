@@ -100,6 +100,18 @@ impl GatewayState {
         self.config.lock().map(|c| c.port).unwrap_or(super::DEFAULT_PORT)
     }
 
+    /// Records the port the gateway actually bound.
+    ///
+    /// The configured value is a request, not a guarantee — it can be taken.
+    /// Everything downstream (the dashboard, and the address handed to a
+    /// launched tool) has to use what was really bound, or it advertises an
+    /// endpoint nothing is listening on.
+    pub fn set_port(&self, port: u16) {
+        if let Ok(mut config) = self.config.lock() {
+            config.port = port;
+        }
+    }
+
     /// Records an incoming request. Call once per request, before generation.
     pub fn record_request(&self, client: &str, protocol: &str, now_ms: u64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);

@@ -96,6 +96,12 @@ impl PackManager {
             cwd.join("sidecars").join("runtime_profiles"),
             cwd.join("src-tauri").join("sidecars").join("runtime_profiles"),
             cwd.parent().map(|p| p.join("sidecars").join("runtime_profiles")).unwrap_or_default(),
+            // Next to the executable, for an installed app: its working
+            // directory is wherever the shortcut points, never the repo.
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|dir| dir.join("sidecars").join("runtime_profiles")))
+                .unwrap_or_default(),
         ];
 
         let mut profiles = HashMap::new();

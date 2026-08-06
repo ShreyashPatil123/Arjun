@@ -65,7 +65,8 @@ pub struct GenerationHandle {
 
 impl GenerationHandle {
     /// Stops this generation. Safe to call at any time, including after
-    /// completion. Takes effect within one token.
+    /// completion. Takes effect within one token, or within one prefill chunk
+    /// if the prompt is still being processed.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -88,6 +89,38 @@ pub struct Canceller {
 impl Canceller {
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Cancels its job unless disarmed before being dropped.
+///
+/// A response stream reaches its final event only when the client read the
+/// whole answer. Every other ending — the client hung up, the connection
+/// dropped, the request timed out and the task was aborted — destroys the
+/// stream without running any of its code. Attaching cancellation to a guard's
+/// `Drop` covers those endings, which is what stops an abandoned request from
+/// holding the model against everyone still waiting.
+pub struct CancelOnDrop {
+    canceller: Canceller,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    pub fn new(canceller: Canceller) -> Self {
+        Self { canceller, armed: true }
+    }
+
+    /// Marks the generation as finished normally, so dropping is a no-op.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.canceller.cancel();
+        }
     }
 }
 
@@ -192,6 +225,33 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
     let started = std::time::Instant::now();
     log::info!("[SCHEDULER] Starting job from '{}'", job.origin.label());
 
+    // Bridges the scheduler's cancel flag into the runtime's while the prompt is
+    // still being decoded.
+    //
+    // The callback below cannot do this: it first fires after prefill, the phase
+    // that dominates a request. Without this watcher a client that hung up
+    // during prefill kept the worker busy to the end, blocking everyone queued
+    // behind it. Polling rather than signalling because the flag is a plain
+    // atomic shared with a blocking FFI call that cannot await anything.
+    let finished = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let watch_cancel = cancel.clone();
+        let watch_runtime = runtime_cancel.clone();
+        let watch_finished = finished.clone();
+        std::thread::Builder::new()
+            .name("sarathi-cancel-watch".into())
+            .spawn(move || {
+                while !watch_finished.load(Ordering::Relaxed) {
+                    if watch_cancel.load(Ordering::Relaxed) {
+                        watch_runtime.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .ok()
+    };
+
     let cancel_for_cb = cancel.clone();
     let out_for_cb = out.clone();
     let result = manager.generate_direct(&job.messages, &job.params, move |chunk| {
@@ -208,6 +268,11 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
             runtime_cancel.store(false, Ordering::Relaxed);
         }
     });
+
+    finished.store(true, Ordering::Relaxed);
+    if let Some(handle) = watcher {
+        let _ = handle.join();
+    }
 
     match result {
         Ok(text) => log::info!(
@@ -249,6 +314,36 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
         c.cancel();
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_abandoned_stream_cancels_its_job_when_dropped() {
+        // The case this exists for: a client hangs up while the prompt is still
+        // being decoded, so no terminal event is ever produced and none of the
+        // stream's own completion code runs.
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = CancelOnDrop::new(Canceller { flag: flag.clone() });
+        }
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "dropping an unfinished stream must release the model"
+        );
+    }
+
+    #[test]
+    fn a_completed_stream_does_not_look_like_an_abandoned_one() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = CancelOnDrop::new(Canceller { flag: flag.clone() });
+            guard.disarm();
+        }
+
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a generation that ended on its own must not be reported as cancelled"
+        );
     }
 
     #[test]

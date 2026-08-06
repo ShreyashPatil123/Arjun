@@ -241,7 +241,10 @@ export const SystemInfo: React.FC = () => {
           <Button
             variant="primary"
             icon={<Sparkles size={16} />}
-            onClick={() => navigate('/models')}
+            // Discover, not Storage: this offers models to find, and `/models`
+            // is the installed-models page — which is empty for the people most
+            // likely to press it.
+            onClick={() => navigate('/browse')}
           >
             Find Models For My PC
           </Button>
@@ -716,7 +719,7 @@ export const SystemInfo: React.FC = () => {
           </div>
           <Button
             variant="primary"
-            onClick={() => navigate('/models')}
+            onClick={() => navigate('/browse')}
             className={styles.bannerButton}
           >
             Find Models For My PC

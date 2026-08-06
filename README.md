@@ -135,3 +135,71 @@ graph TD
    ```bash
    npx tauri build
    ```
+
+### ⚡ GPU-Accelerated Builds
+
+**Recommended — let Sarathi pick the backend for the machine it is on:**
+
+```bash
+npm run build:auto
+```
+
+```bash
+npm run dev:auto
+```
+
+`scripts/select-backend.mjs` probes the host and selects the fastest backend it
+can actually build: CUDA when an NVIDIA GPU *and* the toolkit (`nvcc`) are both
+present, Vulkan when the SDK is installed, CPU otherwise. On Windows it also
+locates the Visual Studio C++ environment and switches CMake to the Ninja
+generator, because the CUDA MSBuild integration the toolkit ships is frequently
+not registered. Override the probe with `SARATHI_BACKEND=cuda|vulkan|cpu`.
+
+Why a build step rather than runtime detection: **backend selection in
+llama.cpp is compile-time**. `llama-cpp-sys-2` links GGML with `GGML_CUDA=OFF`
+unless the feature is set, so a CPU-built binary cannot start using a GPU later
+no matter what hardware it finds — every `n_gpu_layers` value is silently
+ignored. Once a GPU-enabled binary exists, how much to offload *is* decided at
+runtime from measured VRAM.
+
+The manual equivalents below remain available; the default `cargo build`
+(no features) is still CPU-only so the project compiles anywhere.
+
+**NVIDIA on WSL2 / Linux (CUDA)** — needs the CUDA Toolkit (`nvcc`) inside the
+WSL2 distro, not just the Windows driver; verify with `nvidia-smi` and
+`nvcc --version` first:
+
+```bash
+npm run tauri:dev:gpu
+```
+
+```bash
+npm run tauri:build:gpu
+```
+
+**Generic / cross-vendor (Vulkan)** — AMD, Intel Arc, or NVIDIA without the
+CUDA Toolkit; needs the Vulkan SDK (`vulkaninfo` to verify):
+
+```bash
+npm run tauri:dev:vulkan
+```
+
+```bash
+npm run tauri:build:vulkan
+```
+
+Equivalent raw cargo invocations from `src-tauri/`:
+
+```bash
+cargo build --release --features cuda
+```
+
+```bash
+cargo build --release --features vulkan
+```
+
+> **Windows + CUDA caveat**: `nvcc` rejects MSVC newer than Visual Studio 2022.
+> If the build fails with *"unsupported Microsoft Visual Studio version"*,
+> install the VS 2022 Build Tools and point CMake at that host compiler via
+> `CMAKE_CUDA_HOST_COMPILER`, or use `--features vulkan`, which has no
+> host-compiler constraint.

@@ -46,6 +46,16 @@ export async function pauseModelDownload(taskId: string): Promise<void> {
   return invoke('pause_model_download', { taskId });
 }
 
+/**
+ * Restarts a paused or failed download from whatever is already on disk.
+ *
+ * The backend resumes from the partial file, so nothing already transferred is
+ * downloaded twice.
+ */
+export async function resumeModelDownload(taskId: string, hfToken?: string): Promise<string> {
+  return invoke('resume_model_download', { taskId, hfToken: hfToken || null });
+}
+
 export async function cancelModelDownload(taskId: string): Promise<void> {
   return invoke('cancel_model_download', { taskId });
 }

@@ -28,7 +28,16 @@ impl MetadataExtractor {
         // 1. Inspect GGUF file header metadata if present
         if let Ok(gguf_file) = Self::find_gguf_file(package_dir, manifest) {
             if let Ok(gguf_info) = Self::inspect_gguf_metadata(&gguf_file) {
-                provenance.gguf_metadata_extracted = true;
+                // Only claim GGUF provenance if something was genuinely read, so
+                // `sourceSummary` stays a truthful record of where values came
+                // from. The runtime sets this flag for real once llama.cpp has
+                // parsed the container.
+                provenance.gguf_metadata_extracted = gguf_info.family.is_some()
+                    || gguf_info.architecture.is_some()
+                    || gguf_info.context_length.is_some()
+                    || gguf_info.eos_token.is_some()
+                    || gguf_info.bos_token.is_some()
+                    || !gguf_info.stop_tokens.is_empty();
                 if let Some(fam) = gguf_info.family {
                     profile.model_family = fam;
                 }
@@ -191,14 +200,21 @@ impl MetadataExtractor {
             return Err(anyhow::anyhow!("File too small"));
         }
 
-        // Generic fallback info from file
+        // Nothing here actually parses the GGUF container — doing so means
+        // walking the full key/value header, which llama.cpp already does when
+        // the model is loaded. The runtime calls `apply_runtime_metadata` at
+        // that point to fill in architecture and tokens from the real thing.
+        //
+        // So this reports no findings rather than inventing any. It previously
+        // returned Llama-3 stop tokens for *every* model, which is how a Gemma
+        // model came to be profiled with `<|eot_id|>`.
         Ok(GgufExtractedInfo {
             family: None,
             architecture: None,
             context_length: None,
             eos_token: None,
             bos_token: None,
-            stop_tokens: vec!["<|eot_id|>".to_string(), "<|end_of_text|>".to_string()],
+            stop_tokens: Vec::new(),
         })
     }
 

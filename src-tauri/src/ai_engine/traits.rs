@@ -177,6 +177,10 @@ pub struct LoadedModelInfo {
     pub backend_used: String,
     pub loaded_at: String,
     pub chat_template: String,
+    /// Where the prompt formatting actually came from: `"gguf"` when the model's
+    /// own template is in use, or `"fallback:<name>"` when a hand-written one is.
+    #[serde(default = "default_template_source")]
+    pub template_source: String,
     pub stop_tokens: Vec<String>,
     #[serde(default = "default_model_family")]
     pub model_family: String,
@@ -185,6 +189,10 @@ pub struct LoadedModelInfo {
 
 fn default_model_family() -> String {
     "Generic".to_string()
+}
+
+fn default_template_source() -> String {
+    "unknown".to_string()
 }
 
 // ─── Inference Status Payload (for Tauri events) ─────────────────────────────

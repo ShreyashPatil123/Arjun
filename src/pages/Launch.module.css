@@ -175,6 +175,27 @@
   color: var(--text-tertiary);
 }
 
+.installing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1;
+}
+
+/* One line of package-manager output. Clipped rather than wrapped: npm emits
+   long paths, and a card that grows a paragraph while installing pushes the
+   rest of the screen around. */
+.installLine {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
 /* Server panel ----------------------------------------------------------- */
 
 .server {

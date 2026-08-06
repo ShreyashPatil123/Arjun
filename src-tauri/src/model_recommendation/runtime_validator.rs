@@ -57,10 +57,29 @@ impl RuntimeValidator {
         }
 
         // Fetch Decoupled Runtime Profile
+        // A certification naming a profile Sarathi does not ship is an
+        // incomplete pack, not a compromised one. Refusing outright was
+        // stricter than the uncertified branch directly above: a model with no
+        // certification at all loads on compatibility defaults, so an
+        // incomplete certification made a model *less* loadable than an unknown
+        // one. Degrade the same way and say so, rather than dead-ending.
         let profile = match pack_manager.get_runtime_profile(&cert.runtime_profile_id) {
             Some(p) => p,
             None => {
-                return Err(anyhow!("Stage 1 Failed: Decoupled runtime profile '{}' not found", cert.runtime_profile_id));
+                log::warn!(
+                    "[RUNTIME_VALIDATOR] Certification for '{}' names runtime profile '{}', which is not installed. Falling back to uncertified compatibility defaults.",
+                    model_id, cert.runtime_profile_id
+                );
+                return Ok(RuntimeValidationResult {
+                    is_valid: true,
+                    stage_passed: "Uncertified Default (profile missing)",
+                    profile: None,
+                    warning: Some(format!(
+                        "Certified runtime profile '{}' is not installed, so '{}' is running in basic compatibility mode rather than its certified configuration.",
+                        cert.runtime_profile_id, model_id
+                    )),
+                    developer_override_active: false,
+                });
             }
         };
 

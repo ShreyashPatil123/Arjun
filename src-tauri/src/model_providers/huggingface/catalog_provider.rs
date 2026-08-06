@@ -147,11 +147,7 @@ impl HuggingFaceCatalogProvider {
     /// Reads the same variable names the official `huggingface_hub` tooling
     /// uses, so an existing setup is picked up automatically.
     fn resolve_token() -> Option<String> {
-        ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"]
-            .iter()
-            .find_map(|k| std::env::var(k).ok())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
+        crate::config::hf_token::get()
     }
 
     /// Discovers models from the live Hub.

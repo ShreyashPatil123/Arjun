@@ -110,7 +110,13 @@ mod tests {
                 expect: id.into(),
             },
             install: None,
-            launch: LaunchSpec { command: id.into(), args: vec![], env: HashMap::new() },
+            launch: LaunchSpec {
+                command: id.into(),
+                args: vec![],
+                env: HashMap::new(),
+                env_remove: vec![],
+                client_config: None,
+            },
             user_defined: false,
         }
     }

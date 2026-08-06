@@ -78,6 +78,27 @@ pub fn run() {
             let memory_manager = Arc::new(MemoryManager::new(&app_data_dir));
             app.manage(memory_manager);
 
+            // Load the saved HuggingFace token into the process before anything
+            // reaches the Hub. Catalog browsing and adapter discovery run from
+            // plain commands with no app handle, so they read it from there
+            // rather than opening config.json themselves.
+            {
+                let config_path = crate::config::ConfigManager::get_config_path(app.handle());
+                match crate::config::ConfigManager::load(&config_path) {
+                    Ok(cfg) if !cfg.hf_token.trim().is_empty() => {
+                        crate::config::hf_token::set(Some(cfg.hf_token));
+                        info!("HuggingFace token loaded from settings");
+                    }
+                    Ok(_) => {
+                        info!(
+                            "No HuggingFace token in settings (environment: {})",
+                            crate::config::hf_token::source()
+                        );
+                    }
+                    Err(e) => log::warn!("Could not read config for HuggingFace token: {e:#}"),
+                }
+            }
+
             let pack_manager = Arc::new(crate::model_recommendation::pack_manager::PackManager::new(&app_data_dir).expect("Failed to initialize PackManager"));
             app.manage(pack_manager);
 
@@ -212,6 +233,8 @@ pub fn run() {
             // Config commands
             commands::config::get_config,
             commands::config::set_config,
+            commands::config::get_hf_token_status,
+            commands::config::set_hf_token,
             commands::config::get_config_value,
             commands::config::set_config_value,
             commands::config::get_default_config,
@@ -241,6 +264,7 @@ pub fn run() {
             // Download & Storage Management commands (Phase 4)
             commands::download::start_model_download,
             commands::download::pause_model_download,
+            commands::download::resume_model_download,
             commands::download::cancel_model_download,
             commands::download::get_active_downloads,
             commands::download::get_installed_models,

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Pause, X, AlertTriangle, Check } from 'lucide-react';
+import { Pause, Play, X, AlertTriangle, Check } from 'lucide-react';
 import { formatEta, type DownloadView } from '../../hooks/useDownloads';
 import { formatSize } from '../../services/catalog.service';
 import styles from './DownloadBar.module.css';
@@ -7,6 +7,7 @@ import styles from './DownloadBar.module.css';
 interface DownloadBarProps {
   download: DownloadView;
   onPause?: (taskId: string) => void;
+  onResume?: (taskId: string) => void;
   onCancel?: (taskId: string) => void;
   onDismiss?: (taskId: string) => void;
 }
@@ -18,9 +19,12 @@ interface DownloadBarProps {
  * A bar alone is not enough — while a download is resolving its size the
  * percentage is meaningless, so the state is spelled out in words too.
  */
-export function DownloadBar({ download: d, onPause, onCancel, onDismiss }: DownloadBarProps) {
+export function DownloadBar({ download: d, onPause, onResume, onCancel, onDismiss }: DownloadBarProps) {
   const failed = d.status === 'Failed';
   const done = d.status === 'Completed';
+  // Both states pick up from the bytes already on disk, so the same control
+  // serves each — nothing already transferred is fetched twice.
+  const resumable = failed || d.status === 'Paused';
   // Size is unknown until the server answers, and a bar that sits at 0% looks
   // stuck. An indeterminate stripe says "working" honestly instead.
   const unknownSize = d.totalBytes === 0 && !done && !failed;
@@ -64,6 +68,17 @@ export function DownloadBar({ download: d, onPause, onCancel, onDismiss }: Downl
               title="Pause"
             >
               <Pause size={13} />
+            </button>
+          )}
+
+          {resumable && onResume && (
+            <button
+              className={styles.iconBtn}
+              onClick={() => onResume(d.taskId)}
+              aria-label={`${failed ? 'Retry' : 'Resume'} ${d.modelName}`}
+              title={failed ? 'Retry from where it stopped' : 'Resume'}
+            >
+              <Play size={13} />
             </button>
           )}
 

@@ -14,7 +14,9 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::ai_engine::scheduler::{Canceller, GenerationHandle, GenerationJob, JobOrigin};
+use crate::ai_engine::scheduler::{
+    CancelOnDrop, Canceller, GenerationHandle, GenerationJob, JobOrigin,
+};
 use crate::ai_engine::traits::{ChatMessage, GenerationParams, StreamChunk};
 use crate::gateway::anthropic::{self, MessagesRequest, MessagesResponse, StreamEvents};
 use crate::gateway::guard::origin_guard;
@@ -46,15 +48,63 @@ impl GatewayHandle {
 ///
 /// A bind failure (usually the port being in use) is returned rather than
 /// panicking, so the desktop app still opens and the user can choose another port.
+/// Binds `addr`, retrying briefly while it is still held.
+///
+/// A port busy at startup is nearly always this app's own previous instance
+/// finishing its shutdown — restarting Sarathi is exactly when this happens, and
+/// the socket clears in well under a second. Retrying keeps the address the user
+/// configured, which matters because anything pointed at it by hand would
+/// otherwise be left behind by a fallback.
+async fn bind_with_retry(
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+    let deadline = std::time::Instant::now() + GRACE;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if std::time::Instant::now() < deadline => {
+                log::debug!("[GATEWAY] {addr} busy ({e}); retrying");
+                tokio::time::sleep(POLL).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub async fn start_gateway(state: Arc<GatewayState>) -> anyhow::Result<GatewayHandle> {
     let requested_port = state.port();
     let app = router(state.clone());
 
     // Loopback only. Never 0.0.0.0 — that would expose the model to the network.
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], requested_port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("could not bind gateway to 127.0.0.1:{requested_port}: {e}"))?;
+    let listener = match bind_with_retry(addr).await {
+        Ok(listener) => listener,
+        Err(first) => {
+            // Binding once and giving up left the gateway down for the entire
+            // session whenever the port was momentarily busy — most often this
+            // app's own previous instance still releasing its socket after a
+            // quick restart. Every client then got ConnectionRefused with
+            // nothing to explain it, and no amount of retrying on their side
+            // could recover, because nothing was ever going to listen.
+            //
+            // An OS-assigned port always succeeds. The bound port is read back
+            // below and published to state, and tools are handed that at launch
+            // rather than the configured value, so a fallback stays invisible.
+            log::warn!(
+                "[GATEWAY] Could not bind 127.0.0.1:{requested_port} ({first}); falling back to a free port"
+            );
+            let any_port = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+            tokio::net::TcpListener::bind(any_port).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "could not bind gateway to 127.0.0.1:{requested_port} ({first}), \
+                     nor to any free port ({e})"
+                )
+            })?
+        }
+    };
 
     // Read the port back from the socket rather than trusting the request.
     // Port 0 means "any free port", and the OS picks the real one — reporting
@@ -64,6 +114,14 @@ pub async fn start_gateway(state: Arc<GatewayState>) -> anyhow::Result<GatewayHa
         .local_addr()
         .map_err(|e| anyhow::anyhow!("bound gateway but could not read its address: {e}"))?
         .port();
+
+    if port != requested_port {
+        log::warn!(
+            "[GATEWAY] Configured port {requested_port} was unavailable; serving on {port} instead"
+        );
+    }
+    // Published so the dashboard and every launched tool use the live address.
+    state.set_port(port);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -268,6 +326,10 @@ fn openai_stream(
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let canceller: Canceller = handle.canceller();
+    // Held by the body stream, so it is dropped whenever the response stream is
+    // — including when the client hangs up mid-prefill, which the tail below
+    // never sees because that only runs on a fully read answer.
+    let mut guard = CancelOnDrop::new(canceller.clone());
     let chunks = UnboundedReceiverStream::new(handle.chunks);
 
     let (head_id, head_model) = (id.clone(), model.clone());
@@ -277,6 +339,9 @@ fn openai_stream(
 
     let (body_id, body_model) = (id.clone(), model.clone());
     let body = chunks.filter_map(move |chunk: StreamChunk| {
+        if chunk.is_final {
+            guard.disarm();
+        }
         let event = if chunk.is_final {
             let reason = chunk.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
             Some(Event::default().data(json_of(&ChatCompletionChunk::closing(
@@ -352,6 +417,9 @@ fn anthropic_stream(
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let canceller: Canceller = handle.canceller();
+    // See the OpenAI stream: the tail only runs for an answer the client read to
+    // the end, so normal completion is not the case that needs covering.
+    let mut guard = CancelOnDrop::new(canceller.clone());
     let chunks = UnboundedReceiverStream::new(handle.chunks);
     let outcome = Outcome::new();
 
@@ -367,6 +435,9 @@ fn anthropic_stream(
     let body_outcome = outcome.clone();
     let body = chunks.filter_map(move |chunk: StreamChunk| {
         let event = if chunk.is_final {
+            // Generation ended on its own, so dropping the guard must not read
+            // as an abandonment.
+            guard.disarm();
             // Terminal events belong to `tail`; just record how it ended.
             let reason = anthropic::map_stop_reason(chunk.finish_reason.as_deref().unwrap_or("stop"));
             body_outcome.record(reason.to_string(), chunk.tokens_generated.unwrap_or(0));
@@ -460,16 +531,37 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn a_port_already_in_use_fails_cleanly() {
-        // The desktop app must still open so the user can choose another port.
+    async fn a_taken_port_falls_back_instead_of_leaving_the_gateway_down() {
+        // Previously this returned an error and the app ran with no gateway for
+        // the rest of the session: every client got ConnectionRefused, retrying
+        // could never help because nothing would ever listen, and the dashboard
+        // still reported the server as running. Serving somewhere is strictly
+        // better than serving nowhere, and callers are handed the live port
+        // rather than the configured one.
         let (_first, port) = start_on_ephemeral_port().await;
 
-        let second = start_gateway(test_state(port)).await;
+        let state = test_state(port);
+        let second = start_gateway(state.clone())
+            .await
+            .expect("a taken port must not stop the gateway from starting");
 
-        assert!(second.is_err(), "binding a taken port must fail rather than panic");
+        assert_ne!(second.port, port, "it must move off the port already in use");
+        assert_ne!(second.port, 0, "the fallback must report a real bound port");
+
+        // The live port has to be published, or launched tools are handed an
+        // address nothing is listening on.
+        assert_eq!(
+            state.port(),
+            second.port,
+            "state must carry the port that was actually bound"
+        );
+
+        // And it must genuinely be accepting connections there.
         assert!(
-            second.unwrap_err().to_string().contains("could not bind"),
-            "the error should name the cause"
+            tokio::net::TcpStream::connect(("127.0.0.1", second.port))
+                .await
+                .is_ok(),
+            "the fallback port must be live"
         );
     }
 }

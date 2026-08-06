@@ -128,14 +128,68 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
     let file_name = format!("{}-{}.gguf", repo_id.split('/').last().unwrap_or("model"), quantization);
     let download_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, file_name);
 
+    // Ask the server directly for size and digest. A size of 0 used to flow
+    // through to the downloader, which skips its integrity check when it does
+    // not know how many bytes to expect — so a truncated transfer would be
+    // renamed to `.gguf` and served as a working model.
+    let (size_bytes, sha256) = probe_remote_artifact(&client, &download_url, hf_token).await;
+    log::info!(
+        "[HF RESOLVER] Tree API unavailable; fell back to '{}' (HEAD reported size: {} bytes)",
+        file_name, size_bytes
+    );
+
     Ok(ResolvedArtifact {
         repo_id,
         file_name,
         download_url,
-        size_bytes: 0, // 0 = will be populated via HTTP HEAD request Content-Length
+        size_bytes,
         quantization: quantization.to_string(),
-        sha256: None,
+        sha256,
     })
+}
+
+/// Asks the server for an artifact's true size and digest via HEAD.
+///
+/// Returns `(0, None)` when the server cannot be reached or refuses the request;
+/// callers must treat an unknown size as "verify some other way", never as
+/// "no verification needed".
+async fn probe_remote_artifact(
+    client: &reqwest::Client,
+    url: &str,
+    hf_token: Option<&str>,
+) -> (u64, Option<String>) {
+    let mut req = client.head(url);
+    if let Some(token) = hf_token {
+        if !token.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", token.trim()));
+        }
+    }
+
+    let Ok(resp) = req.send().await else {
+        return (0, None);
+    };
+    if !resp.status().is_success() {
+        return (0, None);
+    }
+
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches('"').to_string())
+    };
+
+    // For LFS/Xet-backed files these headers describe the actual weights;
+    // Content-Length on a redirect hop only describes the pointer file.
+    let size = header("x-linked-size")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| resp.content_length())
+        .unwrap_or(0);
+
+    // `X-Linked-ETag` carries the LFS object id, which is the file's SHA-256.
+    let sha256 = header("x-linked-etag").filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()));
+
+    (size, sha256)
 }
 
 #[cfg(test)]

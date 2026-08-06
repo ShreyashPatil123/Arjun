@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Current schema version for Model Profile
-pub const CURRENT_PROFILE_VERSION: u32 = 1;
+/// Bumped to 2 when profiles started being filled from real GGUF metadata.
+///
+/// v1 profiles were written before the GGUF was even finalized on disk, so they
+/// carry [`TokenConfig::default`]'s Llama-3 tokens regardless of the actual
+/// model — a Gemma model profiled with `<|eot_id|>` will not stop generating.
+/// Those profiles are rebuilt rather than version-stamped.
+pub const CURRENT_PROFILE_VERSION: u32 = 2;
 
 /// Supported LLM Model Families
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,7 +49,7 @@ impl Default for ModelFamily {
 }
 
 /// Token configuration and stop sequences
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenConfig {
     pub bos_token: Option<String>,
@@ -166,6 +172,21 @@ impl CapabilityRegistry {
     }
 }
 
+/// Model facts read out of a GGUF that llama.cpp has loaded.
+///
+/// Populated by the runtime (which holds the `LlamaModel`) and handed here so
+/// this module stays free of llama.cpp types.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeGgufMetadata {
+    pub architecture: Option<String>,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
+    /// Separate end-of-turn token where a model declares one (Gemma, Llama-3).
+    pub eot_token: Option<String>,
+    pub context_length: u32,
+    pub has_native_chat_template: bool,
+}
+
 /// Metadata extraction provenance tracker
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -233,6 +254,64 @@ impl ModelProfile {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    /// Overwrites guessed token/architecture fields with values read from a
+    /// model that llama.cpp has actually loaded.
+    ///
+    /// Everything here is authoritative: it comes from the GGUF's own metadata
+    /// rather than from pattern-matching the model id, which is how a Gemma
+    /// model ended up profiled as Llama-3. Returns true if anything changed.
+    pub fn apply_runtime_metadata(&mut self, meta: &RuntimeGgufMetadata) -> bool {
+        let before = (
+            self.architecture.clone(),
+            self.tokens.clone(),
+            self.recommended_params.context_length,
+        );
+
+        if let Some(arch) = &meta.architecture {
+            self.architecture = arch.clone();
+            self.model_family = crate::model_intelligence::MetadataExtractor::infer_family_from_string(arch);
+        }
+        if let Some(bos) = &meta.bos_token {
+            self.tokens.bos_token = Some(bos.clone());
+        }
+        if let Some(eos) = &meta.eos_token {
+            self.tokens.eos_token = Some(eos.clone());
+            // The model's own end-of-turn token is the only stop string we can
+            // state with confidence; the defaults were another family's.
+            self.tokens.stop_tokens = vec![eos.clone()];
+        }
+        if let Some(eot) = &meta.eot_token {
+            if !self.tokens.stop_tokens.contains(eot) {
+                self.tokens.stop_tokens.push(eot.clone());
+            }
+        }
+        if meta.context_length > 0 {
+            self.recommended_params.context_length = meta.context_length;
+        }
+
+        // `chat_template` deliberately keeps its family name rather than being
+        // overwritten here. Prompts are rendered from the GGUF's own template,
+        // but if that ever fails to render the family name is what selects the
+        // closest hand-written fallback — replacing it would lose that.
+        self.provenance.gguf_metadata_extracted = true;
+        self.provenance.source_summary = format!(
+            "Token and architecture metadata read from the loaded GGUF via llama.cpp \
+             (embedded chat template: {})",
+            if meta.has_native_chat_template { "yes" } else { "no" }
+        );
+
+        let changed = before
+            != (
+                self.architecture.clone(),
+                self.tokens.clone(),
+                self.recommended_params.context_length,
+            );
+        if changed {
+            self.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        changed
     }
 
     /// Migrate profile if version is older than CURRENT_PROFILE_VERSION

@@ -4,6 +4,7 @@ import {
   Trash2,
   RefreshCw,
   Power,
+  Play,
   AlertTriangle,
   Layers,
   Download,
@@ -18,7 +19,7 @@ import {
   deleteInstalledModel,
   getStorageSummary,
 } from '../services/download.service';
-import { getInferenceStatus, unloadActiveModel } from '../services/ai.service';
+import { getInferenceStatus, loadInstalledModel, unloadActiveModel } from '../services/ai.service';
 import {
   listInstalledAdapters,
   removeAdapter,
@@ -75,7 +76,7 @@ export const Storage: React.FC = () => {
     [addToast, refresh]
   );
 
-  const { downloads, pause, cancel, dismiss } = useDownloads(onDownloadCompleted);
+  const { downloads, pause, resume, cancel, dismiss } = useDownloads(onDownloadCompleted);
 
   useEffect(() => {
     refresh();
@@ -138,6 +139,22 @@ export const Storage: React.FC = () => {
     }
   };
 
+  // Loading reads gigabytes into VRAM and takes a while, so the button reports
+  // progress and every other model's button locks — two concurrent loads would
+  // fight over the same VRAM budget.
+  const handleLoad = async (m: any) => {
+    setBusy(m.modelId);
+    try {
+      await loadInstalledModel(m.providerId, m.modelId, m.quantization);
+      addToast('success', `${m.modelName} loaded — the gateway can serve requests`);
+      await refresh();
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const handleUnload = async () => {
     try {
       await unloadActiveModel();
@@ -185,11 +202,11 @@ export const Storage: React.FC = () => {
           </div>
           <div className={styles.stat}>
             <span className={styles.statLabel}>Used by models</span>
-            <span className={styles.statValue}>{formatSize(summary.totalSizeBytes ?? 0)}</span>
+            <span className={styles.statValue}>{formatSize(summary.totalModelsBytes ?? 0)}</span>
           </div>
           <div className={styles.stat}>
             <span className={styles.statLabel}>Free on disk</span>
-            <span className={styles.statValue}>{formatSize(summary.freeSpaceBytes ?? 0)}</span>
+            <span className={styles.statValue}>{formatSize(summary.availableDiskSpaceBytes ?? 0)}</span>
           </div>
         </div>
       )}
@@ -206,6 +223,7 @@ export const Storage: React.FC = () => {
                 key={d.taskId}
                 download={d}
                 onPause={(id) => void pause(id)}
+                onResume={(id) => void resume(id)}
                 onCancel={(id) => void cancel(id)}
                 onDismiss={dismiss}
               />
@@ -244,13 +262,23 @@ export const Storage: React.FC = () => {
                 </div>
 
                 <div className={styles.modelActions}>
-                  {isLoaded && (
+                  {isLoaded ? (
                     <>
                       <span className={styles.serving}>● Serving the gateway</span>
                       <Button variant="ghost" size="sm" onClick={handleUnload}>
                         <Power size={13} /> Unload
                       </Button>
                     </>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleLoad(m)}
+                      disabled={busy !== null}
+                      title="Load this model so the gateway can serve it"
+                    >
+                      <Play size={13} /> {busy === m.modelId ? 'Loading…' : 'Load'}
+                    </Button>
                   )}
                   <Button
                     variant="ghost"

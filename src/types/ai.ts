@@ -124,6 +124,8 @@ export interface QuantizationOption {
   qualityNote: string;
   /** Whether this option fits the detected memory budget. */
   fits: boolean;
+  /** True for 1–2 bit quantizations, where output can degrade to nonsense. */
+  lowQuality?: boolean;
 }
 
 /**
@@ -164,6 +166,19 @@ export interface ModelCard {
   totalParameters?: number | null;
   contextLength?: number | null;
   quantizations: QuantizationOption[];
+  /**
+   * True when Sarathi vouches for this one: a publisher whose conversions are
+   * dependable, enough real use to have surfaced problems, no reasoning tokens
+   * in its output, and a size that runs on this machine.
+   */
+  recommended: boolean;
+  /**
+   * True when the model narrates its reasoning (`<think>` and similar) into its
+   * replies. Read from the GGUF's own chat template where one was published.
+   */
+  emitsReasoning: boolean;
+  /** ISO-8601 last-modified stamp, for sorting. `ageLabel` is the readable form. */
+  lastModified: string;
 }
 
 /** How a capability is actually being applied to the model. */

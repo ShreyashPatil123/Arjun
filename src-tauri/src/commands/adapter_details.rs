@@ -123,7 +123,7 @@ fn suggested_skills(name: &str) -> Vec<ModelCategory> {
 /// Looks up one adapter and explains what it does.
 #[tauri::command]
 pub async fn get_adapter_details(repo_id: String) -> Result<AdapterDetails, String> {
-    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.trim().is_empty());
+    let token = crate::config::hf_token::get();
 
     let client = reqwest::Client::builder()
         .user_agent("Sarathi/0.1.0")
@@ -167,7 +167,9 @@ pub async fn get_adapter_details(repo_id: String) -> Result<AdapterDetails, Stri
 
     // The same rule the download uses, so the panel and the button never
     // disagree about whether this can be installed.
-    let installable = crate::adapter_manager::store::check_installable(&filenames);
+    // Sized form: the Hub's blob listing is already in hand, and it is what
+    // distinguishes a real adapter from a merged model sharing its repository.
+    let installable = crate::adapter_manager::store::check_installable_sized(&files);
     let gguf_ready = installable.is_ok();
     let blocked_reason = installable.as_ref().err().map(|e| e.to_string());
     let size_bytes = installable

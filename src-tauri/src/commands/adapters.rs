@@ -58,7 +58,7 @@ pub async fn download_adapter(
     adapter_repo_id: String,
 ) -> Result<InstalledAdapter, String> {
     let package = package_dir_for(&app, &provider_id, &model_id)?;
-    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.trim().is_empty());
+    let token = crate::config::hf_token::get();
 
     let client = reqwest::Client::builder()
         .user_agent("Sarathi/0.1.0")

@@ -3,7 +3,9 @@
 //! ZERO firewall prompts, ZERO port conflicts, 100% process lifetime coupling.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
+
+use crate::system_analyzer::process_utils::create_hidden_command;
 use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -35,7 +37,9 @@ impl SidecarAdapter {
         log::info!("[SIDECAR] Spawning Python sidecar from {:?}", target_script);
         let script_dir = target_script.parent().unwrap_or(&cwd);
 
-        let mut command = Command::new("python");
+        // Hidden: a bare Command::new pops a console window when the GUI build
+        // (windows_subsystem = "windows") spawns a console application.
+        let mut command = create_hidden_command("python");
         command.arg(&target_script);
         command.env("PYTHONPATH", script_dir);
         command.stdin(Stdio::piped());

@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 
 /// Creates a `Command` configured to execute without spawning a visible console window on Windows,
 /// and with OS error dialog popups suppressed.
-pub fn create_hidden_command(program: &str) -> Command {
+pub fn create_hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {

@@ -30,10 +30,24 @@ impl ModelIntelligenceManager {
         if profile_path.exists() {
             if let Ok(content) = fs::read_to_string(&profile_path) {
                 if let Ok(mut profile) = serde_json::from_str::<ModelProfile>(&content) {
-                    if profile.migrate_if_needed() {
-                        let _ = Self::write_profile(package_dir, &profile);
+                    // An out-of-date profile is rebuilt from source rather than
+                    // version-stamped in place. Stamping was enough when the
+                    // schema changed, but v1 profiles hold *wrong values* — they
+                    // were written before the GGUF finished downloading, so the
+                    // extractor found no file and fell back to another family's
+                    // tokens. Keeping those and relabelling them v2 would leave
+                    // the model unable to stop generating.
+                    if profile.profile_version < CURRENT_PROFILE_VERSION {
+                        log::info!(
+                            "[MODEL_INTELLIGENCE] Profile for '{}' is v{} (current v{}); rebuilding from package sources",
+                            profile.model_id, profile.profile_version, CURRENT_PROFILE_VERSION
+                        );
+                    } else {
+                        if profile.migrate_if_needed() {
+                            let _ = Self::write_profile(package_dir, &profile);
+                        }
+                        return Ok(profile);
                     }
-                    return Ok(profile);
                 }
             }
         }
@@ -90,6 +104,64 @@ mod tests {
         assert!(prof.migrate_if_needed());
         assert_eq!(prof.profile_version, CURRENT_PROFILE_VERSION);
         assert!(!prof.migrate_if_needed());
+    }
+
+    #[test]
+    fn runtime_metadata_replaces_the_default_llama3_tokens() {
+        use crate::model_intelligence::profile::RuntimeGgufMetadata;
+
+        // A fresh profile starts with TokenConfig::default(), which is Llama-3's
+        // vocabulary regardless of the model — this is exactly how a Gemma model
+        // came to be configured with `<|eot_id|>` and never stopped generating.
+        let mut prof = ModelProfile::new("pkg", "some/gemma-model", "Gemma");
+        assert_eq!(prof.tokens.eos_token.as_deref(), Some("<|eot_id|>"));
+
+        let changed = prof.apply_runtime_metadata(&RuntimeGgufMetadata {
+            architecture: Some("gemma3".to_string()),
+            bos_token: Some("<bos>".to_string()),
+            eos_token: Some("<end_of_turn>".to_string()),
+            eot_token: None,
+            context_length: 8192,
+            has_native_chat_template: true,
+        });
+
+        assert!(changed);
+        assert_eq!(prof.architecture, "gemma3");
+        assert_eq!(prof.model_family, ModelFamily::Gemma);
+        assert_eq!(prof.tokens.bos_token.as_deref(), Some("<bos>"));
+        assert_eq!(prof.tokens.eos_token.as_deref(), Some("<end_of_turn>"));
+        // The other family's stop tokens must be gone, not merely added to.
+        assert_eq!(prof.tokens.stop_tokens, vec!["<end_of_turn>".to_string()]);
+        assert_eq!(prof.recommended_params.context_length, 8192);
+        assert!(prof.provenance.gguf_metadata_extracted);
+    }
+
+    #[test]
+    fn runtime_metadata_keeps_a_distinct_end_of_turn_token() {
+        use crate::model_intelligence::profile::RuntimeGgufMetadata;
+
+        let mut prof = ModelProfile::new("pkg", "some/model", "Model");
+        prof.apply_runtime_metadata(&RuntimeGgufMetadata {
+            eos_token: Some("<|end_of_text|>".to_string()),
+            eot_token: Some("<|eot_id|>".to_string()),
+            ..Default::default()
+        });
+
+        // Models whose turn terminator differs from EOS need both, or generation
+        // runs on past the end of the reply.
+        assert_eq!(
+            prof.tokens.stop_tokens,
+            vec!["<|end_of_text|>".to_string(), "<|eot_id|>".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_v1_profile_is_rebuilt_rather_than_relabelled() {
+        // v1 profiles hold wrong values, not merely an old shape, so bumping the
+        // version in place would preserve the bad tokens under a new label.
+        let mut prof = ModelProfile::new("pkg", "some/gemma-model", "Gemma");
+        prof.profile_version = 1;
+        assert!(prof.profile_version < CURRENT_PROFILE_VERSION);
     }
 
     #[test]

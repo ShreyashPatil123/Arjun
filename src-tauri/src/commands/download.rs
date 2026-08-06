@@ -50,6 +50,24 @@ pub fn pause_model_download(
 }
 
 #[tauri::command]
+pub async fn resume_model_download(
+    app_handle: AppHandle,
+    download_mgr: State<'_, Arc<DownloadManager>>,
+    task_id: String,
+    hf_token: Option<String>,
+) -> Result<String, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve AppData directory: {}", e))?;
+
+    download_mgr
+        .resume_download(app_handle.clone(), app_data_dir, &task_id, hf_token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn cancel_model_download(
     app_handle: AppHandle,
     download_mgr: State<'_, Arc<DownloadManager>>,

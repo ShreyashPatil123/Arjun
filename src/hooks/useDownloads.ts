@@ -3,6 +3,7 @@ import {
   getActiveDownloads,
   listenDownloadProgress,
   pauseModelDownload,
+  resumeModelDownload,
   cancelModelDownload,
 } from '../services/download.service';
 import type { DownloadStatus, DownloadTask, DownloadProgressPayload } from '../types/download';
@@ -165,6 +166,21 @@ export function useDownloads(onCompleted?: (view: DownloadView) => void) {
     await pauseModelDownload(taskId);
   }, []);
 
+  /**
+   * Picks a paused or failed download back up.
+   *
+   * Shown optimistically as `Resolving` so the row stops reading as failed the
+   * moment it is clicked; the backend's own events take over from there.
+   */
+  const resume = useCallback(async (taskId: string) => {
+    setDownloads((prev) => {
+      const existing = prev[taskId];
+      if (!existing) return prev;
+      return { ...prev, [taskId]: { ...existing, status: 'Resolving', error: null } };
+    });
+    await resumeModelDownload(taskId);
+  }, []);
+
   // The bar is removed by the `Cancelled` event the backend sends, not here.
   // Removing it optimistically meant a cancel that failed still cleared the
   // bar, so a download could carry on with nothing on screen saying so.
@@ -191,5 +207,5 @@ export function useDownloads(onCompleted?: (view: DownloadView) => void) {
     });
   }, []);
 
-  return { downloads: list, refresh, pause, cancel, dismiss, isDownloading };
+  return { downloads: list, refresh, pause, resume, cancel, dismiss, isDownloading };
 }

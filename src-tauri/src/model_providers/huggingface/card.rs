@@ -279,6 +279,11 @@ pub struct QuantizationOption {
     pub quality_note: String,
     /// Whether this option fits the machine's memory budget.
     pub fits: bool,
+    /// True for 1- and 2-bit quantizations, where output degrades enough that
+    /// a model can read as broken rather than merely weaker. Surfaced so the UI
+    /// can warn before someone spends a multi-gigabyte download finding out.
+    #[serde(default)]
+    pub low_quality: bool,
 }
 
 /// Presentation-ready model card.
@@ -306,6 +311,9 @@ pub struct ModelCard {
     pub likes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_label: Option<String>,
+    /// Raw ISO-8601 last-modified stamp. `age_label` is for reading; this is
+    /// for sorting, which "3mo" cannot support.
+    pub last_modified: String,
     pub is_finetune: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_model: Option<String>,
@@ -314,6 +322,13 @@ pub struct ModelCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
     pub quantizations: Vec<QuantizationOption>,
+    /// Whether this is one Sarathi vouches for. See
+    /// [`crate::model_providers::huggingface::curation`] for what that means.
+    pub recommended: bool,
+    /// Whether the model narrates its reasoning (`<think>` and friends) into
+    /// its replies. Surfaced so the card can say so, since the tokens reach
+    /// anything reading the gateway as plain text.
+    pub emits_reasoning: bool,
 }
 
 /// Human-readable parameter count: `7.6B`, `1.5B`, `350M`.
@@ -381,9 +396,21 @@ fn quality_note(label: &str) -> &'static str {
         "Balanced — recommended"
     } else if l.starts_with("Q3") || l.starts_with("IQ3") {
         "Noticeable quality loss"
+    } else if is_low_quality(label) {
+        "Very low — may produce broken output"
     } else {
         "Smallest — significant quality loss"
     }
+}
+
+/// Whether a quantization is aggressive enough to be worth warning about.
+///
+/// At 1–2 bits per weight the damage is not a gentle decline: models at this
+/// level can lose coherence entirely, which looks like a broken install rather
+/// than a quality setting. Q4_K_M is the usual practical floor.
+fn is_low_quality(label: &str) -> bool {
+    let l = label.to_uppercase();
+    l.starts_with("Q2") || l.starts_with("IQ2") || l.starts_with("Q1") || l.starts_with("IQ1")
 }
 
 fn to_option(q: &Quantization, budget_bytes: u64) -> QuantizationOption {
@@ -392,6 +419,7 @@ fn to_option(q: &Quantization, budget_bytes: u64) -> QuantizationOption {
         size_bytes: q.size_bytes,
         quality_note: quality_note(&q.label).to_string(),
         fits: budget_bytes > 0 && q.size_bytes <= budget_bytes,
+        low_quality: is_low_quality(&q.label),
     }
 }
 
@@ -413,6 +441,14 @@ pub fn build_card(
     let categories = categorize(&repo.repo_id, &repo.tags, params, context, &arch);
     let kind = model_kind(&repo.tags);
 
+    let quantizations: Vec<QuantizationOption> =
+        repo.quantizations.iter().map(|q| to_option(q, budget_bytes)).collect();
+
+    // An unknown budget marks nothing as fitting, which must not be read as
+    // "nothing runs here" — that would empty the recommended section on a
+    // machine whose hardware could not be read.
+    let fits_here = budget_bytes == 0 || quantizations.iter().any(|q| q.fits);
+
     ModelCard {
         repo_id: repo.repo_id.clone(),
         publisher: repo.author.clone(),
@@ -427,11 +463,14 @@ pub fn build_card(
         downloads_label: format_downloads(repo.downloads),
         likes: repo.likes,
         age_label: format_age(&repo.last_modified, now),
+        last_modified: repo.last_modified.clone(),
         is_finetune: repo.is_finetune,
         base_model: repo.base_model.clone(),
         total_parameters: (params > 0).then_some(params),
         context_length: (context > 0).then_some(context),
-        quantizations: repo.quantizations.iter().map(|q| to_option(q, budget_bytes)).collect(),
+        quantizations,
+        recommended: crate::model_providers::huggingface::curation::is_recommended(repo, fits_here),
+        emits_reasoning: crate::model_providers::huggingface::curation::emits_reasoning_tokens(repo),
     }
 }
 

@@ -16,6 +16,15 @@ use crate::ai_engine::traits::*;
 use crate::capability::{self, CapabilityLayer, CapabilityPayload};
 use crate::system_analyzer;
 
+/// Context a model is planned around when its own maximum is larger.
+///
+/// Modern GGUFs advertise ceilings (256K on Gemma 3/4 and Qwen 3) that describe
+/// what the weights permit, not what a desktop card can hold. Budgeting for one
+/// reserves tens of gigabytes of KV cache that will never be used. This is the
+/// working context Sarathi actually plans for; a user who wants more can raise
+/// it per model in Settings.
+const DEFAULT_WORKING_CONTEXT: u32 = 8192;
+
 /// The installed package backing the currently loaded model.
 ///
 /// Captured at load time so each turn can resolve capabilities without
@@ -458,48 +467,110 @@ impl InferenceManager {
         profile: &crate::model_intelligence::ModelProfile,
     ) -> Result<ModelLoadConfig> {
         let analyzer = system_analyzer::get_system_analyzer_manager();
-        let hw_profile = analyzer.get_profile();
 
-        // Determine thread count from hardware profile
-        let threads = if let Some(ref profile) = hw_profile {
-            let cpu = profile.cpu.current();
-            // Use physical cores (not logical/HT) for inference, capped at reasonable value
-            let physical = cpu.physical_cores;
-            std::cmp::min(physical, 16) // Cap at 16 threads
-        } else {
-            // Fallback: use half of available logical processors
-            let sys = sysinfo::System::new_all();
-            let cpus = sys.cpus().len() as u32;
-            std::cmp::max(1, std::cmp::min(cpus / 2, 8))
-        };
+        // Detection is demanded here, not merely read.
+        //
+        // The startup auto-load races the background hardware scan and usually
+        // wins, so the profile is still empty when the most important load of
+        // the session is planned. A missing profile silently means "no GPU",
+        // which is indistinguishable from a machine that genuinely has none —
+        // the model went to CPU on a box with an idle discrete card, every
+        // session, and the log line explaining it read like a hardware fact.
+        //
+        // `analyze_system` joins an in-flight scan rather than duplicating it,
+        // so this costs the scan once and only when something got there first.
+        let hw_profile = analyzer.get_profile().or_else(|| {
+            log::info!(
+                "[INFERENCE_MGR] Hardware profile not ready; running detection before planning GPU offload"
+            );
+            if let Err(e) = analyzer.analyze_system() {
+                log::warn!("[INFERENCE_MGR] Hardware detection failed ({e:#}); planning for CPU");
+            }
+            analyzer.get_profile()
+        });
+
+        // Thread count comes from the machine, with no ceiling of our own.
+        //
+        // Physical cores rather than logical: llama.cpp's GEMM is memory-bandwidth
+        // bound, and running two hyperthreads per core contends for the same L2
+        // without adding throughput. The previous cap of 16 was arbitrary — it
+        // silently discarded half the CPU on a 32-core workstation, and the
+        // fallback's cap of 8 did the same on anything larger.
+        let threads = hw_profile
+            .as_ref()
+            .map(|p| p.cpu.current().physical_cores)
+            .filter(|&cores| cores > 0)
+            .or_else(|| {
+                // No profile yet: sysinfo reports logical CPUs, so halve them as
+                // an estimate of physical cores on an SMT machine.
+                let sys = sysinfo::System::new_all();
+                let logical = sys.cpus().len() as u32;
+                (logical > 0).then(|| logical.div_ceil(2))
+            })
+            .unwrap_or(1)
+            .max(1);
 
         // Provisional context length, needed to size the KV cache before the
         // certified profile is consulted below.
-        let planned_context = profile.effective_params().context_length;
+        let requested_context = profile.effective_params().context_length;
 
         // Determine GPU layers from the hardware profile, accounting for KV
         // cache and OS reserve rather than comparing raw VRAM to file size.
-        let gpu_layers = if let Some(ref hw) = hw_profile {
-            let gpus = hw.gpus.current();
-            if let Some(gpu) = gpus.iter().find(|g| g.cuda_supported || g.vulkan_supported) {
+        let selected_gpu = hw_profile
+            .as_ref()
+            .and_then(|hw| select_inference_gpu(hw.gpus.current()));
+
+        // Size the KV cache against a working context, not the model's ceiling.
+        //
+        // Two failures sat on either side of this. Planning against the
+        // advertised maximum charged the budget for a cache far larger than
+        // would ever be allocated — a 12B claiming 256K left nothing for
+        // weights, so the planner said not one layer fit and sent a model that
+        // partially offloads comfortably to pure CPU. Shrinking the context
+        // until everything fit in VRAM instead bought full offload at 2265
+        // tokens, which no coding agent can work in; its system prompt alone is
+        // refused at that size.
+        //
+        // So the context is held at something usable and the layer count is
+        // what gives. Partial offload degrades smoothly; a context too small to
+        // hold the first message does not.
+        let planned_context = requested_context.min(DEFAULT_WORKING_CONTEXT);
+
+        if planned_context < requested_context {
+            log::info!(
+                "[INFERENCE_MGR] Planning against a {}-token working context, not the model's advertised {}",
+                planned_context,
+                requested_context
+            );
+        }
+
+        let gpu_layers = match &selected_gpu {
+            Some(gpu) => {
+                let budget = usable_vram_bytes(gpu);
                 let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
-                    gpu.vram_total_bytes,
+                    budget,
                     manifest.base_model.size_bytes,
                     planned_context,
                     None, // GGUF layer count not parsed at load time
                 );
                 log::info!(
-                    "[INFERENCE_MGR] GPU '{}': {}",
-                    gpu.model, plan.reason
+                    "[INFERENCE_MGR] Selected GPU '{}' ({}, {:.2} GB usable of {:.2} GB): {}",
+                    gpu.model,
+                    if gpu.is_dedicated { "dedicated" } else { "integrated" },
+                    budget as f64 / 1e9,
+                    gpu.vram_total_bytes as f64 / 1e9,
+                    plan.reason
                 );
                 plan.gpu_layers
-            } else {
-                log::info!("[INFERENCE_MGR] No CUDA/Vulkan capable GPU detected, using CPU mode (0 layers)");
+            }
+            None if hw_profile.is_some() => {
+                log::info!("[INFERENCE_MGR] No GPU with a usable accelerator backend, using CPU mode (0 layers)");
                 0
             }
-        } else {
-            log::info!("[INFERENCE_MGR] No hardware profile available, defaulting to CPU mode");
-            0
+            None => {
+                log::info!("[INFERENCE_MGR] No hardware profile available, defaulting to CPU mode");
+                0
+            }
         };
 
         // Check for authoritative certified RuntimeProfile from PackManager
@@ -519,15 +590,11 @@ impl InferenceManager {
             // It describes the MODEL (template, stop tokens, maximum context) and
             // is authoritative for those. It cannot know anything about the machine
             // it lands on, so every hardware-dependent value stays measured here.
-            let detected_vram = hw_profile
+            // Same GPU the offload plan above chose, so the context it sizes and
+            // the layers it places are budgeted against one card, not two.
+            let detected_vram = selected_gpu
                 .as_ref()
-                .and_then(|hw| {
-                    hw.gpus
-                        .current()
-                        .iter()
-                        .find(|g| g.cuda_supported || g.vulkan_supported)
-                        .map(|g| g.vram_total_bytes)
-                })
+                .map(|gpu| usable_vram_bytes(gpu))
                 .unwrap_or(0);
 
             // The model's advertised context is an upper bound, not an entitlement.
@@ -567,7 +634,10 @@ impl InferenceManager {
             (
                 profile.chat_template.clone(),
                 profile.tokens.stop_tokens.clone(),
-                profile.effective_params().context_length,
+                // The context the offload was budgeted against, not the model's
+                // advertised maximum — allocating a larger cache than the plan
+                // assumed is what pushes the load past the card's memory.
+                planned_context,
                 gpu_layers,
                 threads,
             )
@@ -598,7 +668,7 @@ impl InferenceManager {
 
         // Check if manifest.base_model.file_path points directly to a valid .gguf FILE (not a directory)
         if gguf_path.exists() && gguf_path.is_file() {
-            let clean = gguf_path.to_string_lossy().replace('/', "\\");
+            let clean = gguf_path.to_string_lossy().to_string();
             log::info!("[INFERENCE_MGR] GGUF file resolved at manifest path: {}", clean);
             return Ok(clean);
         }
@@ -613,7 +683,7 @@ impl InferenceManager {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_file() && p.extension().map_or(false, |ext| ext == "gguf") {
-                        found_files.push(p.to_string_lossy().replace('/', "\\"));
+                        found_files.push(p.to_string_lossy().to_string());
                     }
                 }
                 if !found_files.is_empty() {
@@ -631,6 +701,51 @@ impl InferenceManager {
     }
 }
 
+/// VRAM this GPU can actually give the model right now.
+///
+/// Free memory when the driver reports it — a desktop compositor, a browser, or
+/// another model may already hold part of the card, and budgeting against the
+/// total would plan for memory that is not there. Falls back to total when the
+/// vendor exposes no free figure.
+fn usable_vram_bytes(gpu: &crate::system_analyzer::traits::GpuInfo) -> u64 {
+    if gpu.vram_free_bytes > 0 {
+        gpu.vram_free_bytes
+    } else {
+        gpu.vram_total_bytes
+    }
+}
+
+/// Picks the GPU most likely to run the model fastest.
+///
+/// Enumeration order is not preference order: adapters come back in whatever
+/// order the driver reports them, so taking the first compatible one could put
+/// the model on an integrated GPU sharing system RAM while a discrete card sat
+/// idle beside it. This machine reports exactly that pair.
+///
+/// Dedicated memory is ranked *before* capacity, because an integrated GPU's
+/// reported "VRAM" is not comparable to a discrete card's.
+///
+/// An iGPU advertises a slice of system RAM — this machine's Radeon 780M
+/// reports 13 GB beside an RTX 5060's real 8 GB — so ranking by capacity first
+/// handed every model to the slower device on its own memory bus while the
+/// discrete card sat idle. Capacity only decides between cards of the same
+/// kind. Any backend the build can drive is eligible; a card with no usable
+/// memory is not a candidate at all, which is what leaves CPU as the fallback
+/// rather than a broken GPU path.
+pub(crate) fn select_inference_gpu(
+    gpus: &[crate::system_analyzer::traits::GpuInfo],
+) -> Option<crate::system_analyzer::traits::GpuInfo> {
+    gpus.iter()
+        .filter(|g| g.cuda_supported || g.vulkan_supported || g.rocm_supported)
+        .filter(|g| usable_vram_bytes(g) > 0)
+        .max_by(|a, b| {
+            a.is_dedicated
+                .cmp(&b.is_dedicated)
+                .then(usable_vram_bytes(a).cmp(&usable_vram_bytes(b)))
+        })
+        .cloned()
+}
+
 impl Default for InferenceManager {
     fn default() -> Self {
         Self::new()
@@ -640,6 +755,136 @@ impl Default for InferenceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system_analyzer::traits::GpuInfo;
+
+    /// A GPU with only the fields selection looks at set.
+    fn gpu(model: &str, dedicated: bool, total: u64, free: u64, cuda: bool, vulkan: bool) -> GpuInfo {
+        GpuInfo {
+            vendor: String::new(),
+            model: model.to_string(),
+            gpu_type: String::new(),
+            is_dedicated: dedicated,
+            dedicated_video_memory_bytes: if dedicated { total } else { 0 },
+            dedicated_system_memory_bytes: 0,
+            shared_system_memory_bytes: if dedicated { 0 } else { total },
+            total_available_graphics_memory_bytes: total,
+            vram_total_bytes: total,
+            vram_free_bytes: free,
+            driver_version: None,
+            vendor_id: None,
+            device_id: None,
+            compute_capability: None,
+            cuda_supported: cuda,
+            rocm_supported: false,
+            directx_supported: true,
+            vulkan_supported: vulkan,
+            opencl_supported: true,
+            detection_source: "test".into(),
+            confidence: "High".into(),
+        }
+    }
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn the_discrete_gpu_wins_even_when_the_integrated_one_reports_more_memory() {
+        // The real shape of this machine: a Radeon 780M advertising ~13 GB of
+        // shared system memory beside an RTX 5060 with 8 GB of its own, the
+        // iGPU enumerated first.
+        //
+        // Ranking by capacity picked the iGPU, so every model ran on the slower
+        // device over system RAM while the discrete card sat idle. An iGPU's
+        // reported memory is not comparable to real VRAM, so it must not
+        // outrank it however large it looks.
+        let gpus = vec![
+            gpu("Integrated", false, 13 * GB, 12 * GB, false, true),
+            gpu("Discrete", true, 8 * GB, 7 * GB, true, true),
+        ];
+
+        let picked = select_inference_gpu(&gpus).expect("a compatible GPU exists");
+        assert_eq!(picked.model, "Discrete", "a dedicated card outranks any iGPU");
+    }
+
+    #[test]
+    fn a_long_context_model_is_planned_around_a_usable_working_context() {
+        // Gemma 3/4 and Qwen 3 advertise 262144. Budgeting a KV cache for that
+        // leaves nothing for weights, which sent a 12B that partially offloads
+        // fine to pure CPU; shrinking the context until it fully offloaded gave
+        // 2265 tokens, too small for a coding agent's opening message.
+        let planned = 262_144u32.min(DEFAULT_WORKING_CONTEXT);
+        assert_eq!(planned, 8192);
+
+        // With that context the planner places most of a 6.09 GB model on an
+        // 8.28 GB card rather than giving up on the GPU.
+        let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
+            8_280_000_000,
+            6_087_086_624,
+            planned,
+            Some(48),
+        );
+        assert!(
+            plan.gpu_layers > 0,
+            "a model this size must still reach the GPU: {}",
+            plan.reason
+        );
+    }
+
+    #[test]
+    fn a_model_asking_for_less_than_the_working_context_keeps_its_own() {
+        // The cap is a ceiling, not a floor — a 4K model must not be inflated.
+        assert_eq!(4096u32.min(DEFAULT_WORKING_CONTEXT), 4096);
+    }
+
+    #[test]
+    fn capacity_still_decides_between_two_cards_of_the_same_kind() {
+        let discrete = vec![
+            gpu("Small", true, 8 * GB, 7 * GB, true, true),
+            gpu("Large", true, 24 * GB, 22 * GB, true, true),
+        ];
+        assert_eq!(
+            select_inference_gpu(&discrete).expect("a compatible GPU exists").model,
+            "Large"
+        );
+
+        // With no discrete card at all, the iGPU is still better than nothing.
+        let integrated_only = vec![gpu("Integrated", false, 13 * GB, 12 * GB, false, true)];
+        assert_eq!(
+            select_inference_gpu(&integrated_only).expect("a compatible GPU exists").model,
+            "Integrated"
+        );
+    }
+
+    #[test]
+    fn a_gpu_with_no_usable_backend_is_never_selected() {
+        // Present, but nothing the build can drive: CPU must remain the answer
+        // rather than a GPU path that cannot work.
+        let gpus = vec![gpu("Display only", true, 8 * GB, 8 * GB, false, false)];
+        assert!(select_inference_gpu(&gpus).is_none());
+        assert!(select_inference_gpu(&[]).is_none());
+    }
+
+    #[test]
+    fn a_card_already_full_is_not_offered_as_a_target() {
+        // Reports a backend but has nothing left to give — planning against its
+        // total would place layers in memory another process holds.
+        let gpus = vec![gpu("Busy", true, 8 * GB, 0, true, true)];
+        let picked = select_inference_gpu(&gpus).expect("free is 0, so total is used");
+        assert_eq!(usable_vram_bytes(&picked), 8 * GB);
+
+        let unknown_total = vec![gpu("Odd", true, 0, 0, true, true)];
+        assert!(
+            select_inference_gpu(&unknown_total).is_none(),
+            "no memory figure at all means no GPU plan"
+        );
+    }
+
+    #[test]
+    fn free_vram_is_preferred_over_total_when_the_driver_reports_it() {
+        // Another process holding half the card must shrink the budget, or the
+        // planner offloads more layers than will fit.
+        let busy = gpu("Half used", true, 8 * GB, 3 * GB, true, false);
+        assert_eq!(usable_vram_bytes(&busy), 3 * GB);
+    }
 
     #[test]
     fn test_inference_manager_initial_state() {
