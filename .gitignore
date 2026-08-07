@@ -16,7 +16,8 @@ target/
 src-tauri/target/
 src-tauri/gen/
 
-# Editor & OS files
+# Editor & OS files — .claude/settings.local.json is per-developer, not shared
+.claude/settings.local.json
 .vscode/*
 !.vscode/extensions.json
 .idea/
@@ -33,3 +34,4 @@ tmp/
 # Python bytecode from the sidecars — regenerated on every run.
 __pycache__/
 *.pyc
+.gstack/
