@@ -206,6 +206,7 @@ pub async fn launch_tool(
         model_id: model.model_id.clone(),
         model_name: model.model_name.clone(),
         client_dir: client_dir.to_string_lossy().to_string(),
+        context_length: model.context_length,
     };
     let model_label = model.model_name.clone();
 

@@ -192,6 +192,18 @@ pub const PLACEHOLDER_MODEL: &str = "{model}";
 pub const PLACEHOLDER_MODEL_NAME: &str = "{modelName}";
 /// This tool's isolated config directory.
 pub const PLACEHOLDER_CLIENT_DIR: &str = "{clientDir}";
+/// The loaded model's context length, in tokens.
+///
+/// Some clients state a context window in their own config and size requests
+/// against it. A guessed value is not harmless: too high and the client packs a
+/// prompt the gateway then rejects outright, too low and a long-context model is
+/// wasted. This reports what the model was actually loaded with.
+pub const PLACEHOLDER_CONTEXT: &str = "{contextLength}";
+/// Tokens a single reply may use, which is never the whole context.
+///
+/// A client told it may generate as many tokens as the context holds has left
+/// no room for the conversation that prompted them.
+pub const PLACEHOLDER_MAX_OUTPUT: &str = "{maxOutputTokens}";
 
 /// Everything Sarathi knows at the moment a tool is started.
 ///
@@ -206,6 +218,8 @@ pub struct LaunchContext {
     pub model_name: String,
     /// Directory this tool's generated config lives in.
     pub client_dir: String,
+    /// Context length the model is loaded with, in tokens.
+    pub context_length: u32,
 }
 
 impl LaunchContext {
@@ -224,6 +238,16 @@ impl LaunchContext {
 
         let trimmed = cleaned.trim_matches('-').to_string();
         if trimmed.is_empty() { "sarathi-model".to_string() } else { trimmed }
+    }
+
+    /// Tokens a single reply may use.
+    ///
+    /// Half the context, capped: the rest has to hold the conversation that
+    /// asked for it. The cap keeps a long-context model from advertising a reply
+    /// budget far larger than any real answer, which clients use to reserve
+    /// space they then cannot use for history.
+    pub fn max_output_tokens(&self) -> u32 {
+        (self.context_length / 2).min(8192).max(512)
     }
 }
 
@@ -258,6 +282,9 @@ pub fn fill_placeholders(template: &str, ctx: &LaunchContext, json: bool) -> Str
         .replace(PLACEHOLDER_MODEL_NAME, &esc(&ctx.model_name))
         .replace(PLACEHOLDER_MODEL, &esc(&ctx.client_model_id()))
         .replace(PLACEHOLDER_CLIENT_DIR, &esc(&ctx.client_dir))
+        // Numbers need no escaping in either JSON or YAML.
+        .replace(PLACEHOLDER_MAX_OUTPUT, &ctx.max_output_tokens().to_string())
+        .replace(PLACEHOLDER_CONTEXT, &ctx.context_length.to_string())
 }
 
 /// Decides whether version output proves this is the expected tool.
@@ -428,6 +455,166 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             },
             user_defined: false,
         },
+        ToolSpec {
+            id: "hermes-agent".into(),
+            name: "Hermes Agent".into(),
+            description: "Nous Research's tool-using terminal agent.".into(),
+            protocol: Protocol::OpenAi,
+            detect: DetectSpec {
+                command: "hermes".into(),
+                version_arg: "--version".into(),
+                // `hermes` is a crowded name — an unrelated npm package of the
+                // same name ships its own `hermes` binary — so the tool must
+                // identify itself rather than merely exist on PATH.
+                expect: "hermes".into(),
+            },
+            // Nous Research's own installer is a piped shell script that builds
+            // a Python environment, which `PackageManager` deliberately will not
+            // run. This npm package is a community-maintained bridge, not a
+            // first-party release; it is offered because the alternative is no
+            // Install button at all, and the confirmation prompt shows the exact
+            // command first. Override it in tools.json to install differently.
+            install: Some(InstallSpec {
+                manager: PackageManager::Npm,
+                package: "hermes-agent".into(),
+            }),
+            launch: LaunchSpec {
+                command: "hermes".into(),
+                args: vec![],
+                env: HashMap::from([
+                    // Hermes keeps config, credentials, memory and skills under
+                    // HERMES_HOME. Pointing it at the isolated client directory
+                    // is what stops it reading the user's own ~/.hermes and
+                    // answering from whatever provider that names.
+                    ("HERMES_HOME".to_string(), PLACEHOLDER_CLIENT_DIR.to_string()),
+                ]),
+                env_remove: vec![
+                    // Hermes falls back to OPENAI_API_KEY from the environment
+                    // when the config sets no key, which would send traffic to
+                    // OpenAI instead of the gateway.
+                    "OPENAI_API_KEY".into(),
+                    "OPENAI_BASE_URL".into(),
+                    "ANTHROPIC_API_KEY".into(),
+                    "ANTHROPIC_BASE_URL".into(),
+                    // Overrides the configured model for a single run, which
+                    // would silently defeat the generated config.
+                    "HERMES_INFERENCE_MODEL".into(),
+                ],
+                client_config: Some(ClientConfig {
+                    file_name: "config.yaml".into(),
+                    // Values are JSON-escaped on substitution; a double-quoted
+                    // YAML scalar accepts the same \" and \\ escapes, so the
+                    // shared escaping is correct here too.
+                    contents: format!(
+                        r#"# Written by Sarathi on every launch. Edits are overwritten.
+model:
+  provider: "custom"
+  model: "{PLACEHOLDER_MODEL}"
+  base_url: "{PLACEHOLDER_BASE_V1}"
+  api_key: "sarathi-local"
+"#
+                    ),
+                }),
+            },
+            user_defined: false,
+        },
+        ToolSpec {
+            id: "openclaw".into(),
+            name: "OpenClaw".into(),
+            description: "Multi-channel AI gateway with messaging integrations.".into(),
+            protocol: Protocol::OpenAi,
+            detect: DetectSpec {
+                command: "openclaw".into(),
+                version_arg: "--version".into(),
+                expect: "openclaw".into(),
+            },
+            install: Some(InstallSpec {
+                manager: PackageManager::Npm,
+                package: "openclaw".into(),
+            }),
+            launch: LaunchSpec {
+                command: "openclaw".into(),
+                // OpenClaw is a gateway with a CLI in front of it, not a
+                // self-contained agent like the other three. Started with no
+                // subcommand it prints its help and exits 0, which is what a
+                // launch looked like: a console window that appeared and closed
+                // without ever running anything.
+                //
+                // `gateway` is the process that reads the provider config below
+                // and talks to Sarathi, so it is the one worth tracking. Its own
+                // chat UI is a separate client — `openclaw tui` — which connects
+                // to this over a WebSocket once it is up.
+                args: vec!["gateway".into()],
+                env: HashMap::from([
+                    // Points at the generated file rather than a directory —
+                    // OpenClaw takes a path to the config file itself.
+                    (
+                        "OPENCLAW_CONFIG_PATH".to_string(),
+                        format!("{PLACEHOLDER_CLIENT_DIR}/openclaw.json"),
+                    ),
+                    // Keeps sessions, logs and the generated auth token beside
+                    // the config instead of in ~/.openclaw, which the user's own
+                    // OpenClaw install is using.
+                    (
+                        "OPENCLAW_STATE_DIR".to_string(),
+                        format!("{PLACEHOLDER_CLIENT_DIR}/state"),
+                    ),
+                ]),
+                env_remove: vec![
+                    "OPENAI_API_KEY".into(),
+                    "OPENAI_BASE_URL".into(),
+                    "ANTHROPIC_API_KEY".into(),
+                    "ANTHROPIC_AUTH_TOKEN".into(),
+                    "ANTHROPIC_BASE_URL".into(),
+                    "OPENROUTER_API_KEY".into(),
+                    "GEMINI_API_KEY".into(),
+                    "GROQ_API_KEY".into(),
+                    "XAI_API_KEY".into(),
+                    "DEEPSEEK_API_KEY".into(),
+                ],
+                client_config: Some(ClientConfig {
+                    file_name: "openclaw.json".into(),
+                    // `mode: merge` keeps OpenClaw's built-in provider list and
+                    // adds Sarathi to it, rather than replacing the set.
+                    //
+                    // The context figures are the model's real ones rather than
+                    // a fixed guess: OpenClaw sizes requests against them, and
+                    // Sarathi's gateway rejects a prompt longer than the loaded
+                    // context outright rather than truncating it.
+                    contents: format!(
+                        r#"{{
+  "gateway": {{
+    "mode": "local"
+  }},
+  "models": {{
+    "mode": "merge",
+    "providers": {{
+      "sarathi": {{
+        "baseUrl": "{PLACEHOLDER_BASE_V1}",
+        "apiKey": "sarathi-local",
+        "api": "openai-completions",
+        "models": [
+          {{
+            "id": "{PLACEHOLDER_MODEL}",
+            "name": "{PLACEHOLDER_MODEL_NAME}",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {{ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }},
+            "contextWindow": {PLACEHOLDER_CONTEXT},
+            "contextTokens": {PLACEHOLDER_CONTEXT},
+            "maxTokens": {PLACEHOLDER_MAX_OUTPUT}
+          }}
+        ]
+      }}
+    }}
+  }}
+}}
+"#
+                    ),
+                }),
+            },
+            user_defined: false,
+        },
     ]
 }
 
@@ -441,6 +628,7 @@ mod tests {
             model_id: "Qwen/Qwen2.5-3B".into(),
             model_name: "Qwen2.5-3B".into(),
             client_dir: r"C:\data\clients\opencode".into(),
+            context_length: 32768,
         }
     }
 
@@ -710,5 +898,112 @@ mod tests {
         assert!(spec.install.is_none(), "install is optional");
         assert!(spec.launch.args.is_empty());
         assert!(spec.validate().is_ok());
+    }
+
+
+    #[test]
+    fn the_new_providers_are_shipped_alongside_the_originals() {
+        let ids: Vec<String> = builtin_tools().into_iter().map(|t| t.id).collect();
+        for expected in ["claude-code", "opencode", "hermes-agent", "openclaw"] {
+            assert!(ids.contains(&expected.to_string()), "missing {expected}");
+        }
+    }
+
+
+    #[test]
+    fn hermes_is_pointed_at_the_gateway_and_away_from_the_users_own_home() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "hermes-agent").unwrap();
+        let ctx = ctx_on(11435);
+
+        let env = resolve_env(&tool.launch.env, &ctx);
+        assert_eq!(env.get("HERMES_HOME").unwrap(), &ctx.client_dir);
+
+        let cfg = tool.launch.client_config.as_ref().unwrap();
+        let body = fill_placeholders(&cfg.contents, &ctx, true);
+        assert_eq!(cfg.file_name, "config.yaml", "hermes reads config.yaml from HERMES_HOME");
+        assert!(body.contains("base_url: \"http://127.0.0.1:11435/v1\""), "got: {body}");
+        assert!(body.contains("provider: \"custom\""), "got: {body}");
+        assert!(!body.contains('{'), "every placeholder should be filled: {body}");
+
+        // An inherited OpenAI key would win over the generated config.
+        assert!(tool.launch.env_remove.contains(&"OPENAI_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn openclaw_gets_valid_json_naming_the_gateway_and_the_real_context() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
+        let ctx = ctx_on(11435);
+
+        let env = resolve_env(&tool.launch.env, &ctx);
+        assert!(
+            env.get("OPENCLAW_CONFIG_PATH").unwrap().ends_with("/openclaw.json"),
+            "the variable points at the file, not the directory"
+        );
+
+        let cfg = tool.launch.client_config.as_ref().unwrap();
+        let body = fill_placeholders(&cfg.contents, &ctx, true);
+
+        // Parses, so a Windows path or an odd model name cannot produce a file
+        // OpenClaw silently refuses.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("not valid JSON: {e}
+{body}"));
+
+        let provider = &parsed["models"]["providers"]["sarathi"];
+        assert_eq!(provider["api"], "openai-completions");
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:11435/v1");
+        assert_eq!(parsed["models"]["mode"], "merge", "must not replace the built-in providers");
+
+        let model = &provider["models"][0];
+        assert_eq!(model["id"], ctx.client_model_id());
+        assert_eq!(
+            model["contextWindow"], 32768,
+            "the loaded model's real context, not a guess"
+        );
+        assert!(
+            model["maxTokens"].as_u64().unwrap() < model["contextWindow"].as_u64().unwrap(),
+            "a reply budget equal to the context leaves no room for the prompt"
+        );
+
+        // OpenClaw refuses to start on a config without this, calling it
+        // clobbered — which is how the gateway failed with only providers set.
+        assert_eq!(parsed["gateway"]["mode"], "local", "gateway.mode is mandatory");
+    }
+
+    /// Started bare, `openclaw` prints its help and exits — the launch looked
+    /// like a console window that opened and closed. It needs a subcommand.
+    #[test]
+    fn openclaw_is_launched_with_the_subcommand_that_actually_runs_something() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
+        assert_eq!(tool.launch.args, vec!["gateway".to_string()]);
+    }
+
+    #[test]
+    fn the_reply_budget_never_exceeds_the_context_and_never_collapses() {
+        for (context, expected) in [(32768u32, 8192u32), (8192, 4096), (2048, 1024), (256, 512)] {
+            let mut ctx = ctx_on(11435);
+            ctx.context_length = context;
+            assert_eq!(ctx.max_output_tokens(), expected, "context {context}");
+        }
+    }
+
+    #[test]
+    fn the_context_placeholder_is_substituted_as_a_bare_number() {
+        let ctx = ctx_on(11435);
+        // Unquoted in JSON, so it must not arrive quoted or escaped.
+        assert_eq!(fill_placeholders("{contextLength}", &ctx, true), "32768");
+    }
+
+    #[test]
+    fn a_model_name_with_a_quote_cannot_break_the_generated_json() {
+        let mut ctx = ctx_on(11435);
+        ctx.model_name = r#"Weird "Quoted" \ Name"#.into();
+
+        let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
+        let cfg = tool.launch.client_config.as_ref().unwrap();
+        let body = fill_placeholders(&cfg.contents, &ctx, true);
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("still valid JSON");
+        assert_eq!(parsed["models"]["providers"]["sarathi"]["models"][0]["name"], ctx.model_name);
     }
 }

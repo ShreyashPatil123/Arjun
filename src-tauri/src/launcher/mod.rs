@@ -394,6 +394,7 @@ mod tests {
             model_id: "Qwen/Qwen2.5-3B".into(),
             model_name: "Qwen2.5-3B".into(),
             client_dir: std::env::temp_dir().join("sarathi-test-client").to_string_lossy().into(),
+            context_length: 8192,
         };
         let err = launch(&spec, &ctx, &std::env::temp_dir()).unwrap_err();
         assert!(err.contains("could not start"), "got: {err}");
