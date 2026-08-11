@@ -70,6 +70,10 @@ llama-cpp-2 = { version = "0.1" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 sha2 = "0.10"
+# Reads PEFT adapter weights so they can be converted to GGUF locally. Pure
+# Rust with no C toolchain, which is what makes conversion possible without
+# shipping Python and torch for llama.cpp's `convert_lora_to_gguf.py`.
+safetensors = "0.4"
 # Renders the Jinja chat template embedded in a GGUF. llama.cpp's built-in
 # `llama_chat_apply_template` only recognises a fixed set of well-known formats
 # and returns -1 for anything else, which leaves newer or custom-format models

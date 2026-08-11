@@ -35,3 +35,7 @@ tmp/
 __pycache__/
 *.pyc
 .gstack/
+
+# Toolchain installers people download into the repo root while setting up.
+# They are multi-megabyte binaries that belong on the machine, not in history.
+rustup-init.exe
