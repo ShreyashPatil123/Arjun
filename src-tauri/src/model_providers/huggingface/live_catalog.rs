@@ -321,14 +321,20 @@ pub fn to_model_metadata(repo: &GgufRepo) -> Option<ModelMetadata> {
 
     let arch = estimate_architecture(gguf.total_parameters);
 
-    // `ModelArchitecture::MixtureOfExperts` requires expert counts, and the Hub's
-    // GGUF metadata does not expose them. Rather than invent numbers, discovered
-    // models are recorded as Dense.
+    // The Hub's GGUF metadata does not expose expert counts, so a discovered
+    // model starts out recorded as Dense.
     //
-    // This is safe for the calculation that matters: `gguf.total` already counts
-    // every expert's weights, because llama.cpp must load all of them, so memory
-    // budgeting is correct either way. Expert counts feed only speed estimation,
-    // which is not yet implemented.
+    // That used to be harmless — `gguf.total` counts every expert's weights, so
+    // the *total* memory figure was right either way. It is no longer harmless:
+    // expert counts now decide **placement**. Routed experts can live in system
+    // RAM while attention stays on the GPU, and a model recorded as Dense is
+    // sized as though all of it needed VRAM. That is the difference between
+    // offering a 21B MoE on a 4 GB card and refusing it.
+    //
+    // `moe_geometry` supplies verified counts for known models; anything not in
+    // that table stays Dense rather than being sized on invented numbers. Once
+    // downloaded, `ai_engine::gguf_meta` reads the real geometry from the file
+    // and the table is no longer consulted.
     let architecture = ModelArchitecture::Dense;
 
     let mut use_cases = vec!["chat".to_string(), "general".to_string()];
@@ -343,7 +349,7 @@ pub fn to_model_metadata(repo: &GgufRepo) -> Option<ModelMetadata> {
         use_cases.push("instruct".to_string());
     }
 
-    Some(ModelMetadata {
+    let mut model = ModelMetadata {
         id: repo.repo_id.clone(),
         name: repo.display_name(),
         family: family_name(repo),
@@ -360,7 +366,17 @@ pub fn to_model_metadata(repo: &GgufRepo) -> Option<ModelMetadata> {
         default_dtype: "gguf".to_string(),
         use_cases,
         catalog_version: "live_hf_v2".to_string(),
-    })
+    };
+
+    // Replaces the size-banded guesses above when the model is a verified MoE.
+    // Those guesses are inferred from a parameter count, and a MoE model's count
+    // is dominated by experts — gpt-oss-20b reports 20.9B but has the 24 layers
+    // of a far smaller dense model.
+    if let Some(geometry) = super::moe_geometry::lookup(&gguf.architecture, gguf.total_parameters) {
+        geometry.apply(&mut model);
+    }
+
+    Some(model)
 }
 
 /// Runs a full discovery sweep and returns engine-ready model records.
@@ -478,14 +494,59 @@ mod tests {
 
     #[test]
     fn moe_models_keep_their_full_parameter_count() {
-        // Recorded as Dense because the Hub does not expose expert counts, but
-        // the total must still include every expert's weights — that is the
-        // number memory budgeting depends on.
+        // An architecture with no verified geometry stays Dense, but the total
+        // must still include every expert's weights — that is the number memory
+        // budgeting depends on.
         let m = to_model_metadata(&repo(46_000_000_000, "mixtral", "x/Mixtral-GGUF")).unwrap();
 
         assert_eq!(m.total_parameters, 46_000_000_000);
         assert_eq!(m.architecture, ModelArchitecture::Dense);
         assert!(m.active_parameters.is_none(), "must not invent an active-parameter count");
+    }
+
+    /// The regression that made expert offload unreachable for the models it
+    /// was built for: every discovered repo was recorded as Dense, so the
+    /// scorer sized a 21B MoE as though all of it needed VRAM.
+    #[test]
+    fn a_verified_moe_repo_carries_its_expert_geometry() {
+        let m = to_model_metadata(&repo(20_900_000_000, "gpt-oss", "unsloth/gpt-oss-20b-GGUF"))
+            .expect("should convert");
+
+        assert!(
+            matches!(
+                m.architecture,
+                ModelArchitecture::MixtureOfExperts { num_experts: 32, active_experts: 4 }
+            ),
+            "got {:?}",
+            m.architecture
+        );
+        assert_eq!(m.active_parameters, Some(3_600_000_000));
+        assert_eq!(
+            m.num_layers, 24,
+            "verified geometry must replace the size-banded guess"
+        );
+        assert_eq!(m.total_parameters, 20_900_000_000, "the total still counts every expert");
+    }
+
+    #[test]
+    fn qwen3_moe_is_recognised_too() {
+        let m = to_model_metadata(&repo(30_500_000_000, "qwen3moe", "unsloth/Qwen3-30B-A3B-GGUF"))
+            .expect("should convert");
+
+        assert!(matches!(
+            m.architecture,
+            ModelArchitecture::MixtureOfExperts { num_experts: 128, active_experts: 8 }
+        ));
+        assert_eq!(m.num_layers, 48);
+    }
+
+    #[test]
+    fn an_unverified_moe_architecture_stays_dense_rather_than_guessing() {
+        let m = to_model_metadata(&repo(236_000_000_000, "deepseek2", "x/DeepSeek-V2-GGUF"))
+            .expect("should convert");
+
+        assert_eq!(m.architecture, ModelArchitecture::Dense);
+        assert!(m.active_parameters.is_none());
     }
 
     #[test]

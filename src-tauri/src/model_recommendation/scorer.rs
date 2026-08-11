@@ -104,11 +104,39 @@ pub fn evaluate_model(
                 // Part goes to VRAM (vram_req = total * f_gpu), part goes to System RAM (ram_req = total - vram_req).
                 let offload_backend = runtime::select_preferred_backend(&backends, gpu_budget.cuda_available);
                 if offload_backend.supports_cpu_offload() && vram_available > 0 && total > vram_available {
-                    // Only attempt offload if GPU has enough VRAM for at least 15% of the model
-                    if vram_available >= (total as f64 * 0.15) as u64 {
-                        let f_gpu = (vram_available as f64 / total as f64).min(1.0);
-                        let vram_req = (total as f64 * f_gpu) as u64;
-                        let ram_req = total.saturating_sub(vram_req);
+                    // A MoE model does not offload proportionally: only the
+                    // routed experts move, while attention, the KV cache and
+                    // the router stay on the card. That resident part is small
+                    // and fixed, so the proportional split below both overstates
+                    // the VRAM needed and misreports where memory ends up.
+                    //
+                    // The 15%-of-the-model gate is meaningless here for the same
+                    // reason — what matters is whether the resident part fits,
+                    // which for a 21B MoE is well under 15% of its total.
+                    let moe_split = estimator::split_moe_weights(model, w).map(|split| {
+                        let vram_req = split.resident_bytes + kv + oh;
+                        (vram_req, split.expert_bytes)
+                    });
+
+                    let viable = match moe_split {
+                        Some((vram_req, _)) => vram_req <= vram_available,
+                        None => vram_available >= (total as f64 * 0.15) as u64,
+                    };
+
+                    if viable {
+                        let (vram_req, ram_req) = match moe_split {
+                            Some((vram_req, expert_bytes)) => (vram_req, expert_bytes),
+                            None => {
+                                let f_gpu = (vram_available as f64 / total as f64).min(1.0);
+                                let vram_req = (total as f64 * f_gpu) as u64;
+                                (vram_req, total.saturating_sub(vram_req))
+                            }
+                        };
+                        let f_gpu = if total > 0 {
+                            (vram_req as f64 / total as f64).min(1.0)
+                        } else {
+                            1.0
+                        };
                         let ram_available = budget.system_ram.usable_for_inference;
 
                         if ram_req <= ram_available {
@@ -472,6 +500,93 @@ mod tests {
                 total_bytes: 16 * GB, available_bytes: 8 * GB,
                 usable_for_inference: 6 * GB, ram_speed_mts: Some(3200),
             },
+        }
+    }
+
+    /// The 4 GB minimum spec paired with the RAM a 21B MoE's experts need.
+    ///
+    /// On this class of machine VRAM is *not* the binding constraint — system
+    /// RAM is, because the routed experts live there.
+    fn make_budget_4gb_laptop_32gb_ram() -> MemoryBudget {
+        MemoryBudget {
+            system_ram: SystemRamBudget {
+                total_bytes: 32 * GB,
+                available_bytes: 26 * GB,
+                usable_for_inference: 24 * GB,
+                ram_speed_mts: Some(3200),
+            },
+            ..make_budget_4gb_laptop()
+        }
+    }
+
+    /// gpt-oss-20b: 21B total, 3.6B active, 4 of 32 experts per token.
+    fn make_gpt_oss_20b() -> ModelMetadata {
+        ModelMetadata {
+            id: "openai/gpt-oss-20b".to_string(),
+            name: "gpt-oss 20B".to_string(),
+            family: "gpt-oss".to_string(),
+            architecture: ModelArchitecture::MixtureOfExperts {
+                num_experts: 32,
+                active_experts: 4,
+            },
+            total_parameters: 20_900_000_000,
+            active_parameters: Some(3_600_000_000),
+            num_layers: 24,
+            num_attention_heads: 64,
+            num_kv_heads: 8,
+            head_dimension: 64,
+            hidden_size: 2880,
+            max_context_length: 131072,
+            vocab_size: 201088,
+            default_dtype: "mxfp4".to_string(),
+            use_cases: vec!["code".to_string(), "chat".to_string()],
+            catalog_version: "1.0".to_string(),
+        }
+    }
+
+    /// A MoE model is placed by tensor, not proportionally: only the routed
+    /// experts go to system RAM, so the VRAM figure reflects the attention
+    /// stack rather than a slice of the whole model.
+    #[test]
+    fn a_21b_moe_is_sized_by_its_resident_part_not_a_proportional_slice() {
+        let budget = make_budget_4gb_laptop_32gb_ram();
+        let rec = evaluate_model(&make_gpt_oss_20b(), &budget, &EstimatorConfig::default())
+            .expect("a 21B MoE should be runnable with 4 GB VRAM and 24 GB RAM");
+
+        assert_eq!(
+            rec.estimated_vram_bytes + rec.estimated_ram_bytes,
+            rec.estimated_total_memory_bytes,
+            "the split must account for every byte"
+        );
+
+        if rec.estimated_vram_bytes > 0 {
+            assert!(
+                rec.estimated_vram_bytes <= 3400 * 1024 * 1024,
+                "must not require more VRAM than the card has, got {} bytes",
+                rec.estimated_vram_bytes
+            );
+            assert!(
+                rec.estimated_ram_bytes > rec.estimated_vram_bytes,
+                "experts dominate, so RAM should exceed VRAM ({} vs {})",
+                rec.estimated_ram_bytes,
+                rec.estimated_vram_bytes
+            );
+        }
+    }
+
+    /// The honest failure: a 4 GB card with only 6 GB of usable RAM cannot hold
+    /// ~12 GB of experts, however well the VRAM side is planned.
+    #[test]
+    fn a_21b_moe_is_not_offered_when_ram_cannot_hold_the_experts() {
+        let budget = make_budget_4gb_laptop(); // 6 GB usable RAM
+        let rec = evaluate_model(&make_gpt_oss_20b(), &budget, &EstimatorConfig::default());
+
+        if let Some(rec) = rec {
+            assert!(
+                rec.estimated_ram_bytes <= 6 * GB,
+                "cannot promise {} bytes of RAM on a machine with 6 GB usable",
+                rec.estimated_ram_bytes
+            );
         }
     }
 

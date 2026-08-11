@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod live_catalog;
 pub mod card;
 pub mod curation;
+pub mod moe_geometry;
 
 use crate::model_providers::provider::{ModelProvider, ProviderType};
 

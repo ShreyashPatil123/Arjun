@@ -3,6 +3,7 @@
 //! Provides model loading, token generation with streaming, and resource management.
 //! Designed to be wrapped by InferenceManager for thread-safe Tauri integration.
 
+use std::ffi::CString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,6 +20,30 @@ use llama_cpp_2::sampling::LlamaSampler;
 use crate::ai_engine::lora_binding::LoraAdapterCache;
 use crate::ai_engine::traits::*;
 use crate::capability::CapabilityBackend;
+
+/// Buffer-type override patterns keeping the routed experts of the first
+/// `n_layers` layers in system RAM.
+///
+/// This is precisely what `--n-cpu-moe N` does. There is no distinct C API for
+/// that flag: llama.cpp implements it in `common/arg.cpp` as a loop pushing one
+/// buffer-type override per layer, each built from `llm_ffn_exps_block_regex(i)`
+/// and bound to the CPU buffer type.
+///
+/// The binding's own [`LlamaModelParams::add_cpu_moe_override`] is deliberately
+/// **not** used. Its regex is `\.ffn_(up|down|gate)_(ch|)exps`, which drops the
+/// `gate_up` alternative that upstream carries in `common/common.h`. Models with
+/// *fused* expert tensors — `blk.N.ffn_gate_up_exps`, registered in
+/// `llama-arch.cpp` and shipped by gpt-oss — would not match, and the regex
+/// cannot fall through to the `gate` branch either: after `gate` it requires
+/// `_`, then optionally `ch`, then `exps`, while the tensor has `_up_exps`
+/// there. The offload would silently do nothing and the model would spill or
+/// run out of memory with nothing explaining why.
+fn cpu_moe_override_patterns(n_layers: u32) -> Vec<CString> {
+    (0..n_layers)
+        // The pattern is generated, so it can never contain an interior NUL.
+        .filter_map(|i| CString::new(format!(r"blk\.{i}\.ffn_(up|down|gate|gate_up)_(ch|)exps")).ok())
+        .collect()
+}
 
 /// Core inference runtime wrapping llama.cpp via safe Rust bindings.
 ///
@@ -145,11 +170,41 @@ impl LlamaCppRuntime {
 
         let effective_gpu_layers = if gpu_backend_compiled { config.gpu_layers } else { 0 };
 
+        // Pinning experts to CPU is meaningless without a GPU backend — every
+        // tensor is already in system RAM — so it is reported as not applied
+        // rather than silently requested.
+        let effective_cpu_moe = if gpu_backend_compiled { config.cpu_moe_layers } else { 0 };
+        if config.cpu_moe_layers > 0 && !gpu_backend_compiled {
+            log::warn!(
+                "[STAGE 4 RUNTIME WARN] Expert offload for {} layers requested, but this binary \
+                 was built without a GPU backend — every tensor is on CPU already.",
+                config.cpu_moe_layers
+            );
+        }
+
+        // Declared before `model_params` so it is dropped *after* them: Rust
+        // drops locals in reverse declaration order, and `add_cpu_buft_override`
+        // stores a borrowed pointer with no lifetime tie recorded on the params
+        // (see the crate's SAFETY note on `tensor_buft_override_patterns`), so
+        // these strings must outlive the params that point into them.
+        let expert_patterns = cpu_moe_override_patterns(effective_cpu_moe);
+
         let model_params = {
-            let mut params = LlamaModelParams::default();
-            params = params.with_n_gpu_layers(effective_gpu_layers);
+            let mut params = Box::pin(LlamaModelParams::default().with_n_gpu_layers(effective_gpu_layers));
+            for pattern in &expert_patterns {
+                params.as_mut().add_cpu_buft_override(pattern);
+            }
             params
         };
+
+        if effective_cpu_moe > 0 {
+            log::info!(
+                "[STAGE 4 RUNTIME] MoE expert offload: routed experts of {} layer(s) pinned to \
+                 system RAM via {} buffer-type override(s); all layers still requested on GPU",
+                effective_cpu_moe,
+                expert_patterns.len()
+            );
+        }
 
         // Use the path exactly as resolved upstream. Rewriting separators here
         // corrupts absolute paths on every non-Windows platform.
@@ -244,7 +299,14 @@ impl LlamaCppRuntime {
 
         let (model, actual_backend) = match model_result {
             Ok(m) => {
-                let desc = if effective_gpu_layers > 0 {
+                let desc = if effective_gpu_layers > 0 && effective_cpu_moe > 0 {
+                    // Names the split explicitly: a user whose experts went to
+                    // system RAM should not be told the model is on the GPU.
+                    format!(
+                        "llama.cpp (GPU + experts of {} layers on CPU)",
+                        effective_cpu_moe
+                    )
+                } else if effective_gpu_layers > 0 {
                     format!("llama.cpp (GPU offload: {} layers)", effective_gpu_layers)
                 } else if config.gpu_layers > 0 {
                     "llama.cpp (CPU — built without GPU backend)".to_string()
@@ -341,6 +403,7 @@ impl LlamaCppRuntime {
             context_length: config.context_length,
             // Report what was actually applied, not what was requested.
             gpu_layers: effective_gpu_layers,
+            cpu_moe_layers: effective_cpu_moe,
             threads: config.threads,
             backend_used: backend_desc,
             loaded_at: chrono::Utc::now().to_rfc3339(),
@@ -1127,6 +1190,105 @@ pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name:
 mod tests {
     use super::*;
 
+    // ─── MoE expert offload patterns ────────────────────────────────────────
+
+    /// Matches a tensor name against a generated pattern the way llama.cpp does.
+    fn pattern_matches(pattern: &CString, tensor: &str) -> bool {
+        // The patterns are fixed-shape: `blk\.<i>\.ffn_(a|b|…)_(ch|)exps`.
+        // Rather than pull in a regex engine for a test, expand the two
+        // alternations and check the literal forms.
+        let raw = pattern.to_str().expect("generated pattern is valid UTF-8");
+        let prefix = raw.trim_end_matches(r"\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+        let block = prefix.replace(r"\.", ".");
+
+        ["up", "down", "gate", "gate_up"].iter().any(|proj| {
+            ["ch", ""]
+                .iter()
+                .any(|infix| tensor.contains(&format!("{block}.ffn_{proj}_{infix}exps")))
+        })
+    }
+
+    /// The regression this design exists to prevent.
+    ///
+    /// The crate's own `add_cpu_moe_override()` omits the `gate_up` alternative
+    /// that upstream carries, so a model with fused expert tensors would load
+    /// with the offload silently doing nothing. If anyone "simplifies" the
+    /// pattern generation back to the crate helper, this must fail loudly.
+    #[test]
+    fn generated_patterns_match_fused_gate_up_expert_tensors() {
+        let patterns = cpu_moe_override_patterns(1);
+        assert_eq!(patterns.len(), 1);
+
+        assert!(
+            pattern_matches(&patterns[0], "blk.0.ffn_gate_up_exps.weight"),
+            "fused expert tensors must match, or gpt-oss offloads nothing: {:?}",
+            patterns[0]
+        );
+    }
+
+    #[test]
+    fn generated_patterns_match_split_expert_tensors() {
+        let patterns = cpu_moe_override_patterns(1);
+
+        for tensor in [
+            "blk.0.ffn_up_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_down_chexps.weight",
+        ] {
+            assert!(pattern_matches(&patterns[0], tensor), "{tensor} must match");
+        }
+    }
+
+    /// `--n-cpu-moe N` covers the *first* N layers, one override each.
+    #[test]
+    fn one_pattern_is_generated_per_offloaded_layer() {
+        let patterns = cpu_moe_override_patterns(22);
+        assert_eq!(patterns.len(), 22);
+
+        assert!(patterns[0].to_str().unwrap().starts_with(r"blk\.0\."));
+        assert!(patterns[21].to_str().unwrap().starts_with(r"blk\.21\."));
+
+        // Layer 22 is beyond the requested depth and must stay resident.
+        assert!(!pattern_matches(&patterns[21], "blk.22.ffn_gate_up_exps.weight"));
+    }
+
+    #[test]
+    fn a_depth_of_zero_generates_no_overrides() {
+        assert!(cpu_moe_override_patterns(0).is_empty());
+    }
+
+    #[test]
+    fn patterns_target_only_their_own_layer() {
+        let patterns = cpu_moe_override_patterns(3);
+
+        assert!(pattern_matches(&patterns[1], "blk.1.ffn_up_exps.weight"));
+        assert!(!pattern_matches(&patterns[1], "blk.0.ffn_up_exps.weight"));
+    }
+
+    /// Attention and the KV cache are what expert offload exists to keep on the
+    /// GPU, so they must never be caught by these patterns.
+    #[test]
+    fn patterns_never_match_attention_or_shared_tensors() {
+        let patterns = cpu_moe_override_patterns(4);
+
+        for tensor in [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.ffn_gate_inp.weight",
+            "blk.0.ffn_up_shexp.weight",
+            "token_embd.weight",
+            "output_norm.weight",
+        ] {
+            for pattern in &patterns {
+                assert!(
+                    !pattern_matches(pattern, tensor),
+                    "{tensor} must stay resident but matched {pattern:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_runtime_initial_status() {
         let runtime = LlamaCppRuntime::new();
@@ -1347,6 +1509,7 @@ mod tests {
             quantization: "Q8_0".to_string(),
             context_length: 65536,
             gpu_layers: 999,
+            cpu_moe_layers: 0,
             threads: 4,
             chat_template: "llama3".to_string(),
             stop_tokens: vec![],
@@ -1382,6 +1545,7 @@ mod tests {
             quantization: "Q8_0".to_string(),
             context_length: 4096,
             gpu_layers: 0,
+            cpu_moe_layers: 0,
             threads: 4,
             chat_template: "llama3".to_string(),
             stop_tokens: vec![],

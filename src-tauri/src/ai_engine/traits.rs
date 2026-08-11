@@ -147,6 +147,16 @@ pub struct ModelLoadConfig {
     pub context_length: u32,
     /// Number of model layers to offload to GPU (0 = CPU-only)
     pub gpu_layers: u32,
+    /// For a Mixture-of-Experts model, how many layers' *routed experts* are
+    /// kept in system RAM rather than VRAM. 0 for dense models and for MoE
+    /// models that fit outright.
+    ///
+    /// This is orthogonal to `gpu_layers`: a MoE model is split by tensor, so
+    /// every layer still goes to the GPU while the bulk of the expert weight
+    /// stays in RAM. Reducing `gpu_layers` instead would evict attention and
+    /// the KV cache, which is exactly what must stay resident.
+    #[serde(default)]
+    pub cpu_moe_layers: u32,
     /// Number of CPU threads for inference
     pub threads: u32,
     /// Model chat template (e.g., "chatml", "llama3", "gemma", "mistral")
@@ -173,6 +183,11 @@ pub struct LoadedModelInfo {
     pub file_path: String,
     pub context_length: u32,
     pub gpu_layers: u32,
+    /// Layers whose routed experts were placed in system RAM. Reported so the
+    /// UI can say where the weights actually went rather than implying the
+    /// whole model is on the GPU.
+    #[serde(default)]
+    pub cpu_moe_layers: u32,
     pub threads: u32,
     pub backend_used: String,
     pub loaded_at: String,

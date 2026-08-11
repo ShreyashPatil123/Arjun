@@ -544,32 +544,100 @@ impl InferenceManager {
             );
         }
 
-        let gpu_layers = match &selected_gpu {
+        // Real geometry from the GGUF header, so placement works from the
+        // model's actual layer count and KV cost instead of size-banded
+        // guesses. An unreadable header is not fatal — planning falls back to
+        // the estimates it used before, just less precisely.
+        let gguf_meta =
+            match crate::ai_engine::gguf_meta::read_gguf_metadata(std::path::Path::new(gguf_path)) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    log::warn!(
+                        "[INFERENCE_MGR] Could not read GGUF header ({e:#}); planning on estimates"
+                    );
+                    None
+                }
+            };
+
+        // Host memory available for offloaded experts. Routed through the same
+        // budget calculator the recommender uses, so the loader and the
+        // recommendation apply identical OS reserves rather than two different
+        // notions of "usable".
+        let usable_ram = hw_profile
+            .as_ref()
+            .map(|hw| {
+                crate::model_recommendation::budget::calculate_budget(
+                    hw,
+                    &crate::model_recommendation::traits::BudgetConfig::default(),
+                )
+                .system_ram
+                .usable_for_inference
+            })
+            .unwrap_or(0);
+
+        let (gpu_layers, cpu_moe_layers) = match &selected_gpu {
             Some(gpu) => {
                 let budget = usable_vram_bytes(gpu);
-                let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
-                    budget,
-                    manifest.base_model.size_bytes,
-                    planned_context,
-                    None, // GGUF layer count not parsed at load time
-                );
-                log::info!(
-                    "[INFERENCE_MGR] Selected GPU '{}' ({}, {:.2} GB usable of {:.2} GB): {}",
+                let model_bytes = manifest.base_model.size_bytes;
+                let gpu_label = format!(
+                    "GPU '{}' ({}, {:.2} GB usable of {:.2} GB)",
                     gpu.model,
                     if gpu.is_dedicated { "dedicated" } else { "integrated" },
                     budget as f64 / 1e9,
                     gpu.vram_total_bytes as f64 / 1e9,
-                    plan.reason
                 );
-                plan.gpu_layers
+
+                // A MoE model is placed by tensor, not by layer: routed experts
+                // move to system RAM while attention, KV cache, router and
+                // shared experts stay on the card. Reducing the layer count —
+                // the dense lever — would evict exactly the wrong things.
+                let moe_plan = gguf_meta.as_ref().filter(|m| m.is_moe()).map(|m| {
+                    let geom = crate::ai_engine::vram_planner::MoeGeometry {
+                        total_layers: m.block_count,
+                        expert_bytes: m.expert_bytes(model_bytes, None),
+                        kv_bytes_per_token: m.kv_bytes_per_token(),
+                        active_params: m.active_params(None).unwrap_or(0),
+                    };
+                    crate::ai_engine::vram_planner::plan_moe_offload(
+                        model_id,
+                        budget,
+                        usable_ram,
+                        model_bytes,
+                        planned_context,
+                        &geom,
+                    )
+                });
+
+                match moe_plan {
+                    Some(plan) if plan.fits => {
+                        log::info!("[INFERENCE_MGR] Selected {gpu_label}: {}", plan.reason);
+                        (plan.gpu_layers, plan.cpu_moe_layers)
+                    }
+                    rejected => {
+                        if let Some(plan) = rejected {
+                            log::info!(
+                                "[INFERENCE_MGR] Expert offload not viable ({}); placing densely instead",
+                                plan.reason
+                            );
+                        }
+                        let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
+                            budget,
+                            model_bytes,
+                            planned_context,
+                            gguf_meta.as_ref().map(|m| m.block_count),
+                        );
+                        log::info!("[INFERENCE_MGR] Selected {gpu_label}: {}", plan.reason);
+                        (plan.gpu_layers, 0)
+                    }
+                }
             }
             None if hw_profile.is_some() => {
                 log::info!("[INFERENCE_MGR] No GPU with a usable accelerator backend, using CPU mode (0 layers)");
-                0
+                (0, 0)
             }
             None => {
                 log::info!("[INFERENCE_MGR] No hardware profile available, defaulting to CPU mode");
-                0
+                (0, 0)
             }
         };
 
@@ -652,6 +720,10 @@ impl InferenceManager {
             quantization: quantization.to_string(),
             context_length,
             gpu_layers,
+            // Survives a certified profile's clamp on `gpu_layers`: that clamp
+            // only ever lowers GPU residency, which frees VRAM, so an expert
+            // split planned against a larger budget stays valid.
+            cpu_moe_layers,
             threads,
             chat_template,
             stop_tokens,

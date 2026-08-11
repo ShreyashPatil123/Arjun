@@ -172,6 +172,222 @@ pub fn plan_gpu_offload(
     }
 }
 
+// ─── MoE expert offload ─────────────────────────────────────────────────────
+
+/// Extra layers of experts pushed to CPU beyond the computed minimum.
+///
+/// The offload depth is **not monotonic** in speed: performance is worst when
+/// VRAM is oversubscribed, best at the smallest depth that genuinely fits, and
+/// declines gently past that. The formula below targets that knee, and this
+/// biases one layer to the safe side of it — for the same reason the module
+/// already errs high on KV cache, an over-commit crashes while an under-commit
+/// only costs throughput.
+const MOE_SLACK_LAYERS: u32 = 1;
+
+/// Host memory reserved beyond the expert weights themselves — activations,
+/// the CPU-side scratch llama.cpp allocates for offloaded matmuls, and page
+/// cache pressure from the mapped file.
+const MOE_HOST_OVERHEAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Model geometry needed to place a MoE model, from
+/// [`gguf_meta`](super::gguf_meta).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeGeometry {
+    pub total_layers: u32,
+    /// Routed-expert weights across all layers.
+    pub expert_bytes: u64,
+    /// Exact f16 KV cost, not the size-banded estimate — that bands on file
+    /// size, which for MoE is dominated by experts rather than attention.
+    pub kv_bytes_per_token: u64,
+    /// Active parameters per token, for the reason string.
+    pub active_params: u64,
+}
+
+/// Where a MoE model's weights go.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeOffloadPlan {
+    /// Always [`FULL_OFFLOAD`] when `fits`. A MoE model is split by *tensor*,
+    /// not by layer: attention, KV cache, router and shared experts stay on the
+    /// GPU while routed experts move, so reducing the layer count — the dense
+    /// lever — would evict exactly the wrong things.
+    pub gpu_layers: u32,
+    /// N: routed experts of `blk.0` through `blk.(N-1)` are pinned to CPU.
+    pub cpu_moe_layers: u32,
+    /// False when even all-experts-on-CPU will not fit. The caller falls back
+    /// to [`plan_gpu_offload`], which handles dense partial offload and CPU-only.
+    pub fits: bool,
+    pub reason: String,
+}
+
+impl MoeOffloadPlan {
+    fn wont_fit(total_layers: u32, reason: impl Into<String>) -> Self {
+        Self {
+            gpu_layers: 0,
+            cpu_moe_layers: total_layers,
+            fits: false,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Plans a MoE model's expert offload against real VRAM.
+///
+/// Returns the smallest number of layers whose routed experts must live in
+/// system RAM for the rest of the model to fit on the card, plus one slack
+/// layer. Everything else — attention, KV cache, router, shared experts — stays
+/// resident, which is what makes a 21B MoE usable on a 4 GB card at all.
+pub fn plan_moe_offload(
+    model_id: &str,
+    vram_total_bytes: u64,
+    ram_available_bytes: u64,
+    model_bytes: u64,
+    context_length: u32,
+    geom: &MoeGeometry,
+) -> MoeOffloadPlan {
+    let layers = geom.total_layers.max(1);
+
+    if vram_total_bytes == 0 {
+        return MoeOffloadPlan::wont_fit(layers, "No GPU VRAM detected");
+    }
+    if geom.expert_bytes == 0 {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            "No routed-expert weights identified, so there is nothing to offload",
+        );
+    }
+
+    // Offloaded experts have to live in system RAM, and on the machines this
+    // targets that is usually the binding constraint rather than VRAM: a 21B
+    // MoE's experts are ~12 GB, which a 16 GB laptop cannot hold however well
+    // the VRAM side is planned. Without this check a plan that fits the card
+    // is accepted and the host thrashes instead.
+    let host_required = geom.expert_bytes.saturating_add(MOE_HOST_OVERHEAD_BYTES);
+    if host_required > ram_available_bytes {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            format!(
+                "MoE offload needs {:.2} GB of system RAM for experts (+{:.2} GB overhead) \
+                 but only {:.2} GB is usable — this machine is limited by RAM, not VRAM",
+                as_gb(geom.expert_bytes),
+                as_gb(MOE_HOST_OVERHEAD_BYTES),
+                as_gb(ram_available_bytes)
+            ),
+        );
+    }
+
+    let usable = vram_total_bytes.saturating_sub(OS_RESERVE_BYTES);
+    if usable < MIN_USABLE_VRAM_BYTES {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            format!(
+                "Only {:.2} GB usable VRAM after {:.2} GB OS reserve — below the {:.2} GB minimum",
+                as_gb(usable),
+                as_gb(OS_RESERVE_BYTES),
+                as_gb(MIN_USABLE_VRAM_BYTES)
+            ),
+        );
+    }
+
+    let kv_bytes = geom
+        .kv_bytes_per_token
+        .saturating_mul(u64::from(context_length.max(1)));
+    let after_kv = usable.saturating_sub(kv_bytes);
+    let compute_reserve = (after_kv as f64 * COMPUTE_OVERHEAD_FRACTION) as u64;
+    let weight_budget = after_kv.saturating_sub(compute_reserve);
+
+    if weight_budget == 0 {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            format!(
+                "KV cache for {} tokens (~{:.2} GB) exhausts {:.2} GB usable VRAM",
+                context_length,
+                as_gb(kv_bytes),
+                as_gb(usable)
+            ),
+        );
+    }
+
+    let headroom = format!(
+        "VRAM {:.2} GB − {:.2} GB OS − {:.2} GB KV@{} − {:.2} GB compute = {:.2} GB weight budget",
+        as_gb(vram_total_bytes),
+        as_gb(OS_RESERVE_BYTES),
+        as_gb(kv_bytes),
+        context_length,
+        as_gb(compute_reserve),
+        as_gb(weight_budget)
+    );
+
+    // Everything fits as-is; no reason to send experts across PCIe.
+    if weight_budget >= model_bytes {
+        return MoeOffloadPlan {
+            gpu_layers: FULL_OFFLOAD,
+            cpu_moe_layers: 0,
+            fits: true,
+            reason: format!(
+                "MoE resident: {} ({} active) fits entirely in VRAM, no experts offloaded; {headroom}",
+                model_id,
+                as_billions(geom.active_params)
+            ),
+        };
+    }
+
+    let per_layer = geom.expert_bytes / u64::from(layers);
+    if per_layer == 0 {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            format!(
+                "Expert weights ({:.2} GB over {} layers) are too small to offload usefully",
+                as_gb(geom.expert_bytes),
+                layers
+            ),
+        );
+    }
+
+    let deficit = model_bytes - weight_budget;
+    // Ceiling division: a partly-covered layer still has to move.
+    let needed = deficit.div_ceil(per_layer);
+
+    if needed > u64::from(layers) {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            format!(
+                "MoE offload insufficient: {} needs {:.2} GB off the card but all {} layers of \
+                 experts are only {:.2} GB; {headroom}",
+                model_id,
+                as_gb(deficit),
+                layers,
+                as_gb(geom.expert_bytes)
+            ),
+        );
+    }
+
+    let n = (needed as u32 + MOE_SLACK_LAYERS).min(layers);
+
+    MoeOffloadPlan {
+        gpu_layers: FULL_OFFLOAD,
+        cpu_moe_layers: n,
+        fits: true,
+        reason: format!(
+            "MoE offload: {} ({} active) — experts of {}/{} layers to CPU ({:.2} GB), \
+             {} layers resident; {headroom}",
+            model_id,
+            as_billions(geom.active_params),
+            n,
+            layers,
+            as_gb(u64::from(n) * per_layer),
+            layers - n
+        ),
+    }
+}
+
+/// Formats a parameter count as billions, e.g. `3.6B`.
+fn as_billions(params: u64) -> String {
+    if params == 0 {
+        return "unknown".to_string();
+    }
+    format!("{:.1}B", params as f64 / 1e9)
+}
+
 /// Smallest context worth loading. Below this a model is not useful for coding.
 const MIN_VIABLE_CONTEXT: u32 = 2048;
 
@@ -364,6 +580,241 @@ mod tests {
         for (vram, model, ctx) in cases {
             let plan = plan_gpu_offload(vram, model, ctx, None);
             assert!(plan.gpu_layers == 0 || plan.gpu_layers > 0);
+        }
+    }
+
+    // ─── MoE expert offload ─────────────────────────────────────────────────
+
+    /// gpt-oss-20b: 24 layers, 21B total / 3.6B active, routed experts about
+    /// 93% of a 12.8 GB MXFP4 file, and 24 × 8 × (64+64) × 2 = 49,152 bytes of
+    /// KV per token.
+    fn gpt_oss_geometry() -> MoeGeometry {
+        MoeGeometry {
+            total_layers: 24,
+            expert_bytes: 11_904_000_000,
+            kv_bytes_per_token: 49_152,
+            active_params: 3_600_000_000,
+        }
+    }
+
+    const GPT_OSS_BYTES: u64 = 12_800_000_000;
+    const WORKING_CONTEXT: u32 = 8192;
+    /// Enough host RAM to hold gpt-oss-20b's ~11.9 GB of experts, so VRAM is the
+    /// variable under test rather than the RAM gate.
+    const ROOMY_RAM: u64 = 24 * GB;
+
+    fn plan_gpt_oss_on(vram: u64) -> MoeOffloadPlan {
+        plan_gpt_oss_with(vram, ROOMY_RAM)
+    }
+
+    fn plan_gpt_oss_with(vram: u64, ram: u64) -> MoeOffloadPlan {
+        plan_moe_offload(
+            "gpt-oss-20b",
+            vram,
+            ram,
+            GPT_OSS_BYTES,
+            WORKING_CONTEXT,
+            &gpt_oss_geometry(),
+        )
+    }
+
+    /// The minimum-spec target: an RTX 3050 4 GB must run a 12.8 GB MoE model.
+    #[test]
+    fn the_4gb_minimum_spec_fits_a_21b_moe() {
+        let plan = plan_gpt_oss_on(4 * GB);
+
+        assert!(plan.fits, "{}", plan.reason);
+        assert_eq!(plan.cpu_moe_layers, 22, "{}", plan.reason);
+        assert_eq!(
+            plan.gpu_layers, FULL_OFFLOAD,
+            "MoE splits by tensor, so every layer still goes to the GPU"
+        );
+    }
+
+    #[test]
+    fn an_8gb_card_keeps_more_experts_resident_than_a_4gb_one() {
+        let small = plan_gpt_oss_on(4 * GB);
+        let large = plan_gpt_oss_on(8 * GB);
+
+        assert_eq!(large.cpu_moe_layers, 14, "{}", large.reason);
+        assert!(
+            large.cpu_moe_layers < small.cpu_moe_layers,
+            "more VRAM must mean fewer experts on CPU ({} vs {})",
+            large.cpu_moe_layers,
+            small.cpu_moe_layers
+        );
+    }
+
+    #[test]
+    fn a_roomy_card_offloads_nothing() {
+        let plan = plan_gpt_oss_on(24 * GB);
+
+        assert!(plan.fits);
+        assert_eq!(plan.cpu_moe_layers, 0, "{}", plan.reason);
+        assert_eq!(plan.gpu_layers, FULL_OFFLOAD);
+    }
+
+    /// The whole point of the MoE branch: the dense lever (fewer layers) would
+    /// evict attention and KV cache, which is exactly what must stay resident.
+    #[test]
+    fn a_fitting_plan_never_reduces_the_layer_count() {
+        for vram in [3 * GB, 4 * GB, 6 * GB, 8 * GB, 12 * GB, 24 * GB] {
+            let plan = plan_gpt_oss_on(vram);
+            if plan.fits {
+                assert_eq!(
+                    plan.gpu_layers, FULL_OFFLOAD,
+                    "at {:.0} GB: {}",
+                    as_gb(vram),
+                    plan.reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offload_depth_never_exceeds_the_layers_that_exist() {
+        for vram in [GB, 2 * GB, 3 * GB, 4 * GB, 8 * GB] {
+            let plan = plan_gpt_oss_on(vram);
+            assert!(
+                plan.cpu_moe_layers <= gpt_oss_geometry().total_layers,
+                "at {:.0} GB got depth {}",
+                as_gb(vram),
+                plan.cpu_moe_layers
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_too_large_even_with_every_expert_on_cpu_does_not_fit() {
+        // Non-expert weights alone dwarf the card.
+        let plan = plan_moe_offload(
+            "huge-moe",
+            4 * GB,
+            ROOMY_RAM,
+            100 * GB,
+            WORKING_CONTEXT,
+            &gpt_oss_geometry(),
+        );
+
+        assert!(!plan.fits, "{}", plan.reason);
+        assert!(plan.reason.contains("insufficient"), "got: {}", plan.reason);
+    }
+
+    /// The real limit on the 4 GB minimum spec: a 16 GB laptop cannot hold
+    /// ~12 GB of experts however well the card is planned. The message has to
+    /// name RAM, because "buy a bigger GPU" would be the wrong conclusion.
+    #[test]
+    fn a_machine_without_ram_for_the_experts_is_refused_and_says_so() {
+        let plan = plan_gpt_oss_with(4 * GB, 6 * GB);
+
+        assert!(!plan.fits, "{}", plan.reason);
+        assert!(plan.reason.contains("system RAM"), "got: {}", plan.reason);
+        assert!(plan.reason.contains("limited by RAM"), "got: {}", plan.reason);
+    }
+
+    #[test]
+    fn the_same_card_succeeds_once_there_is_ram_for_the_experts() {
+        assert!(!plan_gpt_oss_with(4 * GB, 6 * GB).fits);
+        assert!(plan_gpt_oss_with(4 * GB, 24 * GB).fits, "RAM was the only blocker");
+    }
+
+    /// Mind the units: `GB` in this file is a GiB (1024³), while the expert
+    /// figure is decimal bytes. 11.90 GB of experts is 11.09 GiB, and the host
+    /// overhead adds 0.5 GiB — so 11 GiB is short and 12 GiB is not.
+    #[test]
+    fn ram_just_short_of_the_experts_is_refused_and_just_enough_is_not() {
+        let short = plan_gpt_oss_with(4 * GB, 11 * GB);
+        assert!(!short.fits, "11 GiB cannot hold 11.09 GiB of experts plus overhead");
+
+        assert!(
+            plan_gpt_oss_with(4 * GB, 12 * GB).fits,
+            "12 GiB does cover them, so the gate must not be over-eager"
+        );
+    }
+
+    #[test]
+    fn no_gpu_cannot_offload_experts() {
+        let plan = plan_gpt_oss_on(0);
+
+        assert!(!plan.fits);
+        assert!(plan.reason.contains("No GPU"), "got: {}", plan.reason);
+    }
+
+    #[test]
+    fn a_dense_model_has_nothing_to_offload() {
+        let geom = MoeGeometry {
+            expert_bytes: 0,
+            ..gpt_oss_geometry()
+        };
+        let plan = plan_moe_offload("llama-8b", 4 * GB, ROOMY_RAM, 5 * GB, WORKING_CONTEXT, &geom);
+
+        assert!(!plan.fits);
+        assert!(plan.reason.contains("nothing to offload"), "got: {}", plan.reason);
+    }
+
+    /// The reason string is the only record of why a machine got the depth it
+    /// did, and it has to be auditable the same way the dense plans are.
+    #[test]
+    fn the_reason_names_the_model_the_active_params_and_the_depth() {
+        let plan = plan_gpt_oss_on(4 * GB);
+
+        assert!(plan.reason.contains("gpt-oss-20b"), "got: {}", plan.reason);
+        assert!(plan.reason.contains("3.6B active"), "got: {}", plan.reason);
+        assert!(plan.reason.contains("22/24"), "got: {}", plan.reason);
+        assert!(plan.reason.contains("weight budget"), "got: {}", plan.reason);
+        assert!(plan.reason.contains("KV@8192"), "got: {}", plan.reason);
+    }
+
+    /// Over-committing VRAM crashes; under-committing only costs throughput.
+    #[test]
+    fn the_depth_is_biased_past_the_bare_minimum() {
+        let plan = plan_gpt_oss_on(4 * GB);
+        let geom = gpt_oss_geometry();
+        let per_layer = geom.expert_bytes / u64::from(geom.total_layers);
+
+        let moved = u64::from(plan.cpu_moe_layers) * per_layer;
+        let deficit = GPT_OSS_BYTES - 2_594_764_227; // weight budget on a 4 GB card
+
+        assert!(
+            moved > deficit,
+            "must move strictly more than the deficit ({moved} vs {deficit})"
+        );
+    }
+
+    #[test]
+    fn a_longer_context_pushes_more_experts_off_the_card() {
+        let short = plan_moe_offload("m", 8 * GB, ROOMY_RAM, GPT_OSS_BYTES, 2048, &gpt_oss_geometry());
+        let long = plan_moe_offload("m", 8 * GB, ROOMY_RAM, GPT_OSS_BYTES, 32768, &gpt_oss_geometry());
+
+        assert!(
+            long.cpu_moe_layers >= short.cpu_moe_layers,
+            "a larger KV cache leaves less room for experts ({} vs {})",
+            long.cpu_moe_layers,
+            short.cpu_moe_layers
+        );
+    }
+
+    #[test]
+    fn moe_plans_never_panic_across_extremes() {
+        let geometries = [
+            gpt_oss_geometry(),
+            MoeGeometry { total_layers: 0, expert_bytes: 0, kv_bytes_per_token: 0, active_params: 0 },
+            MoeGeometry {
+                total_layers: u32::MAX,
+                expert_bytes: u64::MAX,
+                kv_bytes_per_token: u64::MAX,
+                active_params: u64::MAX,
+            },
+        ];
+        let cases = [(0u64, 0u64, 0u32), (u64::MAX, u64::MAX, u32::MAX), (4 * GB, 1, 1), (1, 4 * GB, 128_000)];
+
+        for geom in &geometries {
+            for (vram, model, ctx) in cases {
+                for ram in [0u64, ROOMY_RAM, u64::MAX] {
+                    let plan = plan_moe_offload("x", vram, ram, model, ctx, geom);
+                    assert!(plan.cpu_moe_layers <= geom.total_layers.max(1));
+                }
+            }
         }
     }
 }

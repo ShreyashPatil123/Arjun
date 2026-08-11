@@ -8,9 +8,10 @@
 //! ### Weight Memory
 //! `weight_bytes = total_parameters × bits_per_weight / 8`
 //!
-//! For MoE models, `total_parameters` includes ALL experts (all weights
-//! must be loaded into memory). Active parameters are used only for
-//! speed estimation (deferred to future phase).
+//! For MoE models, `total_parameters` includes ALL experts, because every
+//! weight must be resident *somewhere*. Where it is resident is a separate
+//! question: [`split_moe_weights`] divides them into the part that has to be in
+//! VRAM and the routed experts llama.cpp can pin to system RAM.
 //!
 //! ### KV Cache Memory (GQA-Aware)
 //! `kv_cache_bytes = 2 × layers × kv_heads × head_dim × context × bytes_per_element`
@@ -41,7 +42,8 @@
 //! ## Assumptions
 //! - KV cache uses FP16 precision regardless of weight quantization
 //! - Batch size is 1 (single-user local inference)
-//! - MoE: all expert weights resident; routing overhead negligible
+//! - MoE: every expert weight is resident in *some* memory tier — see
+//!   [`split_moe_weights`] for the VRAM/RAM division; routing overhead negligible
 
 use crate::model_recommendation::traits::*;
 
@@ -51,6 +53,73 @@ pub fn estimate_weight_memory(model: &ModelMetadata, quant: &QuantizationSpec) -
     let params = model.total_parameters;
     // weight_bytes = params × bits_per_weight / 8
     (params as f64 * quant.bits_per_weight / 8.0) as u64
+}
+
+/// How a MoE model's weights divide between the memory that must be on the GPU
+/// and the routed experts that can live in system RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeWeightSplit {
+    /// Attention, router, shared experts, embeddings and norms. These stay in
+    /// VRAM — they are latency-critical and small.
+    pub resident_bytes: u64,
+    /// Routed experts, which llama.cpp can pin to system RAM per layer.
+    pub expert_bytes: u64,
+}
+
+/// Ceiling on the share of weights attributed to routed experts, so a figure
+/// that disagrees with the stated totals cannot claim the whole model is
+/// offloadable and leave nothing resident.
+const MAX_EXPERT_FRACTION: f64 = 0.95;
+
+/// Splits a MoE model's weights into resident and offloadable parts.
+///
+/// A MoE model does **not** offload proportionally the way a dense one does.
+/// Only the routed experts move; attention and the KV cache have to stay on the
+/// card. Treating it proportionally overstates the VRAM a machine needs and
+/// misreports where the memory actually goes.
+///
+/// The expert share is solved from figures the catalog already carries. With
+/// `D` non-expert parameters and `E` routed-expert parameters:
+///
+/// ```text
+/// D + E                       = total
+/// D + E × (active/num experts) = active
+/// ⇒ E = (total − active) / (1 − active_experts/num_experts)
+/// ```
+///
+/// Returns `None` for dense models, or when the figures cannot produce a
+/// sensible split — the caller then falls back to the proportional estimate.
+pub fn split_moe_weights(model: &ModelMetadata, weight_bytes: u64) -> Option<MoeWeightSplit> {
+    let (num_experts, active_experts) = match model.architecture {
+        ModelArchitecture::MixtureOfExperts { num_experts, active_experts } => {
+            (num_experts, active_experts)
+        }
+        _ => return None,
+    };
+
+    if num_experts == 0 || active_experts == 0 || active_experts >= num_experts {
+        return None;
+    }
+
+    let total = model.total_parameters as f64;
+    let active = model.active_parameters? as f64;
+    if total <= 0.0 || active <= 0.0 || active >= total {
+        return None;
+    }
+
+    let used_share = f64::from(active_experts) / f64::from(num_experts);
+    let expert_params = (total - active) / (1.0 - used_share);
+    if expert_params <= 0.0 {
+        return None;
+    }
+
+    let expert_fraction = (expert_params / total).min(MAX_EXPERT_FRACTION);
+    let expert_bytes = (weight_bytes as f64 * expert_fraction) as u64;
+
+    Some(MoeWeightSplit {
+        resident_bytes: weight_bytes.saturating_sub(expert_bytes),
+        expert_bytes,
+    })
 }
 
 /// Estimate KV cache memory in bytes for a given context length.
@@ -144,6 +213,165 @@ mod tests {
             default_dtype: "bf16".to_string(),
             use_cases: vec!["chat".to_string(), "general".to_string()],
             catalog_version: "1.0".to_string(),
+        }
+    }
+
+    /// gpt-oss-20b: 21B total, 3.6B active, 4 of 32 experts per token.
+    fn make_gpt_oss_20b() -> ModelMetadata {
+        ModelMetadata {
+            id: "openai/gpt-oss-20b".to_string(),
+            name: "gpt-oss 20B".to_string(),
+            family: "gpt-oss".to_string(),
+            architecture: ModelArchitecture::MixtureOfExperts {
+                num_experts: 32,
+                active_experts: 4,
+            },
+            total_parameters: 20_900_000_000,
+            active_parameters: Some(3_600_000_000),
+            num_layers: 24,
+            num_attention_heads: 64,
+            num_kv_heads: 8,
+            head_dimension: 64,
+            hidden_size: 2880,
+            max_context_length: 131072,
+            vocab_size: 201088,
+            default_dtype: "mxfp4".to_string(),
+            use_cases: vec!["code".to_string(), "chat".to_string()],
+            catalog_version: "1.0".to_string(),
+        }
+    }
+
+    // ─── MoE weight split ───────────────────────────────────────────────────
+
+    /// The point of the split: a 21B MoE needs only a small resident part in
+    /// VRAM, which is what lets it run on a 4 GB card at all.
+    #[test]
+    fn moe_weights_split_into_a_small_resident_part_and_large_experts() {
+        let model = make_gpt_oss_20b();
+        let weight_bytes = 12_800_000_000u64;
+
+        let split = split_moe_weights(&model, weight_bytes).expect("gpt-oss is MoE");
+
+        assert!(
+            split.resident_bytes < weight_bytes / 5,
+            "attention and router should be a small share, got {} of {weight_bytes}",
+            split.resident_bytes
+        );
+        assert!(split.expert_bytes > split.resident_bytes * 4);
+    }
+
+    #[test]
+    fn a_moe_split_accounts_for_every_weight_byte() {
+        for model in [make_gpt_oss_20b(), make_mixtral_8x7b()] {
+            let weight_bytes = 12_800_000_000u64;
+            let split = split_moe_weights(&model, weight_bytes).unwrap();
+
+            assert_eq!(
+                split.resident_bytes + split.expert_bytes,
+                weight_bytes,
+                "{} lost or invented bytes",
+                model.id
+            );
+        }
+    }
+
+    /// Solved from the catalog figures, so it must reproduce the stated active
+    /// parameter count rather than using a fixed guess.
+    #[test]
+    fn the_expert_share_reproduces_the_stated_active_parameters() {
+        let model = make_gpt_oss_20b();
+        let split = split_moe_weights(&model, model.total_parameters).unwrap();
+
+        // resident + experts × (4/32) should land back on 3.6B.
+        let implied_active = split.resident_bytes + split.expert_bytes / 8;
+        let stated = model.active_parameters.unwrap();
+        let drift = implied_active.abs_diff(stated) as f64 / stated as f64;
+
+        assert!(drift < 0.05, "implied {implied_active} vs stated {stated}");
+    }
+
+    /// The recommendation and the load must describe the same model.
+    ///
+    /// The scorer sizes a model from catalog metadata (total and active
+    /// parameters); the loader sizes the same model from its GGUF header (layer
+    /// count and expert dimensions). Those are independent derivations of the
+    /// same quantity, and if they drift the user is shown one VRAM/RAM split
+    /// and gets another.
+    #[test]
+    fn catalog_and_gguf_geometry_agree_on_the_expert_share() {
+        use crate::ai_engine::gguf_meta::GgufMetadata;
+
+        let file_bytes = 12_800_000_000u64;
+
+        // Recommend-time: solved from total and active parameters.
+        let from_catalog = split_moe_weights(&make_gpt_oss_20b(), file_bytes)
+            .expect("gpt-oss is MoE")
+            .expert_bytes;
+
+        // Load-time: computed from the header geometry verified against
+        // openai/gpt-oss-20b's published config.json.
+        let from_header = GgufMetadata {
+            architecture: "gpt-oss".to_string(),
+            block_count: 24,
+            embedding_length: 2880,
+            expert_count: 32,
+            expert_used_count: 4,
+            expert_ff_length: 2880,
+            head_count_kv: 8,
+            key_length: 64,
+            value_length: 64,
+            parameter_count: Some(20_900_000_000),
+        }
+        .expert_bytes(file_bytes, None);
+
+        let drift = from_catalog.abs_diff(from_header) as f64 / from_header as f64;
+        assert!(
+            drift < 0.10,
+            "the two paths must not disagree by more than 10%: catalog {from_catalog} vs header {from_header} ({:.1}%)",
+            drift * 100.0
+        );
+    }
+
+    #[test]
+    fn a_dense_model_has_no_expert_split() {
+        assert!(split_moe_weights(&make_llama31_8b(), 8_000_000_000).is_none());
+        assert!(split_moe_weights(&make_codelama_7b(), 7_000_000_000).is_none());
+    }
+
+    #[test]
+    fn a_moe_model_without_active_parameters_cannot_be_split() {
+        // The live HF catalog records these as Dense precisely because the Hub
+        // does not expose expert counts; a partial record must not be guessed at.
+        let mut model = make_gpt_oss_20b();
+        model.active_parameters = None;
+
+        assert!(split_moe_weights(&model, 12_800_000_000).is_none());
+    }
+
+    #[test]
+    fn nonsense_expert_counts_are_refused_rather_than_extrapolated() {
+        let weight_bytes = 12_800_000_000u64;
+
+        for architecture in [
+            ModelArchitecture::MixtureOfExperts { num_experts: 0, active_experts: 0 },
+            ModelArchitecture::MixtureOfExperts { num_experts: 4, active_experts: 4 },
+            ModelArchitecture::MixtureOfExperts { num_experts: 4, active_experts: 9 },
+        ] {
+            let mut model = make_gpt_oss_20b();
+            model.architecture = architecture;
+            assert!(split_moe_weights(&model, weight_bytes).is_none(), "{:?}", model.architecture);
+        }
+    }
+
+    #[test]
+    fn something_always_stays_resident() {
+        // A split that offloaded everything would leave no attention stack on
+        // the card, which is not a configuration llama.cpp can run.
+        let mut model = make_gpt_oss_20b();
+        model.active_parameters = Some(1); // pathological
+
+        if let Some(split) = split_moe_weights(&model, 12_800_000_000) {
+            assert!(split.resident_bytes > 0, "nothing left resident");
         }
     }
 
