@@ -104,7 +104,11 @@ fn describe(skill: ModelCategory) -> &'static str {
 
 /// Skills the author declared through tags, as opposed to ones merely hinted at
 /// by the repository name.
-fn stated_skills(tags: &[String]) -> Vec<ModelCategory> {
+///
+/// Shared with [`crate::capability::assign`], which turns the same evidence into
+/// a capability slot — so the panel and the assignment can never disagree about
+/// what an adapter appears to do.
+pub(crate) fn stated_skills(tags: &[String]) -> Vec<ModelCategory> {
     // Categorising the tags alone — with an empty name — means anything found
     // here came from something the author wrote, not from the repo's title.
     categorize("", tags, 0, 0, "")
@@ -113,7 +117,7 @@ fn stated_skills(tags: &[String]) -> Vec<ModelCategory> {
         .collect()
 }
 
-fn suggested_skills(name: &str) -> Vec<ModelCategory> {
+pub(crate) fn suggested_skills(name: &str) -> Vec<ModelCategory> {
     categorize(name, &[], 0, 0, "")
         .into_iter()
         .filter(|c| !matches!(c, ModelCategory::General | ModelCategory::LoraAdapter))

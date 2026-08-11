@@ -134,9 +134,6 @@ impl HuggingFaceCatalogProvider {
         }
     }
 
-    /// Number of search pages to sweep (100 repositories each).
-    const DISCOVERY_PAGES: u32 = 5;
-
     /// Resolves an optional HuggingFace token from the environment.
     ///
     /// Browsing needs no token — search and metadata reads work anonymously,

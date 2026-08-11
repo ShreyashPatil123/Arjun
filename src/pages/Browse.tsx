@@ -866,24 +866,35 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
           ) : (
             <span
               className={styles.needsConversion}
-              title="PEFT safetensors. llama.cpp needs GGUF, and Sarathi cannot convert yet."
+              title="PEFT safetensors. Sarathi converts it to GGUF after downloading, which needs the base model installed and a supported model family."
             >
-              needs conversion
+              converts on install
             </span>
           )}
         </td>
         <td className={styles.qAction}>
-          {/* No button when it cannot load: a download here would fetch a file
-            * llama.cpp cannot use, which is worse than saying why not. */}
-          {a.ggufReady && (
-            <button
-              className={styles.getBtn}
-              disabled={installing || installed}
-              onClick={onInstall}
-            >
-              {installed ? 'installed' : installing ? 'getting…' : 'Get'}
-            </button>
-          )}
+          {/* Both kinds are installable now. A PEFT adapter is downloaded and
+            * converted in one step; if the conversion cannot be done the whole
+            * install is rolled back, so the button never leaves a file behind
+            * that llama.cpp would refuse. */}
+          <button
+            className={styles.getBtn}
+            disabled={installing || installed}
+            onClick={onInstall}
+            title={
+              a.ggufReady
+                ? 'Download this adapter'
+                : 'Download and convert this adapter to GGUF'
+            }
+          >
+            {installed
+              ? 'installed'
+              : installing
+                ? a.ggufReady
+                  ? 'getting…'
+                  : 'converting…'
+                : 'Get'}
+          </button>
         </td>
       </tr>
 
@@ -902,18 +913,24 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
                         <span className={styles.effectSkill}>{e.skill}</span>
                         {/* A guess read off the repository name must never be
                           * presented with the same weight as the author's own
-                          * tags, so each line says which it is. */}
+                          * tags, so each line says which it is.
+                          *
+                          * The label says "author tagged", not "author says":
+                          * the author supplied a tag, and the sentence beside it
+                          * is Sarathi explaining what that tag means. Wording it
+                          * as speech put our words in their mouth, which also
+                          * made every adapter in a category look identical. */}
                         <span
                           className={
                             e.confidence === 'stated' ? styles.stated : styles.suggested
                           }
                           title={
                             e.confidence === 'stated'
-                              ? "Declared by the adapter's author"
-                              : 'Guessed from the name — the author did not say'
+                              ? 'The author tagged this adapter with this skill. The description is Sarathi explaining what that tag means.'
+                              : 'Guessed from the repository name — the author did not tag it'
                           }
                         >
-                          {e.confidence === 'stated' ? 'author says' : 'from its name'}
+                          {e.confidence === 'stated' ? 'author tagged' : 'from its name'}
                         </span>
                         <span className={styles.effectText}>{e.description}</span>
                       </li>

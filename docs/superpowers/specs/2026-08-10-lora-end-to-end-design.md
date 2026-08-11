@@ -135,6 +135,21 @@ parse:
 `ConversionSummary` gains `rank` and `target_modules`; it already carries `alpha` and
 `architecture`.
 
+### The startup scan may claim, but never evict
+
+Only one adapter can fill a capability, and the scan runs on every launch. So the
+scan claims a slot only when that slot is **free**, and refreshes a record only
+when that record already points into the directory being scanned.
+
+Both halves matter, and getting either wrong is silent. Reading the target slot
+blindly would copy one adapter's rank and alpha onto another. Claiming an
+occupied slot would take a capability away from whichever adapter the user had
+assigned to it — not once, but on every single launch, with nothing in the UI to
+show why the choice kept reverting.
+
+An adapter that suits an occupied slot stays installed and unassigned, available
+to be assigned by hand.
+
 ### Two collateral fixes the bridge requires
 
 `verify_adapter_files` hard-requires `adapter_config.json`. The ready-GGUF install path never
@@ -146,6 +161,19 @@ The auto-discovery path in `download_manager` calls `convert_adapter` after land
 weights, instead of stamping `requires_conversion` and stopping. On failure it keeps today's
 behaviour but records the real conversion error in `reason`, so the UI can say why rather
 than showing a permanent unexplained warning.
+
+### A third, found during implementation
+
+`write_manifest` carries Single Source of Truth protection that restores any
+`Installed` adapter record a write would downgrade. It is aimed at automatic
+passes — its own log line reads *"blocked automatic overwrite"* — but it triggers
+purely on `adapters/<capability>/` holding files, which is exactly the shape
+auto-discovery writes.
+
+Routing a user's reassignment through it was therefore silently reverted: the UI
+reported the change, the manifest kept the old record. `write_manifest_user_initiated`
+writes without the merge, and the reassignment and removal paths use it. Automatic
+callers keep the protected path unchanged.
 
 ## Error handling
 

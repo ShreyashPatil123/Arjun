@@ -22,6 +22,7 @@
 //!   through its prompt profile rather than being dropped, so behaviour is
 //!   consistent whether or not adapters are installed.
 
+pub mod assign;
 pub mod classifier;
 pub mod eval;
 pub mod policy;
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter_manager::ModelPackageManifest;
 use crate::ai_engine::traits::{ChatMessage, GenerationParams};
 
+pub use assign::{AssignmentConfidence, CapabilityAssignment};
 pub use classifier::{ClassificationResult, IntentClassifier};
 pub use policy::{CapabilityTracker, SwitchDecision, SwitchPolicy, GENERAL};
 pub use profile::{CapabilityBackend, CapabilitySpec, SamplingOverrides, DEFAULT_LORA_SCALE};

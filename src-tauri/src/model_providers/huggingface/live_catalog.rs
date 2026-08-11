@@ -39,7 +39,25 @@ const CONCURRENCY: usize = 8;
 pub const ANONYMOUS_PAGES: u32 = 1;
 
 /// Search pages to sweep with a token. Authenticated limits are far higher.
-pub const AUTHENTICATED_PAGES: u32 = 5;
+///
+/// At 100 repositories per page this is 2,000 candidates, which is what fills
+/// every category in the library rather than only the most-downloaded corner of
+/// it. Three things make that affordable:
+///
+/// - The result is cached for 24 hours, so the cost is paid once a day, not per
+///   visit.
+/// - Detail requests run at [`CONCURRENCY`], so the sweep is bounded work rather
+///   than 2,000 serial round trips.
+/// - A page that fails past the first is not fatal: `discover_repos` keeps
+///   everything already collected and stops there. Reaching a rate limit
+///   therefore shortens the catalog instead of emptying it, which is what makes
+///   raising this safe rather than a gamble.
+///
+/// It is deliberately not unbounded. The Hub holds tens of thousands of GGUF
+/// repositories, and sweeping all of them would cost an hour of requests to
+/// surface models nobody scrolls to. The long tail is reachable through search,
+/// which queries the Hub directly and is not limited by this.
+pub const AUTHENTICATED_PAGES: u32 = 20;
 
 /// Pages to sweep given whether a token is available.
 pub fn pages_for(token: Option<&str>) -> u32 {

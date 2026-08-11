@@ -23,6 +23,11 @@ import { getInferenceStatus, loadInstalledModel, unloadActiveModel } from '../se
 import {
   listInstalledAdapters,
   removeAdapter,
+  setAdapterCapability,
+  ASSIGNMENT_SOURCE,
+  CAPABILITIES,
+  CAPABILITY_LABELS,
+  type Capability,
   type InstalledAdapter,
 } from '../services/adapters.service';
 import { formatSize } from '../services/catalog.service';
@@ -116,6 +121,33 @@ export const Storage: React.FC = () => {
       await deleteInstalledModel(m.providerId, m.modelId, m.quantization);
       addToast('success', `${m.modelName} deleted`);
       await refresh();
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * Points a capability at an adapter, or unassigns it.
+   *
+   * The whole list for this model is refetched rather than patched locally: only
+   * one adapter can hold a capability, so assigning one displaces another, and
+   * guessing which from here would eventually disagree with the manifest.
+   */
+  const handleCapabilityChange = async (m: any, a: InstalledAdapter, next: string) => {
+    const capability = next === '' ? null : (next as Capability);
+    setBusy(a.id);
+    try {
+      await setAdapterCapability(m.providerId, m.modelId, a.id, capability);
+      const found = await listInstalledAdapters(m.providerId, m.modelId);
+      setAdapters((prev) => ({ ...prev, [m.modelId]: found.adapters }));
+      addToast(
+        'success',
+        capability
+          ? `${a.name} will be used for ${CAPABILITY_LABELS[capability]}`
+          : `${a.name} is no longer used`
+      );
     } catch (err) {
       addToast('error', String(err));
     } finally {
@@ -311,12 +343,43 @@ export const Storage: React.FC = () => {
                   {mine?.map((a) => (
                     <div key={a.id} className={styles.adapterRow}>
                       <span className={styles.adapterName}>{a.name}</span>
+
+                      {/*
+                        An adapter only ever runs through the capability it is
+                        assigned to. Where that assignment came from is spelled
+                        out beneath, because most of them are inferred from the
+                        adapter's name and a guess shown as a fact is worse than
+                        no guess at all.
+                      */}
+                      <label className={styles.adapterUse}>
+                        <span className={styles.srOnly}>Use {a.name} for</span>
+                        <select
+                          className={styles.capabilitySelect}
+                          value={a.capability ?? ''}
+                          disabled={busy === a.id}
+                          onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
+                        >
+                          <option value="">Not used</option>
+                          {CAPABILITIES.map((c) => (
+                            <option key={c} value={c}>
+                              {CAPABILITY_LABELS[c]}
+                            </option>
+                          ))}
+                        </select>
+                        {a.capability && a.assignmentConfidence && (
+                          <span className={styles.muted}>
+                            {ASSIGNMENT_SOURCE[a.assignmentConfidence]}
+                          </span>
+                        )}
+                      </label>
+
                       <span className={styles.muted}>{formatSize(a.sizeBytes)}</span>
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => handleRemoveAdapter(m, a)}
                         disabled={busy === a.id}
+                        title="Delete this adapter"
                       >
                         <Trash2 size={12} />
                       </Button>

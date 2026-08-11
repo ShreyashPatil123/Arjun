@@ -237,9 +237,8 @@ pub async fn browse_model_cards(query: Option<String>) -> Result<CatalogPage, St
 #[serde(rename_all = "camelCase")]
 pub struct AdapterPage {
     pub adapters: Vec<live_catalog::AdapterListing>,
-    /// How many can be loaded as they are. The rest are PEFT safetensors and
-    /// need converting to GGUF first, which Sarathi cannot yet do — saying so
-    /// is better than offering a download that will not load.
+    /// How many can be loaded as they are. The rest are PEFT safetensors, which
+    /// Sarathi converts to GGUF during installation.
     pub ready_count: usize,
     /// Shown when none are directly usable, explaining what that means.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,8 +263,8 @@ pub async fn find_model_adapters(base_model_id: String) -> Result<AdapterPage, S
         Some("No LoRA adapters published for this model yet.".to_string())
     } else if ready_count == 0 {
         Some(format!(
-            "{} adapter(s) found, but none ship GGUF files. They are PEFT safetensors and need \
-             converting before llama.cpp can load them.",
+            "{} adapter(s) found. None ship GGUF, so Sarathi converts them during install — \
+             which needs this base model installed and its family supported.",
             adapters.len()
         ))
     } else {

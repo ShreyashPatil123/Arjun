@@ -88,13 +88,17 @@ impl CapabilityResolver {
         }
 
         let (backend, reason) = match Self::try_bind_adapter(capability, package_dir, manifest) {
-            Ok(path) => {
+            Ok((path, scale)) => {
                 let backend = CapabilityBackend::LoraAdapter {
                     path: path.clone(),
-                    scale: DEFAULT_LORA_SCALE,
+                    scale,
                 };
-                let reason = format!("Bound verified GGUF LoRA adapter at {:?}", path);
-                log::info!("[CAPABILITY] '{}' -> LoRA adapter {:?}", capability, path);
+                let reason =
+                    format!("Bound verified GGUF LoRA adapter at {:?} (scale {:.2})", path, scale);
+                log::info!(
+                    "[CAPABILITY] '{}' -> LoRA adapter {:?} at scale {:.2}",
+                    capability, path, scale
+                );
                 (backend, reason)
             }
             Err(why) => {
@@ -116,13 +120,14 @@ impl CapabilityResolver {
 
     /// Attempts to bind an installed, runtime-loadable GGUF adapter.
     ///
-    /// Returns the reason for rejection on the error path so the caller can
-    /// report *why* a capability degraded rather than silently downgrading.
+    /// Returns the adapter's path and the strength to bind it at. The reason for
+    /// rejection comes back on the error path so the caller can report *why* a
+    /// capability degraded rather than silently downgrading.
     fn try_bind_adapter(
         capability: &str,
         package_dir: &Path,
         manifest: &ModelPackageManifest,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, f32), String> {
         let info = manifest
             .adapters
             .get(capability)
@@ -172,7 +177,23 @@ impl CapabilityResolver {
         // llama.cpp; verifying the magic header keeps the failure in Rust.
         verify_gguf_magic(&path)?;
 
-        Ok(path)
+        // A hand-edited manifest is the only way a scale gets here, so a
+        // nonsensical one is a typo rather than an attack. Non-finite values
+        // would silently poison every weight the adapter touches, so they fall
+        // back to the default loudly instead.
+        let scale = match info.scale {
+            Some(s) if s.is_finite() => s,
+            Some(s) => {
+                log::warn!(
+                    "[CAPABILITY] '{}' has a non-finite adapter scale ({}); using {:.2}",
+                    capability, s, DEFAULT_LORA_SCALE
+                );
+                DEFAULT_LORA_SCALE
+            }
+            None => DEFAULT_LORA_SCALE,
+        };
+
+        Ok((path, scale))
     }
 }
 
@@ -237,6 +258,7 @@ mod tests {
             peft_type: Some("LORA".to_string()),
             checksum: None,
             reason: None,
+            ..Default::default()
         }
     }
 
@@ -245,6 +267,60 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Builds a package holding one bindable GGUF adapter and returns its dir.
+    fn package_with_gguf_adapter(name: &str) -> PathBuf {
+        let dir = temp_dir(name);
+        let adapters = dir.join("adapters").join("coding");
+        fs::create_dir_all(&adapters).unwrap();
+        // Minimal GGUF: magic + version.
+        fs::write(adapters.join("adapter.gguf"), b"GGUF\x03\x00\x00\x00").unwrap();
+        dir
+    }
+
+    fn resolved_scale(resolution: &CapabilityResolution) -> f32 {
+        match &resolution.backend {
+            CapabilityBackend::LoraAdapter { scale, .. } => *scale,
+            other => panic!("expected a LoRA backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recorded_scale_reaches_the_binding() {
+        let dir = package_with_gguf_adapter("scale_recorded");
+        let mut info =
+            adapter_info("Installed", Some("adapters/coding/adapter.gguf"), Some("compatible"));
+        info.scale = Some(0.7);
+
+        let r = CapabilityResolver::resolve("coding", &dir, &manifest_with("coding", info));
+
+        assert_eq!(resolved_scale(&r), 0.7);
+    }
+
+    #[test]
+    fn a_record_without_a_scale_uses_the_default() {
+        let dir = package_with_gguf_adapter("scale_absent");
+        let info =
+            adapter_info("Installed", Some("adapters/coding/adapter.gguf"), Some("compatible"));
+
+        let r = CapabilityResolver::resolve("coding", &dir, &manifest_with("coding", info));
+
+        assert_eq!(resolved_scale(&r), DEFAULT_LORA_SCALE);
+    }
+
+    #[test]
+    fn a_nonsense_scale_falls_back_rather_than_poisoning_the_weights() {
+        // NaN would propagate silently through every weight the adapter touches
+        // and produce garbage tokens with no error anywhere.
+        let dir = package_with_gguf_adapter("scale_nan");
+        let mut info =
+            adapter_info("Installed", Some("adapters/coding/adapter.gguf"), Some("compatible"));
+        info.scale = Some(f32::NAN);
+
+        let r = CapabilityResolver::resolve("coding", &dir, &manifest_with("coding", info));
+
+        assert_eq!(resolved_scale(&r), DEFAULT_LORA_SCALE);
     }
 
     #[test]

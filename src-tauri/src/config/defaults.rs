@@ -31,6 +31,20 @@ pub struct AiSettings {
     pub default_temperature: f32,
     pub use_gpu: bool,
     pub gpu_layers: u32,
+
+    /// Whether startup may load a model without being asked.
+    ///
+    /// Off by default. Loading a model is not a free convenience: it commits
+    /// several gigabytes of VRAM and takes seconds to tens of seconds, and doing
+    /// it before the user has said which model they want makes the app feel like
+    /// it is deciding for them. The gateway reports "no model loaded" until one
+    /// is chosen, which is honest and recoverable.
+    ///
+    /// `serde(default)` so configuration files written before this field existed
+    /// keep parsing — and they inherit the off default rather than the old
+    /// implicit on behaviour.
+    #[serde(default)]
+    pub auto_load_on_startup: bool,
 }
 
 impl Default for AiSettings {
@@ -40,6 +54,7 @@ impl Default for AiSettings {
             default_temperature: 0.7,
             use_gpu: true,
             gpu_layers: 35,
+            auto_load_on_startup: false,
         }
     }
 }

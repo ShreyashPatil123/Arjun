@@ -143,18 +143,40 @@ pub fn run() {
                 }
             });
 
-            // Bring a model up on launch so the gateway can answer immediately.
+            // Optionally bring a model up on launch so the gateway can answer
+            // immediately.
             //
             // Sarathi serves other tools rather than hosting its own chat, so
             // nothing in the UI would otherwise trigger a load — a user could
             // install a model, point Claude Code at the gateway, and get
-            // "no model loaded" with no obvious way to fix it.
+            // "no model loaded" with no obvious way to fix it. That is the case
+            // this exists for.
             //
-            // Prefers the last model used. Falls back to the only installed one.
-            // With several installed and no previous session it loads nothing,
-            // because guessing which model someone wants resident in VRAM is
-            // worse than letting them choose.
-            {
+            // It is off by default all the same: a load commits gigabytes of
+            // VRAM and takes real time, and doing that before the user has named
+            // a model takes a decision away from them. "No model loaded" is a
+            // recoverable state; a surprise load is not. Enable it with
+            // `ai_settings.auto_load_on_startup` when the gateway-first workflow
+            // is what you want.
+            //
+            // When enabled it prefers the last model used, then falls back to the
+            // only installed one. With several installed and no previous session
+            // it loads nothing, because guessing which model someone wants
+            // resident in VRAM is worse than letting them choose.
+            let auto_load_on_startup = config::ConfigManager::load(
+                &config::ConfigManager::get_config_path(app.handle()),
+            )
+            .map(|c| c.ai_settings.auto_load_on_startup)
+            .unwrap_or(false);
+
+            if !auto_load_on_startup {
+                info!(
+                    "Startup auto-load is off — no model will be loaded until one is \
+                     chosen in the app. Set ai_settings.auto_load_on_startup to change this."
+                );
+            }
+
+            if auto_load_on_startup {
                 let inference = app.state::<Arc<InferenceManager>>().inner().clone();
                 let app_data = app.path().app_data_dir().ok();
 
@@ -307,6 +329,7 @@ pub fn run() {
             commands::adapters::list_installed_adapters,
             commands::adapters::download_adapter,
             commands::adapters::remove_adapter,
+            commands::adapters::set_adapter_capability,
             commands::adapter_details::get_adapter_details,
 
             // Phase 6 Memory Engine Commands

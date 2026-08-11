@@ -250,6 +250,10 @@ impl DownloadManager {
                                         peft_type: Some("LORA".to_string()),
                                         checksum: None,
                                         reason: None,
+                                        source: Some(
+                                            crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
+                                        ),
+                                        ..Default::default()
                                     },
                                 );
                             }
@@ -476,6 +480,73 @@ impl DownloadManager {
                             }
 
                             if download_success {
+                                // What just landed is almost always PEFT safetensors, which
+                                // llama.cpp cannot load. Converting here is the whole reason an
+                                // auto-discovered adapter can ever bind: without it the record
+                                // below is stamped `requires_conversion`, and `try_bind_adapter`
+                                // refuses that permanently.
+                                //
+                                // Conversion is CPU- and IO-bound and this is an async task, so
+                                // it runs on the blocking pool rather than stalling the runtime
+                                // for the other capabilities downloading alongside it.
+                                let mut adapter_rel =
+                                    format!("adapters/{}/{}", cap_key, cand.adapter_file_name);
+                                let mut runtime_status = Some("compatible".to_string());
+                                let mut convert_reason: Option<String> = None;
+                                let mut converted: Option<crate::lora::ConversionSummary> = None;
+
+                                let lower = cand.adapter_file_name.to_lowercase();
+                                if lower.ends_with(".safetensors") {
+                                    let dir = cap_dir.clone();
+                                    let pkg = package_dir_cap.clone();
+                                    let outcome = tokio::task::spawn_blocking(move || {
+                                        let base =
+                                            crate::lora::convert::arch::resolve_base_gguf(&pkg)?;
+                                        crate::lora::convert_adapter(&dir, &base)
+                                    })
+                                    .await;
+
+                                    match outcome {
+                                        Ok(Ok(summary)) => {
+                                            // The safetensors were the input. Removing them only
+                                            // after the GGUF exists means a failed conversion
+                                            // still leaves the download intact.
+                                            let _ =
+                                                tokio::fs::remove_file(&target_weight_path).await;
+                                            adapter_rel = format!(
+                                                "adapters/{}/{}",
+                                                cap_key,
+                                                crate::lora::convert::CONVERTED_FILENAME
+                                            );
+                                            actual_downloaded_bytes = summary.output_bytes;
+                                            converted = Some(summary);
+                                        }
+                                        // A conversion failure is not a download failure. The
+                                        // files stay put and the capability falls back to its
+                                        // prompt profile, but the real reason is recorded so the
+                                        // UI can say more than "unavailable".
+                                        Ok(Err(e)) => {
+                                            log::warn!("[DOWNLOAD] '{cap_key}' adapter downloaded but could not be converted: {e:#}");
+                                            runtime_status = Some("requires_conversion".to_string());
+                                            convert_reason = Some(format!("{e:#}"));
+                                        }
+                                        Err(e) => {
+                                            log::warn!("[DOWNLOAD] '{cap_key}' adapter conversion task failed: {e}");
+                                            runtime_status = Some("requires_conversion".to_string());
+                                            convert_reason =
+                                                Some("the conversion did not finish".to_string());
+                                        }
+                                    }
+                                } else if !lower.ends_with(".gguf") {
+                                    // `.bin` is a pickle checkpoint; the converter reads
+                                    // safetensors only, deliberately.
+                                    runtime_status = Some("requires_conversion".to_string());
+                                    convert_reason = Some(
+                                        "this adapter is a .bin checkpoint, which Sarathi does not convert."
+                                            .to_string(),
+                                    );
+                                }
+
                                 log_adapter_transition(
                                     &cap_key,
                                     &AdapterState::Installing,
@@ -490,17 +561,26 @@ impl DownloadManager {
                                     AdapterManifestInfo {
                                         capability: cap_key.clone(),
                                         status: "Installed".to_string(),
-                                        adapter_runtime_status: None,
+                                        adapter_runtime_status: runtime_status,
                                         repo_id: Some(cand.repo_id),
                                         local_path: Some(format!("adapters/{}/", cap_key)),
-                                        adapter_file: Some(format!("adapters/{}/{}", cap_key, cand.adapter_file_name)),
+                                        adapter_file: Some(adapter_rel),
                                         config_file: Some(format!("adapters/{}/adapter_config.json", cap_key)),
                                         size_bytes: Some(actual_downloaded_bytes),
                                         base_model_match: Some(cand.base_model_match),
                                         target_modules: cand.target_modules,
                                         peft_type: Some(cand.peft_type),
                                         checksum: None,
-                                        reason: None,
+                                        reason: convert_reason,
+                                        // The sweep chose this slot, so a later manual assignment
+                                        // can be told apart from it.
+                                        source: Some(
+                                            crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
+                                        ),
+                                        rank: converted.as_ref().and_then(|s| s.rank),
+                                        alpha: converted.as_ref().map(|s| s.alpha),
+                                        architecture: converted.as_ref().map(|s| s.architecture.clone()),
+                                        ..Default::default()
                                     },
                                 );
 
@@ -555,6 +635,10 @@ impl DownloadManager {
                                 peft_type: None,
                                 checksum: None,
                                 reason: Some("Handled natively by base model".to_string()),
+                                source: Some(
+                                    crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
+                                ),
+                                ..Default::default()
                             },
                         );
 

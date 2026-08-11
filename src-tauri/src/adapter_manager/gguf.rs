@@ -152,11 +152,16 @@ fn skip_value<R: Read + Seek>(r: &mut R, vtype: u32) -> Result<()> {
     }
 }
 
-/// Reads `adapter.type` from a GGUF file's metadata.
+/// Reads one text-valued metadata entry from a GGUF file.
 ///
-/// `Ok(None)` means the file parsed correctly but declares no adapter type —
-/// which is what a full model looks like.
-pub fn read_adapter_type(path: &Path) -> Result<Option<String>> {
+/// `Ok(None)` means the file parsed correctly but has no such key. Values other
+/// than the requested one are skipped without being read into memory, so this
+/// stays cheap even on a multi-gigabyte model with a full token vocabulary.
+///
+/// Converting an adapter needs `general.architecture` from the base model, which
+/// is the same walk over the same header — so it shares this rather than
+/// parsing GGUF a second time somewhere else.
+pub fn read_metadata_string(path: &Path, wanted_key: &str) -> Result<Option<String>> {
     let file = File::open(path).map_err(|e| anyhow!("could not open {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
 
@@ -178,9 +183,9 @@ pub fn read_adapter_type(path: &Path) -> Result<Option<String>> {
         let key = read_string(&mut reader)?;
         let vtype = read_u32(&mut reader)?;
 
-        if key == ADAPTER_TYPE_KEY {
+        if key == wanted_key {
             if vtype != value_type::STRING {
-                bail!("`{ADAPTER_TYPE_KEY}` is not text; file looks malformed");
+                bail!("`{wanted_key}` is not text; file looks malformed");
             }
             return Ok(Some(read_string(&mut reader)?));
         }
@@ -189,6 +194,14 @@ pub fn read_adapter_type(path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// Reads `adapter.type` from a GGUF file's metadata.
+///
+/// `Ok(None)` means the file parsed correctly but declares no adapter type —
+/// which is what a full model looks like.
+pub fn read_adapter_type(path: &Path) -> Result<Option<String>> {
+    read_metadata_string(path, ADAPTER_TYPE_KEY)
 }
 
 /// Confirms a downloaded file really is a LoRA adapter.

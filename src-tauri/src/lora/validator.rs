@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterRuntimeStatus {
-    /// Adapter is in GGUF format and can be loaded directly via `--lora`
+    /// Adapter is in GGUF format and can be bound to a live context as it stands
     Compatible,
-    /// Adapter is in SafeTensors PEFT format and requires conversion
-    /// via `convert_lora_to_gguf.py` before runtime loading
+    /// Adapter is in SafeTensors PEFT format and needs converting by
+    /// [`crate::lora::convert_adapter`] before it can be loaded
     RequiresConversion,
     /// Adapter format is unknown, corrupted, or incompatible
     Incompatible,
@@ -181,7 +181,7 @@ fn check_safetensors_adapter(adapter_dir: &Path) -> Option<AdapterValidationResu
             file_size_bytes: Some(safetensors_size),
             peft_type: peft_type.clone(),
             reason: format!(
-                "SafeTensors PEFT adapter ({:.2} MB) — llama.cpp requires GGUF format. Conversion needed via convert_lora_to_gguf.py",
+                "SafeTensors PEFT adapter ({:.2} MB) — llama.cpp needs GGUF, so this has to be converted before it can be used.",
                 safetensors_size as f64 / (1024.0 * 1024.0)
             ),
         })
@@ -345,7 +345,10 @@ mod tests {
         let result = validate_adapter(&temp_dir);
         assert_eq!(result.status, AdapterRuntimeStatus::RequiresConversion);
         assert_eq!(result.adapter_format, Some("SafeTensors (PEFT)".to_string()));
-        assert!(result.reason.contains("convert_lora_to_gguf"));
+        // Conversion happens in-process now; naming the old Python script sent
+        // the user looking for a file that is not there.
+        assert!(result.reason.contains("converted"), "should say what has to happen: {}", result.reason);
+        assert!(result.reason.contains("GGUF"), "should name the target format: {}", result.reason);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

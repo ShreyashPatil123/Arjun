@@ -4,6 +4,40 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+/**
+ * Capability slots the runtime can route a turn to.
+ *
+ * Mirrors CapabilitySpec::all_keys() in capability/profile.rs. An adapter
+ * assigned to none of these is installed but never bound.
+ */
+export const CAPABILITIES = [
+  'coding',
+  'reasoning',
+  'tool-calling',
+  'mathematics',
+  'research',
+] as const;
+
+export type Capability = (typeof CAPABILITIES)[number];
+
+export const CAPABILITY_LABELS: Record<Capability, string> = {
+  coding: 'Coding',
+  reasoning: 'Reasoning',
+  'tool-calling': 'Tool calling',
+  mathematics: 'Mathematics',
+  research: 'Research',
+};
+
+/** How an adapter's capability slot was arrived at — see capability/assign.rs. */
+export type AssignmentConfidence = 'stated' | 'suggested' | 'manual';
+
+/** Plain-language provenance, so a guess is never shown as a fact. */
+export const ASSIGNMENT_SOURCE: Record<AssignmentConfidence, string> = {
+  stated: "from the author's tags",
+  suggested: "guessed from the adapter's name",
+  manual: 'your choice',
+};
+
 export interface InstalledAdapter {
   id: string;
   repoId: string;
@@ -11,6 +45,9 @@ export interface InstalledAdapter {
   baseModelId: string;
   filePath: string;
   sizeBytes: number;
+  /** Slot this adapter is bound to. Absent means installed but unused. */
+  capability?: Capability;
+  assignmentConfidence?: AssignmentConfidence;
 }
 
 export interface InstalledAdapters {
@@ -46,6 +83,27 @@ export function removeAdapter(
   adapterId: string
 ): Promise<void> {
   return invoke<void>('remove_adapter', { providerId, modelId, adapterId });
+}
+
+/**
+ * Points a capability at this adapter, or unassigns it with `null`.
+ *
+ * Only one adapter can be bound per capability, so assigning a slot another
+ * adapter already holds displaces that one. The displaced adapter is unassigned,
+ * not deleted.
+ */
+export function setAdapterCapability(
+  providerId: string,
+  modelId: string,
+  adapterId: string,
+  capability: Capability | null
+): Promise<void> {
+  return invoke<void>('set_adapter_capability', {
+    providerId,
+    modelId,
+    adapterId,
+    capability,
+  });
 }
 
 /** How sure a claim about an adapter is — see adapter_details.rs. */

@@ -10,13 +10,16 @@
 //! meaningful with its base, and deleting a model should take its adapters with
 //! it rather than leaving orphans behind.
 //!
-//! ## Only GGUF is installable
+//! ## What is installable
 //!
-//! llama.cpp loads GGUF adapters. Most published adapters are PEFT safetensors
-//! and cannot be loaded without conversion, which Sarathi does not yet do.
-//! Those are rejected **before** any bytes are fetched, with an explanation —
-//! downloading half a gigabyte that silently fails to load is worse than a
-//! clear refusal.
+//! llama.cpp loads GGUF adapters only. Most published adapters are PEFT
+//! safetensors, which [`crate::lora::convert_adapter`] turns into GGUF locally
+//! during the install — so both are accepted.
+//!
+//! What is still refused is a repository that ships neither: merged model
+//! weights wearing an adapter tag, or a `.bin` pickle checkpoint. Those are
+//! rejected **before** any bytes are fetched, with an explanation — downloading
+//! half a gigabyte that silently fails to load is worse than a clear refusal.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +40,17 @@ pub struct InstalledAdapter {
     pub base_model_id: String,
     pub file_path: String,
     pub size_bytes: u64,
+    /// Capability slot this adapter is bound to, when it has one.
+    ///
+    /// Read from the package manifest rather than from disk: the directory says
+    /// what is installed, the manifest says what will actually be *used*. An
+    /// adapter with `None` here is installed and inert until assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// `stated`, `suggested`, or `manual` — how that slot was arrived at, so the
+    /// UI can show a guess as a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_confidence: Option<String>,
 }
 
 /// Turns a repository id into a directory name safe on every platform.
@@ -150,8 +164,8 @@ pub fn check_installable_sized(files: &[(String, u64)]) -> Result<String> {
             // PEFT form, say so rather than reporting no adapter at all.
             if filenames.iter().any(|f| f.ends_with(".safetensors")) {
                 return Err(anyhow!(
-                    "This adapter is in PEFT safetensors format, which llama.cpp cannot load. \
-                     It needs converting to GGUF first — Sarathi cannot do that yet. \
+                    "This adapter is in PEFT safetensors format, which Sarathi converts to \
+                     GGUF while installing it. \
                      (The GGUF on this page is a merged model, not the adapter.)"
                 ));
             }
@@ -176,11 +190,15 @@ pub fn check_installable_sized(files: &[(String, u64)]) -> Result<String> {
         ));
     }
 
+    // PEFT safetensors are not a refusal any more: `download_adapter` fetches
+    // them and converts to GGUF locally. This is still an `Err` because the
+    // caller's contract is "name the ready-to-load GGUF", and there isn't one —
+    // the caller reads it as "take the conversion path", not as a failure.
     let has_safetensors = filenames.iter().any(|f: &String| f.ends_with(".safetensors"));
     if has_safetensors {
         return Err(anyhow!(
-            "This adapter is in PEFT safetensors format, which llama.cpp cannot load. \
-             It needs converting to GGUF first — Sarathi cannot do that yet."
+            "This adapter is in PEFT safetensors format, which Sarathi converts to GGUF \
+             while installing it."
         ));
     }
 
@@ -197,6 +215,10 @@ pub fn list_installed(package_dir: &Path, base_model_id: &str) -> Vec<InstalledA
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
+
+    // Read once, outside the loop: every directory is looked up against the same
+    // manifest, and re-reading it per adapter would be pure repetition.
+    let manifest = crate::adapter_manager::AdapterRegistry::read_manifest(package_dir).ok();
 
     let mut out = Vec::new();
     for entry in entries.flatten() {
@@ -226,8 +248,21 @@ pub fn list_installed(package_dir: &Path, base_model_id: &str) -> Vec<InstalledA
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| id.clone());
 
+        // Which slot, if any, this directory is wired to. Matching on the
+        // directory prefix rather than the exact filename means a record written
+        // against `adapter_model.safetensors` still resolves after conversion
+        // replaced it with `adapter.gguf`.
+        let prefix = format!("adapters/{}/", id);
+        let assignment = manifest.as_ref().and_then(|m| {
+            m.adapters.iter().find(|(_, a)| {
+                a.adapter_file.as_deref().map(|f| f.starts_with(&prefix)).unwrap_or(false)
+            })
+        });
+
         out.push(InstalledAdapter {
             name: repo_id.split('/').next_back().unwrap_or(&id).replace(['-', '_'], " "),
+            capability: assignment.map(|(key, _)| key.clone()),
+            assignment_confidence: assignment.and_then(|(_, a)| a.assignment_confidence.clone()),
             id,
             repo_id,
             base_model_id: base_model_id.to_string(),
@@ -292,9 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_adapters_are_refused_with_the_reason() {
-        // Rejected before downloading: fetching a file that cannot load is
-        // worse than saying no.
+    fn safetensors_adapters_report_that_they_are_not_directly_loadable() {
+        // This is *not* a user-facing refusal any more. `download_adapter` reads
+        // the error as "no ready GGUF here" and switches to converting the PEFT
+        // weights instead. The error still has to name the format and what is
+        // needed, because it is also what the user sees when there is nothing to
+        // convert either.
         let files = vec!["adapter_model.safetensors".to_string(), "adapter_config.json".to_string()];
 
         let err = check_installable(&files).unwrap_err().to_string();
