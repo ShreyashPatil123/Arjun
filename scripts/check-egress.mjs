@@ -41,6 +41,34 @@ const LOOPBACK_CLIENT_FILES = new Map([
     'src-tauri/src/system_analyzer/ai_runtime_collector.rs',
     'probes http://127.0.0.1:11434 to detect a local Ollama install',
   ],
+  [
+    'src-tauri/src/serving/probe.rs',
+    'probes local inference servers (llama-server, vLLM, SGLang); refuses any URL '
+      + 'whose host does not parse as a loopback address before the client is built',
+  ],
+]);
+
+/**
+ * Files whose host literals are a *ledger of what is refused*, not destinations.
+ *
+ * The bundle gate has to name the vendor endpoints it looks for, and its
+ * self-test has to reintroduce them to prove the gate catches them. Those hosts
+ * appear in the source for the same reason a deny-list appears in a firewall
+ * config: to be matched against, never to be dialled.
+ *
+ * Listed rather than pattern-matched away, and only for rule 2 — the
+ * one-chokepoint rule still applies to these files, so neither may build a
+ * client. A reviewer should confirm a file really is a ledger before adding one.
+ */
+const HOST_LEDGER_FILES = new Map([
+  [
+    'scripts/check-bundle.mjs',
+    'the reviewed ledger of vendor hosts the shipped bundle may contain, and the exclusion list it scans for',
+  ],
+  [
+    'scripts/check-bundle.test.mjs',
+    'reintroduces each excluded host into a throwaway copy to prove the bundle gate catches it',
+  ],
 ]);
 
 /** Directories never worth scanning. */
@@ -140,6 +168,8 @@ function inspect(file) {
   const rel = relative(ROOT, file).split(sep).join('/');
   const isBroker = rel === BROKER_FILE.split(sep).join('/');
   const loopbackOnly = LOOPBACK_CLIENT_FILES.has(rel);
+  // Rule 2 only. These files must still not build a client.
+  const hostLedger = HOST_LEDGER_FILES.has(rel);
   const lines = readFileSync(file, 'utf8').split(/\r?\n/);
   const testsFrom = testRegionStart(lines);
 
@@ -163,6 +193,7 @@ function inspect(file) {
     }
 
     // Rule 2 — every host literal must be on the agreed list.
+    if (hostLedger) return;
     for (const match of line.matchAll(URL_PATTERN)) {
       if (isNamespaceDeclaration(line, match.index)) continue;
       const host = match[1].toLowerCase();
@@ -177,7 +208,13 @@ function inspect(file) {
   });
 }
 
-for (const dir of ['src', 'src-tauri/src', 'scripts', 'sidecars']) {
+// `agent-runtime/src` is ARJUN's own runtime code and is held to the same rule
+// as the rest. Its `vendor/` and `dist/` are skipped by SKIP_DIRS and covered
+// instead by `agent-runtime/scripts/audit-vendor.mjs` (what the vendored copy
+// may contain) and `scripts/check-bundle.mjs` (what actually ships) — the one
+// chokepoint rule cannot apply to a vendored HTTP transport whose entire job is
+// to be one.
+for (const dir of ['src', 'src-tauri/src', 'scripts', 'sidecars', 'agent-runtime/src']) {
   try {
     walk(join(ROOT, dir));
   } catch {

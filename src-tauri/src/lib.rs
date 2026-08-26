@@ -13,10 +13,12 @@ pub mod documents;
 pub mod health;
 pub mod identity;
 pub mod knowledge;
+pub mod agent_runtime;
 pub mod orchestrator;
 pub mod package;
 pub mod policy;
 pub mod registry;
+pub mod serving;
 
 // Phase modules
 pub mod system_analyzer;
@@ -151,6 +153,15 @@ pub fn run() {
 
             app.manage(Arc::new(orchestrator::approvals::ApprovalQueue::new()));
             app.manage(commands::governance::CurrentSession::default());
+            // Started on first run rather than here: the workbench must open for an
+            // auditor, and on a machine where the runtime bundle was never built.
+            app.manage(commands::agent::AgentRuntimeHandle::default());
+            // Model servers ARJUN starts, so a llama-server is loaded once and
+            // reused across runs rather than per prompt.
+            app.manage(Arc::new(serving::ModelServers::new()));
+            // One working directory per run, shared with the agent runtime so a
+            // tool call can be resolved against the run that made it.
+            app.manage(commands::agent::RunWorkspaces::default());
 
             app.manage(sovereignty::global_broker().clone());
 
@@ -392,6 +403,13 @@ pub fn run() {
             // Launch section — start coding tools already connected
 
             // Model browsing by category
+            // Agent runs. The loop lives in the Node runtime; these start,
+            // stop and observe it.
+            commands::agent::agent_start_run,
+            commands::agent::agent_abort_run,
+            commands::agent::agent_steer_run,
+            commands::agent::agent_runtime_health,
+
             commands::sovereignty::get_operating_mode,
             commands::sovereignty::set_operating_mode,
             commands::sovereignty::recent_egress_events,

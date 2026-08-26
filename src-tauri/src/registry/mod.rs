@@ -158,6 +158,13 @@ pub struct ModelEntry {
     /// with an explanation rather than failing obscurely at load time.
     #[serde(default)]
     pub load: Option<LoadSpec>,
+    /// How this model is served: started by ARJUN, or already running.
+    ///
+    /// Absent means the default for the runtime — GGUF is managed, Python is
+    /// not, because ARJUN cannot honestly claim to manage a vLLM process it did
+    /// not provision. See [`crate::serving::ServingSpec`].
+    #[serde(default)]
+    pub serving: Option<crate::serving::ServingSpec>,
     /// Administrators disable a model without deleting it.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -285,6 +292,16 @@ impl ModelRegistry {
         &self.manifest_path
     }
 
+    /// Where the weights live.
+    ///
+    /// Derived from the manifest rather than stored separately, so the two
+    /// cannot disagree about which directory a `ModelEntry::path` is relative
+    /// to. An empty registry loaded from an absent manifest reports the
+    /// directory it looked in, which is what an administrator needs to see.
+    pub fn models_dir(&self) -> &Path {
+        self.manifest_path.parent().unwrap_or(Path::new("."))
+    }
+
     /// Every registered model, including disabled ones, for the admin screen.
     pub fn all(&self) -> &[ModelEntry] {
         &self.entries
@@ -339,6 +356,7 @@ pub(crate) mod tests {
                 model_id: id.into(),
                 quantization: "Q4_K_M".into(),
             }),
+            serving: None,
             enabled: true,
         }
     }

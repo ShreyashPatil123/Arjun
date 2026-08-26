@@ -149,6 +149,10 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                     model_id: installed.model_id.clone(),
                     quantization: installed.quantization.clone(),
                 }),
+                // A discovered GGUF is served by a llama-server ARJUN starts.
+                // Nothing on disk could say otherwise, so this is the runtime
+                // default made explicit rather than a guess.
+                serving: None,
                 enabled: true,
             }
         })
@@ -217,6 +221,7 @@ mod tests {
             permitted_classifications: Vec::new(),
             path: "mystery.gguf".into(),
             load: None,
+            serving: None,
             enabled: true,
         };
         assert!(!entry.meets_floor(ModelRole::Coding));
@@ -285,6 +290,7 @@ mod tests {
             permitted_classifications: Vec::new(),
             path: "x.gguf".into(),
             load: None,
+            serving: None,
             enabled: true,
         };
 

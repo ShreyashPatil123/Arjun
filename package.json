@@ -16,7 +16,7 @@
     "tauri:build:vulkan": "tauri build --features vulkan",
     "check:egress": "node scripts/check-egress.mjs",
     "check:offline": "node scripts/check-offline-build.mjs",
-    "verify": "npm run check:egress && npm run check:offline && npm run runtime:audit && npm run runtime:typecheck && npm run test:runtime && npm run test:rust && npm run test:baseline && npm run test:sidecar",
+    "verify": "npm run check:egress && npm run check:offline && npm run runtime:audit && npm run runtime:typecheck && npm run runtime:test && npm run runtime:build && npm run check:bundle:self && npm run check:bundle && npm run sbom && npm run test:rust && npm run test:baseline && npm run test:integration && npm run test:sidecar",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "test:sidecar": "python -m unittest discover -s sidecars/document_sidecar/tests",
     "accept": "node scripts/acceptance.mjs",
@@ -25,7 +25,12 @@
     "runtime:install": "npm --prefix agent-runtime ci --offline",
     "runtime:audit": "npm --prefix agent-runtime run audit",
     "runtime:typecheck": "npm --prefix agent-runtime run typecheck",
-    "test:runtime": "npm --prefix agent-runtime test"
+    "test:integration": "cargo test --manifest-path src-tauri/Cargo.toml --test agent_runtime && cargo test --manifest-path src-tauri/Cargo.toml --test two_runtimes",
+    "runtime:test": "npm --prefix agent-runtime test",
+    "runtime:build": "npm --prefix agent-runtime run build",
+    "check:bundle": "node scripts/check-bundle.mjs",
+    "check:bundle:self": "node scripts/check-bundle.test.mjs",
+    "sbom": "node scripts/make-sbom.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

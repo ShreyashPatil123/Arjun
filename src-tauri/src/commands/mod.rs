@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod adapter_details;
 pub mod adapters;
 pub mod sovereignty;
+pub mod agent;
 pub mod approvals;
 pub mod governance;
 pub mod health;
