@@ -329,22 +329,30 @@ impl DownloadManager {
                             let target_weight_path = cap_dir.join(&cand.adapter_file_name);
                             let temp_weight_path = cap_dir.join(format!("{}.part", cand.adapter_file_name));
 
-                            let client = reqwest::Client::builder()
-                                .user_agent("Sarathi/0.1.0 (Windows; x64)")
-                                .timeout(std::time::Duration::from_secs(300))
-                                .build()
-                                .unwrap_or_default();
+                            // The broker owns the only outbound client and refuses
+                            // everything in Work mode, so a download cannot start
+                            // unless an operator has entered Provisioning.
+                            let broker = crate::sovereignty::global_broker();
 
                             // 1. Fetch & save adapter_config.json
                             let config_url = format!("https://huggingface.co/{}/raw/main/adapter_config.json", cand.repo_id);
-                            let mut config_req = client.get(&config_url);
-                            if let Some(t) = &hf_token_cap {
-                                if !t.trim().is_empty() {
-                                    config_req = config_req.header("Authorization", format!("Bearer {}", t.trim()));
+                            // A refusal means nothing was sent. That is the same
+                            // outcome as a failed fetch, which this path already
+                            // tolerates, so both collapse to `None`.
+                            let config_response = match broker.authorized_get(&config_url) {
+                                Ok(req) => {
+                                    let mut req = req.timeout(std::time::Duration::from_secs(300));
+                                    if let Some(t) = &hf_token_cap {
+                                        if !t.trim().is_empty() {
+                                            req = req.header("Authorization", format!("Bearer {}", t.trim()));
+                                        }
+                                    }
+                                    req.send().await.ok()
                                 }
-                            }
+                                Err(_) => None,
+                            };
 
-                            let config_ok = if let Ok(c_res) = config_req.send().await {
+                            let config_ok = if let Some(c_res) = config_response {
                                 if c_res.status().is_success() {
                                     if let Ok(bytes) = c_res.bytes().await {
                                         tokio::fs::write(&config_file_path, bytes).await.is_ok()
@@ -376,18 +384,26 @@ impl DownloadManager {
                                         "DownloadManager",
                                     );
 
-                                    let mut weight_req = client.get(&cand.download_url);
-                                    if let Some(t) = &hf_token_cap {
-                                        if !t.trim().is_empty() {
-                                            weight_req = weight_req.header("Authorization", format!("Bearer {}", t.trim()));
+                                    // Same shape as the config fetch above: a refusal
+                                    // and a transport failure both leave this `None`,
+                                    // so download_success simply stays false.
+                                    let weight_response = match broker.authorized_get(&cand.download_url) {
+                                        Ok(req) => {
+                                            let mut req = req.timeout(std::time::Duration::from_secs(300));
+                                            if let Some(t) = &hf_token_cap {
+                                                if !t.trim().is_empty() {
+                                                    req = req.header("Authorization", format!("Bearer {}", t.trim()));
+                                                }
+                                            }
+                                            if existing_bytes > 0 {
+                                                req = req.header("Range", format!("bytes={}-", existing_bytes));
+                                            }
+                                            req.send().await.ok()
                                         }
-                                    }
+                                        Err(_) => None,
+                                    };
 
-                                    if existing_bytes > 0 {
-                                        weight_req = weight_req.header("Range", format!("bytes={}-", existing_bytes));
-                                    }
-
-                                    if let Ok(w_res) = weight_req.send().await {
+                                    if let Some(w_res) = weight_response {
                                         let status_code = w_res.status();
                                         if status_code.is_success() || status_code == reqwest::StatusCode::PARTIAL_CONTENT {
                                             let is_partial = status_code == reqwest::StatusCode::PARTIAL_CONTENT;
@@ -884,9 +900,10 @@ impl DownloadManager {
         cancel_rx: watch::Receiver<bool>,
         tasks: Arc<Mutex<HashMap<String, DownloadTask>>>,
     ) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .user_agent("Sarathi/0.1.0 (Windows; x64)")
-            .build()?;
+        // Checked once here, then the borrowed client is reused across resume
+        // attempts. Retries target the same URL, so re-checking every attempt
+        // would only add duplicate entries to the egress log.
+        let client = crate::sovereignty::global_broker().authorize(url)?;
 
         let mut expected_total = expected_total_bytes;
         let mut resume_from = initial_bytes;
@@ -1482,6 +1499,17 @@ mod tests {
         );
     }
 
+    /// Reaches the real Hugging Face API, so it is ignored by default.
+    ///
+    /// Two reasons, both structural rather than incidental. ARJUN starts in Work
+    /// mode, where the broker refuses every outbound call — so this cannot pass
+    /// without first putting the process into Provisioning. And `npm run
+    /// check:offline` asserts the whole tree builds and tests with no network at
+    /// all, which a test that dials out would contradict.
+    ///
+    /// Run it deliberately, on a connected machine:
+    ///   cargo test --lib -- --ignored test_full_lifecycle_real_download
+    #[ignore = "requires the network and Provisioning mode; see check:offline"]
     #[tokio::test]
     async fn test_full_lifecycle_real_download() {
         let app_data_dir = std::env::temp_dir().join(format!("sarathi_e2e_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(12345)));

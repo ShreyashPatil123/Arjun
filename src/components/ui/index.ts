@@ -8,5 +8,4 @@ export * from './Badge';
 export * from './Toggle';
 export * from './Tooltip';
 export * from './ErrorBoundary';
-export * from './SarathiLogo';
 export * from './DownloadBar';

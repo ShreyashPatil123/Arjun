@@ -68,11 +68,9 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
     let repo_id = resolve_gguf_repo(model_id);
     let api_url = format!("https://huggingface.co/api/models/{}/tree/main", repo_id);
 
-    let client = reqwest::Client::builder()
-        .user_agent("Sarathi/0.1.0 (Windows; x64)")
-        .build()?;
-
-    let mut req = client.get(&api_url);
+    // Through the broker: mode, scheme and host are checked and the decision
+    // recorded before a request can exist. In Work mode this refuses.
+    let mut req = crate::sovereignty::global_broker().authorized_get(&api_url)?;
     if let Some(token) = hf_token {
         if !token.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", token.trim()));
@@ -132,7 +130,10 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
     // through to the downloader, which skips its integrity check when it does
     // not know how many bytes to expect — so a truncated transfer would be
     // renamed to `.gguf` and served as a working model.
-    let (size_bytes, sha256) = probe_remote_artifact(&client, &download_url, hf_token).await;
+    // The fallback URL is a different target from the tree API checked above, so
+    // it is authorized in its own right rather than reusing that decision.
+    let probe_client = crate::sovereignty::global_broker().authorize(&download_url)?;
+    let (size_bytes, sha256) = probe_remote_artifact(probe_client, &download_url, hf_token).await;
     log::info!(
         "[HF RESOLVER] Tree API unavailable; fell back to '{}' (HEAD reported size: {} bytes)",
         file_name, size_bytes
@@ -202,6 +203,17 @@ mod tests {
         assert_eq!(resolve_gguf_repo("Qwen/Qwen2.5-Coder-7B"), "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF");
     }
 
+    /// Reaches the real Hugging Face API, so it is ignored by default.
+    ///
+    /// Two reasons, both structural rather than incidental. ARJUN starts in Work
+    /// mode, where the broker refuses every outbound call — so this cannot pass
+    /// without first putting the process into Provisioning. And `npm run
+    /// check:offline` asserts the whole tree builds and tests with no network at
+    /// all, which a test that dials out would contradict.
+    ///
+    /// Run it deliberately, on a connected machine:
+    ///   cargo test --lib -- --ignored test_real_hf_artifact_resolution
+    #[ignore = "requires the network and Provisioning mode; see check:offline"]
     #[tokio::test]
     async fn test_real_hf_artifact_resolution() {
         let artifact = resolve_artifact("meta-llama/Llama-3.2-1B", "Q8_0", None).await;

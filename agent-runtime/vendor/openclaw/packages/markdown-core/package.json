@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/markdown-core",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./reasoning-tags": "./src/reasoning-tags.js"
+  },
+  "dependencies": {
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm-table": "2.0.0",
+    "micromark-extension-gfm-table": "2.1.1"
+  },
+  "description": "ARJUN sovereign build: reduced to the reasoning-tag partitioner, the only module packages/ai imports. markdown-it, markdown-it-cjk-friendly and yaml are dropped with the modules that needed them."
+}

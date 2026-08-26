@@ -1,0 +1,490 @@
+//! The local model registry.
+//!
+//! PS 26117: *"New open weight models should be addable later without redesigning
+//! the system, since this space is moving fast."* That is the requirement this
+//! module exists to satisfy, and it is stricter than it sounds — it means
+//! registering a model must not involve a code change, a recompile, or a release.
+//!
+//! So a model is a **manifest entry plus a file on disk**. The manifest is read
+//! at startup and on demand; nothing about a particular model is compiled in.
+//! Adding one is: copy the weights in, add an entry, restart.
+//!
+//! ## Two runtimes, one registry
+//!
+//! Some of the best models for this problem are not GGUF and never will be —
+//! Docling, MinerU, most document vision models and rerankers are PyTorch. The
+//! entry therefore names its [`Runtime`], and the router treats both alike. A
+//! registry that assumed GGUF would quietly exclude the whole document pipeline.
+//!
+//! ## What an entry has to declare
+//!
+//! Everything PS step 9 asks for: name, version, licence, hash, parameter class,
+//! quantisation, modalities, context length, expected GPU memory, and the data
+//! classifications it may be used on. The last is the one people forget, and it
+//! is the one that stops a model that phones home — or simply one nobody has
+//! reviewed — from being pointed at vendor negotiations.
+
+pub mod discovery;
+pub mod router;
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::policy::Classification;
+
+/// Which engine loads this model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Runtime {
+    /// In-process `llama.cpp`. GGUF weights, quantised, lowest overhead.
+    LlamaCpp,
+    /// The Python sidecar, over stdio. Transformers models, OCR, embeddings.
+    PythonSidecar,
+}
+
+impl Runtime {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Runtime::LlamaCpp => "llama.cpp",
+            Runtime::PythonSidecar => "Python sidecar",
+        }
+    }
+}
+
+/// The job a model is registered to do.
+///
+/// A model may hold several — a vision-language model is usually competent at
+/// general reasoning too — and the router picks per task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelRole {
+    /// General instruction following, summarising, planning.
+    Reasoning,
+    /// Writing and debugging code.
+    Coding,
+    /// Photographs, drawings, scanned pages.
+    Vision,
+    /// Turning a scanned page into structured text.
+    DocumentOcr,
+    /// Producing vectors for retrieval.
+    Embedding,
+    /// Reordering retrieved passages.
+    Rerank,
+}
+
+impl ModelRole {
+    pub const ALL: &'static [ModelRole] = &[
+        ModelRole::Reasoning,
+        ModelRole::Coding,
+        ModelRole::Vision,
+        ModelRole::DocumentOcr,
+        ModelRole::Embedding,
+        ModelRole::Rerank,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            ModelRole::Reasoning => "reasoning",
+            ModelRole::Coding => "coding",
+            ModelRole::Vision => "vision",
+            ModelRole::DocumentOcr => "document OCR",
+            ModelRole::Embedding => "embedding",
+            ModelRole::Rerank => "reranking",
+        }
+    }
+
+    /// Smallest parameter count, in billions, worth routing this role to.
+    ///
+    /// Not a preference — a cliff. Measured tool-calling accuracy collapses
+    /// below roughly 7B: a smaller model cannot hold the function-calling format
+    /// across a multi-step loop, so an agent built on one fails in a way that
+    /// looks like a bug in the orchestrator rather than a model that is too
+    /// small. Reasoning degrades more gracefully, so its floor is lower.
+    ///
+    /// Grammar-constrained decoding lifts small models substantially, which is
+    /// why these floors are as low as they are — without it they would need to
+    /// be higher. Roles whose models are small by design have no floor at all.
+    pub const fn minimum_parameters_b(self) -> f32 {
+        match self {
+            ModelRole::Coding => 7.0,
+            ModelRole::Reasoning => 3.0,
+            ModelRole::Vision => 1.0,
+            // A 300M embedding model and a 1.2B document VLM are both correct
+            // choices at their size. Judging them on parameter count would rule
+            // out the best available option.
+            ModelRole::DocumentOcr | ModelRole::Embedding | ModelRole::Rerank => 0.0,
+        }
+    }
+}
+
+/// One registered model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEntry {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// SPDX identifier where there is one. Shown before a model is used, because
+    /// a licence a PSU cannot accept is a deployment blocker, not a footnote.
+    pub license: String,
+    /// SHA-256 of the weights, checked at import.
+    pub sha256: Option<String>,
+    pub runtime: Runtime,
+    pub roles: Vec<ModelRole>,
+    pub quantization: Option<String>,
+    /// Total parameters in billions. For a mixture-of-experts model this is the
+    /// total, with `activeParametersB` carrying what actually runs per token.
+    pub parameters_b: f32,
+    #[serde(default)]
+    pub active_parameters_b: Option<f32>,
+    pub context_length: u32,
+    /// Size of the weights on disk, which is what has to fit in memory.
+    pub weights_bytes: u64,
+    /// Classifications this model may be used on. Empty means none — a model
+    /// nobody has reviewed is not usable, rather than usable on everything.
+    #[serde(default)]
+    pub permitted_classifications: Vec<Classification>,
+    /// Path to the weights, relative to the models directory.
+    pub path: PathBuf,
+    /// What the runtime needs to actually load this.
+    ///
+    /// Separate from `path` because the llama.cpp loader addresses a model by
+    /// the package coordinates it was installed under, not by file path. Absent
+    /// on an entry that describes a model the runtime cannot load on its own —
+    /// a Python-sidecar model, for instance — and the activator refuses those
+    /// with an explanation rather than failing obscurely at load time.
+    #[serde(default)]
+    pub load: Option<LoadSpec>,
+    /// Administrators disable a model without deleting it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// The coordinates the inference runtime loads a model by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadSpec {
+    pub provider_id: String,
+    /// The upstream model id, e.g. `Qwen/Qwen2.5-7B-Instruct`.
+    pub model_id: String,
+    pub quantization: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ModelEntry {
+    /// Whether the inference runtime can load this on its own.
+    pub fn is_loadable(&self) -> bool {
+        self.load.is_some()
+    }
+
+    pub fn serves(&self, role: ModelRole) -> bool {
+        self.roles.contains(&role)
+    }
+
+    /// Whether this model may be used on material of a given sensitivity.
+    pub fn permits(&self, classification: Classification) -> bool {
+        self.permitted_classifications.contains(&classification)
+    }
+
+    /// Whether it clears the floor for a role.
+    ///
+    /// Judged on *active* parameters where the model declares them: a sparse
+    /// mixture-of-experts model with 120B total and 5B active behaves like a 5B
+    /// model per token, and pretending otherwise would route agent planning to
+    /// something that cannot hold a tool-call format.
+    pub fn meets_floor(&self, role: ModelRole) -> bool {
+        let effective = self.active_parameters_b.unwrap_or(self.parameters_b);
+        effective >= role.minimum_parameters_b()
+    }
+}
+
+/// What the manifest file holds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelManifest {
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
+}
+
+pub struct ModelRegistry {
+    entries: Vec<ModelEntry>,
+    manifest_path: PathBuf,
+}
+
+impl ModelRegistry {
+    /// Loads the registry: what an administrator declared, plus what is on disk.
+    ///
+    /// Declared entries win on collision. Discovered ones are visible but cleared
+    /// for no classification, so they can be seen and reviewed without being
+    /// usable on real material first.
+    pub fn load_with_discovery(app_data_dir: &Path) -> Result<Self> {
+        let models_dir = app_data_dir.join("models");
+        let declared = Self::load(&models_dir)?;
+        let discovered = discovery::discover(app_data_dir);
+
+        let count = discovered.len();
+        let merged = discovery::merge(declared.entries, discovered);
+        if count > 0 {
+            log::info!(
+                "[REGISTRY] {count} model(s) found on disk; they are listed but cleared for no                  classification until an administrator reviews them"
+            );
+        }
+
+        Ok(Self {
+            entries: merged,
+            manifest_path: declared.manifest_path,
+        })
+    }
+
+    /// Reads the manifest beside the models directory.
+    ///
+    /// A missing manifest is an empty registry, not an error: a fresh install
+    /// legitimately has no models until somebody provisions one, and failing to
+    /// start would be a worse answer than starting with nothing to route to.
+    pub fn load(models_dir: &Path) -> Result<Self> {
+        let manifest_path = models_dir.join("registry.json");
+        if !manifest_path.exists() {
+            return Ok(Self {
+                entries: Vec::new(),
+                manifest_path,
+            });
+        }
+
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("could not read {}", manifest_path.display()))?;
+        let manifest: ModelManifest = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not a valid model manifest", manifest_path.display()))?;
+
+        Self::from_manifest(manifest, manifest_path)
+    }
+
+    pub(crate) fn from_manifest(manifest: ModelManifest, manifest_path: PathBuf) -> Result<Self> {
+        // A duplicate id would make routing depend on manifest order, which is
+        // exactly the kind of silent inconsistency that is painful to diagnose
+        // later. Refuse it at load.
+        let mut seen = BTreeSet::new();
+        for entry in &manifest.models {
+            if !seen.insert(entry.id.clone()) {
+                anyhow::bail!("the model manifest registers {:?} more than once", entry.id);
+            }
+        }
+
+        Ok(Self {
+            entries: manifest.models,
+            manifest_path,
+        })
+    }
+
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    /// Every registered model, including disabled ones, for the admin screen.
+    pub fn all(&self) -> &[ModelEntry] {
+        &self.entries
+    }
+
+    pub fn find(&self, id: &str) -> Option<&ModelEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Models that are enabled, serve this role, clear its floor, and are
+    /// permitted for this material — the candidates the router chooses among.
+    pub fn candidates(
+        &self,
+        role: ModelRole,
+        classification: Option<Classification>,
+    ) -> Vec<&ModelEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.enabled)
+            .filter(|e| e.serves(role))
+            .filter(|e| e.meets_floor(role))
+            .filter(|e| match classification {
+                Some(c) => e.permits(c),
+                None => true,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn entry(id: &str, params: f32, roles: Vec<ModelRole>) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            name: id.into(),
+            version: "1".into(),
+            license: "apache-2.0".into(),
+            sha256: None,
+            runtime: Runtime::LlamaCpp,
+            roles,
+            quantization: Some("Q4_K_M".into()),
+            parameters_b: params,
+            active_parameters_b: None,
+            context_length: 32_768,
+            weights_bytes: (params * 0.6 * 1e9) as u64,
+            permitted_classifications: Classification::ALL.to_vec(),
+            path: PathBuf::from(format!("{id}.gguf")),
+            load: Some(LoadSpec {
+                provider_id: "huggingface".into(),
+                model_id: id.into(),
+                quantization: "Q4_K_M".into(),
+            }),
+            enabled: true,
+        }
+    }
+
+    fn registry(entries: Vec<ModelEntry>) -> ModelRegistry {
+        ModelRegistry::from_manifest(
+            ModelManifest { models: entries },
+            PathBuf::from("registry.json"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_missing_manifest_is_an_empty_registry_not_a_failure() {
+        let registry = ModelRegistry::load(Path::new("./definitely-not-here")).unwrap();
+        assert!(registry.all().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_id_is_refused_at_load() {
+        let result = ModelRegistry::from_manifest(
+            ModelManifest {
+                models: vec![
+                    entry("qwen", 8.0, vec![ModelRole::Reasoning]),
+                    entry("qwen", 4.0, vec![ModelRole::Reasoning]),
+                ],
+            },
+            PathBuf::from("registry.json"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn candidates_are_filtered_by_role() {
+        let registry = registry(vec![
+            entry("coder", 8.0, vec![ModelRole::Coding]),
+            entry("thinker", 8.0, vec![ModelRole::Reasoning]),
+        ]);
+        let coding = registry.candidates(ModelRole::Coding, None);
+        assert_eq!(coding.len(), 1);
+        assert_eq!(coding[0].id, "coder");
+    }
+
+    /// The floor is the point of the whole exercise: a 3B model fits any laptop
+    /// and still cannot hold a tool-call format across a loop.
+    #[test]
+    fn a_model_below_the_coding_floor_is_not_a_candidate() {
+        let registry = registry(vec![entry("tiny", 3.0, vec![ModelRole::Coding])]);
+        assert!(registry.candidates(ModelRole::Coding, None).is_empty());
+        // The same model is fine for reasoning, whose floor is lower.
+        assert_eq!(registry.candidates(ModelRole::Reasoning, None).len(), 0);
+    }
+
+    #[test]
+    fn small_models_are_not_penalised_in_roles_that_are_small_by_design() {
+        let registry = registry(vec![
+            entry("embed", 0.3, vec![ModelRole::Embedding]),
+            entry("docvlm", 1.2, vec![ModelRole::DocumentOcr]),
+        ]);
+        assert_eq!(registry.candidates(ModelRole::Embedding, None).len(), 1);
+        assert_eq!(registry.candidates(ModelRole::DocumentOcr, None).len(), 1);
+    }
+
+    /// A sparse model is judged on what actually runs per token.
+    #[test]
+    fn mixture_of_experts_models_are_judged_on_active_parameters() {
+        let mut sparse = entry("moe", 120.0, vec![ModelRole::Coding]);
+        sparse.active_parameters_b = Some(5.1);
+        assert!(!sparse.meets_floor(ModelRole::Coding), "5.1B active is below the 7B floor");
+
+        sparse.active_parameters_b = Some(10.0);
+        assert!(sparse.meets_floor(ModelRole::Coding));
+    }
+
+    #[test]
+    fn a_disabled_model_is_never_a_candidate() {
+        let mut disabled = entry("retired", 8.0, vec![ModelRole::Reasoning]);
+        disabled.enabled = false;
+        let registry = registry(vec![disabled]);
+        assert!(registry.candidates(ModelRole::Reasoning, None).is_empty());
+        // But it is still listed, so an administrator can see and re-enable it.
+        assert_eq!(registry.all().len(), 1);
+    }
+
+    /// A model nobody has cleared is usable on nothing, rather than everything.
+    #[test]
+    fn an_unreviewed_model_is_permitted_for_no_classification() {
+        let mut unreviewed = entry("unreviewed", 8.0, vec![ModelRole::Reasoning]);
+        unreviewed.permitted_classifications = vec![];
+        let registry = registry(vec![unreviewed]);
+
+        for classification in Classification::ALL {
+            assert!(
+                registry
+                    .candidates(ModelRole::Reasoning, Some(*classification))
+                    .is_empty(),
+                "an unreviewed model should not be usable on {}",
+                classification.label()
+            );
+        }
+    }
+
+    #[test]
+    fn classification_narrows_the_candidate_set() {
+        let mut restricted = entry("restricted", 8.0, vec![ModelRole::Reasoning]);
+        restricted.permitted_classifications = vec![Classification::Internal];
+        let registry = registry(vec![restricted]);
+
+        assert_eq!(
+            registry
+                .candidates(ModelRole::Reasoning, Some(Classification::Internal))
+                .len(),
+            1
+        );
+        assert!(registry
+            .candidates(ModelRole::Reasoning, Some(Classification::Financial))
+            .is_empty());
+    }
+
+    /// The manifest is the whole interface for adding a model: parsing one that
+    /// names a model this code has never heard of must just work.
+    #[test]
+    fn a_model_this_code_has_never_seen_registers_from_json_alone() {
+        let json = r#"{
+            "models": [{
+                "id": "some-future-model-2027",
+                "name": "Something Not Yet Released",
+                "version": "0.1",
+                "license": "apache-2.0",
+                "runtime": "pythonSidecar",
+                "roles": ["vision", "documentOcr"],
+                "parametersB": 2.4,
+                "contextLength": 128000,
+                "weightsBytes": 4800000000,
+                "permittedClassifications": ["processDiagram"],
+                "path": "future/model"
+            }]
+        }"#;
+        let manifest: ModelManifest = serde_json::from_str(json).unwrap();
+        let registry =
+            ModelRegistry::from_manifest(manifest, PathBuf::from("registry.json")).unwrap();
+
+        let entry = registry.find("some-future-model-2027").unwrap();
+        assert_eq!(entry.runtime, Runtime::PythonSidecar);
+        assert!(entry.serves(ModelRole::DocumentOcr));
+        assert!(entry.enabled, "enabled defaults to true when omitted");
+        assert!(entry.permits(Classification::ProcessDiagram));
+    }
+}

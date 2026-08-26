@@ -523,6 +523,17 @@ impl HuggingFaceCatalogProvider {
 mod tests {
     use super::*;
 
+    /// Reaches the real Hugging Face API, so it is ignored by default.
+    ///
+    /// Two reasons, both structural rather than incidental. ARJUN starts in Work
+    /// mode, where the broker refuses every outbound call — so this cannot pass
+    /// without first putting the process into Provisioning. And `npm run
+    /// check:offline` asserts the whole tree builds and tests with no network at
+    /// all, which a test that dials out would contradict.
+    ///
+    /// Run it deliberately, on a connected machine:
+    ///   cargo test --lib -- --ignored test_hf_live_catalog_fetching_and_caching
+    #[ignore = "requires the network and Provisioning mode; see check:offline"]
     #[tokio::test]
     async fn test_hf_live_catalog_fetching_and_caching() {
         let temp_dir = std::env::temp_dir().join(format!("sarathi_cat_test_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));

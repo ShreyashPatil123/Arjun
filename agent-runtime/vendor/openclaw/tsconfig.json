@@ -1,0 +1,161 @@
+{
+  "//": [
+    "ARJUN sovereign build: stands in for OpenClaw's root tsconfig.json, which is",
+    "not vendored (it belongs to the Gateway application, not to the packages we",
+    "reuse). The compilerOptions mirror upstream at the pinned commit so the",
+    "vendored sources compile with the same semantics they were written against.",
+    "",
+    "The `paths` map covers only the packages actually vendored. Entries for the",
+    "excluded cloud provider internals are deliberately absent: a stale path here",
+    "would let a re-sync reintroduce an import that resolves."
+  ],
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "allowSyntheticDefaultImports": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "experimentalDecorators": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2023"
+    ],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "noEmitOnError": true,
+    "noUncheckedSideEffectImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "es2023",
+    "types": [
+      "node"
+    ],
+    "useDefineForClassFields": false,
+    "verbatimModuleSyntax": true,
+    "baseUrl": ".",
+    "paths": {
+      "@openclaw/agent-core": [
+        "./packages/agent-core/src/index.ts"
+      ],
+      "@openclaw/agent-core/harness/compaction": [
+        "./packages/agent-core/src/harness/compaction/compaction.ts"
+      ],
+      "@openclaw/agent-core/harness/branch-summarization": [
+        "./packages/agent-core/src/harness/compaction/branch-summarization.ts"
+      ],
+      "@openclaw/agent-core/harness/utils/truncate": [
+        "./packages/agent-core/src/harness/utils/truncate.ts"
+      ],
+      "@openclaw/agent-core/harness/env/kill-tree": [
+        "./packages/agent-core/src/harness/env/kill-tree.ts"
+      ],
+      "@openclaw/agent-core/*": [
+        "./packages/agent-core/src/*.ts",
+        "./packages/agent-core/src/*/index.ts"
+      ],
+      "@openclaw/ai": [
+        "./packages/ai/src/index.ts"
+      ],
+      "@openclaw/ai/diagnostics": [
+        "./packages/ai/src/utils/diagnostics.ts"
+      ],
+      "@openclaw/ai/event-stream": [
+        "./packages/ai/src/utils/event-stream.ts"
+      ],
+      "@openclaw/ai/providers": [
+        "./packages/ai/src/providers.ts"
+      ],
+      "@openclaw/ai/transports": [
+        "./packages/ai/src/transports.ts"
+      ],
+      "@openclaw/ai/types": [
+        "./packages/ai/src/types.ts"
+      ],
+      "@openclaw/ai/provider-types": [
+        "./packages/ai/src/provider-types.ts"
+      ],
+      "@openclaw/ai/validation": [
+        "./packages/ai/src/validation.ts"
+      ],
+      "@openclaw/ai/internal/openai": [
+        "./packages/ai/src/internal/openai.ts"
+      ],
+      "@openclaw/ai/internal/retry-after": [
+        "./packages/ai/src/internal/retry-after.ts"
+      ],
+      "@openclaw/ai/internal/runtime": [
+        "./packages/ai/src/internal/runtime.ts"
+      ],
+      "@openclaw/ai/internal/shared": [
+        "./packages/ai/src/internal/shared.ts"
+      ],
+      "@openclaw/ai/*": [
+        "./packages/ai/src/*.ts",
+        "./packages/ai/src/*/index.ts"
+      ],
+      "@openclaw/llm-core": [
+        "./packages/llm-core/src/index.ts"
+      ],
+      "@openclaw/llm-core/diagnostics": [
+        "./packages/llm-core/src/utils/diagnostics.ts"
+      ],
+      "@openclaw/llm-core/event-stream": [
+        "./packages/llm-core/src/utils/event-stream.ts"
+      ],
+      "@openclaw/llm-core/types": [
+        "./packages/llm-core/src/types.ts"
+      ],
+      "@openclaw/llm-core/validation": [
+        "./packages/llm-core/src/validation.ts"
+      ],
+      "@openclaw/llm-core/*": [
+        "./packages/llm-core/src/*.ts",
+        "./packages/llm-core/src/*/index.ts"
+      ],
+      "@openclaw/markdown-core/reasoning-tags": [
+        "./packages/markdown-core/src/reasoning-tags.ts"
+      ],
+      "@openclaw/media-core/base64": [
+        "./packages/media-core/src/base64.ts"
+      ],
+      "@openclaw/model-catalog-core": [
+        "./packages/model-catalog-core/src/index.ts"
+      ],
+      "@openclaw/model-catalog-core/*": [
+        "./packages/model-catalog-core/src/*.ts",
+        "./packages/model-catalog-core/src/*/index.ts"
+      ],
+      "@openclaw/net-policy": [
+        "./packages/net-policy/src/index.ts"
+      ],
+      "@openclaw/net-policy/*": [
+        "./packages/net-policy/src/*.ts",
+        "./packages/net-policy/src/*/index.ts"
+      ],
+      "@openclaw/normalization-core": [
+        "./packages/normalization-core/src/index.ts"
+      ],
+      "@openclaw/normalization-core/*": [
+        "./packages/normalization-core/src/*.ts",
+        "./packages/normalization-core/src/*/index.ts"
+      ],
+      "@openclaw/retry": [
+        "./packages/retry/src/index.ts"
+      ],
+      "@openclaw/tool-call-repair": [
+        "./packages/tool-call-repair/src/index.ts"
+      ],
+      "@openclaw/tool-call-repair/*": [
+        "./packages/tool-call-repair/src/*.ts",
+        "./packages/tool-call-repair/src/*/index.ts"
+      ]
+    }
+  }
+}

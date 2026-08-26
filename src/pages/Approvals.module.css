@@ -1,0 +1,249 @@
+.page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6) var(--space-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+.header { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.title {
+  font-family: var(--font-display);
+  font-weight: var(--font-normal);
+  font-size: var(--text-3xl);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.subtitle {
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+  max-width: 64ch;
+  margin: 0;
+}
+
+.error {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-4);
+  background: var(--error-bg);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-lg);
+  color: var(--text-primary);
+}
+
+.error p { margin: 0; font-size: var(--text-sm); }
+
+.empty {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-6);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+  color: var(--text-tertiary);
+}
+
+.empty strong { font-size: var(--text-sm); color: var(--text-primary); }
+.empty p { margin: var(--space-1) 0 0; font-size: var(--text-xs); max-width: 56ch; }
+
+.sectionHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin: 0 0 var(--space-4);
+}
+
+.stack { display: flex; flex-direction: column; gap: var(--space-4); }
+
+/* ── The request card ────────────────────────────────────────────────── */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  /* A pending request is the one thing on this page that needs answering, so
+   * it carries more weight than the history below it. */
+  border-left: 3px solid var(--text-primary);
+}
+
+.settled {
+  border-left-color: var(--border-default);
+  opacity: 0.82;
+}
+
+.cardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.tool {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-base);
+  font-weight: var(--font-medium);
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.meta {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.badge {
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.badgeApproved { background: var(--success-bg, var(--bg-tertiary)); color: var(--success, var(--text-primary)); }
+.badgeRejected { background: var(--error-bg); color: var(--error); }
+
+/* ── The five facets ─────────────────────────────────────────────────── */
+
+.facets {
+  display: grid;
+  grid-template-columns: minmax(120px, 160px) 1fr;
+  gap: var(--space-3) var(--space-4);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.facet { display: contents; }
+
+.facet dt {
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding-top: 2px;
+}
+
+.facet dd { margin: 0; color: var(--text-secondary); min-width: 0; }
+
+.target,
+.facet code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  overflow-wrap: anywhere;
+}
+
+.list { margin: 0; padding-left: var(--space-4); display: grid; gap: var(--space-1); }
+.list li { line-height: var(--leading-relaxed); }
+
+.prose { margin: 0; line-height: var(--leading-relaxed); }
+
+.rejectionReason {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-md);
+}
+
+/* ── Deciding ────────────────────────────────────────────────────────── */
+
+.actions {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle, var(--border-default));
+}
+
+.rejectRow {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  width: 100%;
+  align-items: center;
+}
+
+.reasonInput {
+  flex: 1 1 260px;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.reasonInput:focus {
+  outline: none;
+  border-color: var(--text-primary);
+}
+
+.approve,
+.reject,
+.cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  font-family: inherit;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.approve {
+  color: var(--bg-primary);
+  background: var(--text-primary);
+  border-color: var(--text-primary);
+}
+
+.approve:hover:not(:disabled) { opacity: 0.88; }
+
+.reject {
+  color: var(--error);
+  background: transparent;
+  border-color: var(--error);
+}
+
+.reject:hover:not(:disabled) { background: var(--error-bg); }
+
+.cancel { color: var(--text-secondary); background: transparent; }
+.cancel:hover { color: var(--text-primary); border-color: var(--border-strong); }
+
+.approve:disabled,
+.reject:disabled { opacity: 0.5; cursor: default; }
+
+@media (max-width: 620px) {
+  .facets { grid-template-columns: 1fr; gap: var(--space-1) 0; }
+  .facet dt { padding-top: var(--space-2); }
+}

@@ -13,6 +13,7 @@ use tauri::Emitter;
 use crate::adapter_manager::{AdapterRegistry, ModelPackageManifest};
 use crate::ai_engine::runtime::LlamaCppRuntime;
 use crate::ai_engine::traits::*;
+use crate::ai_engine::residency::{Residency, SwapDecision};
 use crate::capability::{self, CapabilityLayer, CapabilityPayload};
 use crate::system_analyzer;
 
@@ -46,6 +47,10 @@ pub struct InferenceManager {
     active_package: Arc<Mutex<Option<ActivePackage>>>,
     /// Intent classification, switch hysteresis, and capability resolution.
     capability: Arc<CapabilityLayer>,
+    /// Which model is in VRAM, and how long it has been idle. Kept here rather
+    /// than inside the runtime so residency can be inspected without taking the
+    /// generation lock, which a running generation holds for minutes.
+    residency: Arc<Mutex<Residency>>,
 }
 
 impl InferenceManager {
@@ -55,6 +60,7 @@ impl InferenceManager {
             runtime: Arc::new(Mutex::new(LlamaCppRuntime::new())),
             last_used_model_id: Arc::new(Mutex::new(None)),
             active_package: Arc::new(Mutex::new(None)),
+            residency: Arc::new(Mutex::new(Residency::new())),
             capability: Arc::new(CapabilityLayer::default()),
         }
     }
@@ -231,6 +237,13 @@ impl InferenceManager {
         self.set_last_used_model_id(Some(model_id.to_string()));
         let _ = super::session::SessionManager::save_session(app_data_dir, provider_id, model_id, quantization);
 
+        // Residency is recorded only after a load that actually succeeded, so a
+        // failed load never leaves the tracker claiming something is in VRAM
+        // that is not.
+        if let Ok(mut residency) = self.residency.lock() {
+            residency.mark_loaded(model_id.to_string(), std::time::Instant::now());
+        }
+
         if let Some(ref cb) = status_cb {
             cb("Ready", None);
         }
@@ -241,8 +254,71 @@ impl InferenceManager {
     /// Direct unload without requiring Tauri AppHandle
     pub fn unload_active_model_direct(&self) -> Result<()> {
         self.clear_package_context();
+        if let Ok(mut residency) = self.residency.lock() {
+            residency.mark_unloaded();
+        }
         let mut runtime = self.runtime.lock().unwrap();
         runtime.unload_model()
+    }
+
+    /// What has to happen before `model_id` can serve a task.
+    ///
+    /// Answered without loading anything, so the caller can warn about a pause
+    /// before it happens rather than after.
+    pub fn residency_plan(&self, model_id: &str) -> SwapDecision {
+        match self.residency.lock() {
+            Ok(residency) => residency.plan_for(model_id),
+            // A poisoned lock means a previous holder panicked. Reporting "load
+            // it" is the safe answer: worst case a resident model is reloaded.
+            Err(_) => SwapDecision::Load {
+                model_id: model_id.to_string(),
+                reason: "Residency state was lost, so the model will be loaded again.".to_string(),
+            },
+        }
+    }
+
+    /// Relabels the resident model under the id the registry knows it by.
+    ///
+    /// The loader addresses models by their upstream coordinates; the router and
+    /// the registry use a registry id. Without this the residency tracker would
+    /// answer "is X loaded?" about a different naming scheme than the caller
+    /// asked in, and every check would miss.
+    pub fn record_residency_as(&self, registry_id: &str) {
+        if let Ok(mut residency) = self.residency.lock() {
+            residency.mark_loaded(registry_id.to_string(), std::time::Instant::now());
+        }
+    }
+
+    /// The model currently in VRAM, if any.
+    pub fn resident_model_id(&self) -> Option<String> {
+        self.residency
+            .lock()
+            .ok()
+            .and_then(|r| r.resident_model_id().map(str::to_string))
+    }
+
+    /// Releases the resident model if it has been idle past the timeout.
+    ///
+    /// Returns what was released, so the caller can record it. Idle eviction is
+    /// deliberately a caller-driven check rather than a background timer: a
+    /// timer that unloads a model while a task is mid-plan would be a far worse
+    /// failure than holding VRAM slightly longer than necessary.
+    pub fn release_if_idle(&self, ttl: std::time::Duration) -> Option<String> {
+        let victim = {
+            let residency = self.residency.lock().ok()?;
+            residency.idle_eviction(std::time::Instant::now(), ttl)?
+        };
+
+        match self.unload_active_model_direct() {
+            Ok(()) => {
+                log::info!("[RESIDENCY] released {victim} after it sat idle past the timeout");
+                Some(victim)
+            }
+            Err(e) => {
+                log::warn!("[RESIDENCY] could not release the idle model {victim}: {e}");
+                None
+            }
+        }
     }
 
     /// Drops package context and capability stickiness.

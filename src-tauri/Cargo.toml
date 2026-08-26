@@ -70,6 +70,16 @@ llama-cpp-2 = { version = "0.1" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 sha2 = "0.10"
+# A .docx / .xlsx is a ZIP of XML parts. Writing the parts directly rather than
+# through a document library keeps the template engine — and therefore the
+# document's structure — something a reviewer can read in this repository.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Password hashing. Argon2id is the current recommendation for storing
+# passwords: memory-hard, so a stolen database cannot be attacked with the
+# GPU throughput that makes fast hashes useless here.
+argon2 = "0.5"
+# CSPRNG for per-password salts.
+rand_core = { version = "0.6", features = ["std"] }
 # Reads PEFT adapter weights so they can be converted to GGUF locally. Pure
 # Rust with no C toolchain, which is what makes conversion possible without
 # shipping Python and torch for llama.cpp's `convert_lora_to_gguf.py`.
@@ -81,4 +91,9 @@ safetensors = "0.4"
 minijinja = { version = "2", features = ["macros", "loop_controls", "adjacent_loop_items"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation"] }
+windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# Temporary directories for tests that touch the filesystem, cleaned up on drop
+# so a failed run cannot leave state that makes the next one pass.
+tempfile = "3"

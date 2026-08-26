@@ -1,3 +1,3 @@
 export * from './AppShell';
-export * from './TopBar';
+export * from './AppMenu';
 export * from './StatusBar';

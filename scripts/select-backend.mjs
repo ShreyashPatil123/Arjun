@@ -36,11 +36,28 @@ function detectBackend() {
 
   const hasNvidiaGpu = probe('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader']);
   const hasNvcc = probe('nvcc', ['--version']);
+  const hasVulkanSdk = Boolean(process.env.VULKAN_SDK) || probe('glslc', ['--version']);
+
   if (hasNvidiaGpu && hasNvcc) {
-    return { feature: 'cuda', why: 'NVIDIA GPU + CUDA toolkit (nvcc) present' };
+    // nvcc existing is not the same as nvcc being able to build here. Each CUDA
+    // release pins a range of supported MSVC versions, and a newer Visual Studio
+    // is rejected outright — `-allow-unsupported-compiler` exists but NVIDIA's
+    // own warning is that it "may cause incorrect run time execution", which is
+    // not something to opt into silently for inference kernels.
+    const mismatch = cudaHostCompilerMismatch();
+    if (!mismatch) {
+      return { feature: 'cuda', why: 'NVIDIA GPU + CUDA toolkit (nvcc) present' };
+    }
+
+    // Checked before falling through so the reason survives into the log. A
+    // silent downgrade here reads as "this machine has no GPU", which sends
+    // whoever is debugging it in entirely the wrong direction.
+    if (hasVulkanSdk) {
+      return { feature: 'vulkan', why: `${mismatch} — using Vulkan on the same GPU instead` };
+    }
+    return { feature: null, why: `${mismatch}, and no Vulkan SDK to fall back to` };
   }
 
-  const hasVulkanSdk = Boolean(process.env.VULKAN_SDK) || probe('glslc', ['--version']);
   if (hasVulkanSdk) {
     return { feature: 'vulkan', why: 'Vulkan SDK present (vendor-neutral GPU offload)' };
   }
@@ -49,6 +66,38 @@ function detectBackend() {
     return { feature: null, why: 'NVIDIA GPU found but no CUDA toolkit — install it for GPU offload' };
   }
   return { feature: null, why: 'no GPU build toolchain found' };
+}
+
+/**
+ * Whether the installed CUDA refuses the installed Visual Studio.
+ *
+ * Returns an explanation when they are incompatible, or `null` when the pair is
+ * fine or cannot be determined. Undeterminable counts as fine: guessing wrong in
+ * that direction costs one failed build, while guessing wrong the other way
+ * would abandon a working CUDA setup on a machine that has one.
+ */
+function cudaHostCompilerMismatch() {
+  if (!isWindows) return null;
+
+  const nvcc = spawnSync('nvcc', ['--version'], { encoding: 'utf8', shell: true });
+  const cuda = /release (\d+)\.(\d+)/.exec(nvcc.stdout ?? '');
+  if (!cuda) return null;
+
+  const vcvars = findVcvars();
+  if (!vcvars) return null;
+
+  // The Visual Studio major version sits in the install path — "…/2022/…" for
+  // the year-named releases, "…/18/…" for the numbered ones that followed.
+  const edition = /Microsoft Visual Studio[\\/](\d+)[\\/]/.exec(vcvars);
+  if (!edition) return null;
+
+  const vs = Number(edition[1]);
+  // CUDA 12.x supports Visual Studio 2017 through 2022. Anything after 2022 is
+  // numbered rather than year-named, so a small number means a newer release.
+  const supported = vs >= 2017 && vs <= 2022;
+  if (supported) return null;
+
+  return `CUDA ${cuda[1]}.${cuda[2]} does not support the installed Visual Studio ${vs}`;
 }
 
 /**
@@ -123,7 +172,17 @@ if (isWindows && feature === 'cuda') {
 
   const quoted = tauriArgs.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ');
   const line = `"${vcvars}" >nul && set CMAKE_GENERATOR=Ninja&& npx tauri ${quoted}`;
-  const child = spawn('cmd', ['/c', line], { stdio: 'inherit' });
+
+  // `windowsVerbatimArguments` is required, not optional. Node escapes quotes
+  // as \" so that a program using the C runtime's argument parser sees them —
+  // but cmd.exe does not use that parser. It reads the raw command line, so the
+  // backslashes arrive as literal characters and the whole thing fails with
+  // "'\"C:\Program Files\...\vcvars64.bat\"' is not recognized". The flag tells
+  // Node to hand the string over untouched, which is what cmd expects.
+  const child = spawn('cmd', ['/c', line], {
+    stdio: 'inherit',
+    windowsVerbatimArguments: true,
+  });
   child.on('exit', (code) => process.exit(code ?? 1));
 } else {
   const child = spawn('npx', ['tauri', ...tauriArgs], { stdio: 'inherit', shell: isWindows });

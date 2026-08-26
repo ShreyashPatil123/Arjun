@@ -48,6 +48,19 @@
   --z-overlay: 30;
   --z-modal: 40;
   --z-toast: 50;
+
+  /* Display face for the workbench headline. A local stack only — ARJUN must
+   * render identically with the network off, so no webfont may be fetched.
+   * Every family here ships with Windows, macOS or a common Linux desktop. */
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    "Times New Roman", "Liberation Serif", serif;
+
+  /* UI face. Inter used to be pulled from the Google Fonts CDN, which is a real
+   * network call on every launch and would have shown up in the demo's own
+   * network monitor. Replaced with the native system stack: nothing to fetch,
+   * nothing to vendor, and Segoe UI Variable is the native Windows 11 face. */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
 }
 
 /* ── Monochrome palette ──────────────────────────────────────────────────
@@ -166,7 +179,7 @@ html {
 body {
   margin: 0;
   padding: 0;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

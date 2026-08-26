@@ -49,14 +49,17 @@ fn find_peft_weights(filenames: &[String]) -> Option<String> {
 /// because buffering a merged model would cost gigabytes of memory before
 /// anything could reject it.
 async fn fetch_adapter_file(
-    client: &reqwest::Client,
     token: Option<&str>,
     repo_id: &str,
     filename: &str,
     target_dir: &std::path::Path,
 ) -> Result<Vec<u8>, String> {
     let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}?download=true");
-    let mut req = client.get(&url);
+    // Through the broker, which owns the only outbound client in the process
+    // and refuses everything in Work mode.
+    let mut req = crate::sovereignty::global_broker()
+        .authorized_get(&url)
+        .map_err(|e| e.to_string())?;
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -134,15 +137,14 @@ pub async fn download_adapter(
     let package = package_dir_for(&app, &provider_id, &model_id)?;
     let token = crate::config::hf_token::get();
 
-    let client = reqwest::Client::builder()
-        .user_agent("Sarathi/0.1.0")
-        .build()
-        .map_err(|e| format!("could not create an HTTP client: {e}"))?;
-
     // 1. Read the file list and decide whether this is installable at all.
-    let mut info_req = client.get(format!(
-        "https://huggingface.co/api/models/{adapter_repo_id}"
-    ));
+    // Through the broker, which owns the only outbound client in the process
+    // and refuses everything in Work mode.
+    let mut info_req = crate::sovereignty::global_broker()
+        .authorized_get(&format!(
+            "https://huggingface.co/api/models/{adapter_repo_id}"
+        ))
+        .map_err(|e| e.to_string())?;
     if let Some(t) = &token {
         info_req = info_req.bearer_auth(t);
     }
@@ -231,7 +233,6 @@ pub async fn download_adapter(
     match ready_gguf {
         Some(gguf_file) => {
             let bytes = fetch_adapter_file(
-                &client,
                 token.as_deref(),
                 &adapter_repo_id,
                 &gguf_file,
@@ -253,7 +254,6 @@ pub async fn download_adapter(
                 .expect("PEFT weights were present when the source was chosen");
 
             let weight_bytes = fetch_adapter_file(
-                &client,
                 token.as_deref(),
                 &adapter_repo_id,
                 &weights,
@@ -272,7 +272,6 @@ pub async fn download_adapter(
             })?;
 
             let config_bytes = fetch_adapter_file(
-                &client,
                 token.as_deref(),
                 &adapter_repo_id,
                 &config,

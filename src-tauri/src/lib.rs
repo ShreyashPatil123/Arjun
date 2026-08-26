@@ -6,6 +6,17 @@ pub mod database;
 pub mod config;
 pub mod logging;
 pub mod commands;
+pub mod sovereignty;
+pub mod artifacts;
+pub mod audit;
+pub mod documents;
+pub mod health;
+pub mod identity;
+pub mod knowledge;
+pub mod orchestrator;
+pub mod package;
+pub mod policy;
+pub mod registry;
 
 // Phase modules
 pub mod system_analyzer;
@@ -17,7 +28,6 @@ pub mod adapter_manager;
 pub mod ai_engine;
 pub mod capability;
 pub mod gateway;
-pub mod launcher;
 pub mod model_intelligence;
 pub mod lora;
 pub mod installer;
@@ -66,8 +76,10 @@ pub fn run() {
         .plugin(log_plugin)
         .manage(sarathi_core)
         .manage(download_manager)
-        .manage(inference_manager)
-        .setup(|app| {
+        // Cloned rather than moved: the activator built in setup below needs
+        // the same manager the commands see, not a second one.
+        .manage(inference_manager.clone())
+        .setup(move |app| {
             info!("Sarathi application starting...");
 
             // Resolve app_data_dir dynamically from Tauri app handle
@@ -76,6 +88,72 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("./app_data"));
             let memory_manager = Arc::new(MemoryManager::new(&app_data_dir));
+            // The single outbound chokepoint. Managed before anything that could
+            // want the network, so no module can come up with its own client.
+            // Governance state. The audit log is opened first so that everything
+            // after it — including the broker's own decisions — is on the record.
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("the application data directory must resolve");
+            match audit::AuditService::open(&data_dir) {
+                Ok(service) => {
+                    let service = Arc::new(service);
+                    sovereignty::global_broker().attach_audit(service.clone());
+                    app.manage(service);
+                }
+                Err(e) => {
+                    // Running without a durable record is a real degradation, so
+                    // it is logged at error level rather than passed over.
+                    log::error!("[AUDIT] could not open the audit log: {e}");
+                }
+            }
+            match identity::CredentialStore::open(&data_dir) {
+                Ok(store) => {
+                    app.manage(Arc::new(store));
+                }
+                Err(e) => log::error!("[IDENTITY] could not open the credential store: {e}"),
+            }
+            app.manage(Arc::new(identity::UserDirectory::seeded()));
+
+            // The model registry is a manifest beside the models on disk. A
+            // missing one is an empty registry, not a failure — a fresh install
+            // legitimately has nothing to route to until somebody provisions it.
+            // The activator owns model swapping: routing chooses, this loads.
+            app.manage(std::sync::Arc::new(ai_engine::activation::ModelActivator::new(
+                ai_engine::activation::InferenceLoader::new(
+                    inference_manager.clone(),
+                    data_dir.clone(),
+                ),
+            )));
+
+            match registry::ModelRegistry::load_with_discovery(&data_dir) {
+                Ok(loaded) => {
+                    app.manage(Arc::new(loaded));
+                }
+                Err(e) => {
+                    log::error!("[REGISTRY] the model manifest could not be read: {e}");
+                    app.manage(Arc::new(
+                        registry::ModelRegistry::load(std::path::Path::new("./__absent__"))
+                            .expect("an absent manifest always loads as empty"),
+                    ));
+                }
+            }
+            // The knowledge index is the same SQLite file the rest of the app
+            // uses. It is managed here so the health panel can count documents
+            // without opening a second connection per request.
+            match knowledge::index::KnowledgeIndex::open(&data_dir) {
+                Ok(index) => {
+                    app.manage(Arc::new(index));
+                }
+                Err(e) => log::error!("[KNOWLEDGE] the index could not be opened: {e}"),
+            }
+
+            app.manage(Arc::new(orchestrator::approvals::ApprovalQueue::new()));
+            app.manage(commands::governance::CurrentSession::default());
+
+            app.manage(sovereignty::global_broker().clone());
+
             app.manage(memory_manager);
 
             // Load the saved HuggingFace token into the process before anything
@@ -119,7 +197,6 @@ pub fn run() {
             app.manage(gateway_state.clone());
 
             // Tracks tools the Launch screen started, so cards can show Running.
-            app.manage(Arc::new(launcher::LaunchedProcesses::default()));
 
             let app_for_gateway = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -313,14 +390,32 @@ pub fn run() {
             commands::intelligence::route_prompt_capability,
 
             // Launch section — start coding tools already connected
-            commands::launcher::get_launch_overview,
-            commands::launcher::preview_tool_install,
-            commands::launcher::install_tool,
-            commands::launcher::launch_tool,
-            commands::launcher::forget_tool_process,
-            commands::launcher::user_tools_file,
 
             // Model browsing by category
+            commands::sovereignty::get_operating_mode,
+            commands::sovereignty::set_operating_mode,
+            commands::sovereignty::recent_egress_events,
+            commands::sovereignty::run_egress_canary,
+            commands::sovereignty::observe_process_connections,
+            commands::sovereignty::assert_confidential_allowed,
+            commands::governance::list_accounts,
+            commands::governance::sign_in,
+            commands::governance::sign_out,
+            commands::governance::current_session,
+            commands::governance::current_permissions,
+            commands::governance::recent_audit_entries,
+            commands::governance::verify_audit_chain,
+            commands::governance::authentication_status,
+            commands::governance::set_initial_administrator_password,
+            commands::governance::set_account_password,
+            commands::registry::list_registered_models,
+            commands::registry::model_manifest_path,
+            commands::registry::preview_routing,
+            commands::registry::prepare_model_for,
+            commands::registry::model_residency,
+            commands::health::health_snapshot,
+            commands::approvals::list_approvals,
+            commands::approvals::decide_approval,
             commands::catalog::browse_model_cards,
             commands::catalog::list_model_categories,
             commands::catalog::find_model_adapters,

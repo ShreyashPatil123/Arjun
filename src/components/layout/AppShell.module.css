@@ -1,5 +1,23 @@
 .shell {
-  display: flex; flex-direction: column; height: 100dvh; width: 100vw;
-  background: var(--bg-primary); overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  width: 100vw;
+  background: var(--bg-primary);
+  overflow: hidden;
 }
-.main { flex: 1; overflow-y: auto; position: relative; }
+
+/* Deliberately chrome-free: no bar, no border, no fill. The menu floats over
+ * the page so the workbench reads as one uninterrupted surface. */
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+}
+
+.main {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+}

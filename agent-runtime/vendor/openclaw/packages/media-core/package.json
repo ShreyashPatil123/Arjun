@@ -1,0 +1,10 @@
+{
+  "name": "@openclaw/media-core",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "description": "ARJUN sovereign build: reduced to base64.ts, the only module packages/ai imports. The file-type dependency and the media inspection modules that needed it are dropped.",
+  "exports": {
+    "./base64": "./src/base64.ts"
+  }
+}

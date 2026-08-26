@@ -1,0 +1,37 @@
+{
+  "at": "2026-08-26T11:50:36.180Z",
+  "platform": "win32 x64",
+  "results": [
+    {
+      "name": "1. Model auto-selection across task types",
+      "status": "PASS",
+      "detail": "10 routing checks — different task types select different models, each with a recorded reason"
+    },
+    {
+      "name": "2. Agentic task, start to finish",
+      "status": "PASS",
+      "detail": "180 checks — bounded plan, gated tools, grounded artifact that re-opens and verifies"
+    },
+    {
+      "name": "3. Coding task run in the sandbox",
+      "status": "BLOCKED",
+      "detail": "the refusal path is proven by tests, but no container runtime is installed, so code execution is refused rather than sandboxed. Install Podman to unblock this criterion."
+    },
+    {
+      "name": "4. Multimodal task",
+      "status": "BLOCKED",
+      "detail": "35 document-pipeline checks pass — routing, injection scanning, escalation and confidence flagging. But no vision model is provisioned (text weights are present; they cannot read pixels), so scans, handwriting and drawings cannot be read. Download a model with an mmproj projector in Provisioning mode to unblock this."
+    },
+    {
+      "name": "5. Zero egress in Work mode",
+      "status": "PASS",
+      "detail": "source gate clean, build needs no network, 18 sovereignty checks — Work mode refuses, the canary fails, every decision is audited"
+    }
+  ],
+  "summary": {
+    "passed": 3,
+    "failed": 0,
+    "blocked": 2,
+    "unverified": 0
+  }
+}

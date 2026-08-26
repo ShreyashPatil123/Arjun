@@ -1,0 +1,135 @@
+.page {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-8) var(--space-6);
+  background: var(--bg-primary);
+}
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.brand {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.14em;
+  color: var(--text-tertiary);
+}
+
+.heading {
+  font-family: var(--font-display);
+  font-weight: var(--font-normal);
+  font-size: var(--text-3xl);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+  margin: 0;
+  text-wrap: balance;
+}
+
+.lede {
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+  margin: 0 0 var(--space-2);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.label {
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.input,
+.select {
+  width: 100%;
+  padding: var(--space-3) var(--space-3);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-base);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.input:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.hint,
+.hintWarn {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.hint { color: var(--text-tertiary); }
+
+/* Guidance that has become a problem. Still a sentence, never colour alone. */
+.hintWarn { color: var(--text-primary); }
+
+.error {
+  padding: var(--space-3) var(--space-4);
+  background: var(--error-bg);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.submit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--accent-primary);
+  color: var(--accent-foreground);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+}
+
+.submit:hover:not(:disabled) { opacity: 0.9; }
+.submit:disabled { opacity: 0.4; cursor: default; }
+.submit:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.recovery {
+  font-size: var(--text-xs);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  margin: 0;
+}
+
+.footnote {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin: var(--space-2) 0 0;
+}

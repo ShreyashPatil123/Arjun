@@ -1,0 +1,38 @@
+.page {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-6);
+}
+
+.card {
+  max-width: 520px;
+  text-align: center;
+}
+
+.title {
+  font-family: var(--font-display);
+  font-weight: var(--font-normal);
+  font-size: var(--text-3xl);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+  margin: 0 0 var(--space-4);
+}
+
+.purpose {
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+  margin: 0 0 var(--space-6);
+}
+
+.phase {
+  display: inline-block;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin: 0;
+}

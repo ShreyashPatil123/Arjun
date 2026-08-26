@@ -152,16 +152,14 @@ impl HuggingFaceAdapterProvider {
                 search_query.replace(' ', "%20")
             );
 
-            let client = match reqwest::Client::builder()
-                .user_agent("Sarathi/0.1.0 (Windows; x64)")
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-            {
-                Ok(c) => c,
+            // Through the broker, which owns the only outbound client in the
+            // process and refuses everything in Work mode. A refusal skips this
+            // candidate rather than aborting the sweep, matching how an
+            // unreachable repo was already handled here.
+            let mut req = match crate::sovereignty::global_broker().authorized_get(&api_url) {
+                Ok(req) => req.timeout(std::time::Duration::from_secs(5)),
                 Err(_) => continue,
             };
-
-            let mut req = client.get(&api_url);
             if let Some(token) = hf_token {
                 if !token.trim().is_empty() {
                     req = req.header("Authorization", format!("Bearer {}", token.trim()));
@@ -251,12 +249,10 @@ impl HuggingFaceAdapterProvider {
     ) -> Result<AdapterCandidate> {
         let config_url = format!("https://huggingface.co/{}/raw/main/adapter_config.json", repo_id);
 
-        let client = reqwest::Client::builder()
-            .user_agent("Sarathi/0.1.0 (Windows; x64)")
-            .timeout(std::time::Duration::from_secs(8))
-            .build()?;
-
-        let mut req = client.get(&config_url);
+        // Through the broker: refused outright in Work mode.
+        let mut req = crate::sovereignty::global_broker()
+            .authorized_get(&config_url)?
+            .timeout(std::time::Duration::from_secs(8));
         if let Some(token) = hf_token {
             if !token.trim().is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", token.trim()));
@@ -316,7 +312,11 @@ impl HuggingFaceAdapterProvider {
 
         for fname in candidate_files {
             let weight_url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, fname);
-            let mut head_req = client.head(&weight_url);
+            // Refused in Work mode, in which case this candidate is skipped.
+            let Ok(broker_client) = crate::sovereignty::global_broker().authorize(&weight_url) else {
+                continue;
+            };
+            let mut head_req = broker_client.head(&weight_url);
             if let Some(token) = hf_token {
                 if !token.trim().is_empty() {
                     head_req = head_req.header("Authorization", format!("Bearer {}", token.trim()));

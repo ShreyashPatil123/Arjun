@@ -103,19 +103,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// abandoned experiments and personal scratch uploads.
 const MIN_DOWNLOADS: u64 = 50;
 
-fn client(token: Option<&str>) -> Result<reqwest::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
+/// Builds a Hub request through the network broker.
+///
+/// The broker owns the only outbound client in the process, so this no longer
+/// constructs one. It checks operating mode, scheme and host, and records the
+/// decision, before any request can be built — in Work mode this returns a
+/// refusal and the Hub is simply unreachable.
+///
+/// The auth header and timeout move from client defaults to per-request, which
+/// is equivalent here and keeps the token out of any shared client state.
+fn authorized_get(url: &str, token: Option<&str>) -> Result<reqwest::RequestBuilder> {
+    let mut req = crate::sovereignty::global_broker()
+        .authorized_get(url)?
+        .timeout(REQUEST_TIMEOUT);
+
     if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
         let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}"))
             .map_err(|_| anyhow!("HuggingFace token contains invalid characters"))?;
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+        req = req.header(reqwest::header::AUTHORIZATION, value);
     }
-    reqwest::Client::builder()
-        .user_agent("Sarathi/0.1.0")
-        .timeout(REQUEST_TIMEOUT)
-        .default_headers(headers)
-        .build()
-        .map_err(Into::into)
+
+    Ok(req)
 }
 
 /// Searches the Hub for GGUF repositories.
@@ -128,10 +136,9 @@ pub async fn search_repos(
     page: u32,
     token: Option<&str>,
 ) -> Result<Vec<String>> {
-    let client = client(token)?;
     let url = search_url(query, limit, page);
 
-    let resp = client.get(&url).send().await?;
+    let resp = authorized_get(&url, token)?.send().await?;
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(RateLimited { had_token: token.is_some() }.into());
@@ -150,8 +157,7 @@ pub async fn search_repos(
 
 /// Fetches full details for one repository.
 pub async fn fetch_repo(repo_id: &str, token: Option<&str>) -> Result<GgufRepo> {
-    let client = client(token)?;
-    let resp = client.get(detail_url(repo_id)).send().await?;
+    let resp = authorized_get(&detail_url(repo_id), token)?.send().await?;
 
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -243,14 +249,13 @@ pub async fn find_adapters(
         return Ok(Vec::new());
     }
 
-    let client = client(token)?;
     let url = format!(
         "https://huggingface.co/api/models?filter=base_model:adapter:{}&sort=downloads&direction=-1&limit={}&full=true",
         base,
         limit.clamp(1, 50)
     );
 
-    let resp = client.get(&url).send().await?;
+    let resp = authorized_get(&url, token)?.send().await?;
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(RateLimited { had_token: token.is_some() }.into());
     }

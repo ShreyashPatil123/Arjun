@@ -1,0 +1,212 @@
+.page {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-8) var(--space-6) var(--space-16);
+}
+
+.centre {
+  width: 100%;
+  max-width: 780px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Sits the composer slightly above true centre — an optical adjustment, so
+   * the block reads as centred rather than measuring as centred. */
+  margin-bottom: 6vh;
+}
+
+.headline {
+  font-family: var(--font-display);
+  font-weight: var(--font-normal);
+  /* Scales with the viewport so the headline keeps its presence on a laptop
+   * without overwhelming a small window. */
+  font-size: clamp(2rem, 1.2rem + 3.2vw, 3.5rem);
+  line-height: var(--leading-tight);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+  text-align: center;
+  margin: 0 0 var(--space-10);
+}
+
+.composer {
+  width: 100%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  padding: var(--space-4);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.composer:focus-within {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.input {
+  width: 100%;
+  min-height: 56px;
+  background: transparent;
+  border: none;
+  resize: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  padding: 0 var(--space-1);
+}
+
+.input::placeholder { color: var(--text-tertiary); }
+.input:focus { outline: none; }
+
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: var(--space-3);
+}
+
+.controlsRight {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.iconBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast),
+              border-color var(--transition-fast);
+}
+
+.iconBtn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+.iconBtn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.send {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--accent-primary);
+  /* The accent is near-white in this monochrome theme, so the glyph on top of
+   * it must be dark — see the --accent-foreground note in index.css. */
+  color: var(--accent-foreground);
+  cursor: pointer;
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.send:hover:not(:disabled) { transform: translateY(-1px); }
+.send:disabled { opacity: 0.35; cursor: default; }
+.send:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+}
+
+.chip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 240px;
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.chipName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chipRemove {
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: var(--text-base);
+  line-height: 1;
+  padding: 0;
+}
+.chipRemove:hover { color: var(--text-primary); }
+
+/* Shown when the invariant refuses an attachment. It explains the refusal
+ * rather than leaving the attach button apparently broken. */
+.refusal {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--error-bg);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-primary);
+  max-width: 64ch;
+}
+
+.refusal svg { flex: none; margin-top: 1px; }
+
+/* Reports the model that was made ready. Not an alert — this is the ordinary
+ * successful path, so it is drawn as quietly as the composer itself. */
+.prepared {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-secondary);
+  max-width: 64ch;
+}
+
+.prepared strong { color: var(--text-primary); font-weight: var(--font-medium); }
+
+.localBadge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-6);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  text-decoration: none;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.localBadge:hover {
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .send:hover:not(:disabled) { transform: none; }
+}

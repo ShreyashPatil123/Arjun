@@ -1,0 +1,120 @@
+.readout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-5) var(--space-6);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+}
+
+/* ── Headline figures ──────────────────────────────────────────────────── */
+
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-6);
+}
+
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.figureLabel {
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.figureValue {
+  font-size: var(--text-2xl);
+  font-weight: var(--font-semibold);
+  color: var(--text-primary);
+  /* Digits line up between the columns rather than shifting as values change. */
+  font-variant-numeric: tabular-nums;
+  line-height: var(--leading-tight);
+}
+
+.figureNote {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* ── Capability flags ──────────────────────────────────────────────────── */
+
+.flags {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-default);
+}
+
+.flagOn,
+.flagOff {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Supported and unsupported are separated by luminance, and each one always
+ * carries its own sentence — the state is never left to brightness alone. */
+.flagOn .flagIcon { color: var(--text-primary); }
+.flagOff .flagIcon { color: var(--text-tertiary); }
+
+.flagIcon {
+  display: flex;
+  align-items: center;
+  padding-top: 1px;
+}
+
+.flagText {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.flagLabel {
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+}
+
+.flagOn .flagLabel { color: var(--text-primary); }
+.flagOff .flagLabel { color: var(--text-secondary); }
+
+.flagDetail {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-tertiary);
+}
+
+/* ── Nothing scanned yet ───────────────────────────────────────────────── */
+
+.undetected {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-5) var(--space-6);
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+}
+
+.undetectedTitle {
+  font-size: var(--text-base);
+  font-weight: var(--font-medium);
+  color: var(--text-primary);
+}
+
+.undetectedDetail {
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+  max-width: 62ch;
+}

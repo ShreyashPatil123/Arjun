@@ -1,0 +1,29 @@
+//! The organisation's own manuals, SOPs and past correspondence.
+//!
+//! PS 26117 asks the assistant to ground itself in the site's own documents
+//! "through a local knowledge base connector" — a connector, not a file
+//! uploader. A refinery's procedures live on a network share, not on somebody's
+//! desktop, and a product that can only read what was dragged into it will be
+//! kept permanently out of date by that friction alone.
+//!
+//! - [`chunking`]: cutting documents at the boundaries they actually have, so a
+//!   retrieved passage still knows which procedure it came from.
+//! - [`connector`]: reading a local folder or an internal share, read-only.
+//! - [`index`]: finding passages, and never returning one the asker may not see.
+//! - [`hybrid`]: combining keyword and vector search into one honest ranking.
+//! - [`ingest`]: the pipeline from a file on a share to a searchable passage.
+//! - [`evidence`]: handing passages to a model as data, never as instructions.
+
+pub mod chunking;
+pub mod connector;
+pub mod evidence;
+pub mod hybrid;
+pub mod index;
+pub mod ingest;
+
+pub use chunking::{chunk_document, Chunk, ChunkKind};
+pub use connector::{discover, plan_sync, Collection, SourceKind, SyncPlan};
+pub use hybrid::{reciprocal_rank_fusion, Embedder, Hybrid, HybridResults};
+pub use index::{KnowledgeIndex, Retrieval, SearchResult};
+pub use evidence::{present, EvidenceBlock, PresentedPassage};
+pub use ingest::{ingest_collection, DocumentReader, IngestOutcome};

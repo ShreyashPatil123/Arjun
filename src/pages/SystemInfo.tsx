@@ -26,6 +26,7 @@ import { Card, Button, Badge, Dialog, Input, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
 import * as systemService from '../services/system.service';
 import { HardwareProfile, CpuInfo, GpuInfo, MemoryInfo, StorageInfo, OsInfo, SoftwareEnvironment, AIRuntimeInfo, OverrideValue } from '../types/system';
+import { CapabilityReadout } from '../components/system/CapabilityReadout';
 import {
   formatBytes,
   formatFrequency,
@@ -214,6 +215,13 @@ export const SystemInfo: React.FC = () => {
   const validation = profile.validation || { isReadyForAi: false, score: 0, warnings: [], errors: [], recommendations: [] };
   const overrides = profile.overrides || {};
 
+  // A scan that found nothing leaves every field at zero. Rendering that as
+  // "0 Bytes" reads as broken hardware rather than as an absent scan, so the
+  // readout is told which of the two it is looking at.
+  const hardwareDetected = Boolean(
+    (memory.totalBytes || 0) > 0 || (cpu.logicalProcessors || 0) > 0 || gpus.length > 0,
+  );
+
   const memoryUsedPercentage = formatPercentage(memory.usedBytes || 0, memory.totalBytes || 1);
   const primaryGpu = gpus[0];
   const gpuVramUsedBytes = primaryGpu ? (primaryGpu.vramTotalBytes || 0) - (primaryGpu.vramFreeBytes || 0) : 0;
@@ -227,13 +235,10 @@ export const SystemInfo: React.FC = () => {
       <div className={styles.header}>
         <div className={styles.headerInfo}>
           <div className={styles.titleRow}>
-            <h1 className={styles.headerTitle}>System Analyzer</h1>
-            <Badge variant={validation.isReadyForAi ? 'success' : 'warning'} dot={false}>
-              Score: {validation.score || 0}/100 &bull; {validation.isReadyForAi ? 'AI Ready' : 'Optimization Required'}
-            </Badge>
+            <h1 className={styles.headerTitle}>This machine</h1>
           </div>
           <p className={styles.headerSubtitle}>
-            Hardware Architecture &bull; GPU Acceleration &bull; AI Runtime Compatibility Assessment
+            What ARJUN can run here, and the hardware it read to decide.
           </p>
         </div>
 
@@ -258,6 +263,10 @@ export const SystemInfo: React.FC = () => {
           </Button>
         </div>
       </div>
+
+      {/* The question ARJUN actually asks of a host, answered before the
+        * hardware inventory that produced the answer. */}
+      <CapabilityReadout capabilities={aiCapabilities} detected={hardwareDetected} />
 
       {/* Main Grid */}
       <div className={styles.grid}>

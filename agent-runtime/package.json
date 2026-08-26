@@ -1,0 +1,32 @@
+{
+  "name": "@arjun/agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sovereign agent runtime for ARJUN. Vendors OpenClaw's agent loop and OpenAI-compatible provider transport; speaks JSON-RPC over stdio to the Rust core and never opens a listening socket.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "vendor/openclaw/packages/agent-core",
+    "vendor/openclaw/packages/ai",
+    "vendor/openclaw/packages/llm-core",
+    "vendor/openclaw/packages/markdown-core",
+    "vendor/openclaw/packages/media-core",
+    "vendor/openclaw/packages/model-catalog-core",
+    "vendor/openclaw/packages/net-policy",
+    "vendor/openclaw/packages/normalization-core",
+    "vendor/openclaw/packages/retry",
+    "vendor/openclaw/packages/tool-call-repair"
+  ],
+  "scripts": {
+    "audit": "node scripts/audit-vendor.mjs",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "~5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

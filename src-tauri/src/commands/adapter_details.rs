@@ -129,12 +129,13 @@ pub(crate) fn suggested_skills(name: &str) -> Vec<ModelCategory> {
 pub async fn get_adapter_details(repo_id: String) -> Result<AdapterDetails, String> {
     let token = crate::config::hf_token::get();
 
-    let client = reqwest::Client::builder()
-        .user_agent("Sarathi/0.1.0")
-        .build()
-        .map_err(|e| format!("could not create an HTTP client: {e}"))?;
-
-    let mut req = client.get(format!("https://huggingface.co/api/models/{repo_id}?blobs=true"));
+    // Through the broker, which owns the only outbound client in the process
+    // and refuses everything in Work mode.
+    let mut req = crate::sovereignty::global_broker()
+        .authorized_get(&format!(
+            "https://huggingface.co/api/models/{repo_id}?blobs=true"
+        ))
+        .map_err(|e| e.to_string())?;
     if let Some(t) = &token {
         req = req.bearer_auth(t);
     }

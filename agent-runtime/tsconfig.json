@@ -1,0 +1,10 @@
+{
+  "extends": "./vendor/openclaw/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "./vendor/openclaw",
+    "noEmit": true,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*", "vendor/openclaw/packages/*/src/**/*", "vendor/openclaw/test/**/*"],
+  "exclude": ["**/node_modules/**", "**/dist/**"]
+}

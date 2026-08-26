@@ -1,6 +1,6 @@
 import React from 'react';
 import { Outlet } from 'react-router-dom';
-import { TopBar } from './TopBar';
+import { AppMenu } from './AppMenu';
 import { StatusBar } from './StatusBar';
 import { ErrorBoundary } from '../ui';
 import styles from './AppShell.module.css';
@@ -8,7 +8,9 @@ import styles from './AppShell.module.css';
 export const AppShell = () => {
   return (
     <div className={styles.shell}>
-      <TopBar />
+      <header className={styles.header}>
+        <AppMenu />
+      </header>
       <main className={styles.main}>
         <ErrorBoundary>
           <Outlet />

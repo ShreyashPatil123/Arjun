@@ -1,11 +1,11 @@
 {
-  "name": "sarathi",
+  "name": "arjun",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run check:egress && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "dev:auto": "node scripts/select-backend.mjs dev",
@@ -13,7 +13,19 @@
     "tauri:dev:gpu": "tauri dev --features cuda",
     "tauri:build:gpu": "tauri build --features cuda",
     "tauri:dev:vulkan": "tauri dev --features vulkan",
-    "tauri:build:vulkan": "tauri build --features vulkan"
+    "tauri:build:vulkan": "tauri build --features vulkan",
+    "check:egress": "node scripts/check-egress.mjs",
+    "check:offline": "node scripts/check-offline-build.mjs",
+    "verify": "npm run check:egress && npm run check:offline && npm run runtime:audit && npm run runtime:typecheck && npm run test:runtime && npm run test:rust && npm run test:baseline && npm run test:sidecar",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "test:sidecar": "python -m unittest discover -s sidecars/document_sidecar/tests",
+    "accept": "node scripts/acceptance.mjs",
+    "test:baseline": "cargo test --manifest-path src-tauri/Cargo.toml --test baseline",
+    "rehearse": "node scripts/rehearse-no-wsl.mjs",
+    "runtime:install": "npm --prefix agent-runtime ci --offline",
+    "runtime:audit": "npm --prefix agent-runtime run audit",
+    "runtime:typecheck": "npm --prefix agent-runtime run typecheck",
+    "test:runtime": "npm --prefix agent-runtime test"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

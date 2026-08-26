@@ -1,0 +1,412 @@
+//! The calculation workbook — working a reviewer can check without redoing it.
+//!
+//! PS step 27 asks that numerical work be done by a deterministic engine and
+//! shown step by step: *"inputs, units, formula, assumptions, intermediate
+//! values, result, rounding rule"*. [`orchestrator::calculation`] already
+//! produces exactly that record. This module writes it into a spreadsheet,
+//! which is where a process engineer actually checks arithmetic.
+//!
+//! ## Excel is asked to disagree
+//!
+//! Where the expression is plain arithmetic, the result cell is written as a
+//! **live formula**, not the number ARJUN computed. Excel recalculates it on
+//! open. If the two ever disagreed, the workbook would show it — which makes
+//! the file a check on ARJUN rather than a restatement of it.
+//!
+//! Where the expression carries units (`120 bar * 0.5 m^2`) no honest
+//! translation to an Excel formula exists, so the value is written as a number
+//! and the cell beside it says why. A workbook that silently degraded from
+//! "Excel confirms this" to "ARJUN asserts this" would be worse than one that
+//! never claimed the first thing.
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use super::ooxml::{escape, read_part, write_parts};
+use crate::orchestrator::calculation::CalculationRecord;
+
+/// A cell's content, which decides how it is written into the sheet.
+enum Cell {
+    Text(String),
+    Number(f64),
+    /// A live formula. `cached` is what ARJUN computed, so the file reads
+    /// correctly in viewers that do not recalculate.
+    Formula { formula: String, cached: f64 },
+    Empty,
+}
+
+fn column_letter(index: usize) -> String {
+    // A..Z then AA.. — the workbook never needs more than a handful, but
+    // getting this wrong produces a file Excel refuses rather than a wide one.
+    let mut n = index;
+    let mut letters = Vec::new();
+    loop {
+        letters.push((b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    letters.iter().rev().collect()
+}
+
+fn cell_xml(row: usize, column: usize, cell: &Cell) -> String {
+    let reference = format!("{}{}", column_letter(column), row);
+    match cell {
+        Cell::Empty => String::new(),
+        Cell::Text(text) => format!(
+            "<c r=\"{reference}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
+            escape(text)
+        ),
+        Cell::Number(value) => format!("<c r=\"{reference}\"><v>{value}</v></c>"),
+        Cell::Formula { formula, cached } => format!(
+            "<c r=\"{reference}\"><f>{}</f><v>{cached}</v></c>",
+            escape(formula)
+        ),
+    }
+}
+
+/// Whether an expression can be handed to Excel unchanged.
+///
+/// Deliberately conservative. Anything carrying a unit, a name or a function
+/// call is refused, because a translation that was *nearly* right would produce
+/// a workbook that quietly disagrees with the record it is supposed to show.
+fn is_plain_arithmetic(expression: &str) -> bool {
+    !expression.trim().is_empty()
+        && expression
+            .chars()
+            .all(|c| c.is_ascii_digit() || " .+-*/()^".contains(c))
+}
+
+fn sheet_xml(rows: &[Vec<Cell>]) -> String {
+    let mut body = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        let number = index + 1;
+        let cells: String = row
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| cell_xml(number, column, cell))
+            .collect();
+        body.push_str(&format!("<row r=\"{number}\">{cells}</row>"));
+    }
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<cols><col min="1" max="1" width="34" customWidth="1"/><col min="2" max="2" width="22" customWidth="1"/><col min="3" max="3" width="46" customWidth="1"/></cols>
+<sheetData>{body}</sheetData></worksheet>"#
+    )
+}
+
+const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#;
+
+const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
+// `fullCalcOnLoad` is the point of the whole design: Excel recomputes every
+// formula when the file opens rather than trusting the cached values ARJUN
+// wrote, so a disagreement would be visible immediately.
+const WORKBOOK: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Calculation" sheetId="1" r:id="rId1"/></sheets>
+<calcPr calcId="0" fullCalcOnLoad="1"/>
+</workbook>"#;
+
+const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+
+/// What a produced workbook turned out to contain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookCheck {
+    pub opens: bool,
+    /// Calculations found in the sheet.
+    pub calculations: usize,
+    /// How many of those Excel will recompute rather than take on trust.
+    pub live_formulas: usize,
+    pub problems: Vec<String>,
+}
+
+impl WorkbookCheck {
+    pub fn is_sound(&self) -> bool {
+        self.opens && self.problems.is_empty()
+    }
+}
+
+fn rows_for(records: &[CalculationRecord], classification: &str) -> Vec<Vec<Cell>> {
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+
+    rows.push(vec![Cell::Text("Calculation record".into())]);
+    rows.push(vec![Cell::Text(format!("Classification: {classification}"))]);
+    rows.push(vec![Cell::Text(
+        "Computed by ARJUN's calculation engine. Formula cells recompute in Excel.".into(),
+    )]);
+    rows.push(Vec::new());
+
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            rows.push(Vec::new());
+        }
+
+        rows.push(vec![Cell::Text(format!("Calculation {}", index + 1))]);
+        rows.push(vec![
+            Cell::Text("Expression".into()),
+            Cell::Empty,
+            Cell::Text(record.expression.clone()),
+        ]);
+
+        for input in &record.inputs {
+            rows.push(vec![
+                Cell::Text("Input".into()),
+                Cell::Empty,
+                Cell::Text(input.clone()),
+            ]);
+        }
+
+        for (step_index, step) in record.steps.iter().enumerate() {
+            rows.push(vec![
+                Cell::Text(format!("Step {}", step_index + 1)),
+                Cell::Text(step.result.clone()),
+                Cell::Text(step.description.clone()),
+            ]);
+        }
+
+        let (result_cell, note) = if is_plain_arithmetic(&record.expression) {
+            (
+                Cell::Formula {
+                    formula: record.expression.trim().to_string(),
+                    cached: record.value,
+                },
+                "Excel recomputes this cell on open. It should equal the result below.".to_string(),
+            )
+        } else {
+            (
+                Cell::Number(record.value),
+                format!(
+                    "Written as a value, not a formula: the expression carries units, which Excel \
+                     has no way to evaluate. Computed by ARJUN{}.",
+                    if record.deterministic { " deterministically" } else { "" }
+                ),
+            )
+        };
+
+        rows.push(vec![Cell::Text("Recomputed".into()), result_cell, Cell::Text(note)]);
+        rows.push(vec![
+            Cell::Text("Result".into()),
+            Cell::Text(record.formatted.clone()),
+            Cell::Text(if record.unit.is_empty() {
+                "dimensionless".to_string()
+            } else {
+                format!("unit: {}", record.unit)
+            }),
+        ]);
+        rows.push(vec![
+            Cell::Text("Rounding".into()),
+            Cell::Empty,
+            Cell::Text(record.rounding.clone()),
+        ]);
+    }
+
+    rows
+}
+
+/// Writes the calculation workbook.
+pub fn write_workbook(
+    path: &Path,
+    records: &[CalculationRecord],
+    classification: &str,
+) -> Result<(), String> {
+    if records.is_empty() {
+        // An empty workbook would look like a calculation that produced nothing
+        // rather than one that was never run.
+        return Err("There are no calculations to write. Nothing was written.".to_string());
+    }
+
+    let parts = [
+        ("[Content_Types].xml", CONTENT_TYPES.to_string()),
+        ("_rels/.rels", ROOT_RELS.to_string()),
+        ("xl/workbook.xml", WORKBOOK.to_string()),
+        ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.to_string()),
+        ("xl/worksheets/sheet1.xml", sheet_xml(&rows_for(records, classification))),
+    ];
+
+    write_parts(path, &parts).map_err(|e| format!("The workbook could not be written: {e}"))
+}
+
+/// Re-opens a produced workbook and reports what is in it.
+pub fn check_workbook(path: &Path) -> WorkbookCheck {
+    let sheet = match read_part(path, "xl/worksheets/sheet1.xml") {
+        Ok(sheet) => sheet,
+        Err(error) => {
+            return WorkbookCheck {
+                opens: false,
+                calculations: 0,
+                live_formulas: 0,
+                problems: vec![format!("{}: {error}", path.display())],
+            }
+        }
+    };
+
+    let mut problems = Vec::new();
+    for required in ["xl/workbook.xml", "xl/_rels/workbook.xml.rels", "[Content_Types].xml"] {
+        if read_part(path, required).is_err() {
+            problems.push(format!("the workbook is missing {required}"));
+        }
+    }
+
+    // "Calculation 1", not the "Calculation record" title — counting the title
+    // as a calculation would report an empty workbook as holding one.
+    let calculations = sheet
+        .split("Calculation ")
+        .skip(1)
+        .filter(|fragment| fragment.starts_with(|c: char| c.is_ascii_digit()))
+        .count();
+    let live_formulas = sheet.matches("<f>").count();
+
+    if calculations == 0 {
+        problems.push("the workbook contains no calculations".to_string());
+    }
+    if !sheet.contains("Rounding") {
+        problems.push("the workbook does not state its rounding rule".to_string());
+    }
+
+    WorkbookCheck { opens: true, calculations, live_formulas, problems }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::calculation::evaluate;
+
+    fn temp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn column_letters_run_past_z() {
+        assert_eq!(column_letter(0), "A");
+        assert_eq!(column_letter(25), "Z");
+        assert_eq!(column_letter(26), "AA");
+        assert_eq!(column_letter(27), "AB");
+    }
+
+    #[test]
+    fn a_workbook_is_written_and_reopens_soundly() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("(9.0 - 8.2) / 9.0 * 100").unwrap();
+
+        write_workbook(&path, std::slice::from_ref(&record), "Inspection report").unwrap();
+
+        let check = check_workbook(&path);
+        assert!(check.is_sound(), "{:?}", check.problems);
+        assert_eq!(check.calculations, 1);
+    }
+
+    /// The point of the workbook: Excel recomputes and can disagree.
+    #[test]
+    fn plain_arithmetic_is_written_as_a_formula_excel_will_recompute() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("120 * 0.85").unwrap();
+
+        write_workbook(&path, std::slice::from_ref(&record), "Test").unwrap();
+
+        let check = check_workbook(&path);
+        assert_eq!(check.live_formulas, 1);
+
+        let sheet = read_part(&path, "xl/worksheets/sheet1.xml").unwrap();
+        assert!(sheet.contains("<f>120 * 0.85</f>"));
+        assert!(sheet.contains("fullCalcOnLoad") || {
+            read_part(&path, "xl/workbook.xml").unwrap().contains("fullCalcOnLoad")
+        });
+    }
+
+    /// A workbook that silently degraded from "Excel confirms this" to "ARJUN
+    /// asserts this" would be worse than one that never claimed the first.
+    #[test]
+    fn an_expression_with_units_is_a_value_and_says_why() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("120 bar * 0.5").unwrap();
+
+        write_workbook(&path, std::slice::from_ref(&record), "Test").unwrap();
+
+        let sheet = read_part(&path, "xl/worksheets/sheet1.xml").unwrap();
+        assert_eq!(check_workbook(&path).live_formulas, 0);
+        assert!(sheet.contains("carries units"));
+    }
+
+    #[test]
+    fn arithmetic_detection_refuses_anything_it_cannot_hand_to_excel() {
+        assert!(is_plain_arithmetic("1 + 2 * (3 - 4)"));
+        assert!(is_plain_arithmetic("2^10"));
+        assert!(!is_plain_arithmetic("120 bar"));
+        assert!(!is_plain_arithmetic("sqrt(4)"));
+        assert!(!is_plain_arithmetic(""));
+    }
+
+    #[test]
+    fn every_calculation_carries_its_rounding_rule() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("10 / 3").unwrap();
+
+        write_workbook(&path, std::slice::from_ref(&record), "Test").unwrap();
+        let sheet = read_part(&path, "xl/worksheets/sheet1.xml").unwrap();
+        assert!(sheet.contains(&escape(&record.rounding)));
+    }
+
+    #[test]
+    fn several_calculations_share_one_sheet() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let records = vec![evaluate("1 + 1").unwrap(), evaluate("2 * 3").unwrap()];
+
+        write_workbook(&path, &records, "Test").unwrap();
+        assert_eq!(check_workbook(&path).calculations, 2);
+    }
+
+    /// An empty workbook reads as a calculation that produced nothing.
+    #[test]
+    fn no_calculations_refuses_rather_than_writing_an_empty_workbook() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+
+        let error = write_workbook(&path, &[], "Test").unwrap_err();
+        assert!(error.contains("no calculations"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn model_content_containing_xml_still_produces_a_readable_workbook() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("1 + 1").unwrap();
+
+        write_workbook(&path, std::slice::from_ref(&record), "<classified> & \"secret\"").unwrap();
+        assert!(check_workbook(&path).is_sound());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_workbook_is_reported_rather_than_panicking() {
+        let dir = temp();
+        let path = dir.path().join("broken.xlsx");
+        std::fs::write(&path, "not a zip").unwrap();
+
+        let check = check_workbook(&path);
+        assert!(!check.opens);
+        assert!(!check.is_sound());
+    }
+}
