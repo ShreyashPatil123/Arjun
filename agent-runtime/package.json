@@ -22,10 +22,12 @@
   "scripts": {
     "audit": "node scripts/audit-vendor.mjs",
     "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "node scripts/build.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
+    "esbuild": "^0.28.2",
     "typescript": "~5.8.3",
     "vitest": "^3.2.4"
   }
