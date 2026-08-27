@@ -251,9 +251,34 @@ pub struct MemoryItem {
     pub classification: Classification,
     pub acl: Acl,
     pub source: MemorySource,
+    /// The decision that permitted this entry to exist here, when one was
+    /// needed. Stored so a reviewer can check the approval against the item
+    /// rather than against a log entry that may have been written separately.
+    #[serde(default)]
+    pub approval: Option<ApprovalBinding>,
+    /// When this stops being recalled. `None` never expires.
+    #[serde(default)]
+    pub expires_at: Option<String>,
     /// RFC 3339, UTC.
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl MemoryItem {
+    /// Whether this item has passed its expiry at the given instant.
+    ///
+    /// An unparseable expiry counts as expired. The alternative — treating a
+    /// timestamp nobody can read as "never expires" — turns a corrupted field
+    /// into an item that outlives its retention silently.
+    pub fn is_expired_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match &self.expires_at {
+            None => false,
+            Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(at) => at <= now,
+                Err(_) => true,
+            },
+        }
+    }
 }
 
 /// Why a write was refused.
@@ -279,6 +304,14 @@ pub enum MemoryError {
          explicitly approves it."
     )]
     SensitivePreference { key: String },
+
+    #[error(
+        "the approval {approval_id} does not cover this entry: {field} is not what was approved.          A new approval is needed."
+    )]
+    ApprovalDoesNotCover { field: String, approval_id: String },
+
+    #[error("{key:?} is not held in this scope, or you are not cleared to see it.")]
+    NotFound { key: String },
 
     #[error("the memory for this scope could not be read or written: {detail}")]
     Storage { detail: String },
@@ -318,25 +351,147 @@ fn is_sensitive_preference(key: &str) -> bool {
         .any(|sensitive| normalised.contains(sensitive))
 }
 
-/// A person's explicit go-ahead for one specific entry.
+/// The version of the promotion rules an approval was granted under.
 ///
-/// A struct rather than a `bool` so a caller cannot pass `true` without saying
-/// who, and so the approver ends up in the stored record where a reviewer can
-/// see whose decision it was.
+/// Stored on every binding. An approval taken under one set of rules is not
+/// evidence of consent under a different set: if the rules below change, the
+/// version changes with them, and every stored approval becomes re-checkable
+/// rather than silently inherited.
+pub const POLICY_VERSION: u32 = 1;
+
+/// A person's explicit go-ahead, bound to exactly what they approved.
+///
+/// ## Why a boolean is not enough
+///
+/// The obvious shape is `approved: bool`, or an approver's name. Both fail the
+/// same way and the failure is silent: a person approves promoting *one* term
+/// with *one* value from *one* document, the flag is stored, and then the value
+/// changes — a later run rewrites it, a different source is substituted, the
+/// target project is changed — and the flag still reads `true`. The record says
+/// somebody approved this, and nobody approved this.
+///
+/// So the binding carries a hash of every input the decision was about. Before
+/// the item is stored, [`Self::verify`] recomputes those hashes from the request
+/// actually being made and refuses on any mismatch. An approval is thereby good
+/// for one key, one value, one source, one classification and one destination —
+/// and for nothing else.
+///
+/// The hashes are of the content, not the content itself: a reviewer can see
+/// *that* the approved value is the stored value without the record carrying a
+/// second copy of restricted text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Approval {
-    pub approved_by: String,
+pub struct ApprovalBinding {
+    /// Identifies this decision in the approval queue and the audit log.
+    pub approval_id: String,
+    pub approver: String,
     /// RFC 3339, UTC.
     pub at: String,
+    pub key_hash: String,
+    pub value_hash: String,
+    /// Hash of the source the value came from — the document digest for a
+    /// document, the run or operator id otherwise.
+    pub source_hash: String,
+    /// What the source was classified as when the decision was taken.
+    pub source_classification: Classification,
+    /// The scope this was approved *into*, as [`scope_key`] spells it.
+    pub target_scope: String,
+    pub target_project: Option<String>,
+    pub policy_version: u32,
 }
 
-impl Approval {
-    pub fn by(user_id: impl Into<String>) -> Self {
-        Self {
-            approved_by: user_id.into(),
-            at: chrono::Utc::now().to_rfc3339(),
+/// What a source hashes to, for binding purposes.
+pub fn source_fingerprint(source: &MemorySource) -> String {
+    match source {
+        MemorySource::Operator { user_id } => crate::agent_runtime::events::digest(&format!(
+            "operator:{user_id}"
+        )),
+        MemorySource::Run { run_id } => {
+            crate::agent_runtime::events::digest(&format!("run:{run_id}"))
         }
+        // The document digest and the page, because approving a figure on page
+        // 12 is not approving the same figure quoted from page 40 of something
+        // else.
+        MemorySource::Document {
+            document_sha256,
+            page,
+            classification,
+        } => crate::agent_runtime::events::digest(&format!(
+            "document:{document_sha256}:{page}:{}",
+            classification.label()
+        )),
+    }
+}
+
+impl ApprovalBinding {
+    /// Builds a binding over exactly what is being asked for.
+    ///
+    /// Constructed on the Rust side from the approval record and the request,
+    /// never from anything a model supplied — which is what makes the hashes
+    /// mean something. A model that could choose them could choose them to
+    /// match.
+    pub fn bind(
+        approval_id: impl Into<String>,
+        approver: impl Into<String>,
+        request: &Remember,
+    ) -> Self {
+        Self {
+            approval_id: approval_id.into(),
+            approver: approver.into(),
+            at: chrono::Utc::now().to_rfc3339(),
+            key_hash: crate::agent_runtime::events::digest(&request.key),
+            value_hash: crate::agent_runtime::events::digest(&request.value),
+            source_hash: source_fingerprint(&request.source),
+            source_classification: request
+                .source
+                .source_classification()
+                .unwrap_or(request.classification),
+            target_scope: scope_key(&request.scope),
+            target_project: request.scope.project().map(str::to_string),
+            policy_version: POLICY_VERSION,
+        }
+    }
+
+    /// Whether this binding actually authorises the request being made.
+    ///
+    /// Every field is checked. Returning the *first* mismatch by name matters:
+    /// a refusal that says only "not approved" sends somebody to re-approve the
+    /// same thing, whereas one that says the value changed sends them to look
+    /// at what changed it.
+    pub fn verify(&self, request: &Remember) -> Result<(), MemoryError> {
+        let mismatch = |field: &str| {
+            Err(MemoryError::ApprovalDoesNotCover {
+                field: field.to_string(),
+                approval_id: self.approval_id.clone(),
+            })
+        };
+
+        if self.policy_version != POLICY_VERSION {
+            return mismatch("the policy version it was granted under");
+        }
+        if self.key_hash != crate::agent_runtime::events::digest(&request.key) {
+            return mismatch("the key");
+        }
+        if self.value_hash != crate::agent_runtime::events::digest(&request.value) {
+            return mismatch("the value");
+        }
+        if self.source_hash != source_fingerprint(&request.source) {
+            return mismatch("the source it came from");
+        }
+        let classification = request
+            .source
+            .source_classification()
+            .unwrap_or(request.classification);
+        if self.source_classification != classification {
+            return mismatch("the classification of the source");
+        }
+        if self.target_scope != scope_key(&request.scope) {
+            return mismatch("the scope it was approved into");
+        }
+        if self.target_project.as_deref() != request.scope.project() {
+            return mismatch("the project it was approved for");
+        }
+        Ok(())
     }
 }
 
@@ -349,8 +504,12 @@ pub struct Remember {
     pub value: String,
     pub classification: Classification,
     pub source: MemorySource,
-    /// Present only when a person approved this specific entry.
-    pub approval: Option<Approval>,
+    /// Present only when a person approved this exact entry. See
+    /// [`ApprovalBinding`] — a binding that does not verify against this
+    /// request is refused, not honoured.
+    pub approval: Option<ApprovalBinding>,
+    /// When this stops being recalled, RFC 3339 UTC. `None` never expires.
+    pub expires_at: Option<String>,
 }
 
 /// The store.
@@ -430,6 +589,14 @@ impl MemoryStore {
             });
         }
 
+        // An approval only counts for what it was actually given for. Checked
+        // *after* the rules above so a binding cannot be used to skip a check it
+        // was never examined against, and before anything is written so a
+        // refusal leaves no trace of the value it refused.
+        if let Some(binding) = &request.approval {
+            binding.verify(&request)?;
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
         let mut acl = Acl::for_classification(request.classification, request.scope.project());
         if let MemoryScope::User { user_id } = &request.scope {
@@ -447,10 +614,18 @@ impl MemoryStore {
             classification: request.classification,
             acl,
             source: request.source,
+            approval: request.approval.clone(),
+            expires_at: request.expires_at.clone(),
             created_at: now.clone(),
             updated_at: now,
         };
 
+        // The previous value of this key, kept so a failed write can be undone.
+        // Without it a store whose disk write failed would keep serving the new
+        // value from memory while the file on disk says something else - and the
+        // next start would silently revert, which is the shape of defect that
+        // gets diagnosed as "the setting does not save sometimes".
+        let previous: Option<MemoryItem>;
         {
             let mut table = self.lock()?;
             let bucket = table.entry(request.scope.clone()).or_default();
@@ -458,20 +633,113 @@ impl MemoryStore {
                 // Updated in place rather than appended, so a key means one
                 // value and recall does not have to decide between two.
                 Some(existing) => {
-                    existing.value = item.value.clone();
-                    existing.classification = item.classification;
-                    existing.acl = item.acl.clone();
-                    existing.source = item.source.clone();
-                    existing.updated_at = item.updated_at.clone();
+                    previous = Some(existing.clone());
+                    *existing = item.clone();
                 }
-                None => bucket.push(item.clone()),
+                None => {
+                    previous = None;
+                    bucket.push(item.clone());
+                }
             }
         }
 
         if request.scope.is_durable() {
-            self.persist(&request.scope)?;
+            if let Err(error) = self.persist(&request.scope) {
+                // Rolled back before the error is returned, so a caller that
+                // catches it and carries on is not carrying on with a value this
+                // store has already disowned.
+                self.rollback(&request.scope, &item.key, previous);
+                return Err(error);
+            }
         }
         Ok(item)
+    }
+
+    /// Puts one key back the way it was after a failed durable write.
+    ///
+    /// Best-effort by necessity: the lock was reachable a moment ago because the
+    /// mutation went through it, and if it is not now there is nothing further
+    /// this can do. It never invents an entry - an absent `previous` removes the
+    /// key rather than leaving a default in its place.
+    fn rollback(&self, scope: &MemoryScope, key: &str, previous: Option<MemoryItem>) {
+        let Ok(mut table) = self.items.lock() else {
+            return;
+        };
+        let Some(bucket) = table.get_mut(scope) else {
+            return;
+        };
+        bucket.retain(|held| held.key != key);
+        if let Some(restored) = previous {
+            bucket.push(restored);
+        }
+    }
+
+    /// Removes one item, if this reader is entitled to see it.
+    ///
+    /// Entitlement is checked first and deliberately: somebody who may not read
+    /// a key may not delete it either, and a delete that succeeded on an item
+    /// the caller could not see would be a way to probe for its existence.
+    pub fn forget(
+        &self,
+        scope: &MemoryScope,
+        key: &str,
+        session: &Session,
+        project_id: Option<&str>,
+    ) -> Result<MemoryItem, MemoryError> {
+        let held = self
+            .recall_one(scope, key, session, project_id)
+            .ok_or_else(|| MemoryError::NotFound {
+                key: key.to_string(),
+            })?;
+
+        {
+            let mut table = self.lock()?;
+            if let Some(bucket) = table.get_mut(scope) {
+                bucket.retain(|item| item.key != key);
+            }
+        }
+
+        if scope.is_durable() {
+            if let Err(error) = self.persist(scope) {
+                // Put back. A delete that did not reach disk has not happened,
+                // and reporting it as done would lose the item on the next start
+                // for a reason nobody could reconstruct.
+                self.rollback(scope, key, Some(held.clone()));
+                return Err(error);
+            }
+        }
+        Ok(held)
+    }
+
+    /// Drops everything past its expiry in one scope. Returns the keys that went.
+    pub fn expire(&self, scope: &MemoryScope) -> Result<Vec<String>, MemoryError> {
+        self.load_if_needed(scope);
+        let now = chrono::Utc::now();
+        let dropped: Vec<String>;
+        let before: Vec<MemoryItem>;
+        {
+            let mut table = self.lock()?;
+            let bucket = table.entry(scope.clone()).or_default();
+            before = bucket.clone();
+            dropped = bucket
+                .iter()
+                .filter(|item| item.is_expired_at(now))
+                .map(|item| item.key.clone())
+                .collect();
+            bucket.retain(|item| !item.is_expired_at(now));
+        }
+        if dropped.is_empty() {
+            return Ok(dropped);
+        }
+        if scope.is_durable() {
+            if let Err(error) = self.persist(scope) {
+                if let Ok(mut table) = self.items.lock() {
+                    table.insert(scope.clone(), before);
+                }
+                return Err(error);
+            }
+        }
+        Ok(dropped)
     }
 
     /// Everything in one scope this reader may see.
@@ -495,8 +763,13 @@ impl MemoryStore {
         table
             .get(scope)
             .map(|items| {
+                let now = chrono::Utc::now();
                 items
                     .iter()
+                    // Expiry is applied on the way out rather than by a sweep,
+                    // so an item past its retention is never returned even if
+                    // nothing has swept since it lapsed.
+                    .filter(|item| !item.is_expired_at(now))
                     .filter(|item| item.acl.admits(session, project_id))
                     .cloned()
                     .collect()
@@ -703,6 +976,7 @@ mod tests {
                 user_id: "kiran".to_string(),
             },
             approval: None,
+            expires_at: None,
         }
     }
 
@@ -766,6 +1040,7 @@ mod tests {
                     run_id: "run-1".to_string(),
                 },
                 approval: None,
+                expires_at: None,
             })
             .expect("stored");
 
@@ -795,6 +1070,7 @@ mod tests {
                     classification: Classification::VendorNegotiation,
                 },
                 approval: None,
+                expires_at: None,
             })
             .expect_err("must be refused");
 
@@ -806,25 +1082,38 @@ mod tests {
             .is_empty());
     }
 
+    /// The promotion a person is asked to approve, as the tests use it.
+    fn restricted_promotion() -> Remember {
+        Remember {
+            scope: workspace("project-a"),
+            kind: MemoryKind::ProjectFact,
+            key: "unit-price".to_string(),
+            value: "The tendered unit price is ₹4.2 crore.".to_string(),
+            classification: Classification::VendorNegotiation,
+            source: MemorySource::Document {
+                document_sha256: "tender-2026".to_string(),
+                page: 12,
+                classification: Classification::VendorNegotiation,
+            },
+            approval: None,
+            expires_at: None,
+        }
+    }
+
+    /// The same promotion, carrying a binding a person granted for it.
+    fn approved_promotion() -> Remember {
+        let mut request = restricted_promotion();
+        request.approval = Some(ApprovalBinding::bind("apr-1", "asha", &request));
+        request
+    }
+
     #[test]
     fn the_same_promotion_is_allowed_once_a_person_approves_it() {
         // The rule is "not automatically", not "never". A refusal with no way
         // through would make people work around the mechanism entirely.
         let store = MemoryStore::in_memory();
         let stored = store
-            .remember(Remember {
-                scope: workspace("project-a"),
-                kind: MemoryKind::ProjectFact,
-                key: "unit-price".to_string(),
-                value: "The tendered unit price is ₹4.2 crore.".to_string(),
-                classification: Classification::VendorNegotiation,
-                source: MemorySource::Document {
-                    document_sha256: "tender-2026".to_string(),
-                    page: 12,
-                    classification: Classification::VendorNegotiation,
-                },
-                approval: Some(Approval::by("asha")),
-            })
+            .remember(approved_promotion())
             .expect("approved promotion is stored");
 
         // Approval permits the entry; it does not widen who may read it.
@@ -833,6 +1122,233 @@ mod tests {
             .acl
             .cleared_roles
             .contains(&Role::KnowledgeAdministrator));
+        // And the decision is on the item, not only in a log beside it.
+        let binding = stored.approval.expect("the binding is stored");
+        assert_eq!(binding.approver, "asha");
+        assert_eq!(binding.approval_id, "apr-1");
+        assert_eq!(binding.policy_version, POLICY_VERSION);
+    }
+
+    #[test]
+    fn an_approval_does_not_cover_a_value_that_changed_after_it_was_granted() {
+        // The failure a boolean cannot catch. A person approves one figure;
+        // something rewrites the value; the flag still reads "approved". Every
+        // field below is one that, if it drifted, would mean the stored item is
+        // not the item anybody agreed to.
+        let store = MemoryStore::in_memory();
+        let granted = approved_promotion();
+        let binding = granted.approval.clone().expect("bound");
+
+        let mut altered_value = granted.clone();
+        altered_value.value = "The tendered unit price is ₹9.9 crore.".to_string();
+
+        let mut altered_key = granted.clone();
+        altered_key.key = "headline-price".to_string();
+
+        let mut altered_source = granted.clone();
+        altered_source.source = MemorySource::Document {
+            document_sha256: "some-other-tender".to_string(),
+            page: 12,
+            classification: Classification::VendorNegotiation,
+        };
+
+        let mut altered_classification = granted.clone();
+        altered_classification.source = MemorySource::Document {
+            document_sha256: "tender-2026".to_string(),
+            page: 12,
+            // Downgraded, which is exactly how a restricted value would be
+            // smuggled past the promotion rule.
+            classification: Classification::Internal,
+        };
+
+        let mut altered_target = granted.clone();
+        altered_target.scope = workspace("project-b");
+
+        let mut stale_policy = granted.clone();
+        let mut stale = binding.clone();
+        stale.policy_version = POLICY_VERSION + 1;
+        stale_policy.approval = Some(stale);
+
+        for (what, request) in [
+            ("value", altered_value),
+            ("key", altered_key),
+            ("source", altered_source),
+            ("classification", altered_classification),
+            ("target", altered_target),
+            ("policy version", stale_policy),
+        ] {
+            let refusal = store
+                .remember(request)
+                .expect_err("a changed {what} must invalidate the approval");
+            assert!(
+                matches!(refusal, MemoryError::ApprovalDoesNotCover { .. }),
+                "changing the {what} was not caught: {refusal}"
+            );
+        }
+
+        // And nothing was written on the way to any of those refusals.
+        let reader = session("kiran", vec![Role::User]);
+        assert!(store
+            .recall(&workspace("project-a"), &reader, Some("project-a"))
+            .is_empty());
+    }
+
+    #[test]
+    fn an_approval_binding_survives_a_restart_intact() {
+        // A binding that is not durable is a binding that stops being checkable
+        // the moment the process ends — and the next start would either trust an
+        // unverified item or refuse one a person really did approve.
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let store = MemoryStore::open(dir.path());
+            store.remember(approved_promotion()).expect("stored");
+        }
+
+        let reopened = MemoryStore::open(dir.path());
+        let reader = session("kiran", vec![Role::User]);
+        let recalled = reopened
+            .recall_one(&workspace("project-a"), "unit-price", &reader, Some("project-a"))
+            .expect("the promoted item survives");
+        let binding = recalled.approval.expect("its binding survives too");
+
+        assert_eq!(binding.approval_id, "apr-1");
+        assert_eq!(binding.approver, "asha");
+        assert_eq!(binding.source_classification, Classification::VendorNegotiation);
+        assert_eq!(binding.target_project.as_deref(), Some("project-a"));
+        // Still verifies against the request it was granted for.
+        assert!(binding.verify(&approved_promotion()).is_ok());
+    }
+
+    #[test]
+    fn an_expired_item_stops_being_recalled_even_before_it_is_swept() {
+        let store = MemoryStore::in_memory();
+        let mut lapsed = term("project-a", "old-term", "…");
+        lapsed.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        store.remember(lapsed).expect("stored");
+
+        let reader = session("kiran", vec![Role::User]);
+        assert!(store
+            .recall(&workspace("project-a"), &reader, Some("project-a"))
+            .is_empty());
+    }
+
+    #[test]
+    fn an_expiry_nobody_can_parse_is_treated_as_expired() {
+        // The safe reading. Treating an unreadable timestamp as "never expires"
+        // turns one corrupted field into an item that outlives its retention
+        // with nothing to show that it did.
+        let store = MemoryStore::in_memory();
+        let mut broken = term("project-a", "odd", "…");
+        broken.expires_at = Some("whenever".to_string());
+        store.remember(broken).expect("stored");
+
+        let reader = session("kiran", vec![Role::User]);
+        assert!(store
+            .recall(&workspace("project-a"), &reader, Some("project-a"))
+            .is_empty());
+    }
+
+    #[test]
+    fn sweeping_expired_items_removes_them_durably() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let scope = workspace("project-a");
+        {
+            let store = MemoryStore::open(dir.path());
+            let mut lapsed = term("project-a", "old-term", "…");
+            lapsed.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+            store.remember(lapsed).expect("stored");
+            store.remember(term("project-a", "kept", "…")).expect("stored");
+            assert_eq!(store.expire(&scope).expect("swept"), vec!["old-term"]);
+        }
+
+        let reopened = MemoryStore::open(dir.path());
+        let reader = session("kiran", vec![Role::User]);
+        let held = reopened.recall(&scope, &reader, Some("project-a"));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].key, "kept");
+    }
+
+    #[test]
+    fn deleting_needs_the_entitlement_that_reading_needs() {
+        // Otherwise a delete that succeeded on an unreadable item would be a way
+        // to learn the item exists.
+        let store = MemoryStore::in_memory();
+        store.remember(term("project-a", "hot-tap", "…")).expect("stored");
+
+        let outsider = session("ravi", vec![Role::Auditor]);
+        assert!(matches!(
+            store.forget(&workspace("project-a"), "hot-tap", &outsider, Some("project-a")),
+            Err(MemoryError::NotFound { .. })
+        ));
+
+        let cleared = session("kiran", vec![Role::User]);
+        assert!(store
+            .forget(&workspace("project-a"), "hot-tap", &cleared, Some("project-a"))
+            .is_ok());
+        assert!(store
+            .recall(&workspace("project-a"), &cleared, Some("project-a"))
+            .is_empty());
+    }
+
+    #[test]
+    fn a_failed_durable_write_leaves_no_value_behind_in_memory() {
+        // The false success this prevents: the disk write fails, the caller sees
+        // an error, and the store carries on serving the value anyway until the
+        // next start quietly reverts it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = MemoryStore::open(dir.path());
+        let reader = session("kiran", vec![Role::User]);
+        store
+            .remember(term("project-a", "hot-tap", "first"))
+            .expect("the first write lands");
+
+        // A file where the memory directory needs to be. Every later write to
+        // this scope fails at `create_dir_all`.
+        let blocked = MemoryStore::open(&dir.path().join("blocked"));
+        std::fs::write(dir.path().join("blocked").with_extension("tmp"), b"x").ok();
+        std::fs::create_dir_all(dir.path().join("blocked")).ok();
+        std::fs::write(dir.path().join("blocked").join("memory"), b"not a directory")
+            .expect("occupy the memory path with a file");
+
+        let refusal = blocked.remember(term("project-b", "term", "value"));
+        assert!(
+            matches!(refusal, Err(MemoryError::Storage { .. })),
+            "expected a storage failure, got {refusal:?}"
+        );
+        // Nothing readable from the store whose write failed.
+        assert!(blocked
+            .recall(&workspace("project-b"), &reader, Some("project-b"))
+            .is_empty());
+
+        // And the store that did write is untouched by the other's failure.
+        let held = store.recall(&workspace("project-a"), &reader, Some("project-a"));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].value, "first");
+    }
+
+    #[test]
+    fn a_failed_overwrite_leaves_the_previous_value_in_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = MemoryStore::open(dir.path());
+        let reader = session("kiran", vec![Role::User]);
+        store
+            .remember(term("project-a", "hot-tap", "first"))
+            .expect("the first write lands");
+
+        // Make the scope's file unwritable by replacing the directory it lives
+        // in with something a rename cannot target.
+        let memory_dir = dir.path().join("memory");
+        std::fs::remove_dir_all(&memory_dir).ok();
+        std::fs::write(&memory_dir, b"not a directory").expect("occupy the path");
+
+        assert!(store
+            .remember(term("project-a", "hot-tap", "second"))
+            .is_err());
+
+        // The old value, not the new one: the overwrite did not happen.
+        let held = store.recall(&workspace("project-a"), &reader, Some("project-a"));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].value, "first");
     }
 
     #[test]
@@ -851,6 +1367,7 @@ mod tests {
                     classification: Classification::Internal,
                 },
                 approval: None,
+                expires_at: None,
             })
             .is_ok());
     }
@@ -875,6 +1392,7 @@ mod tests {
                     classification: Classification::VendorNegotiation,
                 },
                 approval: None,
+                expires_at: None,
             })
             .is_ok());
     }
@@ -896,6 +1414,7 @@ mod tests {
                         user_id: "kiran".to_string(),
                     },
                     approval: None,
+                    expires_at: None,
                 })
                 .expect_err("must be refused");
             assert!(
@@ -922,6 +1441,7 @@ mod tests {
                     user_id: "kiran".to_string(),
                 },
                 approval: None,
+                expires_at: None,
             })
             .is_ok());
     }
@@ -942,6 +1462,7 @@ mod tests {
                     user_id: "kiran".to_string(),
                 },
                 approval: None,
+                expires_at: None,
             })
             .expect("stored");
 
@@ -983,6 +1504,7 @@ mod tests {
                     user_id: "kiran".to_string(),
                 },
                 approval: None,
+                expires_at: None,
             })
             .expect("stored");
 
@@ -1007,6 +1529,7 @@ mod tests {
                     user_id: "kiran".to_string(),
                 },
                 approval: None,
+                expires_at: None,
             })
             .expect_err("must be refused");
 
@@ -1052,6 +1575,7 @@ mod tests {
                         run_id: "run-1".to_string(),
                     },
                     approval: None,
+                    expires_at: None,
                 })
                 .expect("stored");
         }

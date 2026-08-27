@@ -113,6 +113,8 @@ describe("host tools", () => {
       "create_xlsx",
       "execute_code",
       "load_more_evidence",
+      "memory_promote_approved",
+      "memory_recall_authorized",
       "read_scoped_file",
       "run_calculation",
       "search_documents",

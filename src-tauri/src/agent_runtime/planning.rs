@@ -194,6 +194,11 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         // read the page the passage came from has to ask for whole documents to
         // see context, which is the behaviour this tool exists to remove.
         ToolName::LoadMoreEvidence,
+        // Reading memory is always available: a run that may not consult what
+        // the project already agreed a term means will re-derive it, differently
+        // each time. Promotion is not here — writing something later runs read
+        // is opt-in per plan, and `derive` adds it only where it belongs.
+        ToolName::MemoryRecallAuthorized,
         ToolName::ReadScopedFile,
         ToolName::RunCalculation,
         ToolName::ValidateArtifact,

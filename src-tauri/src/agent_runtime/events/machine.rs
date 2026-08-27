@@ -306,6 +306,14 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         | E::ToolEffectPending
         | E::ToolEffectUnknown
         | E::ToolEffectReconciled
+        // Reading, refusing or promoting memory happens *within* whatever the
+        // run is doing. None of it is an ending and none of it moves the run's
+        // state; treating a recall as a transition would make a task that
+        // consulted its notes look like a task that changed course.
+        | E::MemoryRecalled
+        | E::MemoryRefused
+        | E::MemoryPromoted
+        | E::MemoryForgotten
         // A subagent starting and stopping happens *within* whatever the parent
         // is doing. It does not move the parent's own state, and treating it as
         // a transition would make a fan-out of four readers look like four

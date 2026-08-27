@@ -37,6 +37,11 @@ pub enum ToolName {
     /// documents in its context: a passage that stops mid-clause is followed by
     /// a request for the two pages around it, not for the file.
     LoadMoreEvidence,
+    /// Read what this machine remembers for a scope the signed-in person may see.
+    MemoryRecallAuthorized,
+    /// Copy one of this run's facts into the project's memory, under an approval
+    /// a person granted for that exact fact.
+    MemoryPromoteApproved,
     /// Read a file inside the task workspace.
     ReadScopedFile,
     /// Write a file inside the task workspace.
@@ -57,6 +62,8 @@ impl ToolName {
     pub const ALL: &'static [ToolName] = &[
         ToolName::SearchDocuments,
         ToolName::LoadMoreEvidence,
+        ToolName::MemoryRecallAuthorized,
+        ToolName::MemoryPromoteApproved,
         ToolName::ReadScopedFile,
         ToolName::WriteScopedFile,
         ToolName::RunCalculation,
@@ -71,6 +78,8 @@ impl ToolName {
         match self {
             ToolName::SearchDocuments => "search_documents",
             ToolName::LoadMoreEvidence => "load_more_evidence",
+            ToolName::MemoryRecallAuthorized => "memory_recall_authorized",
+            ToolName::MemoryPromoteApproved => "memory_promote_approved",
             ToolName::ReadScopedFile => "read_scoped_file",
             ToolName::WriteScopedFile => "write_scoped_file",
             ToolName::RunCalculation => "run_calculation",
@@ -90,6 +99,8 @@ impl ToolName {
         match self {
             ToolName::SearchDocuments => "search the knowledge base",
             ToolName::LoadMoreEvidence => "read a specific page range of a document",
+            ToolName::MemoryRecallAuthorized => "read this machine's memory for one scope",
+            ToolName::MemoryPromoteApproved => "record an approved fact in the project's memory",
             ToolName::ReadScopedFile => "read a file from the task workspace",
             ToolName::WriteScopedFile => "write a file into the task workspace",
             ToolName::RunCalculation => "run a calculation",
@@ -173,6 +184,35 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             needs_approval: false,
             max_bytes: None,
             timeout: Duration::from_secs(30),
+            scoped_to_workspace: false,
+        },
+        ToolName::MemoryRecallAuthorized => ToolSpec {
+            name,
+            // Reading memory is reading whatever the person is already cleared
+            // for; the store applies the same clearance the index does.
+            permission: UseModel,
+            arguments: &[ArgumentSpec { name: "scope", kind: Text }],
+            needs_approval: false,
+            max_bytes: None,
+            timeout: Duration::from_secs(10),
+            scoped_to_workspace: false,
+        },
+        ToolName::MemoryPromoteApproved => ToolSpec {
+            name,
+            // Promotion writes something later runs will read. That is the same
+            // kind of act as producing a document, and it is entitled the same
+            // way.
+            permission: GenerateArtifact,
+            arguments: &[
+                ArgumentSpec { name: "key", kind: Text },
+                ArgumentSpec { name: "approvalId", kind: Text },
+            ],
+            // The approval is checked inside the operation, against the exact
+            // value being promoted — a gateway prompt could only ask about the
+            // call, and the call is not what needs approving.
+            needs_approval: false,
+            max_bytes: None,
+            timeout: Duration::from_secs(10),
             scoped_to_workspace: false,
         },
         ToolName::ReadScopedFile => ToolSpec {
@@ -336,6 +376,7 @@ mod tests {
         for tool in [
             ToolName::SearchDocuments,
             ToolName::LoadMoreEvidence,
+            ToolName::MemoryRecallAuthorized,
             ToolName::ReadScopedFile,
             ToolName::RunCalculation,
             ToolName::ValidateArtifact,

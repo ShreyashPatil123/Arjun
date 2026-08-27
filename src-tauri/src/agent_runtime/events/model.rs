@@ -103,6 +103,19 @@ pub enum TaskEventType {
     /// cancellation are each named rather than folded into one ending.
     SubagentStopped,
 
+    // -- Memory -----------------------------------------------------------
+    /// A run read a scope of memory it was entitled to. Carries counts and key
+    /// hashes; never the values, because this record is read by people who are
+    /// not cleared for the material it describes.
+    MemoryRecalled,
+    /// A memory operation was refused, with the fixed reason it was refused for.
+    MemoryRefused,
+    /// A run-scope fact was promoted into a project's memory under an approval.
+    /// Carries the binding's hashes so the decision stays checkable.
+    MemoryPromoted,
+    /// An item was removed, or lapsed past its retention.
+    MemoryForgotten,
+
     // -- Approval ---------------------------------------------------------
     ApprovalRequested,
     ApprovalDecided,
@@ -160,6 +173,10 @@ impl TaskEventType {
             TaskEventType::ArtifactProduced => "artifact_produced",
             TaskEventType::SubagentStarted => "subagent_started",
             TaskEventType::SubagentStopped => "subagent_stopped",
+            TaskEventType::MemoryRecalled => "memory_recalled",
+            TaskEventType::MemoryRefused => "memory_refused",
+            TaskEventType::MemoryPromoted => "memory_promoted",
+            TaskEventType::MemoryForgotten => "memory_forgotten",
             TaskEventType::ApprovalRequested => "approval_requested",
             TaskEventType::ApprovalDecided => "approval_decided",
             TaskEventType::VerificationStarted => "verification_started",
@@ -196,6 +213,10 @@ impl TaskEventType {
             "artifact_produced" => TaskEventType::ArtifactProduced,
             "subagent_started" => TaskEventType::SubagentStarted,
             "subagent_stopped" => TaskEventType::SubagentStopped,
+            "memory_recalled" => TaskEventType::MemoryRecalled,
+            "memory_refused" => TaskEventType::MemoryRefused,
+            "memory_promoted" => TaskEventType::MemoryPromoted,
+            "memory_forgotten" => TaskEventType::MemoryForgotten,
             "approval_requested" => TaskEventType::ApprovalRequested,
             "approval_decided" => TaskEventType::ApprovalDecided,
             "verification_started" => TaskEventType::VerificationStarted,

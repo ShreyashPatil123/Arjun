@@ -34,6 +34,7 @@ pub mod artifacts;
 pub mod events;
 pub mod grants;
 pub mod memory;
+pub mod memory_api;
 pub mod planning;
 pub mod protocol;
 pub mod recording;
@@ -139,6 +140,13 @@ pub struct RuntimeDeps {
     /// this is a source of *descriptions*, and nothing reached through it can
     /// widen what a run may do.
     pub skills: Arc<crate::skills::SkillRegistry>,
+    /// What this machine remembers, and for whom.
+    ///
+    /// Scoped and access-controlled in [`memory`]; reachable by a model only
+    /// through the two methods in [`memory_api`], which fill in the identity,
+    /// project, classification and approval from this side. Held here rather
+    /// than reached for so the handlers stay drivable with no Tauri app.
+    pub memory: memory::SharedMemory,
     /// Where run events go.
     ///
     /// The loop publishes its own events over the wire; these are the ones this
@@ -436,6 +444,11 @@ async fn handle(
         "tool.authorize" => authorize(params, deps).await,
         "tool.execute" => execute(params, deps),
         "capability.search" => capability_search(params, deps),
+        // The whole of a model's reach into memory. Both fill in identity,
+        // project, classification and approval on this side; neither takes them
+        // from the caller. See [`memory_api`].
+        "memory.recall_authorized" => memory_api::recall_authorized(params, deps),
+        "memory.promote_approved" => memory_api::promote_approved(params, deps),
         other => Err(WireError::new(
             code::UNKNOWN_METHOD,
             format!("no handler for {other}"),
@@ -1029,6 +1042,26 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
                     &hits,
                 )
             }),
+        // Served through the same boundary the RPC methods use, so a model
+        // reaching memory by tool and a runtime reaching it by method get
+        // identical policy. Two paths with two implementations would be two
+        // places for the entitlement check to drift.
+        ToolName::MemoryRecallAuthorized => memory_api::recall_authorized(
+            json!({ "runId": call.run_id, "scope": tool_call.text("scope").unwrap_or_default() }),
+            deps,
+        )
+        .map(|value| render_memory(&value))
+        .map_err(|error| error.message),
+        ToolName::MemoryPromoteApproved => memory_api::promote_approved(
+            json!({
+                "runId": call.run_id,
+                "key": tool_call.text("key").unwrap_or_default(),
+                "approvalId": tool_call.text("approvalId").unwrap_or_default(),
+            }),
+            deps,
+        )
+        .map(|value| render_memory(&value))
+        .map_err(|error| error.message),
         ToolName::ValidateArtifact => {
             validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call)
         }
@@ -1226,11 +1259,54 @@ fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
     );
 }
 
+/// Turns a memory result into the prose the model reads.
+///
+/// Written here rather than in [`memory_api`] because that module answers an
+/// RPC whose caller is a program, and this answers a tool call whose caller is a
+/// model. The same JSON serves both; only the rendering differs.
+fn render_memory(value: &Value) -> String {
+    if value.get("promoted").and_then(Value::as_bool) == Some(true) {
+        let key = value.get("key").and_then(Value::as_str).unwrap_or("that fact");
+        return format!(
+            "Recorded {key} in the project's memory under the approval you were granted.              Changing the value later needs a new approval."
+        );
+    }
+
+    let scope = value.get("scope").and_then(Value::as_str).unwrap_or("that scope");
+    let items = value.get("items").and_then(Value::as_array);
+    let Some(items) = items.filter(|items| !items.is_empty()) else {
+        // Said explicitly. A model told nothing came back asks a different
+        // question; one told nothing at all assumes memory is unavailable and
+        // answers from its own recollection instead.
+        return format!(
+            "Nothing is remembered for {scope}. Do not treat that as evidence either way —              search the documents for anything you need to assert."
+        );
+    };
+
+    let mut out = format!("{} remembered item(s) for {scope}.
+
+", items.len());
+    for item in items {
+        let key = item.get("key").and_then(Value::as_str).unwrap_or("");
+        let body = item.get("value").and_then(Value::as_str).unwrap_or("");
+        out.push_str(&format!("- {key}: {body}
+"));
+    }
+    out.push_str(
+        "
+These are this deployment's own notes, not retrieved passages. A claim that needs a          citation still needs a search.
+",
+    );
+    out
+}
+
 /// Names the tool catalogue exposes. Used by the absence test in `tests/`.
 pub fn catalogue() -> Vec<&'static str> {
     ToolName::ALL.iter().map(|tool| tool.as_str()).collect()
 }
 
 
+#[cfg(test)]
+mod memory_boundary_tests;
 #[cfg(test)]
 mod tests;

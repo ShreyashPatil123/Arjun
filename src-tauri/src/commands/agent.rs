@@ -198,7 +198,11 @@ pub struct RuntimeState<'a> {
     pub calls: &'a RunToolCalls,
     pub events: &'a TaskEvents,
     pub skills: &'a Skills,
+    pub memory: &'a AgentMemory,
 }
+
+/// The scoped memory store, as Tauri manages it.
+pub type AgentMemory = crate::agent_runtime::memory::SharedMemory;
 
 fn runtime(
     handle: &AgentRuntimeHandle,
@@ -238,6 +242,7 @@ fn runtime(
         plans: state.plans.clone(),
         events: state.events.clone(),
         skills: state.skills.clone(),
+        memory: state.memory.clone(),
         emit_durable,
         // The same channel the loop's own events travel, so an operator sees
         // one sequence of what happened rather than two interleaved by luck.
@@ -303,6 +308,7 @@ pub async fn agent_start_run(
     calls: State<'_, RunToolCalls>,
     events: State<'_, TaskEvents>,
     skills: State<'_, Skills>,
+    memory: State<'_, AgentMemory>,
 ) -> Result<RunSummary, String> {
     // Checked here as well as in the runtime's handlers. Here it gives the
     // person a clear reason before anything starts; there it stops a call whose
@@ -352,6 +358,7 @@ pub async fn agent_start_run(
         calls: &calls,
         events: &events,
         skills: &skills,
+        memory: &memory,
     };
     let runtime = runtime(&handle, &app, &state)?;
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -1010,6 +1017,7 @@ pub async fn agent_runtime_health(
     calls: State<'_, RunToolCalls>,
     events: State<'_, TaskEvents>,
     skills: State<'_, Skills>,
+    memory: State<'_, AgentMemory>,
 ) -> Result<Value, String> {
     let state = RuntimeState {
         index: &index,
@@ -1023,6 +1031,7 @@ pub async fn agent_runtime_health(
         calls: &calls,
         events: &events,
         skills: &skills,
+        memory: &memory,
     };
     let runtime = runtime(&handle, &app, &state)?;
     runtime

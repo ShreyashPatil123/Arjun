@@ -181,6 +181,13 @@ pub fn run() {
             app.manage(commands::agent::RunPlans::default());
             app.manage(commands::agent::RunCalculations::default());
             app.manage(commands::agent::RunToolCalls::default());
+            // Scoped memory: what this machine remembers, and for whom. Opened
+            // under the same data directory as the index and the task records,
+            // and lazily per scope — a deployment with two hundred projects
+            // should not pay for two hundred file reads to start.
+            app.manage(std::sync::Arc::new(agent_runtime::memory::MemoryStore::open(
+                &data_dir,
+            )) as commands::agent::AgentMemory);
             app.manage(agent_runtime::retrieval::RunPassages::default());
             app.manage(agent_runtime::artifacts::RunArtifacts::default());
 

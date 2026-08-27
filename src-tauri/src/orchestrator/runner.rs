@@ -321,6 +321,13 @@ impl ToolRunner for LocalToolRunner<'_> {
             ToolName::RunCalculation => self.calculate(call),
             ToolName::ExecuteCode => self.execute_code(),
             ToolName::ValidateArtifact => self.validate(resolved_path),
+            // Handled on the agent path, where the run's session and the memory
+            // store are both in reach. The runner is built fresh per call and
+            // holds neither, so serving these here would mean answering a
+            // question about entitlement with no knowledge of who is asking.
+            ToolName::MemoryRecallAuthorized | ToolName::MemoryPromoteApproved => Err(
+                "Memory is served on the agent path, not by this runner.".to_string(),
+            ),
             // Phase 6. Said plainly so a model does not describe a document it
             // has not produced.
             ToolName::CreateDocx | ToolName::CreateXlsx => Err(format!(

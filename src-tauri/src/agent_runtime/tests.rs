@@ -56,6 +56,9 @@ fn deps_with(
         // An empty skills directory: these tests are about the gateway, and
         // the skill system is checked where it belongs, in `skills::tests`.
         skills: Arc::new(crate::skills::SkillRegistry::open(dir.path().join("__no_skills__"))),
+        // On disk under the temp dir, so the durability and isolation these
+        // tests assert are the real ones rather than a per-test map.
+        memory: Arc::new(crate::agent_runtime::memory::MemoryStore::open(dir.path())),
         emit: Arc::new(|_| {}),
         emit_durable: Arc::new(|_| {}),
     });
@@ -642,7 +645,7 @@ fn a_missing_bundle_is_reported_with_the_path_and_the_fix() {
 }
 
 #[test]
-fn the_catalogue_is_the_nine_tools_the_gateway_knows() {
+fn the_catalogue_is_the_eleven_tools_the_gateway_knows() {
     let mut names = catalogue();
     names.sort_unstable();
     assert_eq!(
@@ -652,6 +655,8 @@ fn the_catalogue_is_the_nine_tools_the_gateway_knows() {
             "create_xlsx",
             "execute_code",
             "load_more_evidence",
+            "memory_promote_approved",
+            "memory_recall_authorized",
             "read_scoped_file",
             "run_calculation",
             "search_documents",

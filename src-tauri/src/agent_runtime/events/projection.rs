@@ -100,6 +100,13 @@ pub struct TaskSnapshot {
     /// Names only. The files are in the run's workspace; this is a reference.
     pub artifacts: Vec<String>,
     pub approvals_pending: usize,
+    /// Times this run read a scope of memory it was entitled to.
+    pub memory_reads: u32,
+    /// Facts promoted into project memory under an approval.
+    pub memory_promotions: u32,
+    /// Memory operations refused. Non-zero is worth a look: it means the run
+    /// asked for something policy would not give it.
+    pub memory_refusals: u32,
     /// Bounded workers this run started.
     pub subagents_started: u32,
     pub subagents_finished: u32,
@@ -147,6 +154,9 @@ impl TaskSnapshot {
             activity: Vec::new(),
             turns: 0,
             compactions: 0,
+            memory_reads: 0,
+            memory_promotions: 0,
+            memory_refusals: 0,
             compaction_events: Vec::new(),
             artifacts: Vec::new(),
             approvals_pending: 0,
@@ -317,6 +327,14 @@ impl TaskSnapshot {
                     }
                 }
             }
+
+            // Counted, not quoted. The payloads carry hashes and counts by
+            // construction (see `memory_api`), and folding a value out of one
+            // into a snapshot the Tasks list reads would undo that.
+            TaskEventType::MemoryRecalled => self.memory_reads += 1,
+            TaskEventType::MemoryPromoted => self.memory_promotions += 1,
+            TaskEventType::MemoryRefused => self.memory_refusals += 1,
+            TaskEventType::MemoryForgotten => {}
 
             TaskEventType::ApprovalRequested => self.approvals_pending += 1,
             TaskEventType::ApprovalDecided => {

@@ -281,6 +281,49 @@ export function buildTools(
 
     hostTool({
       ...shared,
+      name: "memory_recall_authorized",
+      label: "Read remembered notes",
+      description:
+        "Read what this deployment remembers for one scope: \"run\" (this task's own state), " +
+        "\"workspace\" (terminology, templates and stable facts agreed for this project), or " +
+        "\"user\" (the signed-in person's preferences). Returns only what that person is " +
+        "cleared to read. These are the deployment's own notes, not retrieved passages — a claim " +
+        "that needs a citation still needs search_documents. You cannot name a project or a " +
+        "person: both are taken from who is signed in.",
+      parameters: Type.Object({
+        scope: Type.Union([Type.Literal("run"), Type.Literal("workspace"), Type.Literal("user")], {
+          description: "Which scope to read.",
+        }),
+      }),
+      executionMode: "parallel",
+    }),
+
+    hostTool({
+      ...shared,
+      name: "memory_promote_approved",
+      label: "Record an approved fact",
+      description:
+        "Copy one fact this run already holds into the project's memory, where later tasks will " +
+        "read it. Needs the id of an approval a person granted for that exact fact: the value is " +
+        "taken from what this run recorded, not from anything you write here, and the approval is " +
+        "checked against it. If the value has changed since the approval, this is refused and a " +
+        "new approval is needed. Use it only for stable project facts, never for figures quoted " +
+        "from a restricted document.",
+      parameters: Type.Object({
+        key: Type.String({
+          description: "The key this run recorded the fact under.",
+        }),
+        approvalId: Type.String({
+          description: "The id of the granted approval for this exact fact.",
+        }),
+      }),
+      // Writes something later runs read. Two promotions in one turn have an
+      // order, and it should not be whichever finished first.
+      executionMode: "sequential",
+    }),
+
+    hostTool({
+      ...shared,
       name: "read_scoped_file",
       label: "Read a file",
       description:
