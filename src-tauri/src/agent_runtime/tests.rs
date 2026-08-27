@@ -42,6 +42,13 @@ fn deps_with(
         workspaces,
         approvals: Arc::new(ApprovalQueue::new()),
         calculations: Arc::default(),
+        passages: Arc::default(),
+        produced: Arc::default(),
+        calls: Arc::default(),
+        // No plan registered, so the budget does not apply and these tests go on
+        // exercising the gateway alone. The plan has its own tests below.
+        plans: Arc::default(),
+        emit: Arc::new(|_| {}),
     });
     (deps, dir)
 }
@@ -432,4 +439,169 @@ fn the_catalogue_is_the_eight_tools_the_gateway_knows() {
             "write_scoped_file",
         ]
     );
+}
+
+/// Deps with a plan registered, so the budget actually applies.
+fn deps_with_plan(prompt: &str) -> (Arc<RuntimeDeps>, tempfile::TempDir) {
+    let (deps, dir) = deps_with(signed_in_user());
+    deps.plans
+        .lock()
+        .expect("fresh lock")
+        .insert("r".to_string(), planning::plan_for("r", prompt));
+    (deps, dir)
+}
+
+#[tokio::test]
+async fn a_tool_outside_the_plan_is_refused_without_stopping_the_run() {
+    // "summarise the report" plans no sandbox work, so execute_code is out. The
+    // refusal has to leave the run able to carry on: one wrong guess by the
+    // planner must not cost the whole task.
+    let (deps, _dir) = deps_with_plan("summarise the inspection report");
+
+    let refused = authorize(
+        json!({
+            "runId": "r",
+            "toolCallId": "tc-1",
+            "tool": "execute_code",
+            "args": { "language": "python", "source": "print(1)" }
+        }),
+        &deps,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["outcome"], "refuse");
+    let reason = refused["reason"].as_str().unwrap();
+    assert!(reason.contains("planned to use"), "{reason}");
+    // It names what it *may* use, so the model can route around it.
+    assert!(reason.contains("search_documents"), "{reason}");
+
+    // And the run is still alive.
+    let allowed = authorize(search("seal wear"), &deps).await.unwrap();
+    assert_eq!(allowed["outcome"], "allow");
+}
+
+#[tokio::test]
+async fn running_out_of_steps_stops_the_run_and_says_so() {
+    let (deps, _dir) = deps_with_plan("what does the SOP say about seal wear?");
+    let allowed = {
+        let plans = deps.plans.lock().expect("fresh lock");
+        plans.get("r").expect("a plan").budget.max_steps
+    };
+
+    // Spend the budget. Steps are counted on execution, so each one is a full
+    // authorise-and-execute cycle — and each query differs, or the loop
+    // detector stops the run first and this would be testing that instead.
+    for i in 0..allowed {
+        let mut call = search(&format!("seal wear question {i}"));
+        call["toolCallId"] = json!(format!("tc-{i}"));
+        let verdict = authorize(call.clone(), &deps).await.unwrap();
+        assert_eq!(verdict["outcome"], "allow", "step {i} of {allowed}");
+        call["grant"] = verdict["grant"].clone();
+        let _ = execute(call, &deps);
+    }
+
+    let refused = authorize(search("one more thing"), &deps).await.unwrap();
+    assert_eq!(refused["outcome"], "refuse");
+    let reason = refused["reason"].as_str().unwrap();
+    assert!(reason.contains("permitted steps"), "{reason}");
+    // PS Part C: the incomplete plan is shown, not hidden.
+    assert!(reason.contains("what was completed"), "{reason}");
+}
+
+#[tokio::test]
+async fn the_same_call_over_and_over_is_stopped_as_going_in_circles() {
+    // PS Part C: "Agent loop repeats → Stop at the step/time/tool budget."
+    // Repeating one search is the shape that failure actually takes, and it
+    // stops well before the step budget because it is making no progress.
+    let (deps, _dir) = deps_with_plan("what does the SOP say about seal wear?");
+
+    let mut outcomes = Vec::new();
+    for i in 0..6 {
+        let mut call = search("the identical question");
+        call["toolCallId"] = json!(format!("tc-{i}"));
+        let verdict = authorize(call.clone(), &deps).await.unwrap();
+        outcomes.push(verdict["outcome"].as_str().unwrap().to_string());
+        if verdict["outcome"] == "allow" {
+            call["grant"] = verdict["grant"].clone();
+            let _ = execute(call, &deps);
+        }
+    }
+
+    let refusal = authorize(search("the identical question"), &deps)
+        .await
+        .unwrap();
+    assert_eq!(refusal["outcome"], "refuse");
+    let reason = refusal["reason"].as_str().unwrap();
+    assert!(reason.contains("going in circles"), "{reason}");
+    // Stopped short of the step budget, which is the point of detecting it.
+    assert!(
+        outcomes.iter().filter(|o| *o == "allow").count() < 12,
+        "{outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_with_no_plan_is_not_blocked_by_one() {
+    // The health check and the runtime's own probes belong to no run. Refusing
+    // every call for a run the plan table never heard of would break those
+    // rather than enforce anything.
+    let (deps, _dir) = deps_with(signed_in_user());
+    let verdict = authorize(search("x"), &deps).await.unwrap();
+    assert_eq!(verdict["outcome"], "allow");
+}
+
+#[tokio::test]
+async fn a_search_that_finds_nothing_records_no_evidence_to_cite() {
+    // The index is empty here, which is the case that matters most: a run that
+    // retrieved nothing must end up with nothing citable, so the verifier
+    // catches an answer that cites [E1] anyway.
+    let (deps, _dir) = deps_with(signed_in_user());
+
+    let allow = authorize(search("wall thickness"), &deps).await.unwrap();
+    let mut call = search("wall thickness");
+    call["grant"] = allow["grant"].clone();
+    let result = execute(call, &deps).unwrap();
+
+    assert!(result["text"].as_str().unwrap().contains("No passages matched"));
+    assert!(retrieval::for_run(&deps.passages, "r").is_empty());
+}
+
+#[tokio::test]
+async fn a_produced_file_is_remembered_so_it_can_be_re_opened() {
+    let (deps, _dir) = deps_with(signed_in_user());
+    let root = deps.root_for("r").expect("the run has a workspace");
+
+    // Written directly: the point under test is the registry, and going through
+    // write_scoped_file would need an approver on the other end.
+    let path = root.join("draft.txt");
+    std::fs::write(&path, b"some text").expect("wrote the draft");
+    artifacts::remember(
+        &deps.produced,
+        "r",
+        artifacts::produced_from(&path, Some(&root), artifacts::Kind::Text, None),
+    );
+
+    let reports = artifacts::report_for_run(&deps.produced, "r");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].name, "draft.txt");
+    assert!(reports[0].sound);
+}
+
+#[tokio::test]
+async fn a_produced_file_that_vanished_is_reported_as_missing_rather_than_sound() {
+    // The failure this catches is a run that says it produced a deliverable and
+    // a Tasks screen that agrees, over a file nobody can open.
+    let (deps, _dir) = deps_with(signed_in_user());
+    let root = deps.root_for("r").expect("the run has a workspace");
+    let path = root.join("gone.docx");
+
+    artifacts::remember(
+        &deps.produced,
+        "r",
+        artifacts::produced_from(&path, Some(&root), artifacts::Kind::Document, Some("approval_note".into())),
+    );
+
+    let reports = artifacts::report_for_run(&deps.produced, "r");
+    assert!(!reports[0].sound);
+    assert!(reports[0].problems.iter().any(|p| p.contains("does not exist")));
 }

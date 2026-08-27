@@ -32,7 +32,10 @@
 pub mod approval;
 pub mod artifacts;
 pub mod grants;
+pub mod planning;
 pub mod protocol;
+pub mod retrieval;
+pub mod tasks;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -51,6 +54,7 @@ use crate::knowledge::KnowledgeIndex;
 use crate::orchestrator::approvals::ApprovalQueue;
 use crate::orchestrator::calculation::CalculationRecord;
 use crate::orchestrator::gateway::{GatewayVerdict, TaskContext, ToolGateway};
+use crate::orchestrator::plan::Continuation;
 use crate::orchestrator::runner::LocalToolRunner;
 use crate::orchestrator::executor::ToolRunner;
 use crate::orchestrator::tools::{ToolCall, ToolName};
@@ -85,6 +89,37 @@ pub struct RuntimeDeps {
     /// computed would be exactly the thing the calculation engine exists to
     /// avoid.
     pub calculations: Arc<Mutex<HashMap<String, Vec<CalculationRecord>>>>,
+    /// Passages a run has retrieved, in the order its citation markers refer to.
+    ///
+    /// Kept for the same reason as the calculations: the verifier resolves each
+    /// `[En]` in the final answer against what was actually retrieved, and it
+    /// cannot do that against passages nobody kept. See [`retrieval`].
+    pub passages: retrieval::RunPassages,
+    /// Files a run has produced, so each can be re-opened and checked when the
+    /// run ends rather than taken on the model's word. See [`artifacts`].
+    pub produced: artifacts::RunArtifacts,
+    /// Every tool call a run has made, in order.
+    ///
+    /// Kept here rather than reconstructed from the event stream, which is
+    /// best-effort: a dropped event costs a progress line, and it should not
+    /// also cost a line in the permanent record of what the run did.
+    pub calls: Arc<Mutex<HashMap<String, Vec<tasks::ToolCallRecord>>>>,
+    /// The plan each run is being held to, keyed by run id.
+    ///
+    /// The budget inside is fixed by [`planning`] before the model is told
+    /// anything, and nothing on the runtime's side of the wire can reach it.
+    pub plans: Arc<Mutex<HashMap<String, crate::orchestrator::plan::PlanRun>>>,
+    /// Where run events go.
+    ///
+    /// The loop publishes its own events over the wire; these are the ones this
+    /// side decides — a step spent, a plan exhausted. They travel the same
+    /// channel because an operator watching a run should see one sequence of
+    /// what happened, not two interleaved by luck.
+    ///
+    /// Injected rather than reached for, so this module keeps no dependency on
+    /// Tauri. That is the same reason [`AgentRuntime::spawn`] takes an emitter,
+    /// and it is what lets the tests drive all of this with no app running.
+    pub emit: Arc<dyn Fn(Value) + Send + Sync>,
 }
 
 impl RuntimeDeps {
@@ -96,6 +131,16 @@ impl RuntimeDeps {
             .ok()
             .and_then(|table| table.get(run_id).map(workspace::Workspace::roots))
             .unwrap_or_default()
+    }
+
+    /// The run's workspace, for naming a produced file relative to it.
+    fn root_for(&self, run_id: &str) -> Option<PathBuf> {
+        self.roots_for(run_id).into_iter().next()
+    }
+
+    /// Publishes one event about a run, in the shape the UI already listens for.
+    fn publish(&self, run_id: &str, event: Value) {
+        (self.emit)(json!({ "runId": run_id, "event": event }));
     }
 }
 
@@ -409,6 +454,15 @@ fn ledger() -> &'static Mutex<GrantLedger> {
 /// idea of waiting.
 async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
     let call = read_call(&params)?;
+
+    // The plan is consulted before the gateway. A task that is out of time
+    // should not be asking about permissions, and "you have run out of steps"
+    // is a more useful thing to tell a model than "that path is fine, but
+    // nothing further will happen".
+    if let Some(reason) = plan_refusal(&call, deps) {
+        return Ok(json!({ "outcome": "refuse", "reason": reason }));
+    }
+
     let verdict = decide(&call, deps, ApprovalState::NotRequested)?;
 
     let (tool, resolved_path) = match verdict {
@@ -460,6 +514,81 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         "grant": grant,
         "resolvedPath": resolved_path,
     }))
+}
+
+/// Puts a call to the run's plan, and says why not when the answer is no.
+///
+/// Two shapes of refusal, deliberately different:
+///
+/// - **A tool outside the plan** is refused without stopping the run. The model
+///   reads the refusal and can do the rest of the work, or say plainly what it
+///   could not do. Stopping there would turn one wrong guess by [`planning`]
+///   into a lost run, which is far too high a price for a keyword miss.
+/// - **Out of steps, out of time, or going in circles** stops the run, and
+///   every later call is refused with the same sentence. Those are the
+///   conditions PS Part C asks to be stopped at, and a limit a model could keep
+///   retrying against would not be a limit.
+///
+/// A run with no plan is allowed through. That is not a hole: the only caller
+/// that starts a run registers a plan first, and refusing every tool call for a
+/// run this table has never heard of would break the runtime's own health check
+/// rather than enforce anything.
+fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
+    let stopped = {
+        // A poisoned table is a panic that happened while the budget was being
+        // read, and carrying on would mean running with no budget at all. That
+        // is the one case here that fails closed: an unbounded run is worse
+        // than a stopped one.
+        let Ok(mut plans) = deps.plans.lock() else {
+            return Some(
+                "This task's plan cannot be read, so there is no budget to hold the work to and \
+                 nothing further will be run. Start the task again."
+                    .to_string(),
+            );
+        };
+        // No plan at all is different, and is allowed: the runtime's own health
+        // probe belongs to no run, and refusing it would break the check rather
+        // than enforce anything.
+        let plan = plans.get_mut(&call.run_id)?;
+
+        // Checked before `may_call`, which halts the whole plan on an
+        // unpermitted tool. Here that is one refused call and no more.
+        let permitted = ToolName::from_str(&call.tool)
+            .map(|tool| plan.budget.permits(tool))
+            .unwrap_or(false);
+        if !permitted {
+            let allowed: Vec<&str> = plan
+                .budget
+                .permitted_tools
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect();
+            return Some(format!(
+                "{} is not one of the tools this task was planned to use. The plan allows: {}. \
+                 Do what you can with those, and say plainly what you could not do.",
+                call.tool,
+                allowed.join(", ")
+            ));
+        }
+
+        match plan.may_call(&ToolCall::new(call.tool.clone(), call.args.clone())) {
+            Continuation::Proceed => return None,
+            Continuation::Stop(reason) => reason,
+        }
+    };
+
+    // Published so the trace says why the run went quiet. Emitted outside the
+    // lock: the handler is arbitrary code, and holding the plan table across it
+    // would let a slow listener block every other run's authorisation.
+    deps.publish(
+        &call.run_id,
+        json!({
+            "type": "plan_stopped",
+            "reason": stopped.explain(),
+            "tool": call.tool,
+        }),
+    );
+    Some(stopped.explain())
 }
 
 /// Renders arguments the way an approver will read them.
@@ -609,21 +738,26 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         &deps.roots_for(&call.run_id),
     );
 
-    // The two artifact tools are handled here rather than in `LocalToolRunner`
-    // because they need the run's accumulated state — its calculations — which
-    // the runner is constructed fresh per call and cannot hold.
+    // Four tools are handled here rather than in `LocalToolRunner` because each
+    // needs the run's accumulated state — its calculations, its evidence, the
+    // files it has produced — and the runner is built fresh per call, so it
+    // cannot hold any of it.
     let outcome = match tool {
-        ToolName::CreateDocx => artifacts::create_docx(
-            &call,
-            resolved_path.as_deref(),
-            &session,
-            &tool_call,
-        ),
-        ToolName::CreateXlsx => artifacts::create_xlsx(
-            resolved_path.as_deref(),
-            &deps.calculations,
-            &call.run_id,
-        ),
+        ToolName::CreateDocx => {
+            artifacts::create_docx(&call, resolved_path.as_deref(), &session, &tool_call)
+        }
+        ToolName::CreateXlsx => {
+            artifacts::create_xlsx(resolved_path.as_deref(), &deps.calculations, &call.run_id)
+        }
+        // Recorded as the run's evidence on the way past, and numbered once
+        // across the whole run so a citation means one passage. See
+        // [`retrieval`].
+        ToolName::SearchDocuments => LocalToolRunner::new(deps.index.as_ref(), &session)
+            .search_hits(&tool_call)
+            .map(|(query, hits)| retrieval::record(&deps.passages, &call.run_id, &query, &hits)),
+        ToolName::ValidateArtifact => {
+            validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call)
+        }
         _ => {
             let runner = LocalToolRunner::new(deps.index.as_ref(), &session);
             let result = runner.run(tool, &tool_call, resolved_path.as_deref());
@@ -642,6 +776,16 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         }
     };
 
+    if outcome.is_ok() {
+        remember_if_produced(deps, &call.run_id, tool, resolved_path.as_deref(), &tool_call);
+    }
+    record_call(deps, &call.run_id, tool.as_str(), &outcome);
+
+    // Counted whatever the tool returned. A failed call cost the same wall
+    // clock and the same context window as a successful one, and a budget that
+    // only counts successes is one a model going in circles never reaches.
+    record_step(deps, &call.run_id, tool);
+
     match outcome {
         Ok(text) => Ok(json!({ "text": text, "details": { "tool": tool.as_str() } })),
         // A tool that fails says why, in words the model can act on. Returned as
@@ -649,6 +793,141 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         // rather than passing it off as an answer.
         Err(reason) => Err(WireError::new(code::TOOL_FAILED, reason)),
     }
+}
+
+/// Re-opens a file this run produced and says what is actually in it.
+///
+/// The runner's own check asks whether the path exists and is not empty, which
+/// is all it *can* ask: it is built fresh per call and does not know the file
+/// was rendered from the `approval_note` template. This does, because the run
+/// remembered it — so `validate_artifact` on a document opens the package and
+/// checks the sections are really there, which is what PS step 30 asks for and
+/// what the tool's own description promises the model.
+fn validate(
+    deps: &Arc<RuntimeDeps>,
+    run_id: &str,
+    resolved_path: Option<&Path>,
+    session: &Session,
+    tool_call: &ToolCall,
+) -> Result<String, String> {
+    let known = resolved_path.and_then(|path| {
+        artifacts::for_run(&deps.produced, run_id)
+            .into_iter()
+            .find(|produced| Path::new(&produced.path) == path)
+    });
+
+    let Some(produced) = known else {
+        // Not something this run produced, so there is no template to check it
+        // against and no claim to make beyond what is on disk. The runner's
+        // existence-and-size check is then the honest answer.
+        let runner = LocalToolRunner::new(deps.index.as_ref(), session);
+        return runner.run(ToolName::ValidateArtifact, tool_call, resolved_path);
+    };
+
+    let report = artifacts::check(&produced);
+    if report.sound {
+        Ok(format!("{}: {}", report.name, report.detail))
+    } else {
+        Err(format!(
+            "{} did not pass its check: {}. Correct it and produce it again.",
+            report.name,
+            report.problems.join("; ")
+        ))
+    }
+}
+
+/// Records a file the call has just produced, so it can be re-opened later.
+fn remember_if_produced(
+    deps: &Arc<RuntimeDeps>,
+    run_id: &str,
+    tool: ToolName,
+    resolved_path: Option<&Path>,
+    tool_call: &ToolCall,
+) {
+    let kind = match tool {
+        ToolName::CreateDocx => artifacts::Kind::Document,
+        ToolName::CreateXlsx => artifacts::Kind::Workbook,
+        ToolName::WriteScopedFile => artifacts::Kind::Text,
+        _ => return,
+    };
+    let Some(path) = resolved_path else { return };
+
+    let template = if tool == ToolName::CreateDocx {
+        tool_call.text("template").map(str::to_string)
+    } else {
+        None
+    };
+    let root = deps.root_for(run_id);
+    artifacts::remember(
+        &deps.produced,
+        run_id,
+        artifacts::produced_from(path, root.as_deref(), kind, template),
+    );
+}
+
+/// Keeps what a tool call did, for the run's record.
+///
+/// A refusal is recorded as its own outcome rather than as a failure. The two
+/// look the same to a naive reader and mean opposite things: a failure is the
+/// tool going wrong, a refusal is the policy working, and a Tasks screen that
+/// paints every refusal red teaches people to skip the ones that matter.
+fn record_call(
+    deps: &Arc<RuntimeDeps>,
+    run_id: &str,
+    tool: &str,
+    outcome: &Result<String, String>,
+) {
+    let record = match outcome {
+        Ok(text) => tasks::ToolCallRecord::new(tool, tasks::CallOutcome::Succeeded, text),
+        Err(reason) => {
+            // The gateway and the plan both refuse in this wording; a tool that
+            // simply went wrong does not. Read from the reason rather than
+            // threaded through, because every refusal path already produces a
+            // sentence and none of them produces a code.
+            let refused = reason.contains("not permitted")
+                || reason.contains("planned to use")
+                || reason.contains("permitted steps")
+                || reason.contains("was not approved")
+                || reason.contains("going in circles");
+            let kind = if refused {
+                tasks::CallOutcome::Refused
+            } else {
+                tasks::CallOutcome::Failed
+            };
+            tasks::ToolCallRecord::new(tool, kind, reason)
+        }
+    };
+
+    if let Ok(mut table) = deps.calls.lock() {
+        table.entry(run_id.to_string()).or_default().push(record);
+    }
+}
+
+/// Marks a step spent and publishes how far through the plan the run is.
+fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
+    // Built inside the lock, published outside it: the handler is arbitrary
+    // code, and holding the plan table across a slow listener would stall every
+    // other run's authorisation.
+    let progress = {
+        let Ok(mut plans) = deps.plans.lock() else {
+            return;
+        };
+        let Some(plan) = plans.get_mut(run_id) else {
+            return;
+        };
+        // `record_call`, not `record_step`: one planned step can take several
+        // tool calls, and ticking a step off per call would report a document
+        // as produced and checked after four searches.
+        plan.record_call();
+        json!({
+            "type": "plan_step",
+            "tool": tool.as_str(),
+            "stepsTaken": plan.steps_taken(),
+            "maxSteps": plan.budget.max_steps,
+            "stepsPlanned": plan.steps.len(),
+        })
+    };
+    deps.publish(run_id, progress);
 }
 
 /// Names the tool catalogue exposes. Used by the absence test in `tests/`.

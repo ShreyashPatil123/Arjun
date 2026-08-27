@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom';
 import { Plus, Mic, ArrowUp, ShieldCheck, ShieldAlert } from 'lucide-react';
 import { sovereigntyService } from '../services/sovereignty.service';
 import { RoutingPreview } from '../components/routing/RoutingPreview';
+import { RunView } from '../components/run/RunView';
+import { isBusy, useRun } from '../components/run/useRun';
 import { registryService, type PreparedModel } from '../services/registry.service';
 import styles from './Workbench.module.css';
 
@@ -21,6 +23,7 @@ export const Workbench = () => {
   const [prepared, setPrepared] = useState<PreparedModel | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { state: run, start, abort, reset } = useRun();
 
   const resize = useCallback(() => {
     const el = textareaRef.current;
@@ -29,31 +32,47 @@ export const Workbench = () => {
     el.style.height = `${Math.min(el.scrollHeight, MAX_COMPOSER_HEIGHT)}px`;
   }, []);
 
+  const busy = preparing || isBusy(run.phase);
   const canSubmit = prompt.trim().length > 0 || attachments.length > 0;
 
   const submit = useCallback(async () => {
-    if (!canSubmit || preparing) return;
+    if (!canSubmit || busy) return;
+    const asked = prompt.trim();
 
-    // Routing and loading happen here, so by the time the orchestrator exists
-    // the right model is already resident. This is the automatic selection the
-    // problem statement asks to be demonstrated: no human step between asking
-    // and the correct model being ready.
+    // Routing and loading happen first, so by the time the run starts the right
+    // model is already resident. This is the automatic selection PS 26117 asks
+    // to be demonstrated: no human step between asking and the correct model
+    // being ready.
     setPreparing(true);
     setRefusal(null);
     try {
-      setPrepared(await registryService.prepareModelFor(prompt.trim()));
+      setPrepared(await registryService.prepareModelFor(asked));
     } catch (e) {
+      // Nothing to run against, so the run is not started. Saying why and
+      // stopping is better than starting a task that will fail on its first
+      // turn for a reason this screen already knows.
       setPrepared(null);
       setRefusal(e instanceof Error ? e.message : String(e));
-    } finally {
       setPreparing(false);
+      return;
     }
+    setPreparing(false);
 
-    // TODO(phase-5): hand the prompt, attachments and the now-loaded model to
-    // the orchestrator, which plans the task and opens the trace view. Stopping
-    // here is deliberate — a stubbed reply would make the workbench look
-    // further along than it is.
-  }, [canSubmit, preparing, prompt]);
+    // The backend routes again, and its decision is the one that counts —
+    // `prepareModelFor` above is what makes the model resident, not what
+    // chooses it. Handing a model down from here would make the automatic
+    // selection optional, which is the opposite of the point.
+    await start(asked);
+  }, [busy, canSubmit, prompt, start]);
+
+  /** Clears the run and returns to the composer, ready for the next task. */
+  const newTask = useCallback(() => {
+    reset();
+    setPrompt('');
+    setAttachments([]);
+    setPrepared(null);
+    setRefusal(null);
+  }, [reset]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter sends; Shift+Enter breaks the line. Matches what people already
@@ -83,6 +102,18 @@ export const Workbench = () => {
     setRefusal(null);
     setAttachments(prev => [...prev, ...picked]);
   };
+
+  // Once a task is under way the composer gives up the screen to it. The two
+  // are deliberately not shown together: a run takes minutes and produces a
+  // page of evidence, and a box inviting a second task above it would suggest
+  // the first can be left unread.
+  if (run.phase !== 'idle') {
+    return (
+      <div className={styles.runPage}>
+        <RunView state={run} onAbort={() => void abort()} onNewTask={newTask} />
+      </div>
+    );
+  }
 
   return (
     <div className={styles.page}>
@@ -141,7 +172,7 @@ export const Workbench = () => {
               <button
                 className={styles.send}
                 onClick={() => void submit()}
-                disabled={!canSubmit || preparing}
+                disabled={!canSubmit || busy}
                 aria-label="Start task"
               >
                 <ArrowUp size={18} />

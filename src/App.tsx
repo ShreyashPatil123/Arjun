@@ -6,6 +6,7 @@ import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
 import { AppShell } from './components/layout';
 import { Workbench } from './pages/Workbench';
+import { Tasks } from './pages/Tasks';
 import { Placeholder } from './pages/Placeholder';
 import { AuditNetwork } from './pages/AuditNetwork';
 import { SignIn } from './pages/SignIn';
@@ -65,18 +66,10 @@ function App() {
                 <Route path="/" element={<AppShell />}>
                   <Route index element={<Workbench />} />
 
+                  <Route path="tasks" element={<Tasks />} />
+
                   {/* Surfaces PS 26117 requires that do not exist yet. Routed and
                     * named now so the shell is complete and the gaps are visible. */}
-                  <Route
-                    path="tasks"
-                    element={
-                      <Placeholder
-                        title="Tasks"
-                        purpose="Every task you have run, with its plan, the models it chose and why, the evidence it retrieved, and the artifacts it produced."
-                        phase="Phase 5 — agent orchestrator"
-                      />
-                    }
-                  />
                   <Route
                     path="knowledge"
                     element={

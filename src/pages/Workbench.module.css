@@ -210,3 +210,13 @@
 @media (prefers-reduced-motion: reduce) {
   .send:hover:not(:disabled) { transform: none; }
 }
+
+/* A run gets the page to itself, top-aligned and scrollable — it is a document
+ * to read through rather than a box to look at, so it does not inherit the
+ * composer's optical centring. */
+.runPage {
+  min-height: 100%;
+  display: flex;
+  justify-content: center;
+  padding: var(--space-8) var(--space-6) var(--space-16);
+}

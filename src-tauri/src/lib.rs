@@ -131,6 +131,17 @@ pub fn run() {
 
             match registry::ModelRegistry::load_with_discovery(&data_dir) {
                 Ok(loaded) => {
+                    // Logged on every start, including — especially — when it is
+                    // zero. An empty registry turns into "no models are
+                    // registered yet" on the workbench, which sends somebody off
+                    // to import models they may already have; this line says
+                    // where it looked, so the next person can tell an empty
+                    // directory from an unreadable manifest in one glance.
+                    info!(
+                        "[REGISTRY] {} model(s) available from {}",
+                        loaded.all().len(),
+                        data_dir.join("models").display()
+                    );
                     app.manage(Arc::new(loaded));
                 }
                 Err(e) => {
@@ -162,6 +173,14 @@ pub fn run() {
             // One working directory per run, shared with the agent runtime so a
             // tool call can be resolved against the run that made it.
             app.manage(commands::agent::RunWorkspaces::default());
+            // The rest of a run's working state, held here for the same reason:
+            // the command that starts a run has to read all of it back when the
+            // run ends, to write the task's record.
+            app.manage(commands::agent::RunPlans::default());
+            app.manage(commands::agent::RunCalculations::default());
+            app.manage(commands::agent::RunToolCalls::default());
+            app.manage(agent_runtime::retrieval::RunPassages::default());
+            app.manage(agent_runtime::artifacts::RunArtifacts::default());
 
             app.manage(sovereignty::global_broker().clone());
 
@@ -409,6 +428,12 @@ pub fn run() {
             commands::agent::agent_abort_run,
             commands::agent::agent_steer_run,
             commands::agent::agent_runtime_health,
+            // What those runs left behind: the plan, the evidence, the working
+            // and the files.
+            commands::agent::agent_task_history,
+            commands::agent::agent_task,
+            commands::agent::agent_task_artifacts,
+            commands::agent::agent_reveal_artifact,
 
             commands::sovereignty::get_operating_mode,
             commands::sovereignty::set_operating_mode,

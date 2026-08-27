@@ -25,7 +25,7 @@ use super::executor::ToolRunner;
 use super::sandbox::{assess, SandboxPolicy, SandboxTier};
 use super::tools::{spec_for, ToolCall, ToolName};
 use crate::identity::Session;
-use crate::knowledge::KnowledgeIndex;
+use crate::knowledge::{KnowledgeIndex, SearchResult};
 
 /// How many passages a search returns to the model.
 ///
@@ -40,6 +40,35 @@ const SEARCH_LIMIT: usize = 6;
 /// exhausting memory, this stops one from exhausting the context window and
 /// pushing the task's own instructions out of it.
 const READ_CHARS: usize = 24_000;
+
+/// Writes retrieved passages the way the model is asked to cite them.
+///
+/// Each passage carries the marker it is to be cited by rather than its
+/// position in this result, so a run that searches several times numbers its
+/// evidence once across the whole task. That matters more than it looks:
+/// [`crate::artifacts::verifier`] resolves each `[En]` in the draft against the
+/// run's accumulated passages, and per-call numbering would make `[E1]` mean a
+/// different passage depending on when in the run it was written.
+pub fn render_passages(query: &str, marked: &[(usize, &SearchResult)]) -> String {
+    if marked.is_empty() {
+        // Said explicitly. An empty result the model has to infer from silence
+        // is how a summary ends up citing something that was never found — PS
+        // Part C asks for exactly this behaviour.
+        return format!(
+            "No passages matched {query:?}. Nothing in the connected collections says this, \
+             so do not assert it. Either try different wording or state that no source was found."
+        );
+    }
+
+    let mut out = format!("{} passage(s) found.\n\n", marked.len());
+    for (marker, hit) in marked {
+        out.push_str(&format!("[E{marker}] {}\n{}\n\n", hit.citation(), hit.text));
+    }
+    out.push_str(
+        "Cite these by their marker — write [E1] after a claim that came from that passage.\n",
+    );
+    out
+}
 
 pub struct LocalToolRunner<'a> {
     pub index: &'a KnowledgeIndex,
@@ -58,29 +87,25 @@ impl<'a> LocalToolRunner<'a> {
         }
     }
 
-    fn search(&self, call: &ToolCall) -> Result<String, String> {
-        let query = call.text("query").unwrap_or_default();
-
+    /// Runs the search and hands back the passages themselves.
+    ///
+    /// Separate from [`Self::search`] because a caller that accumulates a whole
+    /// run's evidence needs the passages, not the prose about them — and the
+    /// two must not be able to disagree about what was retrieved.
+    pub fn search_hits(&self, call: &ToolCall) -> Result<(String, Vec<SearchResult>), String> {
+        let query = call.text("query").unwrap_or_default().to_string();
         let hits = self
             .index
-            .search(self.session, query, SEARCH_LIMIT)
+            .search(self.session, &query, SEARCH_LIMIT)
             .map_err(|e| format!("the knowledge base could not be searched: {e}"))?;
+        Ok((query, hits))
+    }
 
-        if hits.is_empty() {
-            // Said explicitly. An empty result the model has to infer from
-            // silence is how a summary ends up citing something that was never
-            // found — PS Part C asks for exactly this behaviour.
-            return Ok(format!(
-                "No passages matched {query:?}. Nothing in the connected collections says this, \
-                 so do not assert it. Either try different wording or state that no source was found."
-            ));
-        }
-
-        let mut out = format!("{} passage(s) found.\n\n", hits.len());
-        for (i, hit) in hits.iter().enumerate() {
-            out.push_str(&format!("[{}] {}\n{}\n\n", i + 1, hit.citation(), hit.text));
-        }
-        Ok(out)
+    fn search(&self, call: &ToolCall) -> Result<String, String> {
+        let (query, hits) = self.search_hits(call)?;
+        let marked: Vec<(usize, &SearchResult)> =
+            hits.iter().enumerate().map(|(i, hit)| (i + 1, hit)).collect();
+        Ok(render_passages(&query, &marked))
     }
 
     fn read(&self, path: Option<&Path>) -> Result<String, String> {

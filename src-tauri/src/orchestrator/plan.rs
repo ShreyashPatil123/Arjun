@@ -282,6 +282,20 @@ impl PlanRun {
         }
     }
 
+    /// Records that a tool call was spent, without claiming a step is finished.
+    ///
+    /// The distinction matters wherever one planned step takes more than one
+    /// call. [`Self::record_step`] advances the checklist on every call, which
+    /// is right when the caller drives the plan a step at a time. On the agent
+    /// path a model may search four times to satisfy one step, and ticking four
+    /// steps off would tell an operator the document had been produced and
+    /// checked when nothing of the sort had happened.
+    ///
+    /// So the budget is spent either way, and only the claim differs.
+    pub fn record_call(&mut self) {
+        self.steps_taken += 1;
+    }
+
     /// Ends the run because a person has to answer.
     ///
     /// Not a failure — the budget is preserved so the run continues from here

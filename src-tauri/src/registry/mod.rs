@@ -232,7 +232,28 @@ impl ModelRegistry {
     /// usable on real material first.
     pub fn load_with_discovery(app_data_dir: &Path) -> Result<Self> {
         let models_dir = app_data_dir.join("models");
-        let declared = Self::load(&models_dir)?;
+
+        // An unreadable manifest must not also hide the models that are plainly
+        // on disk. It used to: the `?` here short-circuited before discovery
+        // ran, the caller fell back to an empty registry, and the workbench
+        // told an operator with six installed models that none were registered.
+        //
+        // A broken manifest is still a real problem and is still logged loudly.
+        // It is just not a reason to pretend the machine is empty.
+        let declared = match Self::load(&models_dir) {
+            Ok(declared) => declared,
+            Err(error) => {
+                log::error!(
+                    "[REGISTRY] {} could not be read, so only models found on disk are \
+                     available and none of them is cleared for classified material: {error:#}",
+                    models_dir.join("registry.json").display()
+                );
+                Self {
+                    entries: Vec::new(),
+                    manifest_path: models_dir.join("registry.json"),
+                }
+            }
+        };
         let discovered = discovery::discover(app_data_dir);
 
         let count = discovered.len();
@@ -265,7 +286,14 @@ impl ModelRegistry {
 
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("could not read {}", manifest_path.display()))?;
-        let manifest: ModelManifest = serde_json::from_str(&raw)
+        // A byte-order mark is three invisible characters that `serde_json`
+        // refuses outright, and on Windows they are routine: PowerShell's `>`,
+        // `Out-File` and Notepad all write UTF-8 with one by default. Rejecting
+        // a whole registry over them makes every model on the machine vanish
+        // and tells the operator to import models they already have — which is
+        // a long way to travel from three bytes nobody can see.
+        let body = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
+        let manifest: ModelManifest = serde_json::from_str(body)
             .with_context(|| format!("{} is not a valid model manifest", manifest_path.display()))?;
 
         Self::from_manifest(manifest, manifest_path)
@@ -504,5 +532,61 @@ pub(crate) mod tests {
         assert!(entry.serves(ModelRole::DocumentOcr));
         assert!(entry.enabled, "enabled defaults to true when omitted");
         assert!(entry.permits(Classification::ProcessDiagram));
+    }
+
+    /// The manifest a Windows tool wrote.
+    ///
+    /// PowerShell's `>`, `Out-File` and Notepad all write UTF-8 with a byte
+    /// order mark by default, so this is the ordinary shape of a hand-edited
+    /// registry on the platform this ships on, not an exotic corruption.
+    #[test]
+    fn a_manifest_written_with_a_byte_order_mark_still_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+
+        let json = r#"{
+            "models": [{
+                "id": "gemma-4-12b-it",
+                "name": "Gemma 4 12B",
+                "version": "1",
+                "license": "gemma",
+                "runtime": "llamaCpp",
+                "roles": ["reasoning"],
+                "parametersB": 12.0,
+                "contextLength": 8192,
+                "weightsBytes": 7000000000,
+                "permittedClassifications": ["internal"],
+                "path": "local/gemma"
+            }]
+        }"#;
+        std::fs::write(models_dir.join("registry.json"), format!("\u{feff}{json}"))
+            .expect("wrote the manifest");
+
+        let registry = ModelRegistry::load(&models_dir).expect("a BOM is not a broken manifest");
+        assert_eq!(registry.all().len(), 1);
+        assert!(registry.find("gemma-4-12b-it").is_some());
+    }
+
+    /// The failure that made six installed models disappear from the workbench.
+    #[test]
+    fn an_unreadable_manifest_does_not_stop_the_registry_loading() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::write(models_dir.join("registry.json"), b"{ not json at all")
+            .expect("wrote the broken manifest");
+
+        // Loads rather than failing, so the caller does not fall back to an
+        // empty registry and tell an operator that nothing is installed. Any
+        // model on disk would be discovered here; this fixture has none, and
+        // the point under test is that it got that far at all.
+        let registry = ModelRegistry::load_with_discovery(dir.path())
+            .expect("a broken manifest is not a reason to refuse to start");
+        assert!(registry.all().is_empty());
+
+        // The manifest is still reported as broken when it is read on its own,
+        // so nothing here quietly forgives a malformed file.
+        assert!(ModelRegistry::load(&models_dir).is_err());
     }
 }
