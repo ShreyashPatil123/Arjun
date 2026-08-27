@@ -296,7 +296,7 @@ impl EvidenceRecord {
 /// Mirrors `ContextLedgerSnapshot` in the runtime. The counts are the runtime's
 /// own, not re-derived here: two estimators would disagree, and the one that
 /// matters is the one compaction actually decided on.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextLedgerRecord {
     pub system: u32,

@@ -188,6 +188,10 @@ pub fn run() {
             app.manage(std::sync::Arc::new(agent_runtime::memory::MemoryStore::open(
                 &data_dir,
             )) as commands::agent::AgentMemory);
+            // The fixed half of each live run's checkpoint. Dies with the
+            // process on purpose: a seed describes a world observed at start,
+            // and after a restart that world has to be observed again.
+            app.manage(commands::agent::RunCheckpoints::default());
             app.manage(agent_runtime::retrieval::RunPassages::default());
             app.manage(agent_runtime::artifacts::RunArtifacts::default());
 
@@ -551,6 +555,8 @@ pub fn run() {
             commands::agent::agent_reveal_artifact,
             // Recovering a run: the state a window reattaches to, the events
             // since that state, and which runs are still going at all.
+            commands::agent::agent_run_resumability,
+            commands::agent::agent_resume_run,
             commands::agent::agent_task_snapshot,
             commands::agent::agent_task_events,
             commands::agent::agent_active_tasks,

@@ -59,6 +59,7 @@ fn deps_with(
         // On disk under the temp dir, so the durability and isolation these
         // tests assert are the real ones rather than a per-test map.
         memory: Arc::new(crate::agent_runtime::memory::MemoryStore::open(dir.path())),
+        checkpoints: Arc::default(),
         emit: Arc::new(|_| {}),
         emit_durable: Arc::new(|_| {}),
     });

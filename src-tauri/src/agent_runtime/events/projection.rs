@@ -101,6 +101,13 @@ pub struct TaskSnapshot {
     pub artifacts: Vec<String>,
     pub approvals_pending: usize,
     /// Times this run read a scope of memory it was entitled to.
+    /// Resume points written during this run.
+    pub checkpoints_taken: u32,
+    /// Resume points that could not be written. Non-zero means the run cannot be
+    /// continued from as far along as it actually got.
+    pub checkpoint_failures: u32,
+    /// Times a person picked this task up again.
+    pub resumptions: u32,
     pub memory_reads: u32,
     /// Facts promoted into project memory under an approval.
     pub memory_promotions: u32,
@@ -154,6 +161,9 @@ impl TaskSnapshot {
             activity: Vec::new(),
             turns: 0,
             compactions: 0,
+            checkpoints_taken: 0,
+            checkpoint_failures: 0,
+            resumptions: 0,
             memory_reads: 0,
             memory_promotions: 0,
             memory_refusals: 0,
@@ -331,6 +341,11 @@ impl TaskSnapshot {
             // Counted, not quoted. The payloads carry hashes and counts by
             // construction (see `memory_api`), and folding a value out of one
             // into a snapshot the Tasks list reads would undo that.
+            TaskEventType::CheckpointTaken => self.checkpoints_taken += 1,
+            // Counted separately and prominently: a run with failed checkpoints
+            // is a run whose resume point is behind where it actually got to.
+            TaskEventType::CheckpointFailed => self.checkpoint_failures += 1,
+            TaskEventType::RunResumed => self.resumptions += 1,
             TaskEventType::MemoryRecalled => self.memory_reads += 1,
             TaskEventType::MemoryPromoted => self.memory_promotions += 1,
             TaskEventType::MemoryRefused => self.memory_refusals += 1,

@@ -37,12 +37,16 @@
 //! in an event stream. The two answer different questions, and old records
 //! stay readable because nothing about them changed.
 
+pub mod checkpoint;
 pub mod idempotency;
 pub mod machine;
 pub mod model;
 pub mod projection;
 pub mod store;
 
+pub use checkpoint::{
+    NotResumable, Resumability, RunCheckpoint, WorldNow, CHECKPOINT_SCHEMA_VERSION,
+};
 pub use idempotency::{
     args_fingerprint, derive_key, is_side_effecting, EffectLookup, EffectStatus, KeyConflict,
     RecordedOutcome,
@@ -55,5 +59,7 @@ pub use model::{
 pub use projection::{fold, ActivityRecord, TaskSnapshot, UnknownEffect};
 pub use store::{AppendError, EventPage, TaskEventLog};
 
+#[cfg(test)]
+mod checkpoint_store_tests;
 #[cfg(test)]
 mod tests;

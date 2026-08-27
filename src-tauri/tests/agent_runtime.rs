@@ -71,6 +71,7 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
                 dir.path().join("__no_skills__"),
             )),
             memory: Arc::new(sarathi_lib::agent_runtime::memory::MemoryStore::open(dir.path())),
+            checkpoints: Arc::default(),
             emit: Arc::new(|_| {}),
             emit_durable: Arc::new(|_| {}),
         }),

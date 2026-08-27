@@ -31,9 +31,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+use super::checkpoint::{NotResumable, RunCheckpoint};
 use super::idempotency::{self, EffectLookup, EffectStatus, RecordedOutcome};
 use super::machine::RunState;
 use super::model::{
@@ -184,6 +185,23 @@ impl TaskEventLog {
             );
 
             CREATE INDEX IF NOT EXISTS task_snapshots_status_idx ON task_snapshots(status);
+
+            -- The point a run can be continued from. One row per run: the
+            -- newest safe point is the only one worth keeping, and choosing
+            -- between several at resume time has no defensible answer other
+            -- than the newest one. Updated in place, guarded by sequence in
+            -- `save_checkpoint` so a late write from a dying process cannot
+            -- move the point backwards.
+            CREATE TABLE IF NOT EXISTS run_checkpoints (
+                run_id          TEXT PRIMARY KEY,
+                attempt_id      TEXT NOT NULL,
+                last_event_seq  INTEGER NOT NULL,
+                state           TEXT NOT NULL,
+                at              TEXT NOT NULL,
+                schema_version  INTEGER NOT NULL,
+                checkpoint_hash TEXT NOT NULL,
+                body            TEXT NOT NULL
+            );
             ",
         )
         .map_err(|error| format!("could not prepare the task event schema: {error}"))?;
@@ -628,6 +646,126 @@ impl TaskEventLog {
     /// Every side effect nobody can account for, oldest first.
     ///
     /// What the screen that asks a person to reconcile reads.
+    /// Writes the point this run can be continued from.
+    ///
+    /// Sequence-guarded: a checkpoint whose `last_event_seq` is behind the one
+    /// already stored is dropped rather than written. Two writers racing at the
+    /// end of a run — the loop settling a tool and the shutdown path recording
+    /// the ending — would otherwise let whichever finished last decide the
+    /// resume point, and the later writer is not always the further-along one.
+    ///
+    /// Returns whether the row was actually moved, so a caller that needs to
+    /// know its checkpoint landed can tell that from a no-op.
+    pub fn save_checkpoint(&self, checkpoint: &RunCheckpoint) -> Result<bool, String> {
+        // Sealed before it is written, never trusted from the caller. A
+        // checkpoint whose hash was computed elsewhere is a checkpoint whose
+        // hash proves nothing about what is in this row.
+        if !checkpoint.is_intact() {
+            return Err(
+                "the checkpoint does not match its own hash and was not written".to_string(),
+            );
+        }
+        let body = serde_json::to_string(checkpoint)
+            .map_err(|error| format!("the checkpoint could not be written: {error}"))?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+
+        let held: Option<i64> = conn
+            .query_row(
+                "SELECT last_event_seq FROM run_checkpoints WHERE run_id = ?1",
+                [&checkpoint.run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+
+        if let Some(held) = held {
+            if held > checkpoint.last_event_seq {
+                return Ok(false);
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO run_checkpoints
+                 (run_id, attempt_id, last_event_seq, state, at, schema_version, checkpoint_hash, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 attempt_id = excluded.attempt_id,
+                 last_event_seq = excluded.last_event_seq,
+                 state = excluded.state,
+                 at = excluded.at,
+                 schema_version = excluded.schema_version,
+                 checkpoint_hash = excluded.checkpoint_hash,
+                 body = excluded.body",
+            rusqlite::params![
+                checkpoint.run_id,
+                checkpoint.attempt_id,
+                checkpoint.last_event_seq,
+                checkpoint.state.as_str(),
+                checkpoint.at,
+                checkpoint.schema_version,
+                checkpoint.checkpoint_hash,
+                body,
+            ],
+        )
+        .map_err(|error| format!("the checkpoint could not be saved: {error}"))?;
+        Ok(true)
+    }
+
+    /// The point this run can be continued from, if there is one.
+    ///
+    /// A row that will not parse, or whose hash does not match its body, is
+    /// reported as a refusal rather than as absence. The two are different: no
+    /// checkpoint means the run was never safe to continue, and a broken one
+    /// means somebody should know the record was damaged.
+    pub fn checkpoint(&self, run_id: &str) -> Result<Option<RunCheckpoint>, NotResumable> {
+        let conn = self.conn.lock().map_err(|_| NotResumable::UnreadableCheckpoint {
+            detail: "the task event log is poisoned".to_string(),
+        })?;
+
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT body FROM run_checkpoints WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| NotResumable::UnreadableCheckpoint {
+                detail: error.to_string(),
+            })?;
+
+        let Some(body) = body else {
+            return Ok(None);
+        };
+
+        let checkpoint: RunCheckpoint = serde_json::from_str(&body).map_err(|error| {
+            NotResumable::UnreadableCheckpoint {
+                detail: error.to_string(),
+            }
+        })?;
+        if !checkpoint.is_intact() {
+            return Err(NotResumable::CorruptCheckpoint);
+        }
+        Ok(Some(checkpoint))
+    }
+
+    /// Forgets a run's resume point.
+    ///
+    /// Called when a run reaches an ending that leaves nothing to continue. The
+    /// events stay; only the invitation to carry on goes.
+    pub fn clear_checkpoint(&self, run_id: &str) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        conn.execute("DELETE FROM run_checkpoints WHERE run_id = ?1", [run_id])
+            .map_err(|error| format!("the checkpoint could not be cleared: {error}"))?;
+        Ok(())
+    }
+
     pub fn unknown_effects(&self) -> Result<Vec<RecordedOutcome>, String> {
         let conn = self
             .conn

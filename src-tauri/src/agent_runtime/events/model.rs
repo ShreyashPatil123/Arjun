@@ -103,6 +103,17 @@ pub enum TaskEventType {
     /// cancellation are each named rather than folded into one ending.
     SubagentStopped,
 
+    // -- Checkpoints ------------------------------------------------------
+    /// A resume point was written. Carries the sequence and the attempt, never
+    /// the notes themselves.
+    CheckpointTaken,
+    /// A resume point could not be written. Recorded so a later reader sees the
+    /// gap rather than inferring it from a resume point further back than it
+    /// should be.
+    CheckpointFailed,
+    /// A person asked for a stopped run to be continued, and it was.
+    RunResumed,
+
     // -- Memory -----------------------------------------------------------
     /// A run read a scope of memory it was entitled to. Carries counts and key
     /// hashes; never the values, because this record is read by people who are
@@ -173,6 +184,9 @@ impl TaskEventType {
             TaskEventType::ArtifactProduced => "artifact_produced",
             TaskEventType::SubagentStarted => "subagent_started",
             TaskEventType::SubagentStopped => "subagent_stopped",
+            TaskEventType::CheckpointTaken => "checkpoint_taken",
+            TaskEventType::CheckpointFailed => "checkpoint_failed",
+            TaskEventType::RunResumed => "run_resumed",
             TaskEventType::MemoryRecalled => "memory_recalled",
             TaskEventType::MemoryRefused => "memory_refused",
             TaskEventType::MemoryPromoted => "memory_promoted",
@@ -213,6 +227,9 @@ impl TaskEventType {
             "artifact_produced" => TaskEventType::ArtifactProduced,
             "subagent_started" => TaskEventType::SubagentStarted,
             "subagent_stopped" => TaskEventType::SubagentStopped,
+            "checkpoint_taken" => TaskEventType::CheckpointTaken,
+            "checkpoint_failed" => TaskEventType::CheckpointFailed,
+            "run_resumed" => TaskEventType::RunResumed,
             "memory_recalled" => TaskEventType::MemoryRecalled,
             "memory_refused" => TaskEventType::MemoryRefused,
             "memory_promoted" => TaskEventType::MemoryPromoted,

@@ -199,10 +199,18 @@ pub struct RuntimeState<'a> {
     pub events: &'a TaskEvents,
     pub skills: &'a Skills,
     pub memory: &'a AgentMemory,
+    pub checkpoints: &'a RunCheckpoints,
 }
 
 /// The scoped memory store, as Tauri manages it.
 pub type AgentMemory = crate::agent_runtime::memory::SharedMemory;
+
+/// The fixed half of each live run's checkpoint, keyed by run id.
+///
+/// Established when a run starts and dropped when it ends. See
+/// `agent_runtime::resume::CheckpointSeed` for why the deep loop needs it.
+pub type RunCheckpoints =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, crate::agent_runtime::resume::CheckpointSeed>>>;
 
 fn runtime(
     handle: &AgentRuntimeHandle,
@@ -243,6 +251,7 @@ fn runtime(
         events: state.events.clone(),
         skills: state.skills.clone(),
         memory: state.memory.clone(),
+        checkpoints: state.checkpoints.clone(),
         emit_durable,
         // The same channel the loop's own events travel, so an operator sees
         // one sequence of what happened rather than two interleaved by luck.
@@ -309,6 +318,7 @@ pub async fn agent_start_run(
     events: State<'_, TaskEvents>,
     skills: State<'_, Skills>,
     memory: State<'_, AgentMemory>,
+    checkpoints: State<'_, RunCheckpoints>,
 ) -> Result<RunSummary, String> {
     // Checked here as well as in the runtime's handlers. Here it gives the
     // person a clear reason before anything starts; there it stops a call whose
@@ -359,6 +369,7 @@ pub async fn agent_start_run(
         events: &events,
         skills: &skills,
         memory: &memory,
+        checkpoints: &checkpoints,
     };
     let runtime = runtime(&handle, &app, &state)?;
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -416,6 +427,9 @@ pub async fn agent_start_run(
     // gateway has roots to resolve against.
     let workspace = Workspace::create(&app_data_dir(&app)?, &run_id).map_err(|e| e.to_string())?;
     let workspace_note = workspace.describe();
+    // Kept because the checkpoint seed below needs the directory's identity, and
+    // the workspace itself is about to be moved into the shared table.
+    let workspace_root = Some(workspace.root().to_path_buf());
     workspaces
         .lock()
         .map_err(|_| "the workspace table is poisoned".to_string())?
@@ -428,6 +442,35 @@ pub async fn agent_start_run(
     let task_plan = planning::plan_for(&run_id, &request.prompt);
     let plan_note = describe_plan(&task_plan);
     let planned = PlanRecord::of(&task_plan);
+    // The fixed half of every checkpoint this attempt will take. Established
+    // here because this is the first point at which all of it is known: the
+    // workspace exists, the plan is fixed, the model is chosen, and the session
+    // that authorised it is in hand. Recorded now so the deep loop can take a
+    // checkpoint after each tool result without re-deriving any of it.
+    {
+        let seed = crate::agent_runtime::resume::CheckpointSeed {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            plan_hash: crate::agent_runtime::resume::plan_hash_of(&request.prompt),
+            policy_hash: crate::agent_runtime::resume::policy_hash(
+                &signed_in,
+                request.classification,
+                &format!("{:?}", crate::sovereignty::global_broker().mode()),
+            ),
+            // The workspace was created a moment ago, so this resolves. An
+            // unresolvable one would mean the directory vanished between
+            // creating it and describing it, and a seed built on a workspace
+            // that is not there would claim a world nobody observed.
+            workspace_hash: workspace_root
+                .as_deref()
+                .and_then(crate::agent_runtime::resume::workspace_hash_of)
+                .unwrap_or_default(),
+            model_id: routing.model_id.clone(),
+        };
+        if let Ok(mut seeds) = checkpoints.lock() {
+            seeds.insert(run_id.clone(), seed);
+        }
+    }
+
     // The instant this run must stop by. A property of the plan, so it is only
     // knowable once the plan is fixed — and fixed it is: nothing after this
     // point may extend it.
@@ -1018,6 +1061,7 @@ pub async fn agent_runtime_health(
     events: State<'_, TaskEvents>,
     skills: State<'_, Skills>,
     memory: State<'_, AgentMemory>,
+    checkpoints: State<'_, RunCheckpoints>,
 ) -> Result<Value, String> {
     let state = RuntimeState {
         index: &index,
@@ -1032,6 +1076,7 @@ pub async fn agent_runtime_health(
         events: &events,
         skills: &skills,
         memory: &memory,
+        checkpoints: &checkpoints,
     };
     let runtime = runtime(&handle, &app, &state)?;
     runtime
@@ -1477,4 +1522,176 @@ fn ledger_record(ledger: &Value) -> Option<crate::agent_runtime::tasks::ContextL
         // fit, and clamping it to zero would report that as "exactly full".
         headroom: top("headroom"),
     })
+}
+
+/// How resumable a stopped run is, as the Tasks screen asks.
+///
+/// Read-only. Answering this must never change anything about the run, because
+/// a screen asks it on every refresh and an operator has not decided anything by
+/// looking.
+#[tauri::command]
+pub async fn agent_run_resumability(
+    app: AppHandle,
+    run_id: String,
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+    registry: State<'_, Arc<ModelRegistry>>,
+) -> Result<crate::agent_runtime::events::Resumability, String> {
+    let signed_in = require_session(&session)?;
+    Ok(assess_resumability(&app, &run_id, &signed_in, &events, &registry))
+}
+
+/// Continues a stopped run as a new attempt at the same task.
+///
+/// ## Why this is a separate command from starting a run
+///
+/// Reattaching to a run and continuing one look similar on a screen and are not
+/// remotely the same act. Reattaching reads a record. Continuing takes actions
+/// in the world, under an authorisation that was granted at some earlier moment
+/// to a person who may no longer hold it, against files that may no longer be
+/// where they were. Every one of those has to be re-established before anything
+/// runs, and a single command that did both would inevitably grow a path where
+/// one of them was skipped.
+///
+/// So the checks happen here, before any work, and the refusals are specific:
+/// see `NotResumable`. The most important is that a side effect nobody settled
+/// stops this outright — continuing would either repeat it or assume it worked,
+/// and nothing on this side can tell which.
+#[tauri::command]
+pub async fn agent_resume_run(
+    app: AppHandle,
+    run_id: String,
+    operator_intent: String,
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+    registry: State<'_, Arc<ModelRegistry>>,
+    audit: State<'_, Arc<AuditService>>,
+) -> Result<crate::agent_runtime::resume::Attempt, String> {
+    use crate::agent_runtime::events::Resumability;
+
+    let signed_in = require_session(&session)?;
+
+    // Assessed and refused before anything else happens. A resumption that
+    // records its own intent and then discovers it may not proceed has written a
+    // line saying a person continued a run that never continued.
+    let verdict = assess_resumability(&app, &run_id, &signed_in, &events, &registry);
+    let (attempt_id, from_seq) = match verdict {
+        Resumability::Resumable {
+            attempt_id,
+            from_seq,
+            ..
+        } => (attempt_id, from_seq),
+        Resumability::NeedsReconciliation { because, .. } => return Err(because),
+        Resumability::ViewOnly { because } => return Err(because),
+    };
+    let _ = attempt_id;
+
+    let attempt = crate::agent_runtime::resume::Attempt::new(&run_id, &operator_intent, from_seq);
+
+    // Recorded before the loop is asked to do anything, and treated as
+    // recovery-critical: a resumption that is not in the history is one a later
+    // reader would count as part of the original attempt, and the whole point of
+    // an attempt id is that those are told apart.
+    events
+        .record(
+            EventDraft::new(
+                &run_id,
+                TaskEventType::RunResumed,
+                &signed_in.user.id,
+            )
+            .with(json!({
+                "attemptId": attempt.attempt_id,
+                "fromSeq": attempt.from_seq,
+                // The operator note, already bounded by `Attempt::new`.
+                "operatorIntent": attempt.operator_intent,
+            })),
+        )
+        .map_err(|error| {
+            format!(
+                "This run was not resumed: the resumption could not be recorded ({error}), and                  continuing without a record of it would leave the work unattributable."
+            )
+        })?;
+
+    let _ = audit.record(
+        &signed_in.user.id,
+        AuditKind::ModelRegistry,
+        format!("resumed task {run_id} as attempt {}", attempt.attempt_id),
+        None,
+    );
+
+    Ok(attempt)
+}
+
+/// The read-only half of both commands above.
+///
+/// Gathers the world as it is now and puts it to the checkpoint. Everything it
+/// reads is re-derived rather than remembered, which is the entire basis on
+/// which a resumption can be called safe.
+fn assess_resumability(
+    app: &AppHandle,
+    run_id: &str,
+    signed_in: &crate::identity::Session,
+    events: &TaskEvents,
+    registry: &Arc<ModelRegistry>,
+) -> crate::agent_runtime::events::Resumability {
+    use crate::agent_runtime::events::{NotResumable, Resumability};
+
+    let checkpoint = match events.checkpoint(run_id) {
+        Ok(found) => found,
+        // A damaged or unreadable checkpoint is surfaced as its own refusal
+        // rather than folded into "no checkpoint": absence means the run was
+        // never safe to continue, and damage means somebody should know the
+        // record was harmed.
+        Err(refusal) => {
+            return Resumability::ViewOnly {
+                because: refusal.explain(),
+            }
+        }
+    };
+
+    let Ok(Some(snapshot)) = events.snapshot(run_id) else {
+        return Resumability::ViewOnly {
+            because: NotResumable::NoCheckpoint.explain(),
+        };
+    };
+
+    // The prompt the plan is re-derived from, and the person the run belongs to,
+    // both read from the run's own durable record rather than from the caller.
+    let prompt = snapshot.prompt.clone();
+    let owner = snapshot.actor.clone();
+
+    let workspace_root = app_data_dir(app)
+        .map(|dir| dir.join("runs").join(run_id))
+        .unwrap_or_default();
+
+    // Whether the model this run was routed to can still be served. A different
+    // model would produce a second half the first half does not match.
+    let model_available = checkpoint
+        .as_ref()
+        .map(|point| registry.find(&point.model_id).is_some())
+        .unwrap_or(false);
+
+    let context = crate::agent_runtime::resume::ResumeContext {
+        session: signed_in,
+        prompt: &prompt,
+        // Read back off the run rather than supplied: a caller that could name
+        // the classification could name a lower one.
+        classification: snapshot
+            .classification
+            .as_deref()
+            .and_then(|label| {
+                crate::policy::Classification::ALL
+                    .iter()
+                    .copied()
+                    .find(|c| c.label() == label)
+            }),
+        sovereignty_mode: &format!("{:?}", crate::sovereignty::global_broker().mode()),
+        workspace_root: &workspace_root,
+        model_available,
+        owner: &owner,
+        ended: snapshot.state.is_terminal(),
+        state: snapshot.state,
+    };
+
+    Resumability::of(checkpoint.as_ref(), &context.world())
 }

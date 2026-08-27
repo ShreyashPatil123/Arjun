@@ -67,6 +67,91 @@ impl RuntimeDeps {
     }
 }
 
+impl RuntimeDeps {
+    /// Writes the point this run could be continued from, right now.
+    ///
+    /// Called after every tool result and either side of a side-effecting call.
+    /// A checkpoint is cheap — one small row, overwritten — and the alternative
+    /// is a run that can only be resumed from wherever the last expensive
+    /// milestone happened to be.
+    ///
+    /// ## Why a failure here is returned rather than logged
+    ///
+    /// Everything else in this module is best-effort: a dropped progress event
+    /// costs a line on a screen. This is not that. A run that believes it
+    /// checkpointed and did not will later be *offered* for resumption from a
+    /// point that does not exist, and whoever accepts that offer gets a
+    /// continuation built on a record nobody wrote. So the caller is told, and
+    /// the caller decides whether it is safe to go on.
+    ///
+    /// Returns `Ok(false)` when the run has no seed — started before checkpoints
+    /// existed, or never fully started. That is not a failure: there is nothing
+    /// to checkpoint against, and inventing a world to record would be worse
+    /// than recording nothing.
+    pub(super) fn checkpoint(
+        &self,
+        run_id: &str,
+        state: events::RunState,
+        notes: crate::agent_runtime::memory::RunMemory,
+    ) -> Result<bool, String> {
+        let seed = {
+            let Ok(seeds) = self.checkpoints.lock() else {
+                return Err("the checkpoint table was left locked by a failed write".to_string());
+            };
+            match seeds.get(run_id) {
+                Some(seed) => seed.clone(),
+                None => return Ok(false),
+            }
+        };
+
+        // The sequence this checkpoint is taken after, read from the history
+        // rather than counted here: a local counter and the durable log
+        // disagreeing is exactly the drift a resumption would act on.
+        let last_seq = self
+            .events
+            .events_since(run_id, 0)
+            .map(|page| page.last_seq())
+            .unwrap_or(0);
+
+        // Effects nobody has settled. Read fresh every time, because an effect
+        // becoming unknown is the single fact that must stop a resumption, and a
+        // stale copy of this list is a copy that says a run is safe.
+        let unknown: Vec<String> = self
+            .events
+            .unknown_effects()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|effect| effect.run_id == run_id)
+            .map(|effect| effect.idempotency_key.clone())
+            .collect();
+
+        let checkpoint = seed.checkpoint(run_id, state, last_seq, notes, None, unknown);
+        crate::agent_runtime::resume::checkpoint_now(&self.events, &checkpoint)
+    }
+
+    /// Takes a checkpoint, and records the failure to take one.
+    ///
+    /// For the call sites where stopping the run is not the right answer but
+    /// silently continuing is not either: the failure becomes a durable event,
+    /// so a later reader sees the gap rather than inferring it from a resume
+    /// point further back than it should be.
+    pub(super) fn checkpoint_or_note(
+        &self,
+        run_id: &str,
+        state: events::RunState,
+        notes: crate::agent_runtime::memory::RunMemory,
+    ) {
+        if let Err(error) = self.checkpoint(run_id, state, notes) {
+            log::error!("[tasks] run {run_id}: the checkpoint could not be written: {error}");
+            self.remember(
+                run_id,
+                events::TaskEventType::CheckpointFailed,
+                json!({ "detail": error }),
+            );
+        }
+    }
+}
+
 /// Records a refusal.
 ///
 /// One place rather than five, because a refusal that reaches the model and not
@@ -124,6 +209,15 @@ pub(super) fn remember_outcome(
         ),
     };
     deps.remember(&call.run_id, event_type, payload);
+
+    // Checkpointed after the outcome is recorded and before the loop is told,
+    // so the resume point never claims a tool settled that the history does not
+    // also show settling.
+    deps.checkpoint_or_note(
+        &call.run_id,
+        events::RunState::ToolResultRecorded,
+        crate::agent_runtime::memory::RunMemory::default(),
+    );
 
     // The file is a reference: its name, so the Tasks screen can list what a
     // run produced without opening anything.

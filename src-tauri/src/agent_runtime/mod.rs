@@ -38,6 +38,7 @@ pub mod memory_api;
 pub mod planning;
 pub mod protocol;
 pub mod recording;
+pub mod resume;
 pub mod retrieval;
 pub mod tasks;
 pub mod workspace;
@@ -147,6 +148,18 @@ pub struct RuntimeDeps {
     /// project, classification and approval from this side. Held here rather
     /// than reached for so the handlers stay drivable with no Tauri app.
     pub memory: memory::SharedMemory,
+    /// The parts of a checkpoint that are fixed for the life of an attempt.
+    ///
+    /// Held so the deep loop can take a checkpoint after every tool result
+    /// without re-deriving the policy, plan and workspace hashes it would need
+    /// to do that — those are established once, when the run starts, from state
+    /// this side of the wire does not otherwise carry.
+    ///
+    /// A run with no seed is a run started before this existed, or one whose
+    /// start did not complete. Both mean no checkpoint is taken, which is the
+    /// honest answer: a checkpoint assembled from defaults would claim a world
+    /// nobody observed.
+    pub checkpoints: Arc<Mutex<HashMap<String, resume::CheckpointSeed>>>,
     /// Where run events go.
     ///
     /// The loop publishes its own events over the wire; these are the ones this

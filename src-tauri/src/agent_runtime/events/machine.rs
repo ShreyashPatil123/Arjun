@@ -310,6 +310,13 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         // run is doing. None of it is an ending and none of it moves the run's
         // state; treating a recall as a transition would make a task that
         // consulted its notes look like a task that changed course.
+        // A checkpoint is an observation about the run, not a move within it.
+        // `run_resumed` is here for a subtler reason: the state a resumption
+        // lands in is the state the checkpoint recorded, and that is restored
+        // explicitly rather than implied by this event.
+        | E::CheckpointTaken
+        | E::CheckpointFailed
+        | E::RunResumed
         | E::MemoryRecalled
         | E::MemoryRefused
         | E::MemoryPromoted
