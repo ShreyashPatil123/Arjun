@@ -53,6 +53,14 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             workspaces,
             approvals: Arc::new(ApprovalQueue::new()),
             calculations: Arc::default(),
+            passages: Arc::default(),
+            produced: Arc::default(),
+            calls: Arc::default(),
+            // No plan registered: these tests are about the transport between
+            // the two processes, and a budget refusing a call would make a wire
+            // problem and a policy problem look the same.
+            plans: Arc::default(),
+            emit: Arc::new(|_| {}),
         }),
         // Returned so the directory outlives the test; dropping it early would
         // delete the SQLite file out from under the runtime.

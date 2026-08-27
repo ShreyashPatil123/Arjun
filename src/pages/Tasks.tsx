@@ -1,0 +1,433 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  FileSpreadsheet,
+  FileText,
+  FolderOpen,
+  ShieldCheck,
+} from 'lucide-react';
+import {
+  agentService,
+  type ArtifactReport,
+  type TaskRecord,
+  type TaskSummary,
+} from '../services/agent.service';
+import styles from './Tasks.module.css';
+
+/**
+ * Every task this machine has run, and what each one rests on.
+ *
+ * PS 26117 asks for exactly this: *"every task you have run, with its plan, the
+ * models it chose and why, the evidence it retrieved, and the artifacts it
+ * produced."* The list is deliberately not filtered to successes — the run
+ * somebody comes here to look at is usually the one that went wrong, and a
+ * screen showing only good news would be worse than no screen.
+ *
+ * ## Why the artifacts are checked again on opening
+ *
+ * The saved record says what the check found when the run ended. This page also
+ * asks the backend to re-open the files now, because a deliverable can be
+ * moved, replaced or truncated long after the run that made it. The two
+ * disagreeing is information, so both are shown rather than the newer quietly
+ * replacing the older.
+ */
+
+const KIND_ICONS = {
+  document: FileText,
+  workbook: FileSpreadsheet,
+  text: FileText,
+} as const;
+
+function when(iso: string): string {
+  const at = new Date(iso);
+  return Number.isNaN(at.getTime())
+    ? iso
+    : at.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function howLong(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function size(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function ArtifactRow({
+  artifact,
+  now,
+  onReveal,
+}: {
+  artifact: ArtifactReport;
+  /** The same file as it is on disk today. Absent until the re-check lands. */
+  now: ArtifactReport | undefined;
+  onReveal: (name: string) => void;
+}) {
+  const Icon = KIND_ICONS[artifact.kind];
+  // Only worth calling out when it *changed*. Printing "still sound" on every
+  // row would train people to skip the line that matters.
+  const changed = now && now.sound !== artifact.sound;
+
+  return (
+    <li className={styles.artifact}>
+      <Icon size={16} className={styles.artifactIcon} />
+      <div className={styles.artifactBody}>
+        <div className={styles.artifactName}>
+          <strong>{artifact.name}</strong>
+          <span className={styles.dim}>{size(artifact.bytes)}</span>
+          <span className={artifact.sound ? styles.tagSound : styles.tagUnsound}>
+            {artifact.sound ? 'checked out when produced' : 'did not pass its check'}
+          </span>
+        </div>
+        <p className={styles.artifactDetail}>{artifact.detail}</p>
+        {changed && now && (
+          <p className={styles.changed}>
+            <AlertTriangle size={13} />
+            <span>On disk now: {now.detail}</span>
+          </p>
+        )}
+        {artifact.problems.length > 0 && (
+          <ul className={styles.problems}>
+            {artifact.problems.map((text, i) => (
+              <li key={i}>{text}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <button
+        className={styles.revealBtn}
+        onClick={() => onReveal(artifact.name)}
+        aria-label={`Show ${artifact.name} in the file manager`}
+      >
+        <FolderOpen size={14} />
+      </button>
+    </li>
+  );
+}
+
+function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
+  const [record, setRecord] = useState<TaskRecord | null>(null);
+  const [onDisk, setOnDisk] = useState<ArtifactReport[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const loaded = await agentService.task(runId);
+        if (!live) return;
+        setRecord(loaded);
+        // Best-effort, and after the record: a re-check that fails should not
+        // stop the task being readable.
+        try {
+          const fresh = await agentService.taskArtifacts(runId);
+          if (live) setOnDisk(fresh);
+        } catch {
+          // Leaves the rows showing what the run found, which is still a true
+          // statement about the moment it ran.
+        }
+      } catch (e) {
+        if (live) setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [runId]);
+
+  const reveal = useCallback(
+    (name: string) => {
+      void agentService.revealArtifact(runId, name).catch(e => {
+        setError(e instanceof Error ? e.message : String(e));
+      });
+    },
+    [runId],
+  );
+
+  const back = (
+    <button className={styles.back} onClick={onBack}>
+      <ArrowLeft size={14} />
+      <span>All tasks</span>
+    </button>
+  );
+
+  if (error) {
+    return (
+      <div className={styles.page}>
+        {back}
+        <p className={styles.failure} role="alert">
+          <AlertTriangle size={15} />
+          <span>{error}</span>
+        </p>
+      </div>
+    );
+  }
+
+  if (!record) {
+    return (
+      <div className={styles.page}>
+        {back}
+        <p className={styles.dim}>Reading this task&rsquo;s record&hellip;</p>
+      </div>
+    );
+  }
+
+  const verification = record.verification;
+  const standing = verification?.standing;
+
+  return (
+    <div className={styles.page}>
+      {back}
+
+      <header className={styles.detailHead}>
+        <h1 className={styles.prompt}>{record.prompt}</h1>
+        <p className={styles.meta}>
+          {when(record.startedAt)} &middot; {howLong(record.durationSeconds)} &middot; {record.turns}{' '}
+          turn(s)
+        </p>
+      </header>
+
+      {record.failure && (
+        <p className={styles.failure} role="alert">
+          <AlertTriangle size={15} />
+          <span>{record.failure}</span>
+        </p>
+      )}
+
+      <section className={styles.card}>
+        <h2 className={styles.cardTitle}>Model</h2>
+        <p className={styles.body}>
+          <strong>{record.routing.modelName}</strong> took this as{' '}
+          {record.routing.intent.toLowerCase()} work
+          {record.routing.usedFallback ? ', after the first choice did not fit' : ''}.
+        </p>
+        {/* In the order they applied, and not summarised: these are the answer
+          * to "why this model", and a paraphrase is not that answer. */}
+        <ul className={styles.reasons}>
+          {record.routing.reasons.map((reason, i) => (
+            <li key={i}>{reason}</li>
+          ))}
+        </ul>
+        <p className={styles.dim}>
+          {record.routing.gpuPlanSummary} &middot;{' '}
+          {record.endpoint.runtime === 'llamaCpp' ? 'llama.cpp' : 'Python sidecar'} on{' '}
+          {record.endpoint.baseUrl}
+        </p>
+      </section>
+
+      <section className={styles.card}>
+        <header className={styles.cardHead}>
+          <h2 className={styles.cardTitle}>Plan</h2>
+          <span className={styles.dim}>
+            {record.plan.stepsTaken} of {record.plan.maxSteps} tool calls
+          </span>
+        </header>
+        {/* What the run set out to do, with no per-step tick: one planned step
+          * can take several tool calls, so reaching the end of the loop does
+          * not establish that each step was carried out. The produced files
+          * and the check are the evidence for that. */}
+        <ol className={styles.steps}>
+          {record.plan.steps.map(step => (
+            <li key={step.ordinal} className={styles.step}>
+              <span className={styles.stepMark} aria-hidden>
+                {step.ordinal}
+              </span>
+              <span>{step.intent}</span>
+            </li>
+          ))}
+        </ol>
+        <p className={styles.dim}>{record.plan.stoppedBecause}</p>
+      </section>
+
+      {record.artifacts.length > 0 && (
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>Produced</h2>
+          <ul className={styles.artifacts}>
+            {record.artifacts.map(artifact => (
+              <ArtifactRow
+                key={artifact.path}
+                artifact={artifact}
+                now={onDisk.find(item => item.path === artifact.path)}
+                onReveal={reveal}
+              />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {verification && standing && (
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>Checked</h2>
+          <p
+            className={standing.standing === 'ready' ? styles.verdictReady : styles.verdictReview}
+          >
+            {standing.standing === 'ready' ? (
+              <ShieldCheck size={15} />
+            ) : (
+              <AlertTriangle size={15} />
+            )}
+            <span>
+              {standing.standing === 'ready'
+                ? 'Every claim resolved to a passage this task retrieved, and its figures matched the recorded calculations.'
+                : `${standing.blocking} thing(s) needed checking before this was relied on, and ${standing.advisory} were worth a look.`}
+            </span>
+          </p>
+          {verification.findings.length > 0 && (
+            <ul className={styles.findings}>
+              {verification.findings.map((finding, i) => (
+                <li
+                  key={i}
+                  className={
+                    finding.severity === 'blocking'
+                      ? `${styles.finding} ${styles.findingBlocking}`
+                      : styles.finding
+                  }
+                >
+                  {finding.detail}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {record.calculations.length > 0 && (
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>Working</h2>
+          {/* The engine's record, not the model's account of it. Every step is
+            * here because a figure nobody can retrace is one nobody can check. */}
+          <ul className={styles.calculations}>
+            {record.calculations.map((calculation, i) => (
+              <li key={i} className={styles.calculation}>
+                <code className={styles.expression}>{calculation.expression}</code>
+                <ol className={styles.calcSteps}>
+                  {calculation.steps.map((step, j) => (
+                    <li key={j}>
+                      {step.description} &rarr; {step.result}
+                    </li>
+                  ))}
+                </ol>
+                <p className={styles.result}>
+                  = {calculation.formatted}{' '}
+                  <span className={styles.dim}>({calculation.rounding})</span>
+                </p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {record.evidence.length > 0 && (
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>Evidence</h2>
+          <ul className={styles.evidence}>
+            {record.evidence.map(passage => (
+              <li key={passage.marker} className={styles.passage}>
+                <span className={styles.marker}>[E{passage.marker}]</span>
+                <div className={styles.passageBody}>
+                  <p className={styles.citation}>{passage.citation}</p>
+                  <p className={styles.excerpt}>{passage.excerpt}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <section className={styles.card}>
+        <h2 className={styles.cardTitle}>Answer</h2>
+        {record.answer.trim() ? (
+          <div className={styles.answer}>{record.answer}</div>
+        ) : (
+          <p className={styles.dim}>This task ended without an answer.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+export const Tasks = () => {
+  const [tasks, setTasks] = useState<TaskSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setTasks(await agentService.history());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setTasks([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (open) {
+    return (
+      <Detail
+        runId={open}
+        onBack={() => {
+          setOpen(null);
+          // Re-read on the way back: a run may have finished while the detail
+          // was open, and a list that silently omits it is one nobody trusts.
+          void load();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className={styles.page}>
+      <header className={styles.head}>
+        <h1 className={styles.title}>Tasks</h1>
+        <p className={styles.subtitle}>
+          Every task run on this machine, with the plan it was held to, the model it chose and why,
+          the evidence it retrieved and the files it produced.
+        </p>
+      </header>
+
+      {error && (
+        <p className={styles.failure} role="alert">
+          <AlertTriangle size={15} />
+          <span>{error}</span>
+        </p>
+      )}
+
+      {tasks === null ? (
+        <p className={styles.dim}>Reading the task records&hellip;</p>
+      ) : tasks.length === 0 ? (
+        <p className={styles.empty}>
+          Nothing has been run yet. Ask something in the workbench and it will appear here with
+          everything it rested on.
+        </p>
+      ) : (
+        <ul className={styles.list}>
+          {tasks.map(task => (
+            <li key={task.runId}>
+              <button className={styles.row} onClick={() => setOpen(task.runId)}>
+                <span className={styles.rowPrompt}>{task.prompt}</span>
+                <span className={styles.rowMeta}>
+                  {when(task.finishedAt)} &middot; {task.modelName} &middot;{' '}
+                  {howLong(task.durationSeconds)}
+                  {task.artifactCount > 0 && ` · ${task.artifactCount} file(s)`}
+                  {task.evidenceCount > 0 && ` · ${task.evidenceCount} passage(s)`}
+                </span>
+                {/* "Ready" means it finished, its claims resolved and its files
+                  * opened — not merely that it did not crash. */}
+                <span className={task.ready ? styles.rowReady : styles.rowReview}>
+                  {task.failure ? 'failed' : task.ready ? 'ready' : 'needs review'}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+};

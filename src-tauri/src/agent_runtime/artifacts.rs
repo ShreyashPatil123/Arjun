@@ -30,8 +30,10 @@
 //! a property a pump specification can have.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{check_document, check_workbook, write_document, write_workbook, DocumentMetadata};
 use crate::identity::Session;
@@ -39,6 +41,211 @@ use crate::orchestrator::calculation::CalculationRecord;
 use crate::orchestrator::tools::ToolCall;
 
 use super::CallParams;
+
+/// What kind of file a run produced, and therefore how it is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Kind {
+    Document,
+    Workbook,
+    /// A note or draft. Checked for being present and non-empty, no more —
+    /// there is no structure to check it against.
+    Text,
+}
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Document => "Word document",
+            Kind::Workbook => "Workbook",
+            Kind::Text => "Text file",
+        }
+    }
+}
+
+/// A file this run produced, remembered so it can be re-opened afterwards.
+///
+/// The template is kept because a document cannot really be checked without it:
+/// the check asks whether the sections the template promised are in the file,
+/// and a checker that does not know which template was used can only ask
+/// whether the ZIP opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Produced {
+    /// What to call it. Relative to the run's workspace, which is where it is.
+    pub name: String,
+    pub path: String,
+    pub kind: Kind,
+    pub template: Option<String>,
+    /// RFC 3339, UTC.
+    pub produced_at: String,
+}
+
+/// Files produced so far, keyed by run id — the same shape as the calculation
+/// and evidence tables, and per run for the same reason.
+pub type RunArtifacts = Arc<Mutex<HashMap<String, Vec<Produced>>>>;
+
+/// Records a produced file against its run.
+///
+/// A path written twice replaces the earlier entry rather than appearing twice:
+/// the model correcting a document it just produced is ordinary, and a list
+/// showing one file as two deliverables would misreport what the run made.
+pub fn remember(table: &RunArtifacts, run_id: &str, produced: Produced) {
+    if let Ok(mut table) = table.lock() {
+        let entries = table.entry(run_id.to_string()).or_default();
+        if let Some(existing) = entries.iter_mut().find(|kept| kept.path == produced.path) {
+            *existing = produced;
+        } else {
+            entries.push(produced);
+        }
+    }
+}
+
+/// Everything this run produced, in the order it was produced.
+pub fn for_run(table: &RunArtifacts, run_id: &str) -> Vec<Produced> {
+    table
+        .lock()
+        .ok()
+        .and_then(|table| table.get(run_id).cloned())
+        .unwrap_or_default()
+}
+
+/// Drops a finished run's list once its report has been written.
+pub fn forget(table: &RunArtifacts, run_id: &str) {
+    if let Ok(mut table) = table.lock() {
+        table.remove(run_id);
+    }
+}
+
+/// Builds the record of a produced file.
+///
+/// The name is relative to the workspace, so the name the model wrote is the
+/// name that comes back — an absolute path with a UUID in it tells the person
+/// reading the task nothing they wanted to know.
+pub fn produced_from(
+    path: &Path,
+    root: Option<&Path>,
+    kind: Kind,
+    template: Option<String>,
+) -> Produced {
+    let name = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|| {
+            Path::new(path.file_name().unwrap_or_default())
+                .display()
+                .to_string()
+        });
+    Produced {
+        name,
+        path: path.display().to_string(),
+        kind,
+        template,
+        produced_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// What re-opening a produced file found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactReport {
+    pub name: String,
+    pub path: String,
+    pub kind: Kind,
+    /// Carried through so a later re-check asks the same question this one did.
+    /// A document checked against a different template than it was rendered
+    /// from reports missing sections that were never promised.
+    #[serde(default)]
+    pub template: Option<String>,
+    pub bytes: u64,
+    /// False when the file is missing, empty, will not open, or is missing
+    /// something the template promised.
+    pub sound: bool,
+    /// One line, in the words somebody reading the task would use.
+    pub detail: String,
+    pub problems: Vec<String>,
+    pub produced_at: String,
+}
+
+/// Re-opens a produced file and reports what is actually in it.
+///
+/// PS step 30 asks that the application open the generated file locally and
+/// confirm it is not corrupt and that required sections exist. Checking the
+/// file rather than the code that wrote it is the whole point: a bug between
+/// the template and the ZIP passes every test of the template and still
+/// produces a document that opens to a page of placeholders.
+pub fn check(produced: &Produced) -> ArtifactReport {
+    let path = PathBuf::from(&produced.path);
+    let report = |sound: bool, detail: String, problems: Vec<String>, bytes: u64| ArtifactReport {
+        name: produced.name.clone(),
+        path: produced.path.clone(),
+        kind: produced.kind,
+        template: produced.template.clone(),
+        bytes,
+        sound,
+        detail,
+        problems,
+        produced_at: produced.produced_at.clone(),
+    };
+
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return report(
+            false,
+            "The file is not where the task said it wrote it.".to_string(),
+            vec!["the file does not exist".to_string()],
+            0,
+        );
+    };
+    let bytes = metadata.len();
+    if bytes == 0 {
+        return report(
+            false,
+            "The file was created but nothing was written into it.".to_string(),
+            vec!["the file is empty".to_string()],
+            0,
+        );
+    }
+
+    match produced.kind {
+        Kind::Document => {
+            let template = produced.template.as_deref().unwrap_or("approval_note");
+            let check = check_document(&path, template);
+            let detail = if check.is_sound() {
+                format!(
+                    "Opens, and holds the {} section(s) the {template} template promises.",
+                    check.sections.len()
+                )
+            } else if check.opens {
+                "Opens, but does not hold everything the template promises.".to_string()
+            } else {
+                "Does not open as a Word document.".to_string()
+            };
+            report(check.is_sound(), detail, check.problems, bytes)
+        }
+        Kind::Workbook => {
+            let check = check_workbook(&path);
+            let detail = if check.is_sound() {
+                format!(
+                    "Opens, with {} calculation(s), {} of them live formulas Excel recomputes.",
+                    check.calculations, check.live_formulas
+                )
+            } else if check.opens {
+                "Opens, but the working in it is not sound.".to_string()
+            } else {
+                "Does not open as a workbook.".to_string()
+            };
+            report(check.is_sound(), detail, check.problems, bytes)
+        }
+        // Nothing to check it against beyond being there and having content,
+        // and claiming more than that would be inventing a standard.
+        Kind::Text => report(true, format!("Present, {bytes} byte(s)."), Vec::new(), bytes),
+    }
+}
+
+/// Re-opens everything a run produced.
+pub fn report_for_run(table: &RunArtifacts, run_id: &str) -> Vec<ArtifactReport> {
+    for_run(table, run_id).iter().map(check).collect()
+}
 
 /// Renders a Word document from fields the model supplied.
 pub fn create_docx(
