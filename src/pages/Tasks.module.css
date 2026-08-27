@@ -93,7 +93,9 @@
 }
 
 .rowReady,
-.rowReview {
+.rowReview,
+.rowLive,
+.rowInterrupted {
   grid-area: state;
   padding: 2px var(--space-2);
   border-radius: var(--radius-sm);
@@ -103,6 +105,17 @@
 
 .rowReady { background: var(--success-bg); color: var(--success); }
 .rowReview { background: var(--warning-bg); color: var(--warning); }
+/* Still going. Drawn as information rather than as a warning: nothing is wrong
+ * with a task that has not finished yet. */
+.rowLive { background: var(--info-bg); color: var(--info); }
+/* Stopped, out of time, or closed on top of. None of these is a fault, and
+ * painting them the same red as a failure would teach people to skip the row
+ * that actually broke. */
+.rowInterrupted {
+  background: transparent;
+  color: var(--text-tertiary);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
 
 /* --- Detail ----------------------------------------------------------- */
 

@@ -291,6 +291,220 @@ export interface TaskSummary {
   /** False when it failed, needs review, or produced an unsound file. */
   ready: boolean;
   failure: string | null;
+  /** Where the run stands. The only value that can say `degraded_needs_human`. */
+  state: RunState;
+  /** True while it is still going. A live row has no finish time. */
+  live: boolean;
+}
+
+/**
+ * Where a run is.
+ *
+ * The nine live states name things a person might need to do something about —
+ * "waiting for you to approve an action" is not the same as "the model is
+ * thinking", and a single `running` cannot tell them apart.
+ *
+ * The six endings are deliberately distinct. `stoppedByBudget` is the budget
+ * doing its job and `stoppedByPolicy` is the policy doing its job; neither is a
+ * fault, and painting them the same colour as `failed` teaches people to skip
+ * the row that actually broke. `degradedNeedsHuman` is not a verdict at all —
+ * nothing decided it, the application closed on top of the run.
+ */
+export type RunState =
+  | 'created'
+  | 'classified'
+  | 'routed'
+  | 'planned'
+  | 'running'
+  | 'awaiting_approval'
+  | 'executing_tool'
+  | 'tool_result_recorded'
+  | 'verifying'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+  | 'stopped_by_budget'
+  | 'stopped_by_policy'
+  | 'degraded_needs_human';
+
+/** The endings. Nothing follows one. */
+export const TERMINAL_STATES: readonly RunState[] = [
+  'completed',
+  'cancelled',
+  'failed',
+  'stopped_by_budget',
+  'stopped_by_policy',
+  'degraded_needs_human',
+];
+
+export const isTerminal = (state: RunState) => TERMINAL_STATES.includes(state);
+
+/**
+ * A side effect nobody can account for.
+ *
+ * It was in flight when the process went away, so the file it names may or may
+ * not have been written. Deliberately not retried: repeating it could do it
+ * twice, and assuming it happened could mean it never does. A person has to go
+ * and look.
+ */
+export interface UnknownEffect {
+  idempotencyKey: string;
+  tool: string;
+  /** A file name — a reference to go and check, never contents. */
+  target: string;
+  at: string;
+}
+
+/** One of those, as the reconciliation queue lists it across every run. */
+export interface RecordedEffect {
+  idempotencyKey: string;
+  runId: string;
+  tool: string;
+  argsFingerprint: string;
+  status: 'pending' | 'succeeded' | 'failed' | 'unknown';
+  result: string;
+  target: string;
+  at: string;
+}
+
+/** One thing a run did, as the recovered trace shows it. */
+export interface ActivityRecord {
+  toolCallId: string;
+  tool: string;
+  /** `running`, `done`, `failed`, `refused` or `replayed`. */
+  status: string;
+  at: string;
+}
+
+/**
+ * What a run has done so far, without replaying its history.
+ *
+ * The thing a window reads when it mounts holding a run id — after a remount,
+ * or after the whole application was restarted. Deliberately carries a
+ * *reference* to the answer rather than the answer: a finished run's text is in
+ * its task record, and one still going has no answer yet.
+ */
+export interface TaskSnapshot {
+  runId: string;
+  /** The last event folded in. Ask for events after this to catch up. */
+  seq: number;
+  schemaVersion: number;
+  state: RunState;
+  startedAt: string;
+  updatedAt: string;
+  /** When the run must stop, if it has a deadline. */
+  deadline: string | null;
+  /** Who started it. */
+  actor: string;
+  prompt: string;
+  modelName: string;
+  classification: string | null;
+  plan: PlanRecord | null;
+  activity: ActivityRecord[];
+  turns: number;
+  compactions: number;
+  /** Names of the files it produced. */
+  artifacts: string[];
+  approvalsPending: number;
+  /** Side effects that were in flight when the process went away. Non-empty is
+   *  why a run is `degraded_needs_human`. */
+  unknownEffects: UnknownEffect[];
+  stoppedBecause: string | null;
+  failure: string | null;
+  answerHash: string | null;
+  answerChars: number;
+  /** Events that were on disk and could not be read. Non-empty means the
+   *  history has a hole in it, and the screen says so rather than pretending
+   *  the trace is complete. */
+  unreadableEvents: UnreadableEvent[];
+  /** Events that could not legally follow the state they arrived in. Recorded,
+   *  not applied — surfaced because two writers disagreeing about a run is
+   *  worth somebody knowing. */
+  anomalies: string[];
+}
+
+export interface UnreadableEvent {
+  seq: number;
+  eventId: string;
+  /** What is wrong with it, in words. */
+  problem: string;
+}
+
+/** What a durable event is called. */
+export type TaskEventType =
+  | 'runCreated'
+  | 'runClassified'
+  | 'runRouted'
+  | 'planReady'
+  | 'runStarted'
+  | 'planStep'
+  | 'planStopped'
+  | 'turnEnded'
+  | 'contextCompacted'
+  | 'toolAuthorized'
+  | 'toolRefused'
+  | 'toolSucceeded'
+  | 'toolFailed'
+  | 'toolReplayed'
+  | 'toolEffectPending'
+  | 'toolEffectUnknown'
+  | 'toolEffectReconciled'
+  | 'artifactProduced'
+  | 'approvalRequested'
+  | 'approvalDecided'
+  | 'verificationStarted'
+  | 'runCompleted'
+  | 'runFailed'
+  | 'runCancelled'
+  | 'runStoppedByBudget'
+  | 'runStoppedByPolicy'
+  | 'runDegraded'
+  // Read back from a database written by an earlier build; never sent.
+  | 'runTimedOut'
+  | 'runInterrupted';
+
+/**
+ * One event from the durable history.
+ *
+ * Distinct from `AgentEvent`, which is the best-effort live stream. This one
+ * was written down, is ordered by `seq`, and is what a window catching up
+ * reads. Payloads are redacted at the source: fields that could carry document
+ * text arrive as `{ sha256, chars }`, never as the text.
+ */
+export interface TaskEvent {
+  runId: string;
+  eventId: string;
+  seq: number;
+  eventType: TaskEventType;
+  at: string;
+  actor: string;
+  schemaVersion: number;
+  payload: Record<string, unknown>;
+  payloadHash: string;
+}
+
+/**
+ * One durable event as it arrives on the live channel.
+ *
+ * The same row [`TaskEvent`] describes, minus the payload hash — a client has
+ * no way to check it and carrying it would only suggest otherwise.
+ */
+export interface DurableEvent {
+  runId: string;
+  seq: number;
+  eventId: string;
+  eventType: TaskEventType;
+  at: string;
+  actor: string;
+  schemaVersion: number;
+  payload: Record<string, unknown>;
+}
+
+export interface TaskEventPage {
+  events: TaskEvent[];
+  unreadable: UnreadableEvent[];
+  /** The highest position accounted for, readable or not. */
+  lastSeq: number;
 }
 
 /**
@@ -376,6 +590,17 @@ export interface AgentEventEnvelope {
 /** Backend event channel. One stream for every run; filter on `runId`. */
 const AGENT_EVENT = 'agent://event';
 
+/**
+ * The durable channel.
+ *
+ * Every message here names a row that is on disk and carries its sequence
+ * number. That number is the whole difference between the two channels: a
+ * client that receives seq 14 having applied seq 12 knows it missed one and can
+ * go and fetch it. On `agent://event` a lost message and a quiet run look
+ * identical.
+ */
+const AGENT_DURABLE_EVENT = 'agent://durable';
+
 export const agentService = {
   /**
    * Runs one prompt to completion.
@@ -454,6 +679,83 @@ export const agentService = {
   /** One task in full — its plan, routing, evidence, working and artifacts. */
   task(runId: string): Promise<TaskRecord> {
     return getBackendService().invoke<TaskRecord>('agent_task', { runId });
+  },
+
+  /**
+   * What a run has done so far, without replaying its history.
+   *
+   * Call this when a component mounts holding a run id it did not start —
+   * after a remount, or after the whole application was restarted. Resolves
+   * `null` for a run id nothing is known about, which is an ordinary answer
+   * rather than an error.
+   */
+  snapshot(runId: string): Promise<TaskSnapshot | null> {
+    return getBackendService().invoke<TaskSnapshot | null>('agent_task_snapshot', { runId });
+  },
+
+  /**
+   * A run's durable events after `afterSeq`, in order.
+   *
+   * The catch-up half of recovery: hold a snapshot at sequence 12, ask for
+   * everything after 12, apply it. Not the same thing as `subscribe`, which is
+   * the live best-effort stream and can drop a line.
+   */
+  events(runId: string, afterSeq = 0): Promise<TaskEventPage> {
+    return getBackendService().invoke<TaskEventPage>('agent_task_events', { runId, afterSeq });
+  },
+
+  /**
+   * Subscribes to the durable event stream.
+   *
+   * Prefer this for anything that has to be *correct*; `subscribe` is for
+   * anything that has to be *immediate*. The two are not alternatives — a
+   * window normally watches both, taking responsiveness from one and
+   * reconciliation from the other.
+   */
+  async subscribeDurable(
+    handler: (event: DurableEvent) => void,
+    runId?: string,
+  ): Promise<UnlistenFn> {
+    return listen<DurableEvent>(AGENT_DURABLE_EVENT, ({ payload }) => {
+      if (runId && payload.runId !== runId) return;
+      handler(payload);
+    });
+  },
+
+  /**
+   * Side effects nobody can account for, across every run.
+   *
+   * Requires the permission to approve outputs: deciding whether work happened
+   * is the same kind of judgement as signing off that it was done properly.
+   */
+  unknownEffects(): Promise<RecordedEffect[]> {
+    return getBackendService().invoke<RecordedEffect[]>('agent_unknown_effects');
+  },
+
+  /**
+   * Records what a person found out about an interrupted side effect.
+   *
+   * Resolves `false` when there was nothing left to reconcile — somebody else
+   * got there first, which is an ordinary race and not an error.
+   */
+  reconcileEffect(runId: string, idempotencyKey: string, happened: boolean): Promise<boolean> {
+    return getBackendService().invoke<boolean>('agent_reconcile_effect', {
+      runId,
+      idempotencyKey,
+      happened,
+    });
+  },
+
+  /**
+   * The runs the record still considers live.
+   *
+   * How a window that has just opened finds a run to reattach to. Read from the
+   * durable record rather than from anything in memory, because after a restart
+   * there is nothing in memory and a run left mid-flight is exactly what
+   * somebody needs to be told about.
+   */
+  activeTasks(): Promise<TaskSnapshot[]> {
+    return getBackendService().invoke<TaskSnapshot[]>('agent_active_tasks');
   },
 
   /**

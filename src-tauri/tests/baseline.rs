@@ -394,6 +394,7 @@ fn the_baseline_run_produces_a_grounded_artifact_and_a_checkable_package() {
     let result = export(
         &package_path,
         &TaskPackage {
+            skills: &[],
             task_id: "baseline-1",
             exported_at: chrono::Utc::now(),
             exported_by: "engineer",

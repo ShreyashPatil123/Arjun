@@ -38,7 +38,9 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "../agent-runtime/dist/arjun-agent-runtime.mjs"
+      "../agent-runtime/dist/arjun-agent-runtime.mjs",
+      "../skills/",
+      "../agents/"
     ]
   }
 }

@@ -48,7 +48,16 @@ fn deps_with(
         // No plan registered, so the budget does not apply and these tests go on
         // exercising the gateway alone. The plan has its own tests below.
         plans: Arc::default(),
+        // In memory: these tests are about the gateway, and a durable history
+        // is checked where it belongs, in `events::tests`.
+        events: Arc::new(
+            crate::agent_runtime::events::TaskEventLog::in_memory().expect("an event log"),
+        ),
+        // An empty skills directory: these tests are about the gateway, and
+        // the skill system is checked where it belongs, in `skills::tests`.
+        skills: Arc::new(crate::skills::SkillRegistry::open(dir.path().join("__no_skills__"))),
         emit: Arc::new(|_| {}),
+        emit_durable: Arc::new(|_| {}),
     });
     (deps, dir)
 }
@@ -214,6 +223,216 @@ async fn a_write_inside_the_runs_own_directory_is_put_to_a_person() {
     assert!(item.request.arguments.iter().any(|a| a.contains("note.txt")));
 
     waiting.abort();
+}
+
+/// The same side effect, asked for twice, happens once.
+///
+/// Exercised through the real `authorize`/`execute` pair rather than against
+/// the store, because the thing being checked is that `execute` consults the
+/// record *before* it reaches the tool. A test at the store level would pass
+/// with the consultation deleted.
+#[tokio::test]
+async fn a_side_effecting_call_made_twice_is_performed_once() {
+    let (deps, dir) = deps_with(signed_in_user());
+    let reviewer = Session::open(User::new("ravi", "Ravi Menon", vec![Role::Reviewer]));
+
+    let write = |tool_call_id: &str| {
+        json!({
+            "runId": "r",
+            "toolCallId": tool_call_id,
+            "tool": "write_scoped_file",
+            "args": { "path": "note.txt", "content": "the seal is worn" }
+        })
+    };
+
+    // A write is put to a person, so each attempt has to be approved before it
+    // can be executed at all.
+    let approve_next = |deps: Arc<RuntimeDeps>, call: Value| {
+        let reviewer = reviewer.clone();
+        async move {
+            let queue = deps.approvals.clone();
+            let waiting = tokio::spawn({
+                let deps = deps.clone();
+                async move { authorize(call, &deps).await }
+            });
+            let item = loop {
+                if let Some(item) = queue.pending().first().cloned() {
+                    break item;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            queue
+                .decide(&reviewer, &item.request.id, true, None)
+                .expect("the reviewer approves");
+            waiting.await.expect("the task finished").expect("authorised")
+        }
+    };
+
+    let first = approve_next(deps.clone(), write("tc-1")).await;
+    let mut call = write("tc-1");
+    call["grant"] = first["grant"].clone();
+    let done = execute(call, &deps).expect("the write runs");
+    assert!(done["details"]["replayed"].is_null());
+
+    let path = dir.path().join("runs").join("r").join("note.txt");
+    let written = std::fs::read_to_string(&path).expect("the file exists");
+    // Changed on disk after the fact, so a genuine second write would be
+    // visible as the file going back to what the tool would have put there.
+    std::fs::write(&path, "edited after the run").expect("overwritten");
+
+    // The same call again — a new tool-call id and a new grant, which is
+    // exactly what a loop replaying an unacknowledged call produces.
+    let second = approve_next(deps.clone(), write("tc-2")).await;
+    let mut again = write("tc-2");
+    again["grant"] = second["grant"].clone();
+    let replayed = execute(again, &deps).expect("the replay answers");
+
+    assert_eq!(replayed["details"]["replayed"], json!(true));
+    assert_eq!(replayed["text"], done["text"]);
+    // The file was not written a second time.
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still there"),
+        "edited after the run"
+    );
+    assert_ne!(written, "edited after the run");
+}
+
+/// A write interrupted mid-flight is not silently attempted again.
+///
+/// Two independent things stop the retry, and this exercises both in the order
+/// they actually apply:
+///
+/// 1. **The run is over.** Recovery ends every run it finds without an ending,
+///    so the loop that was carrying it gets no further authorisations at all.
+///    This is what prevents the repeat in practice.
+/// 2. **The effect is unaccountable.** Even presented with a grant, the same
+///    key is refused, because nobody can say whether the first attempt took.
+///    This is the belt to that braces — it holds if anything ever resumed a
+///    degraded run.
+#[tokio::test]
+async fn an_interrupted_write_is_refused_rather_than_repeated() {
+    let (deps, dir) = deps_with(signed_in_user());
+
+    let args = json!({ "path": "note.txt", "content": "the seal is worn" });
+    let key = crate::agent_runtime::events::derive_key("r", "write_scoped_file", &args);
+    let fingerprint = crate::agent_runtime::events::args_fingerprint(&args);
+
+    // A run that was under way, and a write whose intent reached the disk and
+    // whose outcome did not. Exactly what a process killed mid-write leaves.
+    deps.events
+        .record(
+            crate::agent_runtime::events::EventDraft::new(
+                "r",
+                crate::agent_runtime::events::TaskEventType::RunCreated,
+                "priya",
+            )
+            .with(json!({ "promptShown": "draft a note" })),
+        )
+        .expect("created");
+    deps.events
+        .begin_effect("r", &key, "write_scoped_file", &fingerprint, "note.txt");
+
+    // The next start finds both.
+    deps.events
+        .recover_interrupted(crate::agent_runtime::events::SYSTEM_ACTOR)
+        .expect("recovery ran");
+
+    // 1. The run is ended, so nothing new is authorised — the loop cannot even
+    //    get as far as asking a person to approve the write again.
+    let verdict = authorize(
+        json!({
+            "runId": "r",
+            "toolCallId": "tc-2",
+            "tool": "write_scoped_file",
+            "args": args,
+        }),
+        &deps,
+    )
+    .await
+    .expect("a verdict");
+    assert_eq!(verdict["outcome"], "refuse");
+    assert!(verdict["reason"].as_str().unwrap().contains("has ended"));
+
+    // 2. And the effect itself is unaccountable, so even a call that somehow
+    //    arrived with a grant would be refused rather than performed.
+    match deps
+        .events
+        .begin_effect("r", &key, "write_scoped_file", &fingerprint, "note.txt")
+    {
+        crate::agent_runtime::events::EffectLookup::Unknown(recorded) => {
+            let refusal = recorded.unknown_refusal();
+            assert!(refusal.contains("note.txt"), "{refusal}");
+            assert!(
+                refusal.contains("may or may not"),
+                "the refusal must not claim to know: {refusal}"
+            );
+            assert!(refusal.contains("not been attempted again"), "{refusal}");
+        }
+        other => panic!("an interrupted write must not be repeatable: {other:?}"),
+    }
+
+    // Nothing was written. A retry that produced the file would be exactly the
+    // double-write this exists to prevent.
+    assert!(!dir.path().join("runs").join("r").join("note.txt").exists());
+}
+
+/// A cancellation stops the run at a boundary, not mid-tool.
+#[tokio::test]
+async fn no_new_tool_call_is_authorised_once_the_run_has_ended() {
+    let (deps, _dir) = deps_with(signed_in_user());
+
+    // Ordinary calls are fine while the run is live.
+    let before = authorize(search("wall thickness"), &deps).await.unwrap();
+    assert_eq!(before["outcome"], "allow");
+
+    // Somebody presses stop. This is the record of it, which is what the
+    // gateway consults — not anything in the child process's memory.
+    deps.events
+        .record(
+            crate::agent_runtime::events::EventDraft::new(
+                "r",
+                crate::agent_runtime::events::TaskEventType::RunCancelled,
+                "priya",
+            )
+            .with(json!({ "failure": "Stopped, because somebody stopped it." })),
+        )
+        .expect("cancelled");
+
+    let after = authorize(search("wall thickness"), &deps).await.unwrap();
+    assert_eq!(after["outcome"], "refuse");
+    let reason = after["reason"].as_str().unwrap();
+    assert!(reason.contains("has ended"), "{reason}");
+    // Told what to do about it, so the model reports rather than retries.
+    assert!(reason.contains("Stop and report"), "{reason}");
+}
+
+/// A repeated search is not collapsed, and deliberately.
+#[tokio::test]
+async fn a_read_only_call_made_twice_is_performed_twice() {
+    let (deps, _dir) = deps_with(signed_in_user());
+
+    let run_once = |id: &str| {
+        let deps = deps.clone();
+        let call = json!({
+            "runId": "r",
+            "toolCallId": id,
+            "tool": "search_documents",
+            "args": { "query": "wall thickness" }
+        });
+        async move {
+            let allow = authorize(call.clone(), &deps).await.unwrap();
+            let mut with_grant = call;
+            with_grant["grant"] = allow["grant"].clone();
+            execute(with_grant, &deps).expect("the search runs")
+        }
+    };
+
+    let first = run_once("tc-1").await;
+    let second = run_once("tc-2").await;
+    // Neither is a replay: collapsing repeated searches would hide a model
+    // going in circles from the repeat limit that exists to catch it.
+    assert!(first["details"]["replayed"].is_null());
+    assert!(second["details"]["replayed"].is_null());
 }
 
 #[tokio::test]

@@ -11,6 +11,8 @@ import {
   agentService,
   type ArtifactReport,
   type TaskRecord,
+  type TaskSnapshot,
+  type RunState,
   type TaskSummary,
 } from '../services/agent.service';
 import styles from './Tasks.module.css';
@@ -33,11 +35,72 @@ import styles from './Tasks.module.css';
  * replacing the older.
  */
 
+/** How each ending is drawn. Anything unmapped falls back to the ready/review
+ *  pair, so a status from a newer backend still renders. */
+const STATUS_STYLE: Partial<Record<RunState, string>> = {
+  created: styles.rowLive,
+  classified: styles.rowLive,
+  routed: styles.rowLive,
+  planned: styles.rowLive,
+  running: styles.rowLive,
+  awaiting_approval: styles.rowLive,
+  executing_tool: styles.rowLive,
+  tool_result_recorded: styles.rowLive,
+  verifying: styles.rowLive,
+  // Not faults. Drawn apart from `failed` so a list of them does not train
+  // people to skip the row that actually broke.
+  degraded_needs_human: styles.rowInterrupted,
+  cancelled: styles.rowInterrupted,
+  stopped_by_budget: styles.rowInterrupted,
+  stopped_by_policy: styles.rowInterrupted,
+};
+
 const KIND_ICONS = {
   document: FileText,
   workbook: FileSpreadsheet,
   text: FileText,
 } as const;
+
+/**
+ * What a row's tag says.
+ *
+ * Distinguishing the endings matters more here than anywhere else in the
+ * product: this is the screen somebody opens to find out what happened, and a
+ * run that was stopped on purpose, one that hit its time budget, and one the
+ * application closed on top of are three different stories that all used to
+ * read as "failed".
+ */
+function statusLabel(state: RunState, ready: boolean): string {
+  switch (state) {
+    case 'created':
+    case 'classified':
+    case 'routed':
+    case 'planned':
+      return 'starting';
+    case 'running':
+    case 'tool_result_recorded':
+      return 'running';
+    case 'awaiting_approval':
+      return 'needs approval';
+    case 'executing_tool':
+      return 'running a tool';
+    case 'verifying':
+      return 'verifying';
+    case 'cancelled':
+      return 'stopped';
+    case 'stopped_by_budget':
+      return 'reached its limit';
+    case 'stopped_by_policy':
+      return 'not permitted';
+    case 'degraded_needs_human':
+      return 'interrupted';
+    case 'failed':
+      return 'failed';
+    case 'completed':
+    default:
+      return ready ? 'ready' : 'needs review';
+  }
+}
 
 function when(iso: string): string {
   const at = new Date(iso);
@@ -113,6 +176,9 @@ function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
   const [record, setRecord] = useState<TaskRecord | null>(null);
   const [onDisk, setOnDisk] = useState<ArtifactReport[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** What is known about a run that has no record: one still going, or one the
+   *  process took down with it. Both are exactly the rows somebody clicks. */
+  const [known, setKnown] = useState<TaskSnapshot | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -131,7 +197,15 @@ function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
           // statement about the moment it ran.
         }
       } catch (e) {
-        if (live) setError(e instanceof Error ? e.message : String(e));
+        // A run writes its record when it ends, so a run that has not ended —
+        // or was never allowed to — has none. That is not an error to show
+        // somebody who has just clicked the row: the durable history knows
+        // what it managed to do, and showing that is the whole point of
+        // keeping it.
+        const snapshot = await agentService.snapshot(runId).catch(() => null);
+        if (!live) return;
+        if (snapshot) setKnown(snapshot);
+        else setError(e instanceof Error ? e.message : String(e));
       }
     })();
     return () => {
@@ -163,6 +237,66 @@ function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
           <AlertTriangle size={15} />
           <span>{error}</span>
         </p>
+      </div>
+    );
+  }
+
+  // No record, but a history. Everything below it needs a `TaskRecord` — an
+  // answer, evidence, a verification — and this run has none of those, so what
+  // is shown is what actually happened rather than a page of empty sections.
+  if (!record && known) {
+    return (
+      <div className={styles.page}>
+        {back}
+        <h1 className={styles.prompt}>{known.prompt}</h1>
+        <p className={styles.meta}>
+          {statusLabel(known.state, false)} &middot;{' '}
+          {known.modelName || 'not routed yet'} &middot; started {when(known.startedAt)}
+        </p>
+        <p className={styles.failure} role="status">
+          <AlertTriangle size={15} />
+          <span>
+            {known.failure ?? 'This task has not finished yet.'} It has no full record — a task writes
+            one when it ends — so what follows is what was written down as it happened.
+            {known.unreadableEvents.length > 0 &&
+              ` ${known.unreadableEvents.length} step(s) of that history could not be read, and are missing below.`}
+          </span>
+        </p>
+
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>What it did</h2>
+          {known.activity.length === 0 ? (
+            <p className={styles.dim}>
+              {known.state === 'running'
+                ? 'Nothing has been called yet.'
+                : 'It stopped before calling anything.'}
+            </p>
+          ) : (
+            <ol className={styles.steps}>
+              {known.activity.map(item => (
+                <li key={item.toolCallId} className={styles.step}>
+                  <span>{item.tool}</span>
+                  <span className={styles.dim}>{item.status}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+
+        {known.artifacts.length > 0 && (
+          <section className={styles.card}>
+            <h2 className={styles.cardTitle}>Files it had produced</h2>
+            <ul className={styles.problems}>
+              {known.artifacts.map(name => (
+                <li key={name}>{name}</li>
+              ))}
+            </ul>
+            <p className={styles.dim}>
+              These were written before it stopped, and were never checked — a file is re-opened
+              and verified when a task finishes, and this one did not.
+            </p>
+          </section>
+        )}
       </div>
     );
   }
@@ -413,15 +547,20 @@ export const Tasks = () => {
               <button className={styles.row} onClick={() => setOpen(task.runId)}>
                 <span className={styles.rowPrompt}>{task.prompt}</span>
                 <span className={styles.rowMeta}>
-                  {when(task.finishedAt)} &middot; {task.modelName} &middot;{' '}
-                  {howLong(task.durationSeconds)}
+                  {task.live ? 'started ' + when(task.startedAt) : when(task.finishedAt)} &middot;{' '}
+                  {task.modelName || 'routing'} &middot;{' '}
+                  {task.live ? 'still running' : howLong(task.durationSeconds)}
                   {task.artifactCount > 0 && ` · ${task.artifactCount} file(s)`}
                   {task.evidenceCount > 0 && ` · ${task.evidenceCount} passage(s)`}
                 </span>
                 {/* "Ready" means it finished, its claims resolved and its files
-                  * opened — not merely that it did not crash. */}
-                <span className={task.ready ? styles.rowReady : styles.rowReview}>
-                  {task.failure ? 'failed' : task.ready ? 'ready' : 'needs review'}
+                  * opened — not merely that it did not crash. The three
+                  * endings that are not failures are named rather than folded
+                  * into one: a run somebody stopped, a run that ran out of
+                  * time, and a run the application closed on top of all read
+                  * as "failed" otherwise, and only one of those is a fault. */}
+                <span className={STATUS_STYLE[task.state] ?? (task.ready ? styles.rowReady : styles.rowReview)}>
+                  {statusLabel(task.state, task.ready)}
                 </span>
               </button>
             </li>

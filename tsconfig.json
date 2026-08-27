@@ -21,5 +21,10 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
+  /* The frontend tests are not part of the application, and their runner lives
+     under agent-runtime/ rather than at the root — this repository installs
+     offline, and a second copy of vitest would mean a network install. They are
+     type-checked by tsconfig.test.json, which knows where to find it. */
+  "exclude": ["src/**/*.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

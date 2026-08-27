@@ -15,7 +15,7 @@ import {
   type PlanRecord,
   type VerificationReport,
 } from '../../services/agent.service';
-import { labelFor, type RunState } from './useRun';
+import { labelFor, type RunViewState } from './useRun';
 import styles from './RunView.module.css';
 
 /**
@@ -196,7 +196,7 @@ function Artifacts({ artifacts, runId }: { artifacts: ArtifactReport[]; runId: s
 }
 
 interface Props {
-  state: RunState;
+  state: RunViewState;
   onAbort: () => void;
   onNewTask: () => void;
 }
@@ -220,6 +220,21 @@ export const RunView = ({ state, onAbort, onNewTask }: Props) => {
           </button>
         )}
       </header>
+
+      {/* Said plainly rather than left for somebody to infer from a trace that
+        * looks thin. A recovered run is a reconstruction from what was written
+        * down as it happened, and it is missing whatever the live stream would
+        * have shown in between — which is exactly the sort of gap a person
+        * reading a trace will otherwise read as "the run did nothing". */}
+      {state.recovered && (
+        <p className={styles.note} role="status">
+          {running
+            ? 'Reattached to a task that was already running. What is shown below was read back from its record.'
+            : 'Read back from this task’s record after the window reopened.'}
+          {state.historyIncomplete &&
+            ' Part of the record could not be read, so some steps may be missing from the list below.'}
+        </p>
+      )}
 
       {/* Which model took it and why. The routing decision is shown with the
         * work rather than buried in the audit log, because "why this model"
@@ -272,6 +287,13 @@ export const RunView = ({ state, onAbort, onNewTask }: Props) => {
                   {/* Not a failure of the tool: the policy or a person said no,
                     * and the model reads that and carries on. */}
                   {item.status === 'refused' && 'not permitted'}
+                  {/* The side effect had already happened, so it was not done
+                    * a second time. Worth showing: a reader counting document
+                    * writes should not count this one twice. */}
+                  {item.status === 'replayed' && 'already done — not repeated'}
+                  {/* In flight when the process went away. Nobody can say
+                    * whether it took effect, so it was not tried again. */}
+                  {item.status === 'unknown' && 'interrupted — needs checking'}
                 </span>
               </li>
             ))}
@@ -304,6 +326,27 @@ export const RunView = ({ state, onAbort, onNewTask }: Props) => {
           <p className={styles.note}>
             {summary.plan.stoppedBecause} {summary.turns} turn(s).
           </p>
+        </section>
+      )}
+
+      {/* The one thing on this screen that asks a person to go and do
+        * something in the world. A side effect was in flight when the process
+        * went away, so the file it names may or may not exist — and repeating
+        * it could do it twice. Named individually because "something was
+        * interrupted" is not actionable and "note.docx may not have been
+        * written" is. */}
+      {state.unknownEffects.length > 0 && (
+        <section className={styles.section}>
+          <h2 className={styles.sectionTitle}>Needs checking</h2>
+          <ul className={styles.problems}>
+            {state.unknownEffects.map(effect => (
+              <li key={effect.idempotencyKey}>
+                <strong>{effect.target || effect.tool}</strong> — this action was interrupted
+                while it was happening, so nobody can say whether it took effect. It has not
+                been attempted again.
+              </li>
+            ))}
+          </ul>
         </section>
       )}
 

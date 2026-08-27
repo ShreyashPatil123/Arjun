@@ -31,9 +31,11 @@
 
 pub mod approval;
 pub mod artifacts;
+pub mod events;
 pub mod grants;
 pub mod planning;
 pub mod protocol;
+pub mod recording;
 pub mod retrieval;
 pub mod tasks;
 pub mod workspace;
@@ -61,10 +63,22 @@ use crate::orchestrator::tools::{ToolCall, ToolName};
 use crate::policy::ApprovalState;
 use grants::GrantLedger;
 use protocol::{code, Frame, Outgoing, WireError};
+use recording::{refused, remember_loop_event, remember_outcome, remember_refusal};
 
-/// Event name the UI listens on. One channel for every run; the payload carries
-/// the run id so a listener can filter.
+/// Event name the UI listens on for the loop's own progress.
+///
+/// One channel for every run; the payload carries the run id so a listener can
+/// filter. Best-effort by design — a dropped event costs a progress line —
+/// which is exactly why it is not the channel a client reconciles against.
 pub const AGENT_EVENT: &str = "agent://event";
+
+/// Event name the UI listens on for the durable history.
+///
+/// Every message here corresponds to a row that is on disk, and carries the
+/// sequence number of that row. A client that sees a gap in those numbers knows
+/// it missed something and asks for a snapshot; a client watching only
+/// [`AGENT_EVENT`] cannot tell a quiet run from a lost message.
+pub const AGENT_DURABLE_EVENT: &str = "agent://durable";
 
 /// Everything a handler needs that is not on the wire.
 ///
@@ -109,6 +123,21 @@ pub struct RuntimeDeps {
     /// The budget inside is fixed by [`planning`] before the model is told
     /// anything, and nothing on the runtime's side of the wire can reach it.
     pub plans: Arc<Mutex<HashMap<String, crate::orchestrator::plan::PlanRun>>>,
+    /// The durable record of what each run has done, in order.
+    ///
+    /// Written *as* the run happens, unlike the task record in [`tasks`], which
+    /// is written once at the end. The difference is what a window that
+    /// remounted mid-run, or a process that starts after one died mid-run, has
+    /// to read: after the fact there is nothing to reconstruct from, so the
+    /// reconstruction has to be written on the way past. See [`events`].
+    pub events: Arc<events::TaskEventLog>,
+    /// The skills installed on this machine.
+    ///
+    /// Held so `capability.search` can answer without a round trip through the
+    /// UI. A skill is guidance, not permission — see [`crate::skills`] — so
+    /// this is a source of *descriptions*, and nothing reached through it can
+    /// widen what a run may do.
+    pub skills: Arc<crate::skills::SkillRegistry>,
     /// Where run events go.
     ///
     /// The loop publishes its own events over the wire; these are the ones this
@@ -120,6 +149,13 @@ pub struct RuntimeDeps {
     /// Tauri. That is the same reason [`AgentRuntime::spawn`] takes an emitter,
     /// and it is what lets the tests drive all of this with no app running.
     pub emit: Arc<dyn Fn(Value) + Send + Sync>,
+    /// Where durable events go, once they are on disk.
+    ///
+    /// Separate from [`Self::emit`] because the two make different promises. A
+    /// message on that channel is a progress line that may be dropped; a
+    /// message on this one names a row that exists, and carries the sequence
+    /// number a client reconciles against.
+    pub emit_durable: Arc<dyn Fn(Value) + Send + Sync>,
 }
 
 impl RuntimeDeps {
@@ -142,9 +178,7 @@ impl RuntimeDeps {
     fn publish(&self, run_id: &str, event: Value) {
         (self.emit)(json!({ "runId": run_id, "event": event }));
     }
-}
 
-impl RuntimeDeps {
     fn session(&self) -> Result<Session, WireError> {
         self.session
             .read()
@@ -377,6 +411,12 @@ async fn dispatch(
         }
         Frame::Notification { method, params } => {
             if method == "run.event" {
+                // Two of the loop's own events are kept as well as shown. The
+                // rest are progress that a recovered trace can do without; a
+                // turn count and a compaction are not. The compaction in
+                // particular is a caveat on everything the run says afterwards,
+                // and a trace that lost it would overstate its own grounding.
+                remember_loop_event(deps, &params);
                 emit(params);
             } else {
                 log::debug!("[agent-runtime] unhandled notification {method}");
@@ -394,11 +434,66 @@ async fn handle(
     match method {
         "tool.authorize" => authorize(params, deps).await,
         "tool.execute" => execute(params, deps),
+        "capability.search" => capability_search(params, deps),
         other => Err(WireError::new(
             code::UNKNOWN_METHOD,
             format!("no handler for {other}"),
         )),
     }
+}
+
+/// Concise metadata for the skills this run could use.
+///
+/// Deliberately **not** a tool. It takes no grant, appears in no catalogue and
+/// spends no step, because it does nothing: it reads local metadata that has
+/// already been validated and filters it by what the signed-in person may see.
+/// Making it a tool would put a read of a description behind the same gate as
+/// writing a document, which teaches an operator that the gate is noise.
+///
+/// It returns cards — a name, a description, a version, a tool list — and never
+/// a skill's instructions. Loading those is a separate, deliberate step. That
+/// split is requirement 10, and it is what stops every skill on the machine
+/// reaching every prompt.
+fn capability_search(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+    let session = deps.session()?;
+    let run_id = params
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let query = params
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    // The run's own tool list, so a card can be read against what this task can
+    // actually do. A run with no plan registered permits nothing, which is the
+    // correct answer rather than an error: the health probe belongs to no run.
+    let permits: Vec<ToolName> = deps
+        .plans
+        .lock()
+        .ok()
+        .and_then(|plans| {
+            plans
+                .get(run_id)
+                .map(|plan| plan.budget.permitted_tools.clone())
+        })
+        .unwrap_or_default();
+
+    let context = crate::skills::SkillContext {
+        session: &session,
+        // Read at the moment of the call rather than captured when the run
+        // started: switching the workbench into provisioning mode must change
+        // which skills are offered, not only which ones start.
+        mode: crate::sovereignty::global_broker().mode(),
+        run_permits: &permits,
+    };
+
+    let found = deps.skills.search(query, &context);
+    Ok(json!({
+        "skills": found,
+        // Said explicitly so a caller does not have to infer it from the shape.
+        "note": "Metadata only. Ask for a skill by name to read its instructions.",
+    }))
 }
 
 /// Fields both tool methods need off the wire.
@@ -455,12 +550,30 @@ fn ledger() -> &'static Mutex<GrantLedger> {
 async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
     let call = read_call(&params)?;
 
+    // Is this run over? Asked first, and asked of the durable record rather
+    // than of anything in memory.
+    //
+    // This is where a cancellation actually lands. Telling the child to abort
+    // is a request that takes effect whenever the loop next looks; this is the
+    // boundary it cannot cross. A tool already executing is left to finish —
+    // interrupting it is what creates an effect nobody can account for — but
+    // nothing new starts. So "stop" means "no further actions", which is the
+    // promise a person pressing the button is actually making.
+    if let Some(ending) = deps.events.ending(&call.run_id) {
+        let reason = format!(
+            "This task has ended ({}), so no further tool calls will be made. Stop and report \\
+             what was completed.",
+            ending.as_str().replace('_', " ")
+        );
+        return Ok(refused(deps, &call, reason));
+    }
+
     // The plan is consulted before the gateway. A task that is out of time
     // should not be asking about permissions, and "you have run out of steps"
     // is a more useful thing to tell a model than "that path is fine, but
     // nothing further will happen".
     if let Some(reason) = plan_refusal(&call, deps) {
-        return Ok(json!({ "outcome": "refuse", "reason": reason }));
+        return Ok(refused(deps, &call, reason));
     }
 
     let verdict = decide(&call, deps, ApprovalState::NotRequested)?;
@@ -470,9 +583,7 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
             tool,
             resolved_path,
         } => (tool, resolved_path),
-        GatewayVerdict::Refuse { reason } => {
-            return Ok(json!({ "outcome": "refuse", "reason": reason }))
-        }
+        GatewayVerdict::Refuse { reason } => return Ok(refused(deps, &call, reason)),
         GatewayVerdict::NeedsApproval {
             tool,
             summary,
@@ -483,6 +594,16 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| call.tool.clone());
+            deps.remember(
+                &call.run_id,
+                events::TaskEventType::ApprovalRequested,
+                json!({
+                    "toolCallId": call.tool_call_id,
+                    "tool": call.tool,
+                    "target": target,
+                }),
+            );
+
             let outcome = approval::await_decision(
                 &deps.approvals,
                 &session,
@@ -494,11 +615,20 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
             )
             .await;
 
+            let decided = matches!(outcome, approval::ApprovalOutcome::Approved { .. });
+            deps.remember(
+                &call.run_id,
+                events::TaskEventType::ApprovalDecided,
+                json!({
+                    "toolCallId": call.tool_call_id,
+                    "tool": call.tool,
+                    "approved": decided,
+                }),
+            );
+
             match outcome {
                 approval::ApprovalOutcome::Approved { .. } => (tool, resolved_path),
-                other => {
-                    return Ok(json!({ "outcome": "refuse", "reason": other.refusal() }))
-                }
+                other => return Ok(refused(deps, &call, other.refusal())),
             }
         }
     };
@@ -507,6 +637,18 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         .lock()
         .map_err(|_| WireError::new(code::INTERNAL, "grant ledger is poisoned"))?
         .issue(&call.run_id, &call.tool_call_id, &call.tool, &call.args);
+
+    deps.remember(
+        &call.run_id,
+        events::TaskEventType::ToolAuthorized,
+        json!({
+            "toolCallId": call.tool_call_id,
+            "tool": tool.as_str(),
+            // A reference, so two events about one call can be matched up
+            // without either of them carrying what the call was about.
+            "argsFingerprint": events::args_fingerprint(&call.args),
+        }),
+    );
 
     Ok(json!({
         "outcome": "allow",
@@ -587,6 +729,11 @@ fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
             "reason": stopped.explain(),
             "tool": call.tool,
         }),
+    );
+    deps.remember(
+        &call.run_id,
+        events::TaskEventType::PlanStopped,
+        json!({ "reason": stopped.explain(), "tool": call.tool }),
     );
     Some(stopped.explain())
 }
@@ -738,6 +885,113 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         &deps.roots_for(&call.run_id),
     );
 
+    // Has this exact side effect already happened, or is it happening now, or
+    // did the lights go out in the middle of it? Asked before the tool runs and
+    // answered from disk, because the case it exists for is the one where the
+    // process that ran it the first time is gone. See [`events::idempotency`].
+    let effect = events::is_side_effecting(tool).then(|| {
+        // The runtime may supply a key. Accepting one is safe because the
+        // recorded tool and argument fingerprint are checked against the call
+        // being made — a key that names a different call is refused, not
+        // replayed — and deriving one here means this works with a runtime
+        // bundle that has never heard of idempotency keys.
+        let key = params
+            .get("idempotencyKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| events::derive_key(&call.run_id, tool.as_str(), &call.args));
+        (key, events::args_fingerprint(&call.args))
+    });
+
+    if let Some((key, fingerprint)) = &effect {
+        // A reference to what is being acted on, so a person reconciling an
+        // unknown effect later is told which file to go and look at. A name,
+        // never contents.
+        let target = resolved_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| tool.as_str())
+            .to_string();
+
+        match deps
+            .events
+            .begin_effect(&call.run_id, key, tool.as_str(), fingerprint, &target)
+        {
+            // Nothing has happened under this key. The intent is now on disk,
+            // so a process that dies during the next few lines leaves evidence
+            // it was trying rather than leaving nothing at all.
+            events::EffectLookup::Fresh => {
+                deps.remember(
+                    &call.run_id,
+                    events::TaskEventType::ToolEffectPending,
+                    json!({
+                        "toolCallId": call.tool_call_id,
+                        "tool": tool.as_str(),
+                        "target": target,
+                        "idempotencyKey": key,
+                    }),
+                );
+            }
+
+            // Already settled. Return what it did; do not do it again.
+            events::EffectLookup::Settled(recorded) => {
+                deps.remember(
+                    &call.run_id,
+                    events::TaskEventType::ToolReplayed,
+                    json!({
+                        "toolCallId": call.tool_call_id,
+                        "tool": tool.as_str(),
+                        "firstRunAt": recorded.at,
+                        "succeeded": recorded.succeeded(),
+                    }),
+                );
+                let outcome = recorded.replay();
+                record_call(deps, &call.run_id, tool.as_str(), &outcome);
+                // Counted like any other call. A replay still costs a turn and
+                // a slice of the context window, and a budget that did not
+                // count it is one a model repeating itself never reaches.
+                record_step(deps, &call.run_id, tool);
+                return match outcome {
+                    Ok(text) => Ok(json!({
+                        "text": text,
+                        "details": { "tool": tool.as_str(), "replayed": true },
+                    })),
+                    Err(reason) => Err(WireError::new(code::TOOL_FAILED, reason)),
+                };
+            }
+
+            // Two attempts at one side effect at the same moment. Refused
+            // rather than serialised: whichever finished last would win, which
+            // is not a decision anybody made.
+            events::EffectLookup::InFlight(recorded) => {
+                let reason = format!(
+                    "another attempt at this exact action is already under way ({} on {}), so it \
+                     was not started a second time.",
+                    recorded.tool, recorded.target
+                );
+                remember_refusal(deps, &call, &reason);
+                return Err(WireError::new(code::REFUSED, reason));
+            }
+
+            // The one that matters. A side effect was in flight when the
+            // process went away, and nobody can say whether it took. Repeating
+            // it could do it twice; assuming it happened could mean it never
+            // does. Both are worse than stopping and asking.
+            events::EffectLookup::Unknown(recorded) => {
+                let reason = recorded.unknown_refusal();
+                remember_refusal(deps, &call, &reason);
+                return Err(WireError::new(code::REFUSED, reason));
+            }
+
+            events::EffectLookup::Conflict(conflict) => {
+                let reason = conflict.to_string();
+                remember_refusal(deps, &call, &reason);
+                return Err(WireError::new(code::REFUSED, reason));
+            }
+        }
+    }
+
     // Four tools are handled here rather than in `LocalToolRunner` because each
     // needs the run's accumulated state — its calculations, its evidence, the
     // files it has produced — and the runner is built fresh per call, so it
@@ -776,10 +1030,21 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         }
     };
 
+    // Settled whichever way it went, and before anything is returned to the
+    // loop. The intent went down before the tool ran; this is the other half.
+    // A side effect that happened and was never settled stays `pending`, and
+    // the next start promotes it to `unknown` — which is the correct answer
+    // when nobody can say what happened, and the wrong one when somebody could
+    // have.
+    if let Some((key, _)) = &effect {
+        deps.events.settle_effect(&call.run_id, key, &outcome);
+    }
+
     if outcome.is_ok() {
         remember_if_produced(deps, &call.run_id, tool, resolved_path.as_deref(), &tool_call);
     }
     record_call(deps, &call.run_id, tool.as_str(), &outcome);
+    remember_outcome(deps, &call, tool, resolved_path.as_deref(), &outcome);
 
     // Counted whatever the tool returned. A failed call cost the same wall
     // clock and the same context window as a successful one, and a budget that
@@ -927,7 +1192,18 @@ fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
             "stepsPlanned": plan.steps.len(),
         })
     };
-    deps.publish(run_id, progress);
+    deps.publish(run_id, progress.clone());
+    // The same figures, kept. A run recovered after a restart should show how
+    // far through its budget it got, and the plan table that knows is in memory.
+    deps.remember(
+        run_id,
+        events::TaskEventType::PlanStep,
+        json!({
+            "tool": tool.as_str(),
+            "stepsTaken": progress.get("stepsTaken").cloned().unwrap_or(Value::Null),
+            "maxSteps": progress.get("maxSteps").cloned().unwrap_or(Value::Null),
+        }),
+    );
 }
 
 /// Names the tool catalogue exposes. Used by the absence test in `tests/`.

@@ -60,7 +60,18 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             // the two processes, and a budget refusing a call would make a wire
             // problem and a policy problem look the same.
             plans: Arc::default(),
+            // Written to the same directory the rest of the run's state lives
+            // in, so a tool call replayed across these tests behaves as it
+            // would in the application.
+            events: Arc::new(
+                sarathi_lib::agent_runtime::events::TaskEventLog::open(dir.path())
+                    .expect("a task event log"),
+            ),
+            skills: Arc::new(sarathi_lib::skills::SkillRegistry::open(
+                dir.path().join("__no_skills__"),
+            )),
             emit: Arc::new(|_| {}),
+            emit_durable: Arc::new(|_| {}),
         }),
         // Returned so the directory outlives the test; dropping it early would
         // delete the SQLite file out from under the runtime.

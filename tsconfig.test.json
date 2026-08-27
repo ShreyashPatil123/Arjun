@@ -1,0 +1,16 @@
+{
+  /* Type-checks the frontend tests, which tsconfig.json excludes.
+
+     The only difference is knowing where vitest is: it is installed under
+     agent-runtime/ rather than at the root, because this repository is built
+     and verified offline and a second copy would mean a network install. */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "vitest": ["./agent-runtime/node_modules/vitest/dist/index.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": []
+}

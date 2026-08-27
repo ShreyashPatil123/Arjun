@@ -68,6 +68,43 @@ impl Classification {
         }
     }
 
+    /// How restricted this material is, as a rank rather than a category.
+    ///
+    /// The seven classifications are categories, not a scale, and most of the
+    /// product treats them that way — a decision about who may read a P&ID is
+    /// not a decision about a number. But a *ceiling* needs an ordering: a
+    /// subagent told it may handle nothing above `Internal` has to be able to
+    /// refuse `Financial`, and "refuse anything that is not exactly Internal"
+    /// would also refuse the harmless case of a narrower child.
+    ///
+    /// So the rank is **derived from [`Self::cleared_roles`] rather than
+    /// invented**: material more roles may read is less restricted. That gives
+    /// two tiers, which is what the clearance sets actually distinguish. It is
+    /// deliberately not a finer scale, because a finer one would be a judgement
+    /// about relative sensitivity that nobody at the site has made.
+    pub fn sensitivity(self) -> u8 {
+        match self {
+            // Readable by the user, the knowledge administrator and the
+            // reviewer: the everyday material.
+            Classification::Internal | Classification::ProcessDiagram => 0,
+            // Readable by the user and the reviewer only.
+            Classification::Financial
+            | Classification::VendorNegotiation
+            | Classification::BusinessStrategy
+            | Classification::UnreleasedDesign
+            | Classification::InternalCorrespondence => 1,
+        }
+    }
+
+    /// Whether material of this kind may be handled under `ceiling`.
+    ///
+    /// Equal rank is permitted: a ceiling of `Financial` allows
+    /// `VendorNegotiation`, because the clearance sets are identical and
+    /// pretending otherwise would be a distinction the site has not drawn.
+    pub fn within(self, ceiling: Classification) -> bool {
+        self.sensitivity() <= ceiling.sensitivity()
+    }
+
     /// Roles cleared to handle material of this kind.
     ///
     /// The auditor is absent from every one of these on purpose: an auditor

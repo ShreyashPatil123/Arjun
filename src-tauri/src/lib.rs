@@ -19,6 +19,8 @@ pub mod package;
 pub mod policy;
 pub mod registry;
 pub mod serving;
+pub mod skills;
+pub mod subagents;
 
 // Phase modules
 pub mod system_analyzer;
@@ -181,6 +183,112 @@ pub fn run() {
             app.manage(commands::agent::RunToolCalls::default());
             app.manage(agent_runtime::retrieval::RunPassages::default());
             app.manage(agent_runtime::artifacts::RunArtifacts::default());
+
+            // The durable half of all of the above. Everything managed just
+            // now dies with this process; this is what a run leaves behind
+            // while it is still going, and it is opened before any command can
+            // run so that no run starts unrecorded.
+            let task_events: std::sync::Arc<agent_runtime::events::TaskEventLog> = std::sync::Arc::new(
+                agent_runtime::events::TaskEventLog::open(&data_dir).unwrap_or_else(|error| {
+                    // A run with no durable history is a real degradation, and
+                    // it is logged as one. It is not a reason to refuse to
+                    // open: an unrecorded run is worse than a recorded one and
+                    // better than an application that will not start.
+                    log::error!("[TASKS] the task event log could not be opened: {error}");
+                    agent_runtime::events::TaskEventLog::in_memory()
+                        .expect("an in-memory task event log")
+                }),
+            );
+
+            // Runs that were going when the process last went away. Closed off
+            // here, before anything else writes, so the Tasks screen never
+            // shows a run that has been "running" since last Tuesday next to
+            // one that is running now.
+            match task_events.recover_interrupted(agent_runtime::events::SYSTEM_ACTOR) {
+                Ok(recovered) if !recovered.is_empty() => {
+                    info!(
+                        "[TASKS] {} run(s) were interrupted by the last shutdown and have been \
+                         closed off: {}",
+                        recovered.len(),
+                        recovered.join(", ")
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => log::error!("[TASKS] interrupted runs could not be closed off: {error}"),
+            }
+            let subagent_events = std::sync::Arc::clone(&task_events);
+            app.manage(task_events as commands::agent::TaskEvents);
+
+            // Skills: reusable instructions an operator installs. Discovered
+            // once at start, metadata only — reading every SKILL.md into memory
+            // here would be the thing that puts every skill in front of every
+            // model. See `skills::registry`.
+            //
+            // Resolved as a bundled resource in a packaged build and as the
+            // sibling directory in a checkout, the same way the agent runtime
+            // bundle is.
+            let skills_dir = app
+                .path()
+                .resolve("skills", tauri::path::BaseDirectory::Resource)
+                .ok()
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .map(|root| root.join("skills"))
+                        .unwrap_or_default()
+                });
+            let skills = std::sync::Arc::new(skills::SkillRegistry::open(&skills_dir));
+            let found = skills.snapshot();
+            info!(
+                "[SKILLS] {} of {} skill(s) available from {}",
+                found.available(),
+                found.count(),
+                skills_dir.display()
+            );
+            for card in found.cards().iter().filter(|card| !card.is_available()) {
+                // Quarantined skills are named at start rather than only when
+                // somebody goes looking. An operator who installed one and
+                // cannot find it should not have to open a screen to find out
+                // why.
+                if let Some(reason) = &card.quarantined {
+                    log::warn!("[SKILLS] {} is quarantined: {}", card.name, reason.explain());
+                }
+            }
+            app.manage(skills as commands::agent::Skills);
+
+            // Subagent profiles: bounded workers a run may delegate to. Loaded
+            // beside the skills and for the same reasons — an operator reads
+            // and reviews a file, and Rust enforces what it declares.
+            let agents_dir = app
+                .path()
+                .resolve("agents", tauri::path::BaseDirectory::Resource)
+                .ok()
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .map(|root| root.join("agents"))
+                        .unwrap_or_default()
+                });
+            let loaded_profiles = subagents::load_profiles(&agents_dir);
+            info!(
+                "[SUBAGENTS] {} profile(s) from {}",
+                loaded_profiles.profiles.len(),
+                agents_dir.display()
+            );
+            for rejected in &loaded_profiles.rejected {
+                // Named at start rather than only when somebody goes looking.
+                log::warn!(
+                    "[SUBAGENTS] {} was not loaded: {}",
+                    rejected.file,
+                    rejected.error.explain()
+                );
+            }
+            app.manage(std::sync::Arc::new(subagents::SubagentManager::new(
+                loaded_profiles.profiles,
+                subagent_events,
+            )) as commands::agent::Subagents);
 
             app.manage(sovereignty::global_broker().clone());
 
@@ -434,6 +542,19 @@ pub fn run() {
             commands::agent::agent_task,
             commands::agent::agent_task_artifacts,
             commands::agent::agent_reveal_artifact,
+            // Recovering a run: the state a window reattaches to, the events
+            // since that state, and which runs are still going at all.
+            commands::agent::agent_task_snapshot,
+            commands::agent::agent_task_events,
+            commands::agent::agent_active_tasks,
+            // Side effects that were in flight when the process went away, and
+            // the person saying what actually happened to them.
+            commands::agent::agent_unknown_effects,
+            commands::agent::agent_reconcile_effect,
+            // Skills: what is installed, and re-reading the directory.
+            commands::agent::skill_search,
+            commands::agent::skill_reload,
+            commands::agent::subagent_profiles,
 
             commands::sovereignty::get_operating_mode,
             commands::sovereignty::set_operating_mode,

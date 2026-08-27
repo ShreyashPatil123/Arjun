@@ -94,6 +94,7 @@ The individual gates, if you want them one at a time:
 | `npm run runtime:audit` | the vendored OpenClaw copy still has its cloud providers removed |
 | `npm run runtime:typecheck` | types across the agent runtime |
 | `npm run runtime:test` | agent-runtime unit tests (Vitest) |
+| `npm run test:ui` | frontend logic tests — run recovery from the durable record |
 | `npm run check:bundle` | inspects the built runtime artifact for surviving providers |
 | `npm run sbom` | regenerates the CycloneDX SBOM under `evidence/` |
 | `npm run test:rust` | Rust unit tests |
@@ -115,6 +116,9 @@ src/                    React 19 + TypeScript frontend
 src-tauri/              Rust core (crate: sarathi)
   agent_runtime/        supervises the TS runtime; workspace sandbox,
                         capability grants, approval gating, artifact capture
+    events/             durable, ordered task history in SQLite — snapshots
+                        for the UI, idempotency keys for side effects, and
+                        recovery of runs a restart interrupted
   serving/              model serving lifecycle and probing
   model_manager/        download, sizing, and installation
   model_intelligence/   hardware-aware recommendation
@@ -145,6 +149,11 @@ evidence/               generated SBOM and audit output
    which are gated by capability grants and, where required, user approval.
 5. Any outbound request — and there should be very few — goes through the
    sovereignty broker, the one audited chokepoint.
+6. Everything a run does is written to an ordered, append-only history as it
+   happens (`agent_runtime/events/`), separately from the task record a
+   finished run leaves behind. That is what lets a window reattach to a run
+   after a remount, and what lets the next start find the runs the previous
+   process was carrying when it went away.
 
 ---
 

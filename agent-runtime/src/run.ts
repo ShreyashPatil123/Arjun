@@ -39,6 +39,19 @@ export interface RunRequest {
     input?: ("text" | "image")[];
     reasoning?: boolean;
   };
+  /**
+   * When this run must stop, as epoch milliseconds.
+   *
+   * The same instant the Rust side is holding. Sent so the loop can stop
+   * *itself* at a point it knows is safe, rather than being killed from outside
+   * in the middle of a turn — this side knows where its own safe points are and
+   * the other side does not.
+   *
+   * It is not a second authority. The only thing it can do is end the run
+   * earlier than Rust would; every tool call still goes through the gateway,
+   * and nothing here decides whether an action is permitted.
+   */
+  deadlineMs?: number;
 }
 
 export interface RunOutcome {
@@ -208,6 +221,34 @@ export async function startRun(
     onPayload: payloadPolicy(request.model.reasoning ?? false),
   });
 
+  /**
+   * Stops the run when its deadline passes.
+   *
+   * `agent.abort` is the same path an operator's stop button takes, so the
+   * wind-down is the one already tested: the loop finishes what it is doing,
+   * appends the message saying the turn was interrupted, and returns whatever
+   * it had. A deadline that killed the process instead would leave a tool call
+   * in flight and nobody able to say whether it took effect.
+   */
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  if (typeof request.deadlineMs === "number") {
+    const remaining = request.deadlineMs - Date.now();
+    if (remaining <= 0) {
+      // Already past it before the first turn. Refused rather than started, so
+      // a run that waited too long in a queue does not spend a model call to
+      // discover it has no time left.
+      throw new Error(
+        "This task's time budget had already expired before the loop started, so nothing was run.",
+      );
+    }
+    deadlineTimer = setTimeout(() => {
+      agent.abort("the task reached the time limit its plan allowed");
+    }, remaining);
+    // Never hold the process open on its own account: if everything else has
+    // finished, a pending deadline is not a reason to stay alive.
+    deadlineTimer.unref?.();
+  }
+
   let turns = 0;
   agent.subscribe((event: AgentEvent) => {
     if (event.type === "turn_end") turns += 1;
@@ -229,6 +270,7 @@ export async function startRun(
   try {
     await agent.prompt(request.prompt);
   } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
     // A run that ends holding grants means authorisation outlived its call. That
     // is a defect, but clearing is the safe half of handling it either way.
     ledger.clear();

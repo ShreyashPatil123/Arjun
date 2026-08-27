@@ -369,11 +369,28 @@ pub struct TaskSummary {
     pub stopped_because: String,
     pub ready: bool,
     pub failure: Option<String>,
+    /// Where the run stands.
+    ///
+    /// Read off the durable event history where there is one, and derived from
+    /// the record otherwise. It is the only thing on this row that can say
+    /// *degraded* — a run the process took down with it writes no record at
+    /// all, so before the event history existed those runs simply did not
+    /// appear on this screen.
+    pub state: super::events::RunState,
+    /// True while the run is still going. The row is drawn differently and is
+    /// not offered as something to hand on.
+    pub live: bool,
 }
 
 impl From<&TaskRecord> for TaskSummary {
     fn from(record: &TaskRecord) -> Self {
         Self {
+            state: if record.failure.is_some() {
+                super::events::RunState::Failed
+            } else {
+                super::events::RunState::Completed
+            },
+            live: false,
             run_id: record.run_id.clone(),
             user_id: record.user_id.clone(),
             prompt: record.prompt.clone(),
@@ -396,6 +413,62 @@ impl From<&TaskRecord> for TaskSummary {
             ready: record.is_ready(),
             failure: record.failure.clone(),
         }
+    }
+}
+
+/// A row for a run that has no record yet — one still going, or one the process
+/// took down with it.
+///
+/// The counterpart to [`TaskSummary::from`], which reads a finished run's JSON
+/// record. Both produce the same row so the Tasks screen does not have to know
+/// which kind it is looking at; what differs is how much is knowable. A run
+/// still in flight has no duration, no verification and no evidence count yet,
+/// and this reports those as zero rather than inventing them.
+pub fn summary_of(snapshot: &super::events::TaskSnapshot) -> TaskSummary {
+    let live = !snapshot.state.is_terminal();
+    let plan = snapshot.plan.as_ref();
+    TaskSummary {
+        run_id: snapshot.run_id.clone(),
+        user_id: snapshot.actor.clone(),
+        prompt: snapshot.prompt.clone(),
+        started_at: snapshot.started_at.clone(),
+        // A run that has not ended has not ended. Reporting `updated_at` here
+        // would put a finish time on the screen for a task that is still going.
+        finished_at: if live {
+            String::new()
+        } else {
+            snapshot.updated_at.clone()
+        },
+        duration_seconds: duration_between(&snapshot.started_at, &snapshot.updated_at),
+        model_name: snapshot.model_name.clone(),
+        intent: String::new(),
+        turns: snapshot.turns,
+        artifact_count: snapshot.artifacts.len(),
+        evidence_count: 0,
+        tool_call_count: snapshot.activity.len(),
+        unfinished_steps: plan
+            .map(|plan| plan.unfinished().len())
+            .unwrap_or_default(),
+        approvals_pending: snapshot.approvals_pending,
+        stopped_because: snapshot
+            .stopped_because
+            .clone()
+            .unwrap_or_else(|| snapshot.state.describe().to_string()),
+        // Nothing without a record is ready to hand on: there is no answer to
+        // check, no artifact re-opened, and no verification.
+        ready: false,
+        failure: snapshot.failure.clone(),
+        state: snapshot.state,
+        live,
+    }
+}
+
+/// Seconds between two RFC 3339 instants, or zero if either will not parse.
+fn duration_between(from: &str, to: &str) -> u64 {
+    let parse = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw).ok();
+    match (parse(from), parse(to)) {
+        (Some(from), Some(to)) => (to - from).num_seconds().max(0) as u64,
+        _ => 0,
     }
 }
 
@@ -559,6 +632,111 @@ mod tests {
         let listed = list(dir.path());
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "good");
+    }
+
+    /// A record written before the durable event history existed still reads.
+    ///
+    /// Written as raw JSON rather than through [`save`] on purpose: serialising
+    /// the current struct and reading it back would pass however the struct
+    /// changed, which is precisely the regression this is meant to catch. This
+    /// is the exact field set older builds wrote.
+    #[test]
+    fn a_record_from_before_the_event_history_still_lists_and_opens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(directory(dir.path())).expect("the directory");
+        std::fs::write(
+            directory(dir.path()).join("old-run.json"),
+            r#"{
+              "runId": "old-run",
+              "prompt": "draft an approval note",
+              "startedAt": "2026-08-20T10:00:00+00:00",
+              "finishedAt": "2026-08-20T10:00:42+00:00",
+              "durationSeconds": 42,
+              "userId": "priya",
+              "routing": {
+                "modelId": "qwen2.5-7b", "modelName": "Qwen2.5 7B", "role": "reasoning",
+                "intent": "reasoning", "confidence": 0.8, "usedFallback": false,
+                "reasons": ["it fits in VRAM"], "gpuPlanSummary": "all layers on GPU",
+                "fullyOnGpu": true
+              },
+              "endpoint": {
+                "baseUrl": "http://127.0.0.1:8080/v1", "servedModelId": "qwen2.5-7b",
+                "managed": true, "runtime": "llamaCpp"
+              },
+              "plan": {
+                "steps": [], "maxSteps": 12, "maxDurationSeconds": 600,
+                "permittedTools": ["search_documents"], "repeatLimit": 3, "stepsTaken": 2,
+                "stopReason": {"reason": "completed"}, "stoppedBecause": "Finished."
+              },
+              "answer": "The seal is worn beyond the limit [E1].",
+              "turns": 3,
+              "verification": null,
+              "artifacts": [],
+              "evidence": [],
+              "calculations": [],
+              "toolCalls": [],
+              "approvals": [],
+              "failure": null
+            }"#,
+        )
+        .expect("the old record");
+
+        let listed = list(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, "old-run");
+        assert_eq!(listed[0].model_name, "Qwen2.5 7B");
+        // The fields the summary grew are derived, so an old record gets a
+        // truthful value for them rather than a missing one.
+        assert_eq!(listed[0].state, crate::agent_runtime::events::RunState::Completed);
+        assert!(!listed[0].live);
+
+        let opened = load(dir.path(), "old-run").expect("it opens");
+        assert_eq!(opened.answer, "The seal is worn beyond the limit [E1].");
+    }
+
+    #[test]
+    fn an_old_record_that_failed_summarises_as_failed_rather_than_finished() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut written = record("run-1", "2026-08-27T10:00:42+00:00");
+        written.failure = Some("the agent runtime stopped".to_string());
+        save(dir.path(), &written).expect("saved");
+
+        assert_eq!(
+            list(dir.path())[0].state,
+            crate::agent_runtime::events::RunState::Failed
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_record_yet_summarises_from_what_is_known() {
+        // The row an interrupted run gets. Everything the record would have
+        // supplied is absent, and the summary says so rather than inventing it.
+        let mut snapshot = crate::agent_runtime::events::TaskSnapshot::empty("run-1");
+        snapshot.state = crate::agent_runtime::events::RunState::DegradedNeedsHuman;
+        snapshot.prompt = "draft an approval note".to_string();
+        snapshot.actor = "priya".to_string();
+        snapshot.started_at = "2026-08-27T10:00:00+00:00".to_string();
+        snapshot.updated_at = "2026-08-27T10:00:30+00:00".to_string();
+        snapshot.failure = Some("Interrupted: the application closed.".to_string());
+
+        let summary = summary_of(&snapshot);
+        assert_eq!(summary.user_id, "priya");
+        assert_eq!(summary.duration_seconds, 30);
+        assert!(!summary.live);
+        // Nothing without a record is ready to hand on: there is no answer to
+        // check, no artifact re-opened, and no verification.
+        assert!(!summary.ready);
+    }
+
+    #[test]
+    fn a_run_still_going_is_not_given_a_finish_time_it_does_not_have() {
+        let mut snapshot = crate::agent_runtime::events::TaskSnapshot::empty("run-1");
+        snapshot.started_at = "2026-08-27T10:00:00+00:00".to_string();
+        snapshot.updated_at = "2026-08-27T10:00:30+00:00".to_string();
+
+        let summary = summary_of(&snapshot);
+        assert!(summary.live);
+        assert!(summary.finished_at.is_empty());
     }
 
     #[test]

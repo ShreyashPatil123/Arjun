@@ -19,11 +19,15 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::agent_runtime::artifacts::{ArtifactReport, RunArtifacts};
+use crate::agent_runtime::events::{
+    EventDraft, RecordedOutcome, RunState, TaskEvent, TaskEventLog, TaskEventType, TaskSnapshot,
+    SYSTEM_ACTOR,
+};
 use crate::agent_runtime::retrieval::RunPassages;
 use crate::agent_runtime::tasks::{ApprovalRecord, PlanRecord, TaskRecord, TaskSummary, ToolCallRecord};
 use crate::agent_runtime::workspace::Workspace;
 use crate::agent_runtime::{artifacts, planning, retrieval, tasks};
-use crate::agent_runtime::{AgentRuntime, RuntimeDeps, AGENT_EVENT};
+use crate::agent_runtime::{AgentRuntime, RuntimeDeps, AGENT_DURABLE_EVENT, AGENT_EVENT};
 use crate::artifacts::{verify, Evidence, VerificationReport};
 use crate::audit::{AuditKind, AuditService};
 use crate::commands::governance::{require_session, CurrentSession};
@@ -62,6 +66,20 @@ pub type RunCalculations =
 
 /// The one runtime for this session, started on first use.
 pub type AgentRuntimeHandle = Arc<Mutex<Option<Arc<AgentRuntime>>>>;
+
+/// The skills installed on this machine, shared with the runtime.
+pub type Skills = Arc<crate::skills::SkillRegistry>;
+
+/// The subagent roles this deployment has.
+pub type Subagents = Arc<crate::subagents::SubagentManager>;
+
+/// The durable history of every run, shared with the runtime.
+///
+/// The tables above are the working state of runs *this process* is carrying,
+/// and every one of them is gone when the process is. This is the part that is
+/// not: it is written as the run happens, so a window that remounted and a
+/// process that has just started can both find out what a run has been doing.
+pub type TaskEvents = Arc<TaskEventLog>;
 
 /// What the UI sends to start a run.
 ///
@@ -178,6 +196,8 @@ pub struct RuntimeState<'a> {
     pub plans: &'a RunPlans,
     pub calculations: &'a RunCalculations,
     pub calls: &'a RunToolCalls,
+    pub events: &'a TaskEvents,
+    pub skills: &'a Skills,
 }
 
 fn runtime(
@@ -198,6 +218,14 @@ fn runtime(
         let _ = emitter.emit(AGENT_EVENT, event);
     });
 
+    let durable_emitter = app.clone();
+    let emit_durable: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |event: Value| {
+        // Dropping one of these costs a client its place in the sequence — but
+        // that is recoverable, because the gap is detectable and the snapshot
+        // is authoritative. Emitting is still best-effort; the *record* is not.
+        let _ = durable_emitter.emit(AGENT_DURABLE_EVENT, event);
+    });
+
     let deps = Arc::new(RuntimeDeps {
         index: state.index.clone(),
         session: Arc::clone(state.session),
@@ -208,6 +236,9 @@ fn runtime(
         produced: state.produced.clone(),
         calls: state.calls.clone(),
         plans: state.plans.clone(),
+        events: state.events.clone(),
+        skills: state.skills.clone(),
+        emit_durable,
         // The same channel the loop's own events travel, so an operator sees
         // one sequence of what happened rather than two interleaved by luck.
         emit: emit.clone(),
@@ -218,6 +249,31 @@ fn runtime(
 
     *slot = Some(started.clone());
     Ok(started)
+}
+
+/// Records one event durably, then publishes it with its sequence number.
+///
+/// The order matters and is the whole contract of the durable channel: a
+/// message on it names a row that exists. Publishing first and writing second
+/// would let a client apply an event that never landed, and no amount of later
+/// reconciliation would tell it so.
+///
+/// A duplicate is not an error. The event the caller wanted written is there,
+/// which is the outcome it wanted; it is simply not published a second time.
+fn record_and_publish(
+    app: &AppHandle,
+    events: &TaskEvents,
+    draft: EventDraft,
+) -> Result<(), String> {
+    use crate::agent_runtime::events::AppendError;
+    match events.record(draft) {
+        Ok(event) => {
+            let _ = app.emit(AGENT_DURABLE_EVENT, event.envelope());
+            Ok(())
+        }
+        Err(AppendError::Duplicate { .. }) | Err(AppendError::AlreadyEnded { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Routes a prompt to a model, makes sure that model is served, and runs it.
@@ -245,6 +301,8 @@ pub async fn agent_start_run(
     plans: State<'_, RunPlans>,
     calculations: State<'_, RunCalculations>,
     calls: State<'_, RunToolCalls>,
+    events: State<'_, TaskEvents>,
+    skills: State<'_, Skills>,
 ) -> Result<RunSummary, String> {
     // Checked here as well as in the runtime's handlers. Here it gives the
     // person a clear reason before anything starts; there it stops a call whose
@@ -292,10 +350,59 @@ pub async fn agent_start_run(
         plans: &plans,
         calculations: &calculations,
         calls: &calls,
+        events: &events,
+        skills: &skills,
     };
     let runtime = runtime(&handle, &app, &state)?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now();
+
+    // The lifecycle, written as it happens rather than summarised at the end.
+    //
+    // Three events before the loop is even asked to start, because each answers
+    // a different question somebody asks about a run that went wrong: was it
+    // accepted, was its sensitivity understood, and what was it routed to. A
+    // run that dies in its first second still leaves all three.
+    //
+    // `promptShown` rather than `prompt`: the redaction hashes anything called
+    // `prompt`, and this is the person's own words being shown back to them on
+    // their own machine. A task list where every row reads as a hash identifies
+    // nothing.
+    let opening = [
+        (
+            TaskEventType::RunCreated,
+            json!({
+                "promptShown": request.prompt,
+                "correlationId": request.correlation_id,
+            }),
+        ),
+        (
+            TaskEventType::RunClassified,
+            json!({
+                "classification": request
+                    .classification
+                    .map(|c| c.label().to_string())
+                    .unwrap_or_else(|| "Internal".to_string()),
+            }),
+        ),
+        (
+            TaskEventType::RunRouted,
+            json!({
+                "modelId": routing.model_id,
+                "modelName": routing.model_name,
+                "intent": routing.intent,
+                "confidence": routing.confidence,
+                "usedFallback": routing.used_fallback,
+                "runtime": endpoint.runtime.label(),
+            }),
+        ),
+    ];
+    for (event_type, payload) in opening {
+        let draft = EventDraft::new(&run_id, event_type, &signed_in.user.id).with(payload);
+        if let Err(error) = record_and_publish(&app, &events, draft) {
+            log::error!("[tasks] run {run_id}: {} was not recorded: {error}", event_type.as_str());
+        }
+    }
 
     // The run's own directory, created before the model is told anything — so
     // the instructions can name it, and so a tool call cannot arrive before the
@@ -314,6 +421,14 @@ pub async fn agent_start_run(
     let task_plan = planning::plan_for(&run_id, &request.prompt);
     let plan_note = describe_plan(&task_plan);
     let planned = PlanRecord::of(&task_plan);
+    // The instant this run must stop by. A property of the plan, so it is only
+    // knowable once the plan is fixed — and fixed it is: nothing after this
+    // point may extend it.
+    let deadline = started_at
+        + chrono::Duration::from_std(std::time::Duration::from_secs(
+            planned.max_duration_seconds.max(1),
+        ))
+        .unwrap_or_else(|_| chrono::Duration::minutes(10));
     plans
         .lock()
         .map_err(|_| "the plan table is poisoned".to_string())?
@@ -332,6 +447,16 @@ pub async fn agent_start_run(
             },
         }),
     );
+    // Kept as well as published. The published one reaches a window that is
+    // listening now; this one reaches a window that opens in ten minutes.
+    if let Err(error) = record_and_publish(
+        &app,
+        &events,
+        EventDraft::new(&run_id, TaskEventType::PlanReady, &signed_in.user.id)
+            .with(json!({ "plan": planned })),
+    ) {
+        log::warn!("[tasks] run {run_id}: the plan was not recorded: {error}");
+    }
 
     let params = json!({
         "runId": run_id,
@@ -347,6 +472,14 @@ pub async fn agent_start_run(
             "contextWindow": entry.context_length,
             "maxTokens": DEFAULT_MAX_TOKENS,
         },
+        // The same instant this side is holding, as epoch milliseconds. Sent so
+        // the loop stops itself at the boundary rather than being killed from
+        // outside mid-turn — the child knows where its own safe points are and
+        // this side does not.
+        //
+        // It is not a second authority: the loop can only stop *earlier* than
+        // Rust would, and every tool call still goes through the gateway.
+        "deadlineMs": deadline.timestamp_millis(),
     });
 
     // Recorded before the run, not after. A run that crashes or is killed still
@@ -375,7 +508,70 @@ pub async fn agent_start_run(
         })),
     );
 
-    let outcome = runtime.request("run.start", params).await;
+    // The moment the loop is handed the work, and the instant it must stop by.
+    //
+    // The deadline is a property of the plan, so it is only knowable here —
+    // after `planning::plan_for` has fixed the budget. Recorded as well as sent
+    // so a window that reattaches can say how long is left rather than only
+    // that the run is still going.
+    if let Err(error) = record_and_publish(
+        &app,
+        &events,
+        EventDraft::new(&run_id, TaskEventType::RunStarted, &signed_in.user.id)
+            .with(json!({ "deadline": deadline.to_rfc3339() })),
+    ) {
+        log::warn!("[tasks] run {run_id}: the start was not recorded: {error}");
+    }
+
+    // The plan's own time budget, enforced here rather than trusted to the
+    // loop. The plan refuses the *next* tool call once the clock has run out,
+    // which is the right check for a run that is doing things and the wrong one
+    // for a run that is stuck: a model waiting on a model server that will
+    // never answer makes no further calls, so nothing ever asks the plan
+    // whether it may continue. Without a deadline on this side, that run waits
+    // for as long as the application is open.
+    let allowed = std::time::Duration::from_secs(planned.max_duration_seconds.max(1));
+    let (outcome, ending) =
+        match tokio::time::timeout(allowed, runtime.request("run.start", params)).await {
+            Ok(Ok(value)) => (Ok(value), TaskEventType::RunCompleted),
+            Ok(Err(error)) => {
+                // A run the gateway or the plan stopped is not a fault, and a
+                // list that paints it the same colour as one teaches people to
+                // skip the row that actually broke. Read from the refusal's own
+                // wording, because every refusal path produces a sentence and
+                // none of them produces a code.
+                let detail = error.to_string();
+                let stopped_by_policy = detail.contains("not permitted")
+                    || detail.contains("was not approved")
+                    || detail.contains("is not cleared");
+                let stopped_by_budget = detail.contains("permitted steps")
+                    || detail.contains("going in circles")
+                    || detail.contains("time allowed");
+                let kind = if stopped_by_policy {
+                    TaskEventType::RunStoppedByPolicy
+                } else if stopped_by_budget {
+                    TaskEventType::RunStoppedByBudget
+                } else {
+                    TaskEventType::RunFailed
+                };
+                (Err(detail), kind)
+            }
+            Err(_) => {
+                // Told to stop, because the deadline expiring here does not
+                // reach the child on its own: the loop would carry on holding a
+                // model server and a workspace for a run nobody is waiting for.
+                let _ = runtime
+                    .request("run.abort", json!({ "runId": run_id }))
+                    .await;
+                (
+                    Err(format!(
+                        "Stopped: it ran past the {} minutes this task was allowed.",
+                        allowed.as_secs() / 60
+                    )),
+                    TaskEventType::RunStoppedByBudget,
+                )
+            }
+        };
 
     // From here the run is over, one way or the other, and everything below is
     // about leaving a record of it. A run that failed gets the same treatment
@@ -392,7 +588,7 @@ pub async fn agent_start_run(
             value.get("turns").and_then(Value::as_u64).unwrap_or(0) as u32,
             None,
         ),
-        Err(error) => (String::new(), 0, Some(error.to_string())),
+        Err(error) => (String::new(), 0, Some(error.clone())),
     };
 
     // Re-opened, not taken on the model's word. A document that was written and
@@ -412,6 +608,15 @@ pub async fn agent_start_run(
     // The check between a draft and something somebody signs. Skipped when
     // there is no answer to check — reporting "nothing to verify" as a pass
     // would be the one misleading outcome available here.
+    if !answer.trim().is_empty() {
+        let _ = record_and_publish(
+            &app,
+            &events,
+            EventDraft::new(&run_id, TaskEventType::VerificationStarted, &signed_in.user.id)
+                .with(json!({ "answerChars": answer.chars().count() })),
+        );
+    }
+
     let verification = (!answer.trim().is_empty()).then(|| {
         verify(
             &answer,
@@ -520,6 +725,36 @@ pub async fn agent_start_run(
         log::error!("[agent] the record for run {run_id} could not be saved: {error}");
     }
 
+    // The ending, written last. Refused if the run already has one — a person
+    // who pressed stop a moment before the loop finished has already given this
+    // run its ending, and a second one would let a reader pick which happened.
+    let ending_payload = match ending {
+        TaskEventType::RunCompleted => json!({
+            "answer": answer,
+            "turns": turns,
+            "artifacts": produced_files.len(),
+            "stoppedBecause": final_plan.stopped_because,
+        }),
+        _ => json!({
+            "failure": failure,
+            "turns": turns,
+            "stoppedBecause": final_plan.stopped_because,
+        }),
+    };
+    // The event id is derived from the run rather than generated, so a retry
+    // after an ambiguous failure presents the same id and is refused as the
+    // duplicate it is. A run has exactly one ending, and this is what makes
+    // writing it twice harmless rather than merely unlikely.
+    match record_and_publish(
+        &app,
+        &events,
+        EventDraft::idempotent(&run_id, ending, &signed_in.user.id, "ending")
+            .with(ending_payload),
+    ) {
+        Ok(()) => {}
+        Err(error) => log::warn!("[tasks] run {run_id}: the ending was not recorded: {error}"),
+    }
+
     // The run's working state is not needed once its record is written, and
     // holding every passage of every run for the life of the session would grow
     // without bound. The workspace is deliberately left alone — the deliverable
@@ -537,7 +772,7 @@ pub async fn agent_start_run(
     }
 
     // Returned last, so a run that failed still left its record behind first.
-    outcome.map_err(|error| error.to_string())?;
+    outcome?;
 
     Ok(RunSummary {
         run_id,
@@ -642,11 +877,40 @@ pub async fn agent_steer_run(
 }
 
 /// Stops a run in flight.
+///
+/// The cancellation is recorded *before* the child is told, and deliberately.
+/// The record is what a restart reads; telling the loop first and then failing
+/// to write would leave a run that stopped for a reason nobody can see. Writing
+/// first and then failing to reach the loop leaves a run marked cancelled that
+/// is still winding down, which is the direction of error somebody can act on.
 #[tauri::command]
 pub async fn agent_abort_run(
     run_id: String,
     handle: State<'_, AgentRuntimeHandle>,
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
 ) -> Result<bool, String> {
+    let by = require_session(&session)
+        .map(|signed_in| signed_in.user.id)
+        .unwrap_or_else(|_| SYSTEM_ACTOR.to_string());
+
+    // Only for a run the record has heard of. A run id arrives from the UI, and
+    // writing an ending for one that has no beginning would let any caller
+    // conjure a row on the Tasks screen for a task that never ran.
+    if events.snapshot(&run_id)?.is_some() {
+        match events.record(
+            EventDraft::new(&run_id, TaskEventType::RunCancelled, &by).with(json!({
+                "failure": "Stopped, because somebody stopped it.",
+                "cancelledBy": by,
+            })),
+        ) {
+            // Already over — the run finished a moment before the button did.
+            // An ordinary race, and the ending it already has is the true one.
+            Ok(_) | Err(crate::agent_runtime::events::AppendError::AlreadyEnded { .. }) => {}
+            Err(error) => log::warn!("[tasks] run {run_id}: the stop was not recorded: {error}"),
+        }
+    }
+
     let runtime = {
         let slot = handle
             .lock()
@@ -687,6 +951,8 @@ pub async fn agent_runtime_health(
     plans: State<'_, RunPlans>,
     calculations: State<'_, RunCalculations>,
     calls: State<'_, RunToolCalls>,
+    events: State<'_, TaskEvents>,
+    skills: State<'_, Skills>,
 ) -> Result<Value, String> {
     let state = RuntimeState {
         index: &index,
@@ -698,6 +964,8 @@ pub async fn agent_runtime_health(
         plans: &plans,
         calculations: &calculations,
         calls: &calls,
+        events: &events,
+        skills: &skills,
     };
     let runtime = runtime(&handle, &app, &state)?;
     runtime
@@ -728,11 +996,270 @@ fn may_read(session: &Session, record_user_id: &str) -> bool {
 pub async fn agent_task_history(
     app: AppHandle,
     session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
 ) -> Result<Vec<TaskSummary>, String> {
     let signed_in = require_session(&session)?;
-    Ok(tasks::list(&app_data_dir(&app)?)
+    // Records first, snapshots second. Every finished run has written its JSON
+    // record exactly as it always did, and that record is richer than a
+    // snapshot; the snapshots supply only the runs that have no record — the
+    // ones still going, and the ones the process took down with it. Before
+    // this, those simply did not appear, and a task list silently missing the
+    // interrupted runs is the list that misleads.
+    let mut all = tasks::list(&app_data_dir(&app)?);
+    let recorded: std::collections::HashSet<String> =
+        all.iter().map(|task| task.run_id.clone()).collect();
+
+    for snapshot in events.snapshots().unwrap_or_default() {
+        if !recorded.contains(&snapshot.run_id) {
+            all.push(tasks::summary_of(&snapshot));
+            continue;
+        }
+        // The record holds the contents; the history holds the ending. A run
+        // somebody stopped and one that ran out of time both write a record
+        // whose `failure` field cannot tell those two apart — the history can,
+        // so it is where the status comes from.
+        if let Some(task) = all.iter_mut().find(|task| task.run_id == snapshot.run_id) {
+            task.state = snapshot.state;
+            task.live = !snapshot.state.is_terminal();
+        }
+    }
+
+    all.retain(|task| may_read(&signed_in, &task.user_id));
+    // On the finish time, newest first, exactly as before. A run still going
+    // has no finish time and sorts to the top, which is where it belongs.
+    all.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+    Ok(all)
+}
+
+/// The latest state of one task, without replaying its history.
+///
+/// What a window calls when it mounts holding a run id — after a remount, or
+/// after the whole application was restarted. Answers for a run that is still
+/// going, one that finished, and one that was interrupted, which is the point:
+/// before this there was no way to ask about the first and third at all.
+#[tauri::command]
+pub async fn agent_task_snapshot(
+    run_id: String,
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+) -> Result<Option<TaskSnapshot>, String> {
+    let signed_in = require_session(&session)?;
+    let Some(snapshot) = events.snapshot(&run_id)? else {
+        // A run id nobody has heard of is an empty answer, not a failure: the
+        // caller may be holding one from a database that has since been reset.
+        return Ok(None);
+    };
+    if !may_read(&signed_in, &snapshot.actor) {
+        return Err("That task was run by somebody else, and its evidence is theirs.".to_string());
+    }
+    Ok(Some(snapshot))
+}
+
+/// One task's events after `after_seq`, in order.
+///
+/// The catch-up half of recovery. A window that holds a snapshot at sequence 12
+/// asks for everything after 12 and applies it, rather than reloading a state
+/// it already has. Events that could not be read are reported alongside the
+/// ones that could — a history with a hole in it is usable, but only if the
+/// screen reading it knows the hole is there.
+#[tauri::command]
+pub async fn agent_task_events(
+    run_id: String,
+    after_seq: Option<i64>,
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+) -> Result<TaskEventPage, String> {
+    let signed_in = require_session(&session)?;
+    if let Some(snapshot) = events.snapshot(&run_id)? {
+        if !may_read(&signed_in, &snapshot.actor) {
+            return Err(
+                "That task was run by somebody else, and its evidence is theirs.".to_string(),
+            );
+        }
+    }
+    let page = events.events_since(&run_id, after_seq.unwrap_or(0))?;
+    Ok(TaskEventPage {
+        last_seq: page.last_seq(),
+        events: page.events,
+        unreadable: page.unreadable,
+    })
+}
+
+/// A page of events, and what could not be read alongside them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEventPage {
+    pub events: Vec<TaskEvent>,
+    pub unreadable: Vec<crate::agent_runtime::events::UnreadableEvent>,
+    /// The highest position accounted for, readable or not. A caller asks for
+    /// everything after this next time.
+    pub last_seq: i64,
+}
+
+/// Side effects nobody can account for, across every run.
+///
+/// Each one is an action that was in flight when the process went away: a file
+/// that may or may not have been written. They are listed rather than retried,
+/// because retrying could do the thing twice and assuming could mean it never
+/// happens. See [`crate::agent_runtime::events::idempotency`].
+#[tauri::command]
+pub async fn agent_unknown_effects(
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+) -> Result<Vec<RecordedOutcome>, String> {
+    let signed_in = require_session(&session)?;
+    // Reconciling is a reviewer's judgement about whether work happened, which
+    // is the same kind of decision as approving an output. Somebody who may not
+    // make that decision is not shown the queue of them.
+    if !signed_in.holds(Permission::ApproveOutput) {
+        return Err(format!(
+            "{} is not permitted to reconcile interrupted actions. That is a reviewer's decision.",
+            signed_in.user.display_name
+        ));
+    }
+    events.unknown_effects()
+}
+
+/// Records what a person found out about an interrupted side effect.
+///
+/// `happened` is their assertion, not a measurement — they went and looked at
+/// the file. It is stored as an assertion, naming who made it, because a record
+/// that presented a person's judgement as a fact the system established would
+/// be claiming more than it knows.
+///
+/// Resolves `false` when there was nothing under that key to reconcile, which
+/// is an ordinary race — somebody else got there first — and not a failure.
+#[tauri::command]
+pub async fn agent_reconcile_effect(
+    run_id: String,
+    idempotency_key: String,
+    happened: bool,
+    session: State<'_, CurrentSession>,
+    audit: State<'_, Arc<AuditService>>,
+    events: State<'_, TaskEvents>,
+) -> Result<bool, String> {
+    let signed_in = require_session(&session)?;
+    if !signed_in.holds(Permission::ApproveOutput) {
+        return Err(format!(
+            "{} is not permitted to reconcile interrupted actions. That is a reviewer's decision.",
+            signed_in.user.display_name
+        ));
+    }
+
+    let settled = events.reconcile_effect(&run_id, &idempotency_key, happened, &signed_in.user.id)?;
+    if settled {
+        // On the permanent record as well as the run's own history: this is a
+        // person asserting something about work the system could not establish,
+        // which is exactly the kind of claim an auditor comes looking for.
+        let _ = audit.record(
+            &signed_in.user.id,
+            AuditKind::Approval,
+            format!(
+                "{} reconciled an interrupted action in run {run_id}: it {}",
+                signed_in.user.display_name,
+                if happened { "did take effect" } else { "did not take effect" }
+            ),
+            Some(json!({
+                "runId": run_id,
+                "idempotencyKey": idempotency_key,
+                "happened": happened,
+            })),
+        );
+    }
+    Ok(settled)
+}
+
+/// Concise metadata for the skills this person may use.
+///
+/// The UI's half of `capability.search`. Returns cards — never a skill's
+/// instructions — so a screen can list what is installed, and what is
+/// quarantined and why, without any of it reaching a prompt.
+#[tauri::command]
+pub async fn skill_search(
+    query: Option<String>,
+    session: State<'_, CurrentSession>,
+    skills: State<'_, Skills>,
+) -> Result<Vec<crate::skills::SkillCard>, String> {
+    let signed_in = require_session(&session)?;
+    Ok(skills.search(
+        query.as_deref().unwrap_or_default(),
+        &crate::skills::SkillContext {
+            session: &signed_in,
+            mode: crate::sovereignty::global_broker().mode(),
+            // No run in view from here, so nothing is permitted. The cards say
+            // what each skill asks for; what a given run would actually grant
+            // is decided when it loads one.
+            run_permits: &[],
+        },
+    ))
+}
+
+/// The subagent roles this deployment has, and whether each can be performed.
+///
+/// A profile is a declaration; a worker is what performs it. Both are reported,
+/// because a role that is declared and has no worker is a role this build
+/// cannot do — and that reads very differently from one that is missing.
+#[tauri::command]
+pub async fn subagent_profiles(
+    session: State<'_, CurrentSession>,
+    subagents: State<'_, Subagents>,
+) -> Result<Vec<Value>, String> {
+    let _ = require_session(&session)?;
+    Ok(subagents
+        .profiles()
+        .map(|profile| {
+            json!({
+                "name": profile.name,
+                "description": profile.description,
+                "version": profile.version,
+                "modelRole": profile.model_role.label(),
+                "allowedTools": profile.allowed_tools.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "disallowedTools": profile.disallowed_tools.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "isolation": profile.isolation.as_str(),
+                "memoryScope": profile.memory_scope.as_str(),
+                "writePolicy": profile.write_policy.as_str(),
+                "networkPermitted": profile.network_permitted,
+                "classificationCeiling": profile.classification_ceiling.label(),
+                "requiredSchema": profile.required_schema.as_str(),
+                "maxTurns": profile.limits.max_turns,
+                "maxChildren": profile.limits.max_children,
+                // The honest half: this build may not be able to perform it.
+                "hasWorker": subagents.has_worker(&profile.name),
+            })
+        })
+        .collect())
+}
+
+/// Re-reads the skills directory.
+///
+/// Safe at any moment: it swaps a snapshot rather than mutating one, so a run
+/// part-way through a tool call keeps the definition it started with. See
+/// [`crate::skills::SkillRegistry::reload`].
+#[tauri::command]
+pub async fn skill_reload(
+    session: State<'_, CurrentSession>,
+    skills: State<'_, Skills>,
+) -> Result<usize, String> {
+    let _ = require_session(&session)?;
+    Ok(skills.reload().count())
+}
+
+/// The runs that are still going as far as the record is concerned.
+///
+/// How a window that has just opened finds a run to reattach to. Deliberately
+/// derived from the record rather than from the runtime's in-memory tables:
+/// after a restart those are empty, and a run the record still calls live is
+/// exactly the one somebody needs to be told about.
+#[tauri::command]
+pub async fn agent_active_tasks(
+    session: State<'_, CurrentSession>,
+    events: State<'_, TaskEvents>,
+) -> Result<Vec<TaskSnapshot>, String> {
+    let signed_in = require_session(&session)?;
+    Ok(events
+        .running()?
         .into_iter()
-        .filter(|task| may_read(&signed_in, &task.user_id))
+        .filter(|snapshot| may_read(&signed_in, &snapshot.actor))
         .collect())
 }
 

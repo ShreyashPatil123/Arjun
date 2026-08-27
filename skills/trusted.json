@@ -1,0 +1,29 @@
+{
+  "trusted": [
+    {
+      "name": "inspection-approval-note",
+      "sha256": "f16fb0591b1b933abdfa1a8aea04996f2709693864a67298674979a6e9ece869",
+      "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    },
+    {
+      "name": "multimodal-inspection",
+      "sha256": "7791df424ab422ba664a05877fc3e243e02211f9e22d6378403b7abac046fb89",
+      "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    },
+    {
+      "name": "engineering-calculation",
+      "sha256": "a71ea4b2e44e3727163adf1c151185a7053777662914323ab75f2e32ee374a26",
+      "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    },
+    {
+      "name": "sandbox-code-task",
+      "sha256": "07eb20466f7ab69ffebac2f627f1b3d549278cf3f495c06dbc23844d5510c04c",
+      "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    },
+    {
+      "name": "artifact-verification",
+      "sha256": "0a38fcddad864f6909227b34724bedb3f12af9e4c3a5bfab2922606b9e977f6e",
+      "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    }
+  ]
+}

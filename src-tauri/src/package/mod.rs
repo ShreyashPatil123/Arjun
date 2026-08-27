@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::audit::{AuditEntry, ChainVerification};
+use crate::skills::SkillUse;
 use crate::knowledge::index::SearchResult;
 use crate::orchestrator::calculation::CalculationRecord;
 use crate::orchestrator::executor::StepOutcome;
@@ -68,6 +69,13 @@ pub struct TaskPackage<'a> {
     pub evidence: &'a [SearchResult],
     pub calculations: &'a [CalculationRecord],
     pub models: &'a [ModelUse],
+    /// Skills the run loaded, with the hash and version of each.
+    ///
+    /// On the manifest rather than only in a part file, so that checking which
+    /// instructions a task was working from does not require unpacking it. A
+    /// skill is guidance the model was given, and "what was it told" is one of
+    /// the first questions asked when an output looks wrong.
+    pub skills: &'a [SkillUse],
     pub trace: &'a [StepOutcome],
     pub approvals: &'a [ApprovalRecord],
     pub audit: &'a [AuditEntry],
@@ -98,6 +106,10 @@ pub struct PackageManifest {
     pub audit_chain_intact: Option<bool>,
     /// What ARJUN produced this. Recorded so a package outlives the version.
     pub produced_by: String,
+    /// Skills the run loaded. Each carries its content hash and version, so a
+    /// reader can tell whether the instructions a task followed are the ones
+    /// installed today.
+    pub skills: Vec<SkillUse>,
 }
 
 /// Serialises one part of the package, pretty-printed so a person opening the
@@ -218,6 +230,7 @@ pub fn export(path: &Path, package: &TaskPackage<'_>) -> Result<ExportResult, St
         files,
         audit_chain_intact: package.chain.map(|c| c.intact),
         produced_by: format!("ARJUN {}", env!("CARGO_PKG_VERSION")),
+        skills: package.skills.to_vec(),
     };
 
     let manifest_bytes = json(&manifest)?;
@@ -473,6 +486,7 @@ mod tests {
 
     fn package<'a>(f: &'a Fixture, artifacts: &'a [std::path::PathBuf]) -> TaskPackage<'a> {
         TaskPackage {
+            skills: &[],
             task_id: "task-42",
             exported_at: Utc::now(),
             exported_by: "r.iyer",
