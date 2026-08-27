@@ -499,3 +499,67 @@
   color: var(--text-primary);
 }
 .failure svg { flex: none; margin-top: 2px; }
+
+/* The context ledger. A row per section, with a bar showing its share of what
+   was committed — the shape of the window is easier to read than eight
+   numbers, and the numbers are still there for anyone who wants them. */
+.ledger {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ledgerRow {
+  display: grid;
+  grid-template-columns: minmax(9rem, 12rem) 1fr auto;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.ledgerBar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.ledgerFill {
+  display: block;
+  height: 100%;
+  background: var(--text-tertiary);
+}
+
+/* The reserve is committed by policy, not grown by the run. Drawn hollow so it
+   does not read as space somebody could reclaim. */
+.ledgerReserve .ledgerFill {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--text-tertiary) 0 2px,
+    transparent 2px 5px
+  );
+}
+
+.ledgerTokens {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
+.compactions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.compaction {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-secondary);
+}

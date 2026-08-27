@@ -158,19 +158,75 @@ pub(super) fn remember_loop_event(deps: &Arc<RuntimeDeps>, params: &Value) {
     };
     match event.get("type").and_then(Value::as_str) {
         Some("turn_end") => deps.remember(run_id, events::TaskEventType::TurnEnded, json!({})),
+        // Copied field by field rather than forwarded whole. The loop's event
+        // carries a `type` this side has already branched on, and a payload that
+        // grows silently with whatever a future runtime adds is a payload
+        // nobody has checked for document text. Naming each field means a new
+        // one has to be added here, by somebody who can see what it holds.
         Some("context_compacted") => deps.remember(
             run_id,
             events::TaskEventType::ContextCompacted,
             json!({
+                "ordinal": event.get("ordinal").cloned().unwrap_or(Value::Null),
                 "tokensBefore": event.get("tokensBefore").cloned().unwrap_or(Value::Null),
                 "tokensAfter": event.get("tokensAfter").cloned().unwrap_or(Value::Null),
                 "messagesSummarised": event
                     .get("messagesSummarised")
                     .cloned()
                     .unwrap_or(Value::Null),
+                "refinedExistingSummary": event
+                    .get("refinedExistingSummary")
+                    .cloned()
+                    .unwrap_or(Value::Bool(false)),
+                "toolResultsCleared": event
+                    .get("toolResultsCleared")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                // Counts only. The ledger says how many tokens each section
+                // held, never what was in them, so it is safe in a record read
+                // more widely than the transcript it describes.
+                "ledger": ledger_counts(event.get("ledger")),
+                // Stamped by the store when the row is written; carried here so
+                // a payload read on its own is not undated.
+                "at": chrono::Utc::now().to_rfc3339(),
             }),
         ),
         _ => {}
     }
 }
 
+
+/// The ledger's section counts, flattened and stripped of anything else.
+///
+/// The runtime sends a nested snapshot; the record holds a flat row of numbers.
+/// Rebuilt rather than forwarded so a field the runtime adds later cannot ride
+/// into the durable record unexamined — every number below is one somebody
+/// chose to keep.
+fn ledger_counts(ledger: Option<&Value>) -> Value {
+    let Some(ledger) = ledger else {
+        return Value::Null;
+    };
+    let section = |name: &str| {
+        ledger
+            .get("sections")
+            .and_then(|sections| sections.get(name))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let top = |name: &str| ledger.get(name).and_then(Value::as_i64).unwrap_or(0);
+
+    json!({
+        "system": section("system"),
+        "skill": section("skill"),
+        "toolSchema": section("toolSchema"),
+        "evidence": section("evidence"),
+        "notes": section("notes"),
+        "transcript": section("transcript"),
+        "compaction": section("compaction"),
+        "reserve": section("reserve"),
+        "occupied": top("occupied"),
+        "committed": top("committed"),
+        "window": top("window"),
+        "headroom": top("headroom"),
+    })
+}

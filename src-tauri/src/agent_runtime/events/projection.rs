@@ -86,6 +86,17 @@ pub struct TaskSnapshot {
     pub turns: u32,
     /// Times older history was replaced by a summary so the run could continue.
     pub compactions: u32,
+    /// What each of those compactions actually did.
+    ///
+    /// The count says the window ran out; these say what filled it, how much
+    /// was reclaimed, and whether each pass refined the summary already held or
+    /// started a new one. A run that reports three compactions and cannot say
+    /// any of that is a run nobody can diagnose after the fact — which is the
+    /// position the Tasks screen was in before this existed.
+    ///
+    /// Folded from the durable events, so a trace read after a restart shows
+    /// the same list a watched one did.
+    pub compaction_events: Vec<super::super::tasks::CompactionRecord>,
     /// Names only. The files are in the run's workspace; this is a reference.
     pub artifacts: Vec<String>,
     pub approvals_pending: usize,
@@ -136,6 +147,7 @@ impl TaskSnapshot {
             activity: Vec::new(),
             turns: 0,
             compactions: 0,
+            compaction_events: Vec::new(),
             artifacts: Vec::new(),
             approvals_pending: 0,
             subagents_started: 0,
@@ -253,7 +265,26 @@ impl TaskSnapshot {
             // Counted from the events rather than incremented locally, so a
             // recovered trace and a watched one agree.
             TaskEventType::TurnEnded => self.turns += 1,
-            TaskEventType::ContextCompacted => self.compactions += 1,
+            TaskEventType::ContextCompacted => {
+                self.compactions += 1;
+                // The count is incremented whether or not the payload can be
+                // read. A compaction that happened is a fact about the run, and
+                // an unreadable payload should cost its detail, not its
+                // existence.
+                if let Ok(mut record) = serde_json::from_value::<
+                    super::super::tasks::CompactionRecord,
+                >(event.payload.clone())
+                {
+                    // The envelope's own instant, not one inside the payload:
+                    // the payload crossed a process boundary and the envelope
+                    // was stamped where the row was written.
+                    record.at = event.at.clone();
+                    if record.ordinal == 0 {
+                        record.ordinal = self.compactions;
+                    }
+                    self.compaction_events.push(record);
+                }
+            }
 
             TaskEventType::ToolAuthorized => self.begin_call(event, "running"),
             TaskEventType::ToolRefused => self.settle_call(event, "refused"),

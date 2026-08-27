@@ -31,6 +31,12 @@ use crate::identity::Permission;
 pub enum ToolName {
     /// Search the organisation's own documents.
     SearchDocuments,
+    /// Read a named page range of a document already retrieved from.
+    ///
+    /// The counterpart to search, and the reason a run does not need whole
+    /// documents in its context: a passage that stops mid-clause is followed by
+    /// a request for the two pages around it, not for the file.
+    LoadMoreEvidence,
     /// Read a file inside the task workspace.
     ReadScopedFile,
     /// Write a file inside the task workspace.
@@ -50,6 +56,7 @@ pub enum ToolName {
 impl ToolName {
     pub const ALL: &'static [ToolName] = &[
         ToolName::SearchDocuments,
+        ToolName::LoadMoreEvidence,
         ToolName::ReadScopedFile,
         ToolName::WriteScopedFile,
         ToolName::RunCalculation,
@@ -63,6 +70,7 @@ impl ToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
             ToolName::SearchDocuments => "search_documents",
+            ToolName::LoadMoreEvidence => "load_more_evidence",
             ToolName::ReadScopedFile => "read_scoped_file",
             ToolName::WriteScopedFile => "write_scoped_file",
             ToolName::RunCalculation => "run_calculation",
@@ -81,6 +89,7 @@ impl ToolName {
     pub const fn describe(self) -> &'static str {
         match self {
             ToolName::SearchDocuments => "search the knowledge base",
+            ToolName::LoadMoreEvidence => "read a specific page range of a document",
             ToolName::ReadScopedFile => "read a file from the task workspace",
             ToolName::WriteScopedFile => "write a file into the task workspace",
             ToolName::RunCalculation => "run a calculation",
@@ -145,6 +154,22 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             name,
             permission: SearchKnowledge,
             arguments: &[ArgumentSpec { name: "query", kind: Text }],
+            needs_approval: false,
+            max_bytes: None,
+            timeout: Duration::from_secs(30),
+            scoped_to_workspace: false,
+        },
+        ToolName::LoadMoreEvidence => ToolSpec {
+            name,
+            // The same permission as search, because it reads the same shelf
+            // through the same clearance checks. A weaker permission here would
+            // be a way to read by page number what may not be read by searching.
+            permission: SearchKnowledge,
+            arguments: &[
+                ArgumentSpec { name: "documentSha256", kind: Text },
+                ArgumentSpec { name: "fromPage", kind: Integer },
+                ArgumentSpec { name: "toPage", kind: Integer },
+            ],
             needs_approval: false,
             max_bytes: None,
             timeout: Duration::from_secs(30),
@@ -243,6 +268,21 @@ impl ToolCall {
     pub fn text(&self, key: &str) -> Option<&str> {
         self.arguments.get(key).and_then(|v| v.as_str())
     }
+
+    /// The argument as a non-negative whole number.
+    ///
+    /// A string of digits is accepted as well as a JSON number: local models
+    /// emit `"fromPage": "11"` often enough that refusing it would spend a turn
+    /// on a formatting quarrel rather than on the work. Anything else — a
+    /// negative, a fraction, a word — is absent, because a page number this
+    /// could not read is not a page number it should guess at.
+    pub fn integer(&self, key: &str) -> Option<u32> {
+        let value = self.arguments.get(key)?;
+        if let Some(number) = value.as_u64() {
+            return u32::try_from(number).ok();
+        }
+        value.as_str()?.trim().parse::<u32>().ok()
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +335,7 @@ mod tests {
     fn reading_and_computing_do_not_interrupt_anyone() {
         for tool in [
             ToolName::SearchDocuments,
+            ToolName::LoadMoreEvidence,
             ToolName::ReadScopedFile,
             ToolName::RunCalculation,
             ToolName::ValidateArtifact,

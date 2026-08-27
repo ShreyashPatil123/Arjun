@@ -311,6 +311,111 @@ impl KnowledgeIndex {
 
         Ok(rows.filter_map(Result::ok).collect())
     }
+
+    /// The chunks of one document between two pages, in reading order.
+    ///
+    /// ## Why a region and not the document
+    ///
+    /// The obvious way to let a model "read more" is to hand it the document.
+    /// On this workbench a document is a 200-page drawing set, and pasting one
+    /// into an 8k window does not give the model more context — it ends the run,
+    /// because the inference server refuses a prompt at or over its window.
+    ///
+    /// So the model asks for the part it wants. A search returns a passage and
+    /// its page; when that passage is cut off mid-clause, the next thing the
+    /// model needs is pages 11 to 13 of that document, not the whole of it.
+    ///
+    /// ## The checks are the same ones search uses
+    ///
+    /// Clearance is applied here rather than at the caller, and it is applied
+    /// the same way: a reader sees only classifications their roles are cleared
+    /// for, and superseded documents are excluded. That matters because this is
+    /// a second door into the same shelf — a retrieval path that filtered less
+    /// than search would be a way to read by page number what could not be read
+    /// by searching for it.
+    ///
+    /// `to_page` is inclusive. A reader who names one page gets that page.
+    pub fn region(
+        &self,
+        session: &Session,
+        document_sha256: &str,
+        from_page: u32,
+        to_page: u32,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        // A reversed range is a caller mistake, not a reason to return nothing
+        // silently: read the way it was plainly meant.
+        let (from_page, to_page) = if from_page <= to_page {
+            (from_page, to_page)
+        } else {
+            (to_page, from_page)
+        };
+
+        let cleared: Vec<String> = Classification::ALL
+            .iter()
+            .filter(|c| {
+                c.cleared_roles()
+                    .iter()
+                    .any(|role| session.user.roles.contains(role))
+            })
+            .filter_map(|c| serde_json::to_string(c).ok())
+            .collect();
+
+        if cleared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = cleared.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT c.id, c.document_sha256, c.document_name, t.body, c.page,
+                    c.section_path, c.classification
+             FROM chunks c
+             JOIN chunk_text t ON c.id = t.id
+             WHERE c.document_sha256 = ?1
+               AND c.page >= ?2
+               AND c.page <= ?3
+               AND c.superseded = 0
+               AND c.classification IN ({placeholders})
+             ORDER BY c.page, c.ordinal
+             LIMIT ?{}",
+            cleared.len() + 4
+        );
+
+        let conn = self.conn.lock().expect("index lock poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+
+        let document = document_sha256.to_string();
+        let from = from_page as i64;
+        let to = to_page as i64;
+        let limit = limit as i64;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&document, &from, &to];
+        for value in &cleared {
+            bound.push(value);
+        }
+        bound.push(&limit);
+
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let section_path: String = row.get(5)?;
+            let classification: String = row.get(6)?;
+            Ok(SearchResult {
+                chunk_id: row.get(0)?,
+                document_sha256: row.get(1)?,
+                document_name: row.get(2)?,
+                text: row.get(3)?,
+                page: row.get(4)?,
+                section_path: serde_json::from_str(&section_path).unwrap_or_default(),
+                classification: serde_json::from_str(&classification)
+                    .unwrap_or(Classification::Internal),
+                // Not a match against a query, so there is no relevance to
+                // report. Zero rather than an invented figure: a score the
+                // caller might sort by would be a lie about ranking.
+                score: 0.0,
+                retrieval: Retrieval::Keyword,
+            })
+        })?;
+
+        Ok(rows.filter_map(Result::ok).collect())
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +466,172 @@ mod tests {
                 )],
             )
             .unwrap();
+    }
+
+    fn page_chunk(id: &str, sha: &str, ordinal: u32, page: u32, text: &str) -> Chunk {
+        Chunk {
+            id: id.into(),
+            document_sha256: sha.into(),
+            ordinal,
+            char_count: text.len() as u32,
+            text: text.into(),
+            page,
+            section_path: Vec::new(),
+            kind: ChunkKind::Prose,
+        }
+    }
+
+    /// A document with one chunk on each of pages 10 to 14.
+    fn index_manual(f: &Fixture, classification: Classification) {
+        let chunks: Vec<Chunk> = (10..=14)
+            .map(|page| {
+                page_chunk(
+                    &format!("m{page}"),
+                    "manual",
+                    page,
+                    page,
+                    &format!("Manual text on page {page}."),
+                )
+            })
+            .collect();
+        f.index
+            .index_document("Pump Manual", classification, &chunks)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_region_returns_the_pages_asked_for_and_no_others() {
+        // The point of loading a region rather than a document: the model asks
+        // for three pages of a 200-page manual and gets three pages.
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        let hits = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .unwrap();
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.page).collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
+    }
+
+    #[test]
+    fn a_region_of_one_page_is_that_page() {
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        let hits = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 12, 12, 50)
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page, 12);
+    }
+
+    #[test]
+    fn a_region_reads_the_same_clearance_as_a_search() {
+        // The failure this guards: a second door into the same shelf that
+        // filters less than the first. Reading by page number must not return
+        // what searching for the same words would refuse.
+        let f = fixture();
+        index_manual(&f, Classification::VendorNegotiation);
+
+        // A knowledge administrator curates manuals and is not cleared for deal
+        // terms — the same rule `search` applies.
+        let refused = f
+            .index
+            .region(
+                &session(vec![Role::KnowledgeAdministrator]),
+                "manual",
+                11,
+                13,
+                50,
+            )
+            .unwrap();
+        assert!(refused.is_empty());
+
+        let permitted = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .unwrap();
+        assert_eq!(permitted.len(), 3);
+    }
+
+    #[test]
+    fn a_region_of_a_superseded_document_is_empty() {
+        // Superseded material stays traceable and stops being current guidance.
+        // Reading it by page would be a way to quote a withdrawn revision.
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+        f.index.supersede("manual").unwrap();
+
+        assert!(f
+            .index
+            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_reversed_range_is_read_the_way_it_was_plainly_meant() {
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        let hits = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 13, 11, 50)
+            .unwrap();
+
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn a_region_is_bounded_by_its_limit_however_dense_the_pages_are() {
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        let hits = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 10, 14, 2)
+            .unwrap();
+
+        // Two, not five. The ceiling is what actually keeps a dense range from
+        // filling the window.
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn a_region_of_a_document_nobody_indexed_is_empty_rather_than_an_error() {
+        // A model naming a document it half-remembers should read "nothing
+        // there" and search instead, not see a failure it will try to work
+        // around.
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        assert!(f
+            .index
+            .region(&session(vec![Role::User]), "not-a-document", 1, 5, 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_region_comes_back_in_reading_order() {
+        let f = fixture();
+        index_manual(&f, Classification::Internal);
+
+        let hits = f
+            .index
+            .region(&session(vec![Role::User]), "manual", 10, 14, 50)
+            .unwrap();
+        let pages: Vec<u32> = hits.iter().map(|hit| hit.page).collect();
+        let mut sorted = pages.clone();
+        sorted.sort_unstable();
+
+        assert_eq!(pages, sorted);
     }
 
     #[test]

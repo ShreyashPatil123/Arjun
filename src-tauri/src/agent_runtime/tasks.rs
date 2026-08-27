@@ -285,6 +285,71 @@ impl EvidenceRecord {
     }
 }
 
+/// How the context window was divided at a moment in a run.
+///
+/// The answer to the question an operator has when a run compacts four times in
+/// twenty turns: *what filled it?* A compaction count alone says the window ran
+/// out; this says whether it was the tool schemas, one enormous tool result, or
+/// simply a long conversation — and only one of those three has a remedy that
+/// does not degrade the run.
+///
+/// Mirrors `ContextLedgerSnapshot` in the runtime. The counts are the runtime's
+/// own, not re-derived here: two estimators would disagree, and the one that
+/// matters is the one compaction actually decided on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextLedgerRecord {
+    pub system: u32,
+    pub skill: u32,
+    pub tool_schema: u32,
+    pub evidence: u32,
+    pub notes: u32,
+    pub transcript: u32,
+    pub compaction: u32,
+    /// Held back for the model's output and the summarisation request. Not
+    /// occupied — committed, which is the same thing for deciding whether the
+    /// next turn fits.
+    pub reserve: u32,
+    /// Everything except `reserve`.
+    pub occupied: u32,
+    /// `occupied + reserve`. What the next turn has to fit inside.
+    pub committed: u32,
+    /// The model's window. Zero when the runtime was not told one.
+    pub window: u32,
+    /// `window - committed`. Negative would mean the next turn does not fit;
+    /// stored signed so a reader is not told a shortfall is a surplus.
+    pub headroom: i64,
+}
+
+/// One time a run's older history was replaced by a summary.
+///
+/// Kept on the record, not only counted, because "compacted three times" and
+/// "compacted three times, and the third pass had to summarise ninety messages
+/// to claw back four hundred tokens" are different runs, and only the second
+/// tells somebody the task was too large for the model it was given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionRecord {
+    /// Which compaction of this run, 1-based.
+    pub ordinal: u32,
+    /// RFC 3339, UTC.
+    pub at: String,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+    /// Messages now represented by the summary rather than sent whole.
+    pub messages_summarised: u32,
+    /// True when this pass extended the summary already held.
+    ///
+    /// A `false` on anything but the first pass would mean the run started a
+    /// second summary and the earlier half of its history is described twice or
+    /// not at all. Recorded so that is visible rather than inferred.
+    pub refined_existing_summary: bool,
+    /// Raw tool results replaced by an evidence reference, cumulatively.
+    pub tool_results_cleared: u32,
+    /// Where the window stood after this pass.
+    pub ledger: ContextLedgerRecord,
+}
+
 /// Everything worth keeping about one finished run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -316,6 +381,23 @@ pub struct TaskRecord {
     pub approvals: Vec<ApprovalRecord>,
     /// Set when the run ended badly, in the words shown to the person.
     pub failure: Option<String>,
+    /// Every time the run's history was replaced by a summary, in order.
+    ///
+    /// Defaulted so records written before this existed still load. A run that
+    /// never compacted has an empty list, which is the truthful answer and is
+    /// distinguishable from a record that predates the field only by its date.
+    #[serde(default)]
+    pub compactions: Vec<CompactionRecord>,
+    /// The run's bounded notes as they finished.
+    ///
+    /// What a resumption reads. Absent on a record written before this existed,
+    /// and on a run that recorded nothing — the two are not distinguished here,
+    /// because in both cases there is nothing to resume from.
+    #[serde(default)]
+    pub working_notes: Option<super::memory::RunMemory>,
+    /// Where the context window stood when the run ended.
+    #[serde(default)]
+    pub context_ledger: Option<ContextLedgerRecord>,
 }
 
 impl TaskRecord {
@@ -366,6 +448,10 @@ pub struct TaskSummary {
     pub unfinished_steps: usize,
     /// Approval requests nobody answered.
     pub approvals_pending: usize,
+    /// Times the run's older history was replaced by a summary so it could
+    /// continue. Non-zero on a short task is the signal that the routed model's
+    /// window is too small for the work it is being given.
+    pub compaction_count: usize,
     pub stopped_because: String,
     pub ready: bool,
     pub failure: Option<String>,
@@ -409,6 +495,7 @@ impl From<&TaskRecord> for TaskSummary {
                 .iter()
                 .filter(|approval| approval.state == "pending")
                 .count(),
+            compaction_count: record.compactions.len(),
             stopped_because: record.plan.stopped_because.clone(),
             ready: record.is_ready(),
             failure: record.failure.clone(),
@@ -450,6 +537,7 @@ pub fn summary_of(snapshot: &super::events::TaskSnapshot) -> TaskSummary {
             .map(|plan| plan.unfinished().len())
             .unwrap_or_default(),
         approvals_pending: snapshot.approvals_pending,
+        compaction_count: snapshot.compactions as usize,
         stopped_because: snapshot
             .stopped_because
             .clone()
@@ -582,6 +670,9 @@ mod tests {
             )),
             answer: "The seal is worn beyond the limit [E1].".to_string(),
             turns: 3,
+            compactions: Vec::new(),
+            working_notes: None,
+            context_ledger: None,
             verification: None,
             artifacts: Vec::new(),
             evidence: Vec::new(),

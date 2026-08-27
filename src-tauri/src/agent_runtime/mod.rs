@@ -33,6 +33,7 @@ pub mod approval;
 pub mod artifacts;
 pub mod events;
 pub mod grants;
+pub mod memory;
 pub mod planning;
 pub mod protocol;
 pub mod recording;
@@ -1009,6 +1010,25 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         ToolName::SearchDocuments => LocalToolRunner::new(deps.index.as_ref(), &session)
             .search_hits(&tool_call)
             .map(|(query, hits)| retrieval::record(&deps.passages, &call.run_id, &query, &hits)),
+        // Handled here for the same reason as search: a page pulled back later
+        // is this run's evidence and has to be numbered against the same table,
+        // or the marker the model cites will resolve to a different passage.
+        ToolName::LoadMoreEvidence => LocalToolRunner::new(deps.index.as_ref(), &session)
+            .region_hits(&tool_call)
+            .map(|(_, from_page, to_page, hits)| {
+                let name = hits
+                    .first()
+                    .map(|hit| hit.document_name.clone())
+                    .unwrap_or_else(|| "that document".to_string());
+                retrieval::record_region(
+                    &deps.passages,
+                    &call.run_id,
+                    &name,
+                    from_page,
+                    to_page,
+                    &hits,
+                )
+            }),
         ToolName::ValidateArtifact => {
             validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call)
         }

@@ -141,9 +141,27 @@ function hostTool<TSchema extends ReturnType<typeof Type.Object>>(options: {
    * whichever finished first.
    */
   executionMode: "parallel" | "sequential";
+  /**
+   * Told what each call produced, so the run's notes can be kept current.
+   *
+   * Called with the text the *model* is about to read, not with the structured
+   * detail beside it. That is deliberate: the notes exist to record what the
+   * model was told, and a marker the model never saw is one it cannot cite.
+   */
+  observe?: (observation: { tool: string; args: unknown; text: string }) => void;
 }): AgentTool {
-  const { name, label, description, parameters, peer, ledger, runId, modelId, executionMode } =
-    options;
+  const {
+    name,
+    label,
+    description,
+    parameters,
+    peer,
+    ledger,
+    runId,
+    modelId,
+    executionMode,
+    observe,
+  } = options;
   return {
     name,
     label,
@@ -171,6 +189,19 @@ function hostTool<TSchema extends ReturnType<typeof Type.Object>>(options: {
         // document knows which model wrote it.
         model: modelId,
       })) as ToolExecution;
+      // After the call has actually succeeded. Recording an effect before the
+      // gateway and the tool have both agreed to it would tell a resumed run
+      // not to repeat something that never happened.
+      //
+      // Best-effort: a note that could not be taken costs the next attempt some
+      // context, and throwing here would cost this attempt the tool result it
+      // has already paid for.
+      try {
+        observe?.({ tool: name, args: params, text: execution.text });
+      } catch {
+        // Deliberately swallowed. See above.
+      }
+
       return {
         content: [{ type: "text", text: execution.text }],
         details: execution.details ?? null,
@@ -199,8 +230,9 @@ export function buildTools(
   ledger: GrantLedger,
   runId: string,
   modelId: string,
+  observe?: (observation: { tool: string; args: unknown; text: string }) => void,
 ): AgentTool[] {
-  const shared = { peer, ledger, runId, modelId };
+  const shared = { peer, ledger, runId, modelId, observe };
   return [
     hostTool({
       ...shared,
@@ -217,6 +249,32 @@ export function buildTools(
           description:
             "What to look for, in natural language. Specific technical terms retrieve better than paraphrase.",
         }),
+      }),
+      executionMode: "parallel",
+    }),
+
+    hostTool({
+      ...shared,
+      name: "load_more_evidence",
+      label: "Read more of a document",
+      description:
+        "Read a specific page range of a document you have already retrieved a passage from, and " +
+        "add those passages to this task's evidence. Use this when a passage stops mid-clause, a " +
+        "table continues overleaf, or you need the paragraph around a citation. It reads a range, " +
+        "not a document: ask for the few pages you need. Whole documents are not available in one " +
+        "call, and asking for a wide range is refused rather than truncated. The documentSha256 is " +
+        "on every passage search_documents returned.",
+      parameters: Type.Object({
+        documentSha256: Type.String({
+          description: "The document identifier carried on a passage you already retrieved.",
+        }),
+        fromPage: Type.Integer({ description: "First page to read, 1-based and inclusive." }),
+        toPage: Type.Optional(
+          Type.Integer({
+            description:
+              "Last page to read, inclusive. Defaults to fromPage. At most 10 pages per call.",
+          }),
+        ),
       }),
       executionMode: "parallel",
     }),

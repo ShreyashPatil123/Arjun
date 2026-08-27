@@ -642,7 +642,7 @@ fn a_missing_bundle_is_reported_with_the_path_and_the_fix() {
 }
 
 #[test]
-fn the_catalogue_is_the_eight_tools_the_gateway_knows() {
+fn the_catalogue_is_the_nine_tools_the_gateway_knows() {
     let mut names = catalogue();
     names.sort_unstable();
     assert_eq!(
@@ -651,6 +651,7 @@ fn the_catalogue_is_the_eight_tools_the_gateway_knows() {
             "create_docx",
             "create_xlsx",
             "execute_code",
+            "load_more_evidence",
             "read_scoped_file",
             "run_calculation",
             "search_documents",

@@ -34,6 +34,19 @@ use crate::knowledge::{KnowledgeIndex, SearchResult};
 /// what it was asked to do.
 const SEARCH_LIMIT: usize = 6;
 
+/// Most pages one `load_more_evidence` call may span.
+///
+/// Not a performance guard. A model that asks for a hundred pages has stopped
+/// asking for a region and started asking for the document, and serving that is
+/// how a run's context overflows and the inference server refuses the prompt.
+const REGION_PAGE_LIMIT: u32 = 10;
+
+/// Most passages one region read returns, however many pages it spans.
+///
+/// A dense page can hold a dozen chunks. This is the ceiling that actually
+/// bounds what reaches the window; `REGION_PAGE_LIMIT` bounds what is asked for.
+const REGION_CHUNK_LIMIT: usize = 24;
+
 /// Longest file content handed back in one read.
 ///
 /// Below the gateway's own ceiling on purpose: the gateway stops a file from
@@ -99,6 +112,67 @@ impl<'a> LocalToolRunner<'a> {
             .search(self.session, &query, SEARCH_LIMIT)
             .map_err(|e| format!("the knowledge base could not be searched: {e}"))?;
         Ok((query, hits))
+    }
+
+    /// Runs a page-range read and hands back the passages themselves.
+    ///
+    /// The same split as [`Self::search_hits`], for the same reason: the caller
+    /// that accumulates the run's evidence needs the passages, not the prose
+    /// about them, and the two must not be able to disagree.
+    pub fn region_hits(
+        &self,
+        call: &ToolCall,
+    ) -> Result<(String, u32, u32, Vec<SearchResult>), String> {
+        let document = call
+            .text("documentSha256")
+            .ok_or("load_more_evidence needs documentSha256, which is on every passage you have already retrieved")?
+            .to_string();
+        let from_page = call.integer("fromPage").ok_or("load_more_evidence needs fromPage")?;
+        // A caller naming only a start page means that page. Defaulting to the
+        // end of the document would put the whole thing back in the window,
+        // which is the outcome this tool exists to avoid.
+        let to_page = call.integer("toPage").unwrap_or(from_page);
+
+        // Bounded here rather than trusted. A model that asks for pages 1 to
+        // 10,000 is not asking for a region, it is asking for the document, and
+        // serving that request is how the window overflows.
+        if to_page.saturating_sub(from_page) >= REGION_PAGE_LIMIT {
+            return Err(format!(
+                "That is {} pages. Ask for at most {REGION_PAGE_LIMIT} pages at a time, and cite                  the passages you already hold for anything outside that range.",
+                to_page.saturating_sub(from_page) + 1
+            ));
+        }
+
+        let hits = self
+            .index
+            .region(self.session, &document, from_page, to_page, REGION_CHUNK_LIMIT)
+            .map_err(|e| format!("that page range could not be read: {e}"))?;
+        Ok((document, from_page, to_page, hits))
+    }
+
+    fn load_more_evidence(&self, call: &ToolCall) -> Result<String, String> {
+        let (_, from_page, to_page, hits) = self.region_hits(call)?;
+        let name = hits
+            .first()
+            .map(|hit| hit.document_name.clone())
+            .unwrap_or_else(|| "that document".to_string());
+        let marked: Vec<(usize, &SearchResult)> =
+            hits.iter().enumerate().map(|(i, hit)| (i + 1, hit)).collect();
+        let described = if from_page == to_page {
+            format!("page {from_page} of {name}")
+        } else {
+            format!("pages {from_page} to {to_page} of {name}")
+        };
+        let rendered = render_passages(&described, &marked);
+        if hits.is_empty() {
+            return Ok(rendered);
+        }
+        // Which pages actually came back, not which were asked for. A page that
+        // holds nothing indexable returns nothing, and a model that assumes it
+        // received the range it named will cite a page it never read.
+        Ok(format!("Read {described}.
+
+{rendered}"))
     }
 
     fn search(&self, call: &ToolCall) -> Result<String, String> {
@@ -241,6 +315,7 @@ impl ToolRunner for LocalToolRunner<'_> {
     ) -> Result<String, String> {
         match tool {
             ToolName::SearchDocuments => self.search(call),
+            ToolName::LoadMoreEvidence => self.load_more_evidence(call),
             ToolName::ReadScopedFile => self.read(resolved_path),
             ToolName::WriteScopedFile => self.write(call, resolved_path),
             ToolName::RunCalculation => self.calculate(call),

@@ -1120,6 +1120,123 @@ fn a_recovered_trace_keeps_the_caveat_that_history_was_summarised() {
     assert_eq!(snapshot.compactions, 1);
 }
 
+/// One compaction event, with the whole payload the runtime now sends.
+fn compaction_payload(ordinal: u32, refined: bool, before: u32, after: u32) -> serde_json::Value {
+    json!({
+        "ordinal": ordinal,
+        "tokensBefore": before,
+        "tokensAfter": after,
+        "messagesSummarised": 24,
+        "refinedExistingSummary": refined,
+        "toolResultsCleared": 3,
+        "at": "2026-08-28T09:15:00+00:00",
+        "ledger": {
+            "system": 400,
+            "skill": 0,
+            "toolSchema": 1200,
+            "evidence": 300,
+            "notes": 150,
+            "transcript": 2000,
+            "compaction": 250,
+            "reserve": 1600,
+            "occupied": 4300,
+            "committed": 5900,
+            "window": 8192,
+            "headroom": 2292
+        }
+    })
+}
+
+#[test]
+fn a_recovered_trace_says_what_each_compaction_actually_did() {
+    // A count alone says the window ran out. What somebody reviewing the run
+    // needs is which section filled it and how much each pass reclaimed —
+    // otherwise "compacted three times" is a fact with no remedy attached.
+    let log = log();
+    start(&log, "run-1");
+    log.record(
+        EventDraft::new("run-1", TaskEventType::ContextCompacted, SYSTEM_ACTOR)
+            .with(compaction_payload(1, false, 8000, 2100)),
+    )
+    .expect("first compaction");
+    log.record(
+        EventDraft::new("run-1", TaskEventType::ContextCompacted, SYSTEM_ACTOR)
+            .with(compaction_payload(2, true, 7800, 3000)),
+    )
+    .expect("second compaction");
+
+    let snapshot = log.snapshot("run-1").unwrap().unwrap();
+
+    assert_eq!(snapshot.compactions, 2);
+    assert_eq!(snapshot.compaction_events.len(), 2);
+    assert_eq!(snapshot.compaction_events[0].tokens_before, 8000);
+    assert_eq!(snapshot.compaction_events[0].ledger.tool_schema, 1200);
+    // The distinction that decides whether the earlier half of the run is
+    // described once or twice.
+    assert!(!snapshot.compaction_events[0].refined_existing_summary);
+    assert!(snapshot.compaction_events[1].refined_existing_summary);
+}
+
+#[test]
+fn a_compaction_whose_detail_cannot_be_read_is_still_counted() {
+    // An unreadable payload should cost the detail, not the fact. A run that
+    // compacted and appears not to have is a run whose answers look better
+    // grounded than they are.
+    let log = log();
+    start(&log, "run-1");
+    log.record(
+        EventDraft::new("run-1", TaskEventType::ContextCompacted, SYSTEM_ACTOR)
+            .with(json!({ "tokensBefore": "not a number" })),
+    )
+    .expect("a compaction");
+
+    let snapshot = log.snapshot("run-1").unwrap().unwrap();
+    assert_eq!(snapshot.compactions, 1);
+    assert!(snapshot.compaction_events.is_empty());
+}
+
+#[test]
+fn a_compaction_event_carries_no_document_text() {
+    // The ledger is counts only. That is what makes it safe on a screen read
+    // more widely than the transcript it describes — a section size cannot
+    // reveal what was in the section.
+    let log = log();
+    start(&log, "run-1");
+    log.record(
+        EventDraft::new("run-1", TaskEventType::ContextCompacted, SYSTEM_ACTOR)
+            .with(compaction_payload(1, false, 8000, 2100)),
+    )
+    .expect("a compaction");
+
+    let snapshot = log.snapshot("run-1").unwrap().unwrap();
+    let serialised = serde_json::to_string(&snapshot.compaction_events).unwrap();
+
+    // Every value in the record is a number, a boolean or a timestamp. Nothing
+    // in it is prose, so there is nothing for a passage to hide in.
+    for field in ["tokensBefore", "messagesSummarised", "ledger"] {
+        assert!(
+            serialised.contains(&field.to_string())
+                || serialised.contains(&heck_snake(field)),
+            "{field} missing from {serialised}"
+        );
+    }
+    assert!(!serialised.contains("Maintenance SOP"));
+}
+
+/// `camelCase` to `snake_case`, for asserting against either serialisation.
+fn heck_snake(field: &str) -> String {
+    let mut out = String::new();
+    for c in field.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[test]
 fn the_running_list_holds_only_runs_that_have_not_ended() {
     let log = log();

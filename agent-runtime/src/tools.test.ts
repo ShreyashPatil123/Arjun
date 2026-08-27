@@ -112,6 +112,7 @@ describe("host tools", () => {
       "create_docx",
       "create_xlsx",
       "execute_code",
+      "load_more_evidence",
       "read_scoped_file",
       "run_calculation",
       "search_documents",

@@ -15,6 +15,13 @@ import {
   type RunState,
   type TaskSummary,
 } from '../services/agent.service';
+import {
+  compactionWarning,
+  describeCompaction,
+  explainLedger,
+  fitted,
+  ledgerRows,
+} from '../components/run/context-ledger';
 import styles from './Tasks.module.css';
 
 /**
@@ -469,6 +476,79 @@ function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {(record.contextLedger || (record.compactions?.length ?? 0) > 0) && (
+        <section className={styles.card}>
+          <h2 className={styles.cardTitle}>Context</h2>
+          {/* The question this section answers is not "how many tokens" but
+              "why did this run keep losing its history". The sentence comes
+              first for that reason; the table is for whoever wants to check
+              it. */}
+          {record.contextLedger && (
+            <>
+              {explainLedger(record.contextLedger) && (
+                <p className={styles.body}>{explainLedger(record.contextLedger)}</p>
+              )}
+              <ul className={styles.ledger}>
+                {ledgerRows(record.contextLedger).map(row => (
+                  <li
+                    key={row.section}
+                    className={`${styles.ledgerRow}${
+                      row.committedNotOccupied ? ` ${styles.ledgerReserve}` : ''
+                    }`}
+                  >
+                    <span>{row.label}</span>
+                    <span className={styles.ledgerBar}>
+                      <span
+                        className={styles.ledgerFill}
+                        style={{ width: `${Math.round(row.share * 100)}%` }}
+                      />
+                    </span>
+                    <span className={styles.ledgerTokens}>
+                      {row.tokens.toLocaleString()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {/* Said only when it is known. An unrecorded window is not
+                  evidence that anything did not fit. */}
+              {fitted(record.contextLedger) === false && (
+                <p className={styles.dim}>
+                  The next turn would not have fitted in this model&rsquo;s window.
+                </p>
+              )}
+            </>
+          )}
+
+          {(record.compactions?.length ?? 0) > 0 && (
+            <>
+              {compactionWarning(record.compactions ?? []) && (
+                <p className={styles.body}>{compactionWarning(record.compactions ?? [])}</p>
+              )}
+              <ul className={styles.compactions}>
+                {(record.compactions ?? []).map(pass => (
+                  <li key={`${pass.ordinal}-${pass.at}`} className={styles.compaction}>
+                    {describeCompaction(pass)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {/* What a resumption of this run would read. Shown because a person
+              deciding whether to re-run a failed task needs to know it will not
+              redo the document it already produced. */}
+          {record.workingNotes && record.workingNotes.completed.length > 0 && (
+            <p className={styles.dim}>
+              A resumption of this task would already know it had done:{' '}
+              {record.workingNotes.completed
+                .map(effect => `${effect.tool} → ${effect.target}`)
+                .join(', ')}
+              .
+            </p>
+          )}
         </section>
       )}
 

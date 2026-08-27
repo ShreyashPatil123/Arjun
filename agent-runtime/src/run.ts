@@ -17,10 +17,13 @@ import { Agent, convertToLlm, type AgentEvent } from "@openclaw/agent-core";
 import { createLlmRuntime, type Model } from "@openclaw/ai";
 import { registerBuiltInApiProviders } from "@openclaw/ai/providers";
 import type { RpcPeer } from "./peer.js";
-import { RunCompactor } from "./compaction.js";
+import { RunCompactor, type PreservedState } from "./compaction.js";
+import { ContextLedger } from "./context-ledger.js";
+import { WorkingNotes, type WorkingNotesState } from "./working-notes.js";
 import { payloadPolicy } from "./providers.js";
 import { withToolCallRepair } from "./repair.js";
 import { GrantLedger, authorizeToolCall, buildTools } from "./tools.js";
+import { observeToolResult } from "./note-taking.js";
 
 /** What Rust sends with `run.start`. */
 export interface RunRequest {
@@ -52,6 +55,20 @@ export interface RunRequest {
    * and nothing here decides whether an action is permitted.
    */
   deadlineMs?: number;
+  /**
+   * Notes carried over from an earlier attempt at this run.
+   *
+   * Sent when a run is resumed after the process went away. What makes the
+   * resumption safe rather than merely faster is `completed`: it names the side
+   * effects that already happened, so the model is told not to repeat them
+   * instead of rediscovering by doing them twice.
+   */
+  notes?: Partial<WorkingNotesState>;
+  /**
+   * State the Rust side owns and this side must carry across compaction
+   * unchanged. Refreshed by `run.note`; see {@link PreservedState}.
+   */
+  preserved?: PreservedState;
 }
 
 export interface RunOutcome {
@@ -60,6 +77,16 @@ export interface RunOutcome {
   text: string;
   turns: number;
   stopReason?: string;
+  /**
+   * The run's notes as they finished.
+   *
+   * Returned so Rust can persist them with the task record. A run that ends
+   * without handing these back is a run whose next attempt starts from nothing,
+   * which is the case this whole mechanism exists to remove.
+   */
+  notes: WorkingNotesState;
+  /** Where the context stood at the end. Shown on the task trace. */
+  ledger: ReturnType<ContextLedger["snapshot"]>;
 }
 
 /**
@@ -123,6 +150,17 @@ export interface ActiveRun {
    * unstarted tool call or the next model turn — never in the middle of one.
    */
   steer(text: string): void;
+  /**
+   * Updates the state this side must preserve, and the run's notes.
+   *
+   * Pushed from Rust rather than pulled, because everything in it — the plan,
+   * the approvals, the evidence markers — is decided there, and a pull would
+   * mean this side asking mid-compaction over a channel that is also carrying
+   * the tool call it is compacting around.
+   */
+  note(update: { preserved?: PreservedState; notes?: Partial<WorkingNotesState> }): void;
+  /** The notes as they stand. Read when the run ends. */
+  readonly notes: WorkingNotes;
 }
 
 /**
@@ -143,12 +181,45 @@ export async function startRun(
   registerBuiltInApiProviders(runtime.registry);
 
   const model = toModel(request.model);
-  const tools = buildTools(peer, ledger, runId, request.model.id);
+
+  // Seeded from what Rust sent. On a first attempt that is nothing; on a
+  // resumption it is the record of what already happened, including the side
+  // effects that must not happen twice.
+  const notes = WorkingNotes.from(request.notes);
+  let preserved: PreservedState = { ...(request.preserved ?? {}) };
+
+  // The notes are kept from what the tools returned rather than from what the
+  // model chose to write down. See `note-taking.ts` — the entries that make a
+  // resumption safe are exactly the ones a model does not think to record.
+  const tools = buildTools(peer, ledger, runId, request.model.id, (observation) =>
+    observeToolResult(notes, observation),
+  );
+
+  const contextLedger = new ContextLedger(request.model.contextWindow ?? 0);
+  // Measured once. Neither the system prompt nor the tool catalogue changes
+  // during a run, and re-counting them every turn would spend real time
+  // counting characters that are identical to last turn's.
+  contextLedger.setText("system", request.systemPrompt);
+  contextLedger.setText(
+    "toolSchema",
+    tools.map((tool) => `${tool.name}${tool.description ?? ""}${JSON.stringify(tool.parameters ?? {})}`).join(""),
+  );
 
   const compactor = new RunCompactor({
     model,
     runtime,
     apiKey: LOCAL_PLACEHOLDER_KEY,
+    notes,
+    ledger: contextLedger,
+    // Read at the moment of compaction rather than captured, so a decision
+    // taken two turns ago is carried and one taken since the run started is
+    // not silently the stale copy.
+    preserved: () => ({
+      ...preserved,
+      evidenceRefs: preserved.evidenceRefs ?? notes.state.evidenceIds,
+      unresolvedIssues: preserved.unresolvedIssues ?? notes.state.openQuestions,
+      recentFiles: preserved.recentFiles ?? notes.state.artifactIds,
+    }),
     onCompacted: (event) =>
       peer.notify("run.event", {
         runId,
@@ -265,6 +336,11 @@ export async function startRun(
         content: [{ type: "text", text }],
         timestamp: Date.now(),
       }),
+    note: (update) => {
+      if (update.preserved) preserved = { ...preserved, ...update.preserved };
+      if (update.notes) applyNotes(notes, update.notes);
+    },
+    notes,
   });
 
   try {
@@ -286,7 +362,38 @@ export async function startRun(
           .join("\n")
       : "";
 
-  return { runId, text, turns, stopReason: agent.state.errorMessage ? "error" : undefined };
+  return {
+    runId,
+    text,
+    turns,
+    stopReason: agent.state.errorMessage ? "error" : undefined,
+    notes: notes.state,
+    ledger: contextLedger.snapshot(),
+  };
+}
+
+/**
+ * Folds an update into the notes, through the setters rather than by assignment.
+ *
+ * The caps and the de-duplication live in the setters. Assigning the fields
+ * directly would let one `run.note` carrying a hundred evidence markers put a
+ * hundred markers into a list whose ceiling is sixty-four — which is how a
+ * bounded structure quietly stops being bounded.
+ */
+function applyNotes(notes: WorkingNotes, update: Partial<WorkingNotesState>): void {
+  if (typeof update.goal === "string") notes.setGoal(update.goal);
+  if (update.stage) notes.atStage(update.stage.ordinal, update.stage.intent);
+  if (typeof update.nextAction === "string") notes.setNextAction(update.nextAction);
+  for (const decision of update.decisions ?? []) {
+    notes.decided(decision.what, decision.because, decision.at);
+  }
+  for (const id of update.evidenceIds ?? []) notes.sawEvidence(id);
+  for (const id of update.calculationIds ?? []) notes.calculated(id);
+  for (const id of update.artifactIds ?? []) notes.produced(id);
+  for (const question of update.openQuestions ?? []) notes.asked(question);
+  for (const effect of update.completed ?? []) {
+    notes.didEffect(effect.tool, effect.target, effect.at);
+  }
 }
 
 /**

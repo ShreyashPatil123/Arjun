@@ -70,6 +70,61 @@ pub fn record(passages: &RunPassages, run_id: &str, query: &str, hits: &[SearchR
     render_passages(query, &marked)
 }
 
+/// Reads a named page range and records it as this run's evidence.
+///
+/// ## Why this exists rather than a "read the document" tool
+///
+/// A search returns a passage and the page it sits on. Often that is enough;
+/// when it is not — a table split across a page break, a clause that continues
+/// overleaf — the model needs the pages around it. The obvious way to serve that
+/// is to let it read the document, and on this workbench a document is a
+/// 200-page drawing set. Pasted into an 8k window it does not give the model
+/// more context: it ends the run, because the inference server refuses a prompt
+/// at or over its window.
+///
+/// So the unit of "load more" is a page range, and the range the model asked for
+/// is the range it gets. That is what makes progressive disclosure work here —
+/// the run holds markers, and pulls back only the region it turns out to need.
+///
+/// ## What it shares with `record`
+///
+/// Everything that matters. The passages go into the same numbered table under
+/// the same rule — a passage found again keeps the marker it already had — so a
+/// page pulled back after a search does not become a second piece of evidence
+/// corroborating the first.
+pub fn record_region(
+    passages: &RunPassages,
+    run_id: &str,
+    document_name: &str,
+    from_page: u32,
+    to_page: u32,
+    hits: &[SearchResult],
+) -> String {
+    let described = describe_region(document_name, from_page, to_page);
+    let rendered = record(passages, run_id, &described, hits);
+    if hits.is_empty() {
+        // The empty rendering already names what was asked for, so a second
+        // header would repeat it.
+        return rendered;
+    }
+    // Said explicitly, because the rendering itself does not. A model handed
+    // passages with no statement of which pages they came from will cite the
+    // range it asked for rather than the range it received — and those differ
+    // whenever a page holds nothing indexable.
+    format!("Read {described}.
+
+{rendered}")
+}
+
+/// How a page range reads in a sentence.
+fn describe_region(document_name: &str, from_page: u32, to_page: u32) -> String {
+    if from_page == to_page {
+        format!("page {from_page} of {document_name}")
+    } else {
+        format!("pages {from_page} to {to_page} of {document_name}")
+    }
+}
+
 /// Everything this run retrieved, in the order its markers refer to.
 pub fn for_run(passages: &RunPassages, run_id: &str) -> Vec<SearchResult> {
     passages
@@ -148,6 +203,39 @@ mod tests {
     fn finding_nothing_records_nothing_and_says_so() {
         let table: RunPassages = Arc::default();
         let out = record(&table, "r", "unicorns", &[]);
+
+        assert!(out.contains("do not assert it"), "{out}");
+        assert!(for_run(&table, "r").is_empty());
+    }
+
+    #[test]
+    fn a_page_pulled_back_later_keeps_the_marker_it_already_had() {
+        // The whole point of loading a region rather than a document: the model
+        // asks for more of what it already cited, and the thing it cited does
+        // not thereby become two pieces of evidence.
+        let table: RunPassages = Arc::default();
+        record(&table, "r", "seal", &[passage("a", "one")]);
+        let more = record_region(&table, "r", "Maintenance SOP", 4, 4, &[passage("a", "one")]);
+
+        assert!(more.contains("[E1]"), "{more}");
+        assert_eq!(for_run(&table, "r").len(), 1);
+    }
+
+    #[test]
+    fn a_loaded_region_says_which_pages_it_came_from() {
+        let table: RunPassages = Arc::default();
+        let out = record_region(&table, "r", "Maintenance SOP", 11, 13, &[passage("b", "two")]);
+
+        assert!(out.contains("pages 11 to 13"), "{out}");
+        assert!(out.contains("Maintenance SOP"), "{out}");
+    }
+
+    #[test]
+    fn a_region_that_holds_nothing_says_so_rather_than_returning_silence() {
+        // A model told nothing came back asks for a wider range. A model told
+        // nothing at all assumes the page was blank and writes that down.
+        let table: RunPassages = Arc::default();
+        let out = record_region(&table, "r", "Maintenance SOP", 900, 901, &[]);
 
         assert!(out.contains("do not assert it"), "{out}");
         assert!(for_run(&table, "r").is_empty());

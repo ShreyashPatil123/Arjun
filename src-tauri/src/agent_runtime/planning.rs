@@ -190,6 +190,10 @@ pub fn derive(prompt: &str) -> DerivedPlan {
     // stop for a person's approval, which is a real gate rather than a guess.
     let mut permitted = vec![
         ToolName::SearchDocuments,
+        // Always available alongside search. A run that may search but may not
+        // read the page the passage came from has to ask for whole documents to
+        // see context, which is the behaviour this tool exists to remove.
+        ToolName::LoadMoreEvidence,
         ToolName::ReadScopedFile,
         ToolName::RunCalculation,
         ToolName::ValidateArtifact,

@@ -458,6 +458,19 @@ pub async fn agent_start_run(
         log::warn!("[tasks] run {run_id}: the plan was not recorded: {error}");
     }
 
+    // A resumption reads what the earlier attempt recorded. On a first attempt
+    // this is `null`, and the loop starts with empty notes.
+    //
+    // Read from the saved task record rather than from the event history: the
+    // record holds the notes as the loop last reported them, and the history
+    // holds only that compactions happened. A run whose record was never
+    // written has nothing to resume from, and saying so honestly is better than
+    // reconstructing a plausible set of notes nobody actually recorded.
+    let resumed_notes = tasks::load(&app_data_dir(&app)?, &run_id)
+        .ok()
+        .and_then(|previous| previous.working_notes)
+        .filter(|notes| !notes.is_empty());
+
     let params = json!({
         "runId": run_id,
         "prompt": request.prompt,
@@ -480,6 +493,20 @@ pub async fn agent_start_run(
         // It is not a second authority: the loop can only stop *earlier* than
         // Rust would, and every tool call still goes through the gateway.
         "deadlineMs": deadline.timestamp_millis(),
+        // What this run already knows, if it is a resumption.
+        //
+        // Sent at start rather than pushed after the first turn, because the
+        // whole value of it is being read *before* the model decides what to do
+        // — notes that arrive after the loop has re-issued `create_docx` have
+        // not prevented anything.
+        "notes": resumed_notes,
+        // State this side owns and the loop must carry across compaction
+        // unchanged. Refreshed by `run.note` as the run proceeds; sent here so
+        // a run that compacts before its first refresh still carries its plan.
+        "preserved": {
+            "activePlan": planned.stopped_because.clone(),
+            "policyDecisions": Vec::<String>::new(),
+        },
     });
 
     // Recorded before the run, not after. A run that crashes or is killed still
@@ -590,6 +617,24 @@ pub async fn agent_start_run(
         ),
         Err(error) => (String::new(), 0, Some(error.clone())),
     };
+
+    // The run's own notes and its final context ledger, as the loop reported
+    // them. Read from the outcome rather than reconstructed: a run that failed
+    // returns no outcome, and the notes for that run are the ones already in
+    // the durable event history — reconstructing them here from the transcript
+    // would produce a second, disagreeing account of what the run had done.
+    let working_notes = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("notes"))
+        .and_then(|notes| {
+            serde_json::from_value::<crate::agent_runtime::memory::RunMemory>(notes.clone()).ok()
+        });
+    let context_ledger = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("ledger"))
+        .and_then(|ledger| ledger_record(ledger));
 
     // Re-opened, not taken on the model's word. A document that was written and
     // then corrupted still passes every test of the code that wrote it.
@@ -717,6 +762,18 @@ pub async fn agent_start_run(
         tool_calls: made_calls,
         approvals: asked,
         failure: failure.clone(),
+        // Folded from the durable events rather than counted here. The events
+        // are written as each compaction happens, so a run the process took
+        // down with it still has its compaction history — and a record built
+        // from a live counter would not.
+        compactions: events
+            .snapshot(&run_id)
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.compaction_events)
+            .unwrap_or_default(),
+        working_notes,
+        context_ledger,
     };
 
     // Saved before anything is released, so a failure to write is a failure the
@@ -1376,4 +1433,39 @@ fn open_folder(path: &std::path::Path) -> std::io::Result<()> {
     };
 
     command.spawn().map(|_| ())
+}
+
+/// The runtime's context ledger, flattened into the shape the record holds.
+///
+/// Rebuilt field by field rather than deserialised straight through: the wire
+/// shape is nested and the record's is flat, and a `serde` bridge between the
+/// two would silently produce zeros the day the runtime renames a section.
+/// Reading each name here means a rename is a compile error on one side and a
+/// visible zero on the other, rather than a ledger that quietly stops adding up.
+fn ledger_record(ledger: &Value) -> Option<crate::agent_runtime::tasks::ContextLedgerRecord> {
+    let sections = ledger.get("sections")?;
+    let section = |name: &str| {
+        sections
+            .get(name)
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32
+    };
+    let top = |name: &str| ledger.get(name).and_then(Value::as_i64).unwrap_or(0);
+
+    Some(crate::agent_runtime::tasks::ContextLedgerRecord {
+        system: section("system"),
+        skill: section("skill"),
+        tool_schema: section("toolSchema"),
+        evidence: section("evidence"),
+        notes: section("notes"),
+        transcript: section("transcript"),
+        compaction: section("compaction"),
+        reserve: section("reserve"),
+        occupied: top("occupied").max(0) as u32,
+        committed: top("committed").max(0) as u32,
+        window: top("window").max(0) as u32,
+        // Signed on purpose. A negative headroom means the next turn does not
+        // fit, and clamping it to zero would report that as "exactly full".
+        headroom: top("headroom"),
+    })
 }

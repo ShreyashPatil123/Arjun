@@ -245,6 +245,35 @@ export interface CalculationRecord {
   deterministic: boolean;
 }
 
+/** A side effect a run already performed. Read before a resumption acts. */
+export interface CompletedEffect {
+  tool: string;
+  /** What it acted on — a file name, a path, an identifier. */
+  target: string;
+  at: string;
+}
+
+/**
+ * A run's own bounded memory.
+ *
+ * Identifiers, not content: `evidenceIds` holds `E3`, never the passage. That
+ * is what keeps this small enough to carry in context for a whole run and
+ * cheap enough to persist with every task record.
+ */
+export interface RunMemory {
+  goal: string;
+  stage: { ordinal: number; intent: string };
+  decisions: { what: string; because: string; at: string }[];
+  evidenceIds: string[];
+  calculationIds: string[];
+  artifactIds: string[];
+  openQuestions: string[];
+  nextAction: string;
+  completed: CompletedEffect[];
+  /** How many entries the caps dropped, per list. Shown rather than hidden. */
+  dropped: Record<string, number>;
+}
+
 /** Everything kept about one finished run. */
 export interface TaskRecord {
   runId: string;
@@ -258,6 +287,24 @@ export interface TaskRecord {
   plan: PlanRecord;
   answer: string;
   turns: number;
+  /**
+   * Every time the run's history was replaced by a summary, in order.
+   *
+   * Optional so records written before this existed still parse. A run that
+   * never compacted has an empty list — indistinguishable from an older record,
+   * and for the reader's purposes the same thing.
+   */
+  compactions?: CompactionRecord[];
+  /**
+   * The run's bounded notes as they finished.
+   *
+   * What a resumption reads: the goal, the stage it reached, and — the part
+   * that makes resuming safe rather than merely faster — the side effects that
+   * already happened and must not happen again.
+   */
+  workingNotes?: RunMemory | null;
+  /** Where the context window stood when the run ended. */
+  contextLedger?: ContextLedgerRecord | null;
   verification: VerificationReport | null;
   artifacts: ArtifactReport[];
   evidence: EvidenceRecord[];
@@ -287,6 +334,15 @@ export interface TaskSummary {
   /** Steps planned but never reached. Non-zero is the signal to look. */
   unfinishedSteps: number;
   approvalsPending: number;
+  /**
+   * Times the run's older history was replaced by a summary so it could
+   * continue.
+   *
+   * Non-zero on a short task is the signal that the routed model's window is
+   * too small for the work it is being given — which is a routing decision to
+   * revisit, not a fault in the run.
+   */
+  compactionCount: number;
   stoppedBecause: string;
   /** False when it failed, needs review, or produced an unsound file. */
   ready: boolean;
@@ -384,6 +440,52 @@ export interface ActivityRecord {
  * *reference* to the answer rather than the answer: a finished run's text is in
  * its task record, and one still going has no answer yet.
  */
+/**
+ * How the context window was divided at one moment.
+ *
+ * Counts only — how many tokens each section held, never what was in them. That
+ * is what makes it safe to show on a screen read more widely than the
+ * transcript it describes.
+ */
+export interface ContextLedgerRecord {
+  system: number;
+  skill: number;
+  toolSchema: number;
+  evidence: number;
+  notes: number;
+  transcript: number;
+  compaction: number;
+  /** Held back for the model's output. Committed rather than occupied. */
+  reserve: number;
+  /** Everything except `reserve`. */
+  occupied: number;
+  /** `occupied + reserve` — what the next turn has to fit inside. */
+  committed: number;
+  /** The model's window. Zero when the runtime was not told one. */
+  window: number;
+  /** `window - committed`. Negative means the next turn does not fit. */
+  headroom: number;
+}
+
+/** One time a run's older history was replaced by a summary. */
+export interface CompactionRecord {
+  /** Which compaction of this run, 1-based. */
+  ordinal: number;
+  at: string;
+  tokensBefore: number;
+  tokensAfter: number;
+  messagesSummarised: number;
+  /**
+   * True when this pass extended the summary already held. A `false` on
+   * anything but the first means the run started a second summary, and the
+   * earlier half of its history is described twice or not at all.
+   */
+  refinedExistingSummary: boolean;
+  /** Raw tool results replaced by an evidence reference, cumulatively. */
+  toolResultsCleared: number;
+  ledger: ContextLedgerRecord;
+}
+
 export interface TaskSnapshot {
   runId: string;
   /** The last event folded in. Ask for events after this to catch up. */
@@ -403,6 +505,18 @@ export interface TaskSnapshot {
   activity: ActivityRecord[];
   turns: number;
   compactions: number;
+  /**
+   * What each of those compactions actually did.
+   *
+   * The count says the window ran out; these say what filled it. A run that
+   * compacted three times and cannot say which section grew is a run nobody can
+   * diagnose afterwards — and the usual answer, "one enormous tool result", has
+   * a remedy that costs the run nothing.
+   *
+   * Optional so a snapshot from an older backend still parses; absent and empty
+   * mean the same thing to every reader here.
+   */
+  compactionEvents?: CompactionRecord[];
   /** Names of the files it produced. */
   artifacts: string[];
   approvalsPending: number;

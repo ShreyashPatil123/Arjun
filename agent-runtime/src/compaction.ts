@@ -53,6 +53,40 @@ import {
 import { capCompactionSummary } from "@openclaw/agent-core/harness/compaction";
 import type { Model } from "@openclaw/ai";
 import type { AgentCoreCompletionRuntimeDeps } from "@openclaw/agent-core";
+import { ContextLedger, type ContextLedgerSnapshot } from "./context-ledger.js";
+import { WorkingNotes } from "./working-notes.js";
+
+/**
+ * State that must survive compaction verbatim rather than through a summary.
+ *
+ * A summariser is a model, and a model asked to compress twenty turns will
+ * sometimes drop the sentence that said an approval was granted. That is not a
+ * quality problem to be tuned away — it is the difference between a run that
+ * stops for a person and a run that proceeds believing it already did. So the
+ * things whose loss changes what the run is *allowed* to do are carried across
+ * as text this code writes, not as text a model writes.
+ *
+ * Supplied per compaction rather than held, because all of it lives on the Rust
+ * side and can change between turns.
+ */
+export interface PreservedState {
+  /** The plan the run is being held to, and where it has got to. */
+  activePlan?: string;
+  /**
+   * Approvals granted or refused, and any policy refusal already issued.
+   *
+   * The load-bearing one. A granted approval that is summarised away is
+   * re-requested, which is merely annoying; a *refusal* summarised away is
+   * retried, which is the failure that matters.
+   */
+  policyDecisions?: string[];
+  /** Evidence markers the run holds, as references — never the passages. */
+  evidenceRefs?: string[];
+  /** Questions the run has not settled. */
+  unresolvedIssues?: string[];
+  /** Files the run has recently read or produced, by name. */
+  recentFiles?: string[];
+}
 
 /** What compaction did, for the event stream and the run record. */
 export interface CompactionEvent {
@@ -60,6 +94,19 @@ export interface CompactionEvent {
   tokensAfter: number;
   /** Transcript messages now represented by the summary rather than sent whole. */
   messagesSummarised: number;
+  /** Which compaction of this run this was, 1-based. */
+  ordinal: number;
+  /**
+   * True when this compaction extended the summary already held rather than
+   * writing a new one. Recorded because a second compaction that *replaced* the
+   * summary would silently lose the first half of the run, and a counter that
+   * cannot tell the two apart cannot show that it did not happen.
+   */
+  refinedExistingSummary: boolean;
+  /** Raw tool results replaced by an evidence reference on this pass. */
+  toolResultsCleared: number;
+  /** The ledger as it stood after the compaction. */
+  ledger: ContextLedgerSnapshot;
 }
 
 export interface CompactorOptions {
@@ -70,6 +117,18 @@ export interface CompactorOptions {
   /** Called when a compaction happens, so an operator can be told. */
   onCompacted?: (event: CompactionEvent) => void;
   settings?: Partial<CompactionSettings>;
+  /**
+   * The run's bounded notes.
+   *
+   * Rendered into the context ahead of the transcript on every turn, not only
+   * after a compaction: notes that appear only once the window is full are
+   * notes the model was never shown while it was deciding what to record.
+   */
+  notes?: WorkingNotes;
+  /** Where the section counts are accumulated. One per run. */
+  ledger?: ContextLedger;
+  /** Read at each compaction. See {@link PreservedState}. */
+  preserved?: () => PreservedState;
 }
 
 /**
@@ -112,6 +171,208 @@ function asEntries(messages: AgentMessage[]) {
 }
 
 /**
+ * A message timestamp as epoch milliseconds.
+ *
+ * The harness types allow either a number or an RFC 3339 string depending on
+ * where a message came from. Normalised here rather than at each use, so a
+ * string timestamp produces a correct instant instead of `NaN`.
+ */
+function asEpoch(timestamp: string | number | undefined): number | undefined {
+  if (typeof timestamp === "number") return timestamp;
+  if (typeof timestamp !== "string") return undefined;
+  const parsed = Date.parse(timestamp);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/** A message that carries assistant tool calls, viewed structurally. */
+interface ToolCallish {
+  role?: string;
+  toolCallId?: string;
+  content?: unknown;
+}
+
+/** The ids of the tool calls an assistant message issued. */
+function toolCallIdsIn(message: AgentMessage): string[] {
+  const shape = message as ToolCallish;
+  if (shape.role !== "assistant" || !Array.isArray(shape.content)) return [];
+  return shape.content
+    .filter(
+      (block): block is { type: string; id?: string; toolCallId?: string } =>
+        typeof block === "object" && block !== null && (block as { type?: string }).type === "toolCall",
+    )
+    .map((block) => block.id ?? block.toolCallId)
+    .filter((id): id is string => typeof id === "string");
+}
+
+/** The call id a tool-result message answers, if it is one. */
+function toolResultIdOf(message: AgentMessage): string | undefined {
+  const shape = message as ToolCallish;
+  return shape.role === "toolResult" ? shape.toolCallId : undefined;
+}
+
+/**
+ * Whether every tool result in this window has the call that produced it.
+ *
+ * The property a provider enforces and rejects the whole request over. Exposed
+ * rather than kept private because it is the thing worth asserting in a test:
+ * a cut that orphans a tool result does not degrade the run, it ends it with a
+ * malformed-request error that reads like a bug in the agent loop.
+ */
+export function pairingIsIntact(messages: AgentMessage[]): boolean {
+  const issued = new Set<string>();
+  for (const message of messages) {
+    for (const id of toolCallIdsIn(message)) issued.add(id);
+    const answered = toolResultIdOf(message);
+    if (answered !== undefined && !issued.has(answered)) return false;
+  }
+  return true;
+}
+
+/**
+ * Moves a cut earlier until it no longer orphans a tool result.
+ *
+ * `findCutPoint` already chooses turn boundaries and is the primary defence.
+ * This is the second one, and it exists because the two disagree in exactly one
+ * case: the cut is computed over *session entries*, and ARJUN synthesises those
+ * entries positionally from a message list that agent-core may have rewritten —
+ * an interrupt message, a repaired tool call. Re-deriving the property directly
+ * from the messages costs one pass and removes the need to reason about whether
+ * those two representations can drift.
+ *
+ * Returns an index at or before `cut`, never after: this may keep more history
+ * than asked, and must never keep less.
+ */
+export function alignCutToPairs(messages: AgentMessage[], cut: number): number {
+  let aligned = Math.max(0, Math.min(cut, messages.length));
+  // Walk back while the first kept message is a tool result whose call is not
+  // also kept. Each step swallows one more message, so this terminates at 0.
+  for (;;) {
+    const kept = messages.slice(aligned);
+    if (pairingIsIntact(kept) || aligned === 0) return aligned;
+    aligned -= 1;
+  }
+}
+
+/** How many trailing messages are never pruned, however stale they look. */
+const PRUNE_KEEPS_RECENT = 6;
+
+/**
+ * Replaces raw tool-result bodies with a reference once the evidence is durable.
+ *
+ * ## Why this is safe, and only here
+ *
+ * A search result is the largest thing in a document run's context and the most
+ * redundant: the passage text is already in the Rust evidence table under the
+ * marker the model was told to cite, and it stays there for the life of the
+ * run. So once `[E3]` is recorded in the notes, the *text* of the result that
+ * produced it is a second copy of something retrievable, and dropping it costs
+ * the model nothing it cannot ask for again.
+ *
+ * Two conditions, both required, because getting either wrong loses real work:
+ *
+ * - **The marker must already be in the notes.** The notes are what is
+ *   persisted, so a marker present there is one a recovered run can still
+ *   resolve. Pruning against markers seen only in the live transcript would
+ *   discard text whose reference dies with the process.
+ * - **The most recent {@link PRUNE_KEEPS_RECENT} messages are untouched.** The
+ *   model is usually still working with what it just read, and a result pruned
+ *   in the same breath it was returned reads to the model as a tool that
+ *   silently failed.
+ *
+ * The message is rewritten, never removed: removing it would orphan the tool
+ * call that produced it, which is the failure the rest of this file exists to
+ * prevent.
+ */
+export function pruneStaleToolResults(
+  messages: AgentMessage[],
+  durableMarkers: readonly string[],
+): { messages: AgentMessage[]; cleared: number } {
+  if (durableMarkers.length === 0) return { messages, cleared: 0 };
+  const markers = new Set(durableMarkers.map((marker) => marker.toUpperCase()));
+  const cutoff = messages.length - PRUNE_KEEPS_RECENT;
+  let cleared = 0;
+
+  const rewritten = messages.map((message, index) => {
+    if (index >= cutoff) return message;
+    const shape = message as ToolCallish & { content?: unknown };
+    if (shape.role !== "toolResult" || !Array.isArray(shape.content)) return message;
+
+    const text = shape.content
+      .map((block) =>
+        typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : "",
+      )
+      .join("");
+    if (!text) return message;
+
+    // Every marker this result carried, and only markers that are durable.
+    const found = [...text.matchAll(/\[E(\d+)\]/g)].map((match) => `E${match[1]}`);
+    const durable = [...new Set(found)].filter((marker) => markers.has(marker));
+    if (durable.length === 0 || durable.length !== new Set(found).size) {
+      // Nothing durable here, or the result carried a marker that is not yet
+      // recorded. Pruning a partially-durable result would drop the half that
+      // cannot be looked up again, so it is left whole.
+      return message;
+    }
+
+    cleared += 1;
+    return {
+      ...(message as object),
+      content: [
+        {
+          type: "text",
+          text: `[${durable.join(", ")}] Passage text cleared from context. These passages are held as this run's evidence and can be cited by marker; use load_more_evidence to read a specific page again.`,
+        },
+      ],
+    } as AgentMessage;
+  });
+
+  return { messages: rewritten, cleared };
+}
+
+/**
+ * The state carried across a compaction as text, not as a summary.
+ *
+ * Written as a user message rather than a system one so it cannot be reordered
+ * away from the summary it belongs beside, and so a model that follows the last
+ * instruction it saw sees this after the summary rather than before it.
+ */
+function preservedMessage(state: PreservedState, notes: WorkingNotes, timestamp: number): AgentMessage | undefined {
+  const lines: string[] = [];
+  if (state.activePlan) lines.push(`Active plan: ${state.activePlan}`);
+  if (state.policyDecisions?.length) {
+    lines.push("Policy and approval decisions still in force:");
+    for (const decision of state.policyDecisions) lines.push(`  - ${decision}`);
+  }
+  if (state.evidenceRefs?.length) {
+    lines.push(`Evidence available by marker: ${state.evidenceRefs.join(", ")}`);
+  }
+  if (state.unresolvedIssues?.length) {
+    lines.push("Still unresolved:");
+    for (const issue of state.unresolvedIssues) lines.push(`  - ${issue}`);
+  }
+  if (state.recentFiles?.length) {
+    lines.push(`Files in play: ${state.recentFiles.join(", ")}`);
+  }
+
+  const rendered = notes.render();
+  if (rendered) lines.push(rendered);
+  if (lines.length === 0) return undefined;
+
+  return {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: `The earlier history was replaced by the summary above. These facts were carried across unchanged and are current:\n${lines.join("\n")}`,
+      },
+    ],
+    timestamp,
+  } as AgentMessage;
+}
+
+/**
  * Compacts one run's context as it grows.
  *
  * Stateful across turns: it remembers the summary produced so far and how much
@@ -121,10 +382,21 @@ function asEntries(messages: AgentMessage[]) {
 export class RunCompactor {
   readonly #options: CompactorOptions;
   readonly #settings: CompactionSettings;
+  readonly #notes: WorkingNotes;
+  readonly #ledger: ContextLedger;
   #summary?: string;
   /** Messages the summary stands in for: `messages[0..covered)`. */
   #covered = 0;
   #compactions = 0;
+  /**
+   * Raw tool results replaced by a reference in the current projection.
+   *
+   * Assigned, not accumulated. Pruning recomputes over the whole transcript
+   * every turn, so adding each turn's count to the last would report a run that
+   * cleared three results as having cleared thirty by turn ten — a number that
+   * grows with turns rather than with anything that happened.
+   */
+  #cleared = 0;
 
   constructor(options: CompactorOptions) {
     this.#options = options;
@@ -132,23 +404,65 @@ export class RunCompactor {
       ...settingsForWindow(options.model.contextTokens ?? options.model.contextWindow ?? 0),
       ...options.settings,
     };
+    this.#notes = options.notes ?? new WorkingNotes();
+    this.#ledger =
+      options.ledger ??
+      new ContextLedger(options.model.contextTokens ?? options.model.contextWindow ?? 0);
+    this.#ledger.set("reserve", this.#settings.reserveTokens);
   }
 
   get compactions(): number {
     return this.#compactions;
   }
 
+  /** The run's notes, so a caller can record into the same instance. */
+  get notes(): WorkingNotes {
+    return this.#notes;
+  }
+
+  /** The ledger, for a caller that wants to show or persist it. */
+  get ledger(): ContextLedger {
+    return this.#ledger;
+  }
+
   /** What the model is shown, given the transcript and any summary so far. */
   #project(messages: AgentMessage[]): AgentMessage[] {
+    const notes = this.#notes.render();
+
     if (!this.#summary || this.#covered === 0) {
-      return messages;
+      // Before any compaction the notes still go in, ahead of the transcript.
+      // A model asked to maintain notes it has never been shown maintains
+      // nothing, and the first thing it would have recorded is the goal — which
+      // is exactly what the first compaction is most likely to lose.
+      if (!notes) return messages;
+      return [this.#notesMessage(notes, asEpoch(messages[0]?.timestamp)), ...messages];
     }
+
     const summary = createCompactionSummaryMessage(
       this.#summary,
       this.#tokensAt(messages.slice(0, this.#covered)),
       new Date(messages[0]?.timestamp ?? Date.now()).toISOString(),
     ) as unknown as AgentMessage;
-    return [summary, ...messages.slice(this.#covered)];
+
+    const timestamp = asEpoch(messages[this.#covered]?.timestamp) ?? Date.now();
+    const carried = preservedMessage(
+      this.#options.preserved?.() ?? {},
+      this.#notes,
+      timestamp,
+    );
+
+    // The cut is re-aligned here and not only where it was chosen, because the
+    // kept tail is what is actually sent. See `alignCutToPairs`.
+    const tail = messages.slice(alignCutToPairs(messages, this.#covered));
+    return carried ? [summary, carried, ...tail] : [summary, ...tail];
+  }
+
+  #notesMessage(rendered: string, timestamp?: number): AgentMessage {
+    return {
+      role: "user",
+      content: [{ type: "text", text: rendered }],
+      timestamp: timestamp ?? Date.now(),
+    } as AgentMessage;
   }
 
   #tokensAt(messages: AgentMessage[]): number {
@@ -164,14 +478,25 @@ export class RunCompactor {
    */
   async transform(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
     const window = this.#options.model.contextTokens ?? this.#options.model.contextWindow ?? 0;
-    let projected = this.#project(messages);
+
+    // Cheapest saving first, and it happens whether or not this turn compacts:
+    // a passage whose marker is already durable is a second copy of something
+    // retrievable, and clearing it may be enough that no summary is needed at
+    // all. Doing it only at compaction time would mean the run summarises
+    // history it did not have to lose.
+    const pruned = pruneStaleToolResults(messages, this.#notes.state.evidenceIds);
+    const working = pruned.messages;
+    this.#cleared = pruned.cleared;
+
+    let projected = this.#project(working);
     const tokensBefore = this.#tokensAt(projected);
+    this.#measure(projected);
 
     if (!shouldCompact(tokensBefore, window, this.#settings)) {
       return projected;
     }
 
-    const entries = asEntries(messages);
+    const entries = asEntries(working);
     const { firstKeptEntryIndex } = findCutPoint(
       entries,
       this.#covered,
@@ -186,7 +511,11 @@ export class RunCompactor {
       return projected;
     }
 
-    const toSummarise = messages.slice(this.#covered, firstKeptEntryIndex);
+    const toSummarise = working.slice(this.#covered, firstKeptEntryIndex);
+    // Recorded before the summariser is asked, because the answer to "did this
+    // extend the existing summary or replace it?" is decided by whether one was
+    // held going in, and `#summary` is overwritten below.
+    const refinedExistingSummary = this.#summary !== undefined;
 
     // Two failure shapes, both of which must leave the run alive: a returned
     // error result, and a throw. `generateSummary` propagates whatever the
@@ -222,15 +551,54 @@ export class RunCompactor {
     }
 
     this.#summary = capCompactionSummary(summary);
-    this.#covered = firstKeptEntryIndex;
+    // Aligned before it is stored, so the covered boundary and the boundary the
+    // projection actually cuts at can never be two different numbers.
+    this.#covered = alignCutToPairs(working, firstKeptEntryIndex);
     this.#compactions += 1;
+    this.#ledger.countCompaction();
 
-    projected = this.#project(messages);
+    projected = this.#project(working);
+    this.#measure(projected);
+
     this.#options.onCompacted?.({
       tokensBefore,
       tokensAfter: this.#tokensAt(projected),
       messagesSummarised: this.#covered,
+      ordinal: this.#compactions,
+      refinedExistingSummary,
+      toolResultsCleared: this.#cleared,
+      ledger: this.#ledger.snapshot(),
     });
     return projected;
+  }
+
+  /**
+   * Books the projected context into the ledger.
+   *
+   * Only the sections this side can see: the summary, the notes, and the rest
+   * of the transcript. `system`, `skill` and `toolSchema` are set once by the
+   * caller that owns them, and are deliberately not recomputed here — this must
+   * not silently zero a section it has no view of.
+   */
+  #measure(projected: AgentMessage[]): void {
+    const summaryTokens = this.#summary ? estimateContextTokens([projected[0]!]).tokens : 0;
+    const notesText = this.#notes.render();
+    this.#ledger.set("compaction", summaryTokens);
+    this.#ledger.setText("notes", notesText);
+
+    const transcript = this.#summary ? projected.slice(1) : projected;
+    const withoutNotes = transcript.filter((message) => {
+      const content = (message as { content?: unknown }).content;
+      if (!Array.isArray(content)) return true;
+      const text = content
+        .map((block) =>
+          typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
+            ? (block as { text: string }).text
+            : "",
+        )
+        .join("");
+      return !notesText || !text.includes("## Working notes");
+    });
+    this.#ledger.setMessages("transcript", withoutNotes);
   }
 }

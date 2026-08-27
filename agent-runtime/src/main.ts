@@ -9,6 +9,8 @@
 import { RpcPeer, type PeerTransport } from "./peer.js";
 import { ErrorCode } from "./protocol.js";
 import { startRun, type ActiveRun, type RunRequest } from "./run.js";
+import type { PreservedState } from "./compaction.js";
+import type { WorkingNotesState } from "./working-notes.js";
 
 /**
  * Makes stdout unusable for anything except frames.
@@ -127,6 +129,31 @@ function main(): void {
     // distrust the control.
     run?.steer(text);
     return { steered: Boolean(run) };
+  });
+
+  /**
+   * Updates the state a run must carry across compaction.
+   *
+   * Notifications would be cheaper, but this is a request so the core learns
+   * whether the update landed. A preserved approval that was silently dropped
+   * because the run had already ended is the one case where "probably
+   * delivered" is not good enough — the next thing the core does with that
+   * belief is decide not to ask a person again.
+   */
+  peer.handle("run.note", (params) => {
+    const { runId, preserved, notes } = (params ?? {}) as {
+      runId?: string;
+      preserved?: PreservedState;
+      notes?: Partial<WorkingNotesState>;
+    };
+    if (!runId || (preserved === undefined && notes === undefined)) {
+      throw Object.assign(new Error("run.note needs runId and preserved or notes"), {
+        code: ErrorCode.BadParams,
+      });
+    }
+    const run = active.get(runId);
+    run?.note({ preserved, notes });
+    return { noted: Boolean(run), notes: run?.notes.state };
   });
 
   peer.handle("health", () => ({ ready: true, pid: process.pid, node: process.version }));
