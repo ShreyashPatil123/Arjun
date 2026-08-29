@@ -250,6 +250,11 @@ fn runtime(
         plans: state.plans.clone(),
         events: state.events.clone(),
         skills: state.skills.clone(),
+        // Built here, from code, once. Not read from a file and not reachable
+        // from anything a prompt, a skill body or a retrieved document can name
+        // — which is the whole reason policy belongs in a hook rather than in a
+        // system prompt. See `crate::hooks`.
+        hooks: Arc::new(crate::hooks::HookRegistry::with_builtin_policy()),
         memory: state.memory.clone(),
         checkpoints: state.checkpoints.clone(),
         emit_durable,
@@ -334,8 +339,17 @@ pub async fn agent_start_run(
         .max()
         .unwrap_or(0);
 
-    let routing = ModelRouter::route(&registry, &request.prompt, request.classification, vram)
-        .map_err(|failure| failure.reason)?;
+    let routing = ModelRouter::route(
+        &registry,
+        &request.prompt,
+        request.classification,
+        vram,
+        None,
+        false,
+        &[],
+        &[],
+    )
+    .map_err(|failure| failure.reason)?;
 
     let entry = registry
         .find(&routing.model_id)

@@ -451,7 +451,7 @@ mod tests {
 
         match run.may_call(&call) {
             Continuation::Stop(StopReason::Looping { tool, repeats }) => {
-                assert_eq!(tool, "search_documents");
+                assert_eq!(tool, "knowledge.search_authorized");
                 assert_eq!(repeats, 4);
             }
             other => panic!("expected a loop to be caught, got {other:?}"),

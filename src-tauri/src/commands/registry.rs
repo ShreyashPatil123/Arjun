@@ -72,7 +72,17 @@ pub async fn preview_routing(
         .max()
         .unwrap_or(0);
 
-    ModelRouter::route(&registry, &prompt, classification, vram).map_err(|failure| failure.reason)
+    ModelRouter::route(
+        &registry,
+        &prompt,
+        classification,
+        vram,
+        None,
+        false,
+        &[],
+        &[],
+    )
+    .map_err(|failure| failure.reason)
 }
 
 /// Picks the right model for a prompt and loads it, with no human step.
@@ -101,8 +111,17 @@ pub async fn prepare_model_for(
         .max()
         .unwrap_or(0);
 
-    let routing = ModelRouter::route(&registry, &prompt, classification, vram)
-        .map_err(|failure| failure.reason)?;
+    let routing = ModelRouter::route(
+        &registry,
+        &prompt,
+        classification,
+        vram,
+        None,
+        false,
+        &[],
+        &[],
+    )
+    .map_err(|failure| failure.reason)?;
 
     let activation = activator
         .ensure_ready(&registry, &routing.model_id, &signed_in.user.id)

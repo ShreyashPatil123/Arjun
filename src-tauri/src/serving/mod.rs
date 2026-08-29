@@ -395,15 +395,18 @@ mod tests {
             sha256: None,
             runtime: Runtime::LlamaCpp,
             roles: vec![ModelRole::Coding],
+            modalities: vec![crate::registry::Modality::Text],
             quantization: Some("Q4_K_M".into()),
             parameters_b: 7.0,
             active_parameters_b: None,
             context_length: 32_768,
             weights_bytes: 4_700_000_000,
+            supports_structured_output: false,
             permitted_classifications: vec![],
             path: PathBuf::from("qwen2.5-coder-7b-q4.gguf"),
             load: None,
             serving: None,
+            required_runtime_profile: None,
             enabled: true,
         }
     }

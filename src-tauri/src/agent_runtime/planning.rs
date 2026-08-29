@@ -40,7 +40,7 @@
 //! would cost a run that phrased its request unusually.
 
 use crate::orchestrator::plan::{Budget, PlanRun};
-use crate::orchestrator::tools::ToolName;
+use crate::orchestrator::tools::{spec_for, ToolName};
 
 /// Words that mean the answer involves working something out.
 const CALCULATION_WORDS: &[&str] = &[
@@ -194,6 +194,11 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         // read the page the passage came from has to ask for whole documents to
         // see context, which is the behaviour this tool exists to remove.
         ToolName::LoadMoreEvidence,
+        // The same shelf under the same clearance, for the pages that are
+        // pictures. Withholding it would leave a run unable to tell a page it
+        // could not read from a page with nothing on it — and those two lead to
+        // opposite conclusions about whether a clause exists.
+        ToolName::MediaExtractFindings,
         // Reading memory is always available: a run that may not consult what
         // the project already agreed a term means will re-derive it, differently
         // each time. Promotion is not here — writing something later runs read
@@ -202,6 +207,19 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         ToolName::ReadScopedFile,
         ToolName::RunCalculation,
         ToolName::ValidateArtifact,
+        // Metadata about skills, never a skill body. Always available because
+        // progressive disclosure depends on it: a run that cannot see what
+        // guidance exists cannot ask for the guidance it needs, and the
+        // alternative is putting every skill in every prompt.
+        ToolName::CapabilitySearch,
+        // Reading this machine's own record of what it refused to send. Always
+        // available because the question it answers is asked most often exactly
+        // when something has gone wrong.
+        ToolName::SovereigntyGetEvidence,
+        // Read-only by construction — the child inherits a policy that permits
+        // it no writing tool — so it costs nobody an approval and can be offered
+        // without narrowing the parent's own reach.
+        ToolName::AgentDelegateReadonly,
         ToolName::WriteScopedFile,
         ToolName::CreateDocx,
     ];
@@ -211,6 +229,21 @@ pub fn derive(prompt: &str) -> DerivedPlan {
     if writes_code {
         permitted.push(ToolName::ExecuteCode);
     }
+
+    // The sovereignty filter, applied once and last.
+    //
+    // Deliberately not folded into the list above. A tool is dropped here
+    // because of the *mode the machine is in*, which is a different kind of
+    // reason from "this task does not need it" — and a reader asking "why can
+    // this run not reach the internet?" should find one line that says so
+    // rather than a condition threaded through eleven entries.
+    //
+    // Read at plan time rather than per call: the plan is what the operator is
+    // shown and what the budget enforces, so a tool that is not in it is one the
+    // model is never told about. A mode change mid-run cannot widen a plan that
+    // was already fixed.
+    let mode = crate::sovereignty::global_broker().mode();
+    permitted.retain(|tool| spec_for(*tool).network.permitted_in(mode));
 
     // Room for the plan plus recovery from a few mistakes. A step is one tool
     // call, and a plan of six steps allowed only six calls fails the first time

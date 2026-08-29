@@ -9,11 +9,12 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { convertToLlm, type AgentMessage } from "@openclaw/agent-core";
+import { convertToLlm, estimateTokens, type AgentMessage } from "@openclaw/agent-core";
 import type { Model } from "@openclaw/ai";
 import {
   RunCompactor,
   alignCutToPairs,
+  isEvidenceMessage,
   pairingIsIntact,
   pruneStaleToolResults,
 } from "./compaction.js";
@@ -450,6 +451,163 @@ describe("the context ledger says where the window went", () => {
     expect(ledger.snapshot().headroom).toBe(0);
     // Not "it fits": an unknown window is not evidence of room.
     expect(ledger.fits()).toBe(false);
+  });
+});
+
+describe("the ledger tells retrieved evidence apart from conversation", () => {
+  /**
+   * Short questions, long passages — the shape a document run actually has,
+   * and the one where the two lines give opposite advice.
+   */
+  function passageHeavyRun(turns: number): AgentMessage[] {
+    const messages: AgentMessage[] = [];
+    for (let i = 0; i < turns; i++) {
+      messages.push(user(`question ${i}`));
+      messages.push(toolCall(`call_${i}`));
+      messages.push(
+        toolResult(`call_${i}`, `[E${i + 1}] Maintenance SOP, page 4
+${"y".repeat(600)}`),
+      );
+      messages.push(assistant(`answer ${i}`));
+    }
+    return messages;
+  }
+
+  it("recognises a passage by the marker the model was told to cite", () => {
+    expect(
+      isEvidenceMessage(toolResult("c1", "[E1] Maintenance SOP, page 4 — the passage")),
+    ).toBe(true);
+    // A tool that returned no evidence is conversation, however long it is.
+    expect(isEvidenceMessage(toolResult("c1", "Wrote approval-note.docx.", "create_docx"))).toBe(
+      false,
+    );
+    // Nor is the model's own prose about evidence, whatever it quotes.
+    expect(isEvidenceMessage(assistant("As [E1] says, the seal is worn."))).toBe(false);
+  });
+
+  it("still counts a reference stub as evidence once the passage text is cleared", () => {
+    // What pruning leaves behind. It is small, but it is retrieval rather than
+    // conversation, and booking it as conversation would make the evidence line
+    // fall to zero on exactly the runs that retrieved the most.
+    const { messages } = pruneStaleToolResults(passageHeavyRun(4), ["E1", "E2", "E3", "E4"]);
+
+    expect(messages.filter(isEvidenceMessage).length).toBeGreaterThan(0);
+  });
+
+  it("recognises a stub for a result that carried several passages", () => {
+    // A search returns six passages at a time, so the multi-marker stub is the
+    // common case, not the exotic one. A pattern that only matched `[E1]`
+    // would report the evidence line as near-empty on precisely the runs that
+    // retrieved the most — the opposite of what an operator needs to read.
+    const twoMarkers = toolResult("call_1", "[E1] first passage. [E2] second passage.");
+    const { messages, cleared } = pruneStaleToolResults(
+      [...Array.from({ length: 8 }, (_, i) => user(`filler ${i}`)), twoMarkers].reverse(),
+      ["E1", "E2"],
+    );
+
+    expect(cleared).toBe(1);
+    const stub = messages.find((message) => (message as { role?: string }).role === "toolResult");
+    expect(stub).toBeDefined();
+    expect(isEvidenceMessage(stub as AgentMessage)).toBe(true);
+  });
+
+  it("names the passages, not the conversation, when the passages filled the window", async () => {
+    const window = 8_192;
+    const ledger = new ContextLedger(window);
+    const compactor = new RunCompactor({
+      model: model(window),
+      runtime: summariser(),
+      apiKey: "local",
+      ledger,
+    });
+
+    await compactor.transform(passageHeavyRun(6));
+
+    // The whole reason the line exists. An operator told "transcript: 6,000"
+    // reaches for the only lever that phrasing offers — compact sooner — which
+    // shortens the conversation and degrades the run. Told "evidence: 5,200"
+    // they ask for three pages instead of thirty, and lose nothing: the rest is
+    // still retrievable by marker.
+    expect(ledger.get("evidence")).toBeGreaterThan(ledger.get("transcript"));
+    expect(ledger.largest(1)[0]?.section).toBe("evidence");
+  });
+
+  /**
+   * An assistant turn as a real provider returns one: with the usage it
+   * reported for the whole request.
+   *
+   * The plain `assistant` helper above carries none, which is why the ledger
+   * over-reporting went unnoticed — every message a live run receives has this.
+   */
+  function assistantWithUsage(text: string, totalTokens: number): AgentMessage {
+    return {
+      ...(assistant(text) as object),
+      usage: {
+        input: totalTokens,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as unknown as AgentMessage;
+  }
+
+  it("does not report the whole conversation as the size of one section", async () => {
+    // The bug this replaced. The harness estimator answers with the provider's
+    // reported usage for the entire request the moment the list it is handed
+    // contains an assistant message carrying one — right for a whole context,
+    // wrong for a part of it. Measuring a section that way booked the whole run
+    // under that section, and then added the system prompt, the tool schemas
+    // and the notes on top: an occupied total larger than the context, and an
+    // operator told to shed load that was never there.
+    const window = 8_192;
+    const ledger = new ContextLedger(window);
+    const compactor = new RunCompactor({
+      model: model(window),
+      runtime: summariser(),
+      apiKey: "local",
+      ledger,
+    });
+
+    const reported = 6_000;
+    const projected = await compactor.transform([
+      user("what does the SOP say about seal wear?"),
+      toolCall("call_1"),
+      toolResult("call_1", `[E1] Maintenance SOP, page 4 — ${"y".repeat(400)}`),
+      assistantWithUsage("The seal is worn past tolerance.", reported),
+    ]);
+
+    const snapshot = ledger.snapshot();
+    const whole = projected.reduce((total, message) => total + estimateTokens(message), 0);
+
+    expect(snapshot.occupied).toBe(whole);
+    // Concretely: nowhere near the 6,000 the provider reported for the request
+    // as a whole, because these four messages are not that request.
+    expect(snapshot.occupied).toBeLessThan(reported);
+  });
+
+  it("does not count the same tokens under two sections", async () => {
+    // A ledger whose parts exceed its whole cannot be used to decide anything.
+    // The failure it guards against is real: the harness estimator reports the
+    // provider's usage for the entire conversation as soon as the list it is
+    // given contains an assistant message carrying one, so measuring two halves
+    // that way counts the run once per half.
+    const window = 4_096;
+    const ledger = new ContextLedger(window);
+    const compactor = new RunCompactor({
+      model: model(window),
+      runtime: summariser(),
+      apiKey: "local",
+      ledger,
+    });
+
+    const projected = await compactor.transform(passageHeavyRun(12));
+    const whole = projected.reduce((total, message) => total + estimateTokens(message), 0);
+
+    // Nothing set `system`, `skill` or `toolSchema` here, so everything
+    // occupied is something this projection actually contains.
+    expect(ledger.snapshot().occupied).toBe(whole);
   });
 });
 

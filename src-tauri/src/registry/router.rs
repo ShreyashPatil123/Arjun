@@ -29,7 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ModelEntry, ModelRegistry, ModelRole};
+use super::{ModelEntry, ModelRegistry, ModelRole, Modality};
 use crate::ai_engine::vram_planner::{plan_gpu_offload, GpuOffloadPlan};
 use crate::capability::classifier::IntentClassifier;
 use crate::model_intelligence::intent::PromptIntent;
@@ -93,6 +93,10 @@ impl ModelRouter {
         prompt: &str,
         classification: Option<Classification>,
         vram_total_bytes: u64,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
     ) -> Result<RoutingDecision, RoutingFailure> {
         let classified = IntentClassifier::classify(prompt);
         // Taken before `intent` is moved into `role_for` below.
@@ -126,6 +130,10 @@ impl ModelRouter {
             reasons,
             intent_label,
             confidence,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
         )
     }
 
@@ -137,6 +145,10 @@ impl ModelRouter {
         role: ModelRole,
         classification: Option<Classification>,
         vram_total_bytes: u64,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
     ) -> Result<RoutingDecision, RoutingFailure> {
         let reasons = vec![format!(
             "The task needs a {} model, so no classification of the prompt was involved.",
@@ -150,6 +162,10 @@ impl ModelRouter {
             reasons,
             role.label().to_string(),
             1.0,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
         )
     }
 
@@ -161,13 +177,32 @@ impl ModelRouter {
         mut reasons: Vec<String>,
         intent_label: String,
         confidence: f32,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
     ) -> Result<RoutingDecision, RoutingFailure> {
         // Step 3: real candidates only.
-        let mut candidates = registry.candidates(role, classification);
+        let mut candidates = registry.candidates(
+            role,
+            classification,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
+        );
         if candidates.is_empty() {
             return Err(RoutingFailure {
                 role,
-                reason: Self::explain_no_candidates(registry, role, classification),
+                reason: Self::explain_no_candidates(
+                    registry,
+                    role,
+                    classification,
+                    required_modality,
+                    require_structured_output,
+                    available_runtime_profiles,
+                    allowed_licenses,
+                ),
             });
         }
 
@@ -233,6 +268,10 @@ impl ModelRouter {
         registry: &ModelRegistry,
         role: ModelRole,
         classification: Option<Classification>,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
     ) -> String {
         if registry.all().is_empty() {
             return "No models are registered yet. An administrator imports one in \
@@ -269,6 +308,50 @@ impl ModelRouter {
                 role.label(),
                 role.minimum_parameters_b()
             );
+        }
+
+        // Check modality filter
+        if let Some(modality) = required_modality {
+            if !serving.iter().any(|e| e.supports_modality(modality)) {
+                return format!(
+                    "No {} model supports the required modality ({}). A model with {} capability is needed.",
+                    role.label(),
+                    modality.label(),
+                    modality.label()
+                );
+            }
+        }
+
+        // Check structured output filter
+        if require_structured_output {
+            if !serving.iter().any(|e| e.supports_structured_output()) {
+                return format!(
+                    "No {} model supports structured output / tool calling. A model with this capability is needed.",
+                    role.label()
+                );
+            }
+        }
+
+        // Check runtime profile filter
+        if !available_runtime_profiles.is_empty() {
+            if !serving.iter().any(|e| e.runtime_profile_available(available_runtime_profiles)) {
+                return format!(
+                    "No {} model is compatible with the available runtime profiles ({}). A model compatible with one of these profiles is needed.",
+                    role.label(),
+                    available_runtime_profiles.join(", ")
+                );
+            }
+        }
+
+        // Check license filter
+        if !allowed_licenses.is_empty() {
+            if !serving.iter().any(|e| e.license_allowed(allowed_licenses)) {
+                return format!(
+                    "No {} model has an allowed license. Allowed licenses: {}. A model with an allowed license is needed.",
+                    role.label(),
+                    allowed_licenses.join(", ")
+                );
+            }
         }
 
         match classification {
@@ -341,6 +424,10 @@ mod tests {
             "Refactor this Python function and write a unit test for the null pointer case",
             None,
             24 * GB,
+            None,
+            false,
+            &[],
+            &[],
         )
         .unwrap();
 
@@ -349,6 +436,10 @@ mod tests {
             "Summarise the key findings in this inspection report and list them by severity",
             None,
             24 * GB,
+            None,
+            false,
+            &[],
+            &[],
         )
         .unwrap();
 
@@ -360,15 +451,25 @@ mod tests {
     #[test]
     fn an_unclear_prompt_goes_to_reasoning_rather_than_a_specialist() {
         let registry = stocked();
-        let decision = ModelRouter::route(&registry, "hello", None, 24 * GB).unwrap();
+        let decision =
+            ModelRouter::route(&registry, "hello", None, 24 * GB, None, false, &[], &[]).unwrap();
         assert_eq!(decision.role, ModelRole::Reasoning);
     }
 
     #[test]
     fn the_largest_model_that_fits_is_preferred() {
         let registry = stocked();
-        let decision = ModelRouter::route(&registry, "Explain the trade-offs here", None, 80 * GB)
-            .unwrap();
+        let decision = ModelRouter::route(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(decision.model_id, "qwen-32b");
         assert!(!decision.used_fallback);
     }
@@ -377,8 +478,17 @@ mod tests {
     #[test]
     fn a_small_gpu_falls_back_and_says_so() {
         let registry = stocked();
-        let decision = ModelRouter::route(&registry, "Explain the trade-offs here", None, 6 * GB)
-            .unwrap();
+        let decision = ModelRouter::route(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            6 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(decision.model_id, "qwen-8b", "the smallest cleared candidate");
         assert!(decision.used_fallback);
     }
@@ -386,15 +496,26 @@ mod tests {
     #[test]
     fn routing_to_a_role_directly_skips_classification() {
         let registry = stocked();
-        let decision =
-            ModelRouter::route_for_role(&registry, ModelRole::DocumentOcr, None, 8 * GB).unwrap();
+        let decision = ModelRouter::route_for_role(
+            &registry,
+            ModelRole::DocumentOcr,
+            None,
+            8 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(decision.model_id, "surya");
     }
 
     #[test]
     fn an_empty_registry_explains_what_to_do() {
         let registry = registry(vec![]);
-        let failure = ModelRouter::route(&registry, "anything", None, 24 * GB).unwrap_err();
+        let failure =
+            ModelRouter::route(&registry, "anything", None, 24 * GB, None, false, &[], &[])
+                .unwrap_err();
         assert!(failure.reason.contains("No models are registered"), "{}", failure.reason);
     }
 
@@ -406,6 +527,10 @@ mod tests {
             "Refactor this Python function and fix the stack trace",
             None,
             24 * GB,
+            None,
+            false,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(failure.reason.contains("too small"), "{}", failure.reason);
@@ -416,7 +541,17 @@ mod tests {
         let mut off = entry("qwen-8b", 8.0, vec![ModelRole::Reasoning]);
         off.enabled = false;
         let registry = registry(vec![off]);
-        let failure = ModelRouter::route(&registry, "Summarise this", None, 24 * GB).unwrap_err();
+        let failure = ModelRouter::route(
+            &registry,
+            "Summarise this",
+            None,
+            24 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(failure.reason.contains("disabled"), "{}", failure.reason);
     }
 
@@ -431,6 +566,10 @@ mod tests {
             "Summarise this",
             Some(Classification::VendorNegotiation),
             24 * GB,
+            None,
+            false,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(failure.reason.contains("Vendor negotiation"), "{}", failure.reason);
@@ -445,7 +584,9 @@ mod tests {
             "Summarise the inspection findings",
             "hello",
         ] {
-            let decision = ModelRouter::route(&registry, prompt, None, 24 * GB).unwrap();
+            let decision =
+                ModelRouter::route(&registry, prompt, None, 24 * GB, None, false, &[], &[])
+                    .unwrap();
             assert!(
                 !decision.reasons.is_empty(),
                 "no reasons recorded for {prompt:?}"

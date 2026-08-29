@@ -58,6 +58,9 @@ fn deps_with(
         skills: Arc::new(crate::skills::SkillRegistry::open(dir.path().join("__no_skills__"))),
         // On disk under the temp dir, so the durability and isolation these
         // tests assert are the real ones rather than a per-test map.
+        // The deployment's real checks, so these tests exercise the same
+        // refusal path production does rather than an empty registry.
+        hooks: Arc::new(crate::hooks::HookRegistry::with_builtin_policy()),
         memory: Arc::new(crate::agent_runtime::memory::MemoryStore::open(dir.path())),
         checkpoints: Arc::default(),
         emit: Arc::new(|_| {}),
@@ -104,7 +107,7 @@ async fn an_unknown_tool_is_refused_with_the_list_of_real_ones() {
     assert!(verdict["reason"]
         .as_str()
         .unwrap()
-        .contains("search_documents"));
+        .contains("knowledge.search_authorized"));
 }
 
 #[tokio::test]
@@ -223,7 +226,7 @@ async fn a_write_inside_the_runs_own_directory_is_put_to_a_person() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
-    assert_eq!(item.request.tool, "write_scoped_file");
+    assert_eq!(item.request.tool, "workspace.write_text");
     assert!(item.request.arguments.iter().any(|a| a.contains("note.txt")));
 
     waiting.abort();
@@ -646,25 +649,73 @@ fn a_missing_bundle_is_reported_with_the_path_and_the_fix() {
 }
 
 #[test]
-fn the_catalogue_is_the_eleven_tools_the_gateway_knows() {
+fn the_catalogue_is_exactly_the_tools_the_gateway_knows() {
     let mut names = catalogue();
     names.sort_unstable();
     assert_eq!(
         names,
         vec![
-            "create_docx",
-            "create_xlsx",
-            "execute_code",
-            "load_more_evidence",
-            "memory_promote_approved",
-            "memory_recall_authorized",
-            "read_scoped_file",
-            "run_calculation",
-            "search_documents",
-            "validate_artifact",
-            "write_scoped_file",
+            "agent.delegate_readonly",
+            "artifact.create_approval_note",
+            "artifact.create_calculation_workbook",
+            "artifact.verify_docx",
+            "calculation.evaluate_with_units",
+            "capability.search",
+            "knowledge.load_evidence_region",
+            "knowledge.search_authorized",
+            "media.extract_findings",
+            "memory.promote_approved",
+            "memory.recall_authorized",
+            "sandbox.run_code",
+            "sovereignty.get_evidence",
+            "workspace.read_text",
+            "workspace.write_text",
         ]
     );
+}
+
+/// The names in a record written before the rename still resolve to a tool.
+///
+/// The failure this prevents is quiet and late: an approval recorded months ago
+/// says `create_docx`, and a reader that cannot resolve it shows the reviewer an
+/// approval for a tool that appears not to exist — which reads as a corrupted
+/// record rather than an old one.
+#[test]
+fn a_record_written_before_the_rename_still_names_a_real_tool() {
+    use crate::orchestrator::tools::ToolName;
+
+    for (legacy, expected) in [
+        ("search_documents", ToolName::SearchDocuments),
+        ("load_more_evidence", ToolName::LoadMoreEvidence),
+        ("memory_recall_authorized", ToolName::MemoryRecallAuthorized),
+        ("memory_promote_approved", ToolName::MemoryPromoteApproved),
+        ("read_scoped_file", ToolName::ReadScopedFile),
+        ("write_scoped_file", ToolName::WriteScopedFile),
+        ("run_calculation", ToolName::RunCalculation),
+        ("create_docx", ToolName::CreateDocx),
+        ("create_xlsx", ToolName::CreateXlsx),
+        ("execute_code", ToolName::ExecuteCode),
+        ("validate_artifact", ToolName::ValidateArtifact),
+    ] {
+        assert_eq!(
+            ToolName::from_str(legacy),
+            Some(expected),
+            "{legacy} no longer resolves"
+        );
+    }
+}
+
+/// Reading an old name must not make the system start writing it again.
+///
+/// A migration that accepted both spellings *and* emitted whichever it was
+/// given would leave a record where the same tool appears under two names, and
+/// no later reader could count calls to it without knowing both.
+#[test]
+fn resolving_a_legacy_name_still_writes_the_current_one() {
+    use crate::orchestrator::tools::ToolName;
+
+    let resolved = ToolName::from_str("create_docx").expect("legacy name resolves");
+    assert_eq!(resolved.as_str(), "artifact.create_approval_note");
 }
 
 /// Deps with a plan registered, so the budget actually applies.
@@ -699,7 +750,7 @@ async fn a_tool_outside_the_plan_is_refused_without_stopping_the_run() {
     let reason = refused["reason"].as_str().unwrap();
     assert!(reason.contains("planned to use"), "{reason}");
     // It names what it *may* use, so the model can route around it.
-    assert!(reason.contains("search_documents"), "{reason}");
+    assert!(reason.contains("knowledge.search_authorized"), "{reason}");
 
     // And the run is still alive.
     let allowed = authorize(search("seal wear"), &deps).await.unwrap();

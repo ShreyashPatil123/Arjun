@@ -22,7 +22,7 @@ import { ContextLedger } from "./context-ledger.js";
 import { WorkingNotes, type WorkingNotesState } from "./working-notes.js";
 import { payloadPolicy } from "./providers.js";
 import { withToolCallRepair } from "./repair.js";
-import { GrantLedger, authorizeToolCall, buildTools } from "./tools.js";
+import { GrantLedger, authorizeToolCall, buildTools, fetchCatalogue } from "./tools.js";
 import { observeToolResult } from "./note-taking.js";
 
 /** What Rust sends with `run.start`. */
@@ -191,8 +191,22 @@ export async function startRun(
   // The notes are kept from what the tools returned rather than from what the
   // model chose to write down. See `note-taking.ts` — the entries that make a
   // resumption safe are exactly the ones a model does not think to record.
-  const tools = buildTools(peer, ledger, runId, request.model.id, (observation) =>
-    observeToolResult(notes, observation),
+  // Deferred discovery: Rust says which tools this run is eligible for, and
+  // only those get their schema loaded. The plan that decides it was fixed
+  // before the model was told anything, so nothing the model does afterwards
+  // can widen this — and a tool it is never shown is one it cannot spend a turn
+  // being refused for asking about.
+  //
+  // A catalogue that could not be fetched comes back empty, which is the
+  // failing-closed reading: silence from the gateway is not a list of tools.
+  const catalogue = await fetchCatalogue(peer, runId);
+  const tools = buildTools(
+    peer,
+    ledger,
+    runId,
+    request.model.id,
+    (observation) => observeToolResult(notes, observation),
+    catalogue.tools,
   );
 
   const contextLedger = new ContextLedger(request.model.contextWindow ?? 0);

@@ -177,7 +177,7 @@ mod tests {
         // A silent intersection cannot answer that.
         let narrowed = narrow(&[SearchDocuments], &[SearchDocuments, CreateDocx]);
         let said = narrowed.describe();
-        assert!(said.contains("create_docx"), "{said}");
+        assert!(said.contains("artifact.create_approval_note"), "{said}");
         assert!(said.contains("cannot add a tool"), "{said}");
     }
 

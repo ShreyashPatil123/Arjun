@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use crate::registry::{LoadSpec, ModelEntry, ModelRole, Runtime};
+use crate::registry::{LoadSpec, ModelEntry, ModelRole, Modality, Runtime};
 
 /// Reads a parameter count out of a model name.
 ///
@@ -78,6 +78,26 @@ fn infer_parameters_b(name: &str) -> Option<f32> {
         }
     }
     None
+}
+
+/// Guesses what modalities a model supports, from its name.
+///
+/// Defaults to text-only. A model with vision, audio or video indicators in
+/// its name gets those modalities added. An administrator corrects this in the
+/// manifest.
+fn infer_modalities(name: &str) -> Vec<Modality> {
+    let lowered = name.to_ascii_lowercase();
+    let mut modalities = vec![Modality::Text];
+
+    if lowered.contains("-vl")
+        || lowered.contains("vision")
+        || lowered.contains("llava")
+        || lowered.contains("llava")
+    {
+        modalities.push(Modality::Image);
+    }
+
+    modalities
 }
 
 /// Guesses what a model is for, from its name.
@@ -132,6 +152,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 sha256: None,
                 runtime: Runtime::LlamaCpp,
                 roles: infer_roles(&installed.model_name),
+                modalities: infer_modalities(&installed.model_name),
                 quantization: Some(installed.quantization.clone()),
                 parameters_b,
                 active_parameters_b: None,
@@ -139,6 +160,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 // KV-cache estimate does not rule the model out on a laptop.
                 context_length: 8192,
                 weights_bytes: installed.size_bytes,
+                supports_structured_output: false,
                 // Cleared for nothing. See the module note above.
                 permitted_classifications: Vec::new(),
                 path: installed.file_path.clone().into(),
@@ -153,6 +175,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 // Nothing on disk could say otherwise, so this is the runtime
                 // default made explicit rather than a guess.
                 serving: None,
+                required_runtime_profile: None,
                 enabled: true,
             }
         })
@@ -213,15 +236,18 @@ mod tests {
             sha256: None,
             runtime: Runtime::LlamaCpp,
             roles: vec![ModelRole::Coding, ModelRole::Reasoning],
+            modalities: vec![Modality::Text],
             quantization: None,
             parameters_b: 0.0,
             active_parameters_b: None,
             context_length: 8192,
             weights_bytes: 1,
+            supports_structured_output: false,
             permitted_classifications: Vec::new(),
             path: "mystery.gguf".into(),
             load: None,
             serving: None,
+            required_runtime_profile: None,
             enabled: true,
         };
         assert!(!entry.meets_floor(ModelRole::Coding));
@@ -282,15 +308,18 @@ mod tests {
             sha256: None,
             runtime: Runtime::LlamaCpp,
             roles: infer_roles("Qwen2.5-7B-Instruct"),
+            modalities: vec![Modality::Text],
             quantization: None,
             parameters_b: 7.0,
             active_parameters_b: None,
             context_length: 8192,
             weights_bytes: 1,
+            supports_structured_output: false,
             permitted_classifications: Vec::new(),
             path: "x.gguf".into(),
             load: None,
             serving: None,
+            required_runtime_profile: None,
             enabled: true,
         };
 

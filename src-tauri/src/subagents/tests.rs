@@ -439,7 +439,7 @@ async fn a_child_receives_only_the_tools_the_parent_and_profile_agree_on() {
     // The retriever declares one tool, so that is all it gets — even though the
     // parent could have given it eight.
     let reported = &spawned.result().findings[0].statement;
-    assert_eq!(reported, "search_documents");
+    assert_eq!(reported, "knowledge.search_authorized");
 }
 
 #[test]
@@ -744,7 +744,7 @@ async fn several_read_only_children_run_at_once_and_agree() {
         assert_eq!(result.status, ChildStatus::Completed);
         // Every one saw the same narrowed tool list. A race in the narrowing
         // would show up as one of them reporting something else.
-        assert_eq!(result.findings[0].statement, "search_documents");
+        assert_eq!(result.findings[0].statement, "knowledge.search_authorized");
         assert!(ids.insert(result.child_id.clone()), "a child id repeated");
     }
     assert_eq!(ids.len(), 8);
@@ -933,7 +933,7 @@ async fn a_parent_records_the_child_manifest_and_the_result_hash() {
 
     // The manifest: what the child was permitted, not what it asked for.
     let manifest = &started.payload["manifest"];
-    assert_eq!(manifest["allowedTools"][0], "search_documents");
+    assert_eq!(manifest["allowedTools"][0], "knowledge.search_authorized");
     assert_eq!(manifest["networkPermitted"], false);
     assert_eq!(manifest["maxChildren"], 0);
     assert_eq!(manifest["depth"], 1);

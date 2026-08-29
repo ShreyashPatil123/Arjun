@@ -114,6 +114,12 @@ pub struct TaskSnapshot {
     /// Memory operations refused. Non-zero is worth a look: it means the run
     /// asked for something policy would not give it.
     pub memory_refusals: u32,
+    /// Lifecycle checks that refused something.
+    ///
+    /// Non-zero means a deployment's own rule stopped this run doing something
+    /// the product's rules would have allowed — which is the one case where
+    /// reading the run's trace alone would leave somebody puzzled.
+    pub hook_blocks: u32,
     /// Bounded workers this run started.
     pub subagents_started: u32,
     pub subagents_finished: u32,
@@ -167,6 +173,7 @@ impl TaskSnapshot {
             memory_reads: 0,
             memory_promotions: 0,
             memory_refusals: 0,
+            hook_blocks: 0,
             compaction_events: Vec::new(),
             artifacts: Vec::new(),
             approvals_pending: 0,
@@ -354,6 +361,12 @@ impl TaskSnapshot {
             TaskEventType::ApprovalRequested => self.approvals_pending += 1,
             TaskEventType::ApprovalDecided => {
                 self.approvals_pending = self.approvals_pending.saturating_sub(1)
+            }
+
+            TaskEventType::HookEvaluated => {
+                if event.payload.get("blocked").and_then(Value::as_bool) == Some(true) {
+                    self.hook_blocks += 1;
+                }
             }
 
             TaskEventType::VerificationStarted => {}

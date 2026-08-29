@@ -26,9 +26,9 @@
  *    compromised runtime while the re-check protects against a bug in the grant.
  */
 
-import { Type } from "typebox";
 import type { AgentTool, BeforeToolCallContext, BeforeToolCallResult } from "@openclaw/agent-core";
 import { ErrorCode, type ErrorCodeValue } from "./protocol.js";
+import { definitionFor, TOOL_DEFINITIONS, type ToolDefinition } from "./catalogue.js";
 import { RpcError, type RpcPeer } from "./peer.js";
 
 /** What the Rust gateway replies to `tool.authorize`. Mirrors `GatewayVerdict`. */
@@ -122,11 +122,11 @@ export async function authorizeToolCall(
 }
 
 /** Builds one tool whose execution is performed by the Rust core. */
-function hostTool<TSchema extends ReturnType<typeof Type.Object>>(options: {
+function hostTool(options: {
   name: string;
   label: string;
   description: string;
-  parameters: TSchema;
+  parameters: ToolDefinition["parameters"];
   peer: RpcPeer;
   ledger: GrantLedger;
   runId: string;
@@ -211,19 +211,84 @@ function hostTool<TSchema extends ReturnType<typeof Type.Object>>(options: {
 }
 
 /**
- * The catalogue.
+ * One tool's eligibility, as Rust reported it.
  *
- * Mirrors `ToolName` in `src-tauri/src/orchestrator/tools.rs`, which is the
- * authority — a name absent there is refused by the gateway regardless of what
- * is declared here, and a name present there but missing here simply cannot be
- * asked for.
+ * Metadata only — no parameter schema. That is the whole point of asking: the
+ * schemas are the second largest fixed thing in the context window after the
+ * system prompt, and loading one for a tool this run may not call spends window
+ * on a definition whose only use is to have the gateway refuse it.
+ */
+export interface EligibleTool {
+  name: string;
+  summary: string;
+  /** Whether the call only reads. Decides whether it may run beside another. */
+  readOnly: boolean;
+  approvalClass: string;
+  network: string;
+  maxResponseBytes: number;
+  timeoutSeconds: number;
+}
+
+/** What `tool.catalogue` answers. */
+export interface Catalogue {
+  tools: EligibleTool[];
+  mode: string;
+}
+
+/**
+ * Asks Rust which tools this run may be offered.
  *
- * The descriptions are load-bearing. A local 7B model decides which tool to
- * reach for from these sentences alone, and the common failures are all
- * addressable in prose: answering from memory instead of searching, writing an
- * absolute path, recomputing a figure the calculation engine already produced,
- * describing a document it never created. Each description says the thing that
- * prevents its own tool's characteristic mistake.
+ * ## Why this side does not decide
+ *
+ * Eligibility depends on the run's plan and the machine's operating mode,
+ * neither of which is on this side of the wire. Deciding here would mean
+ * re-deriving them from something the child process can see, and the child
+ * process is the part of the system that is deliberately not trusted with that.
+ *
+ * ## Why a failure means no tools rather than all of them
+ *
+ * Failing closed. A gateway that cannot be reached has not said which tools are
+ * eligible, and reading silence as "all of them" would mean a transport fault
+ * widening the surface a model can reach — the one direction a fault must never
+ * move things in. A run with no tools can still answer from what it was told,
+ * and says plainly that it could not use any.
+ */
+export async function fetchCatalogue(peer: RpcPeer, runId: string): Promise<Catalogue> {
+  try {
+    const answer = (await peer.request("tool.catalogue", { runId })) as Catalogue;
+    return {
+      tools: Array.isArray(answer?.tools) ? answer.tools : [],
+      mode: typeof answer?.mode === "string" ? answer.mode : "unknown",
+    };
+  } catch {
+    return { tools: [], mode: "unknown" };
+  }
+}
+
+/**
+ * Builds the tools this run may actually use.
+ *
+ * ## Deferred loading, in two steps
+ *
+ * `eligible` is the metadata Rust returned. Only names in it get their schema
+ * loaded and handed to the model. A name Rust offered that this runtime has no
+ * definition for is skipped rather than guessed at — the two lists are kept in
+ * agreement by a test, and a runtime inventing a schema for a name it does not
+ * know would be inventing an interface to a tool it cannot call.
+ *
+ * Passing `undefined` builds the whole catalogue. That is for the health probe,
+ * which belongs to no run and has no plan to narrow against.
+ *
+ * ## Why execution mode is derived rather than declared
+ *
+ * A tool's `readOnly` flag decides it, in one place. Declaring the two
+ * separately is how a tool ends up marked read-only and running sequentially,
+ * or — much worse — marked as writing and running in parallel with a second
+ * write to the same path. The order of two writes should not be whichever
+ * finished first.
+ *
+ * Rust's answer wins where both have an opinion: it is the side that also
+ * enforces the consequence.
  */
 export function buildTools(
   peer: RpcPeer,
@@ -231,206 +296,37 @@ export function buildTools(
   runId: string,
   modelId: string,
   observe?: (observation: { tool: string; args: unknown; text: string }) => void,
+  eligible?: readonly EligibleTool[],
 ): AgentTool[] {
-  const shared = { peer, ledger, runId, modelId, observe };
-  return [
-    hostTool({
-      ...shared,
-      name: "search_documents",
-      label: "Search documents",
-      description:
-        "Search the organisation's own indexed documents and return passages with their source " +
-        "document and page. Results are filtered by what the signed-in user is permitted to read, " +
-        "so an absent document may exist but be out of scope rather than not exist. Use this " +
-        "before answering anything about internal procedure, specification, or correspondence; do " +
-        "not answer such questions from memory.",
-      parameters: Type.Object({
-        query: Type.String({
-          description:
-            "What to look for, in natural language. Specific technical terms retrieve better than paraphrase.",
-        }),
-      }),
-      executionMode: "parallel",
-    }),
+  const definitions =
+    eligible === undefined
+      ? TOOL_DEFINITIONS.map((definition) => ({ definition, readOnly: definition.readOnly }))
+      : eligible
+          .map((entry) => {
+            const definition = definitionFor(entry.name);
+            return definition ? { definition, readOnly: entry.readOnly } : undefined;
+          })
+          .filter((entry): entry is { definition: ToolDefinition; readOnly: boolean } =>
+            entry !== undefined,
+          );
 
+  return definitions.map(({ definition, readOnly }) =>
     hostTool({
-      ...shared,
-      name: "load_more_evidence",
-      label: "Read more of a document",
-      description:
-        "Read a specific page range of a document you have already retrieved a passage from, and " +
-        "add those passages to this task's evidence. Use this when a passage stops mid-clause, a " +
-        "table continues overleaf, or you need the paragraph around a citation. It reads a range, " +
-        "not a document: ask for the few pages you need. Whole documents are not available in one " +
-        "call, and asking for a wide range is refused rather than truncated. The documentSha256 is " +
-        "on every passage search_documents returned.",
-      parameters: Type.Object({
-        documentSha256: Type.String({
-          description: "The document identifier carried on a passage you already retrieved.",
-        }),
-        fromPage: Type.Integer({ description: "First page to read, 1-based and inclusive." }),
-        toPage: Type.Optional(
-          Type.Integer({
-            description:
-              "Last page to read, inclusive. Defaults to fromPage. At most 10 pages per call.",
-          }),
-        ),
-      }),
-      executionMode: "parallel",
+      peer,
+      ledger,
+      runId,
+      modelId,
+      observe,
+      name: definition.name,
+      label: definition.label,
+      description: definition.description,
+      parameters: definition.parameters,
+      // Reads may overlap: one cannot change what another returns, so several
+      // at once cost the operator the slowest rather than the sum. Everything
+      // that writes, produces a file, runs code or asks a person is serialised.
+      executionMode: readOnly ? "parallel" : "sequential",
     }),
-
-    hostTool({
-      ...shared,
-      name: "memory_recall_authorized",
-      label: "Read remembered notes",
-      description:
-        "Read what this deployment remembers for one scope: \"run\" (this task's own state), " +
-        "\"workspace\" (terminology, templates and stable facts agreed for this project), or " +
-        "\"user\" (the signed-in person's preferences). Returns only what that person is " +
-        "cleared to read. These are the deployment's own notes, not retrieved passages — a claim " +
-        "that needs a citation still needs search_documents. You cannot name a project or a " +
-        "person: both are taken from who is signed in.",
-      parameters: Type.Object({
-        scope: Type.Union([Type.Literal("run"), Type.Literal("workspace"), Type.Literal("user")], {
-          description: "Which scope to read.",
-        }),
-      }),
-      executionMode: "parallel",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "memory_promote_approved",
-      label: "Record an approved fact",
-      description:
-        "Copy one fact this run already holds into the project's memory, where later tasks will " +
-        "read it. Needs the id of an approval a person granted for that exact fact: the value is " +
-        "taken from what this run recorded, not from anything you write here, and the approval is " +
-        "checked against it. If the value has changed since the approval, this is refused and a " +
-        "new approval is needed. Use it only for stable project facts, never for figures quoted " +
-        "from a restricted document.",
-      parameters: Type.Object({
-        key: Type.String({
-          description: "The key this run recorded the fact under.",
-        }),
-        approvalId: Type.String({
-          description: "The id of the granted approval for this exact fact.",
-        }),
-      }),
-      // Writes something later runs read. Two promotions in one turn have an
-      // order, and it should not be whichever finished first.
-      executionMode: "sequential",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "read_scoped_file",
-      label: "Read a file",
-      description:
-        "Read a text file from this task's working directory. Only that directory is readable; " +
-        "any other path is refused. Use a relative name such as \"draft.md\". Binary files and " +
-        "documents are not read this way — use the document tools for those.",
-      parameters: Type.Object({
-        path: Type.String({ description: "Relative to the task's working directory." }),
-      }),
-      executionMode: "parallel",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "run_calculation",
-      label: "Calculate",
-      description:
-        "Evaluate an arithmetic expression with units, deterministically, showing every step. " +
-        "Use this for any number that will appear in a deliverable — a figure you worked out in " +
-        "your head is not verifiable and may be wrong. Quote the result exactly as returned; do " +
-        "not round it again or recompute it.",
-      parameters: Type.Object({
-        expression: Type.String({
-          description: 'With units, for example "1500 kg / 3 m^3" or "0.85 * 240 kW".',
-        }),
-      }),
-      executionMode: "parallel",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "validate_artifact",
-      label: "Check a produced file",
-      description:
-        "Re-open a file this task produced and confirm it is sound. Use it after producing a " +
-        "document or workbook, before telling anyone it is ready.",
-      parameters: Type.Object({
-        path: Type.String({ description: "Relative to the task's working directory." }),
-      }),
-      executionMode: "parallel",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "write_scoped_file",
-      label: "Write a file",
-      description:
-        "Write a text file into this task's working directory. A person must approve it before " +
-        "it happens, so expect a pause. Use this for notes and drafts; use create_docx or " +
-        "create_xlsx for deliverables somebody will be handed.",
-      parameters: Type.Object({
-        path: Type.String({ description: "Relative to the task's working directory." }),
-        content: Type.String({ description: "The complete file contents." }),
-      }),
-      executionMode: "sequential",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "create_docx",
-      label: "Produce a Word document",
-      description:
-        "Produce a Word document from a template. A person must approve it before it happens. " +
-        "Supply every field the template asks for as text; a missing required field fails the " +
-        "render rather than producing a document with a gap in it. The result is marked DRAFT " +
-        "until somebody signs it. Available templates: approval_note.",
-      parameters: Type.Object({
-        path: Type.String({ description: 'Relative, for example "approval-note.docx".' }),
-        template: Type.String({ description: "Template name, for example approval_note." }),
-        content: Type.Record(Type.String(), Type.String(), {
-          description: "Field name to text. Every value must be a string.",
-        }),
-      }),
-      executionMode: "sequential",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "create_xlsx",
-      label: "Produce a calculation workbook",
-      description:
-        "Produce an Excel workbook showing the working for every calculation this task has run, " +
-        "as live formulas Excel recomputes. A person must approve it. It draws on the " +
-        "run_calculation calls already made — it does not take figures as arguments, so run the " +
-        "calculations first.",
-      parameters: Type.Object({
-        path: Type.String({ description: 'Relative, for example "working.xlsx".' }),
-      }),
-      executionMode: "sequential",
-    }),
-
-    hostTool({
-      ...shared,
-      name: "execute_code",
-      label: "Run code in the sandbox",
-      description:
-        "Run code in an isolated sandbox with no network access. A person must approve it. " +
-        "NOTE: execution is not built yet — this call is accepted, checked and then refused, and " +
-        "nothing runs. Treat a refusal as final: say the code was not run rather than describing " +
-        "what it would have produced. Use run_calculation for arithmetic, which does work.",
-      parameters: Type.Object({
-        language: Type.String({ description: "For example python." }),
-        source: Type.String({ description: "The complete program." }),
-      }),
-      executionMode: "sequential",
-    }),
-  ];
+  );
 }
 
 export const toolErrorCode: ErrorCodeValue = ErrorCode.ToolFailed;

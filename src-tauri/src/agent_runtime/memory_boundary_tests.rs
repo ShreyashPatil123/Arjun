@@ -56,6 +56,9 @@ fn deps_in(department: Option<&str>) -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             dir.path().join("__no_skills__"),
         )),
         memory: Arc::new(MemoryStore::open(dir.path())),
+        // The deployment's real checks, so these tests exercise the same
+        // refusal path production does rather than an empty registry.
+        hooks: Arc::new(crate::hooks::HookRegistry::with_builtin_policy()),
         checkpoints: Arc::default(),
         emit: Arc::new(|_| {}),
         emit_durable: Arc::new(|_| {}),

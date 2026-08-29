@@ -692,7 +692,7 @@ mod tests {
         let read = load(dir.path(), "run-1").expect("loaded");
         assert_eq!(read.prompt, written.prompt);
         assert_eq!(read.routing.model_name, "Qwen2.5 7B");
-        assert_eq!(read.plan.permitted_tools, vec!["search_documents"]);
+        assert_eq!(read.plan.permitted_tools, vec!["knowledge.search_authorized"]);
     }
 
     #[test]

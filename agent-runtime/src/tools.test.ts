@@ -11,7 +11,7 @@ function scriptedPeer(script: (method: string, params: unknown) => Promise<unkno
   return peer;
 }
 
-function callContext(toolCallId = "tc-1", name = "search_documents", args: unknown = { query: "seal spec" }) {
+function callContext(toolCallId = "tc-1", name = "knowledge.search_authorized", args: unknown = { query: "seal spec" }) {
   return {
     toolCall: { type: "toolCall", id: toolCallId, name, arguments: args },
     args,
@@ -23,7 +23,7 @@ function callContext(toolCallId = "tc-1", name = "search_documents", args: unkno
 describe("authorizeToolCall", () => {
   it("records the grant and lets the call through when the gateway allows it", async () => {
     const ledger = new GrantLedger();
-    const peer = scriptedPeer(async () => ({ outcome: "allow", tool: "search_documents", grant: "g-1" } satisfies Verdict));
+    const peer = scriptedPeer(async () => ({ outcome: "allow", tool: "knowledge.search_authorized", grant: "g-1" } satisfies Verdict));
 
     const result = await authorizeToolCall(peer, ledger, "run-1", callContext());
 
@@ -44,10 +44,10 @@ describe("authorizeToolCall", () => {
   it("blocks rather than assuming consent when a person is required", async () => {
     const ledger = new GrantLedger();
     const peer = scriptedPeer(async () =>
-      ({ outcome: "needsApproval", tool: "write_scoped_file", summary: "Write 5 bytes to note.txt" } satisfies Verdict),
+      ({ outcome: "needsApproval", tool: "workspace.write_text", summary: "Write 5 bytes to note.txt" } satisfies Verdict),
     );
 
-    const result = await authorizeToolCall(peer, ledger, "run-1", callContext("tc-2", "write_scoped_file"));
+    const result = await authorizeToolCall(peer, ledger, "run-1", callContext("tc-2", "workspace.write_text"));
 
     expect(result?.block).toBe(true);
     expect(result?.reason).toContain("Write 5 bytes to note.txt");
@@ -72,14 +72,14 @@ describe("authorizeToolCall", () => {
     const seen: unknown[] = [];
     const peer = scriptedPeer(async (method, params) => {
       seen.push({ method, params });
-      return { outcome: "allow", tool: "search_documents", grant: "g" } satisfies Verdict;
+      return { outcome: "allow", tool: "knowledge.search_authorized", grant: "g" } satisfies Verdict;
     });
 
     await authorizeToolCall(peer, ledger, "run-42", callContext("tc-9"));
 
     expect(seen[0]).toEqual({
       method: "tool.authorize",
-      params: { runId: "run-42", toolCallId: "tc-9", tool: "search_documents", args: { query: "seal spec" } },
+      params: { runId: "run-42", toolCallId: "tc-9", tool: "knowledge.search_authorized", args: { query: "seal spec" } },
     });
   });
 });
@@ -109,23 +109,23 @@ describe("host tools", () => {
     // Rust's `ToolName` enum is the authority; a name here that is absent
     // there is refused by the gateway regardless of what this declares.
     expect(names.slice().sort()).toEqual([
-      "create_docx",
-      "create_xlsx",
-      "execute_code",
-      "load_more_evidence",
-      "memory_promote_approved",
-      "memory_recall_authorized",
-      "read_scoped_file",
-      "run_calculation",
-      "search_documents",
-      "validate_artifact",
-      "write_scoped_file",
+      "artifact.create_approval_note",
+      "artifact.create_calculation_workbook",
+      "sandbox.run_code",
+      "knowledge.load_evidence_region",
+      "memory.promote_approved",
+      "memory.recall_authorized",
+      "workspace.read_text",
+      "calculation.evaluate_with_units",
+      "knowledge.search_authorized",
+      "artifact.verify_docx",
+      "workspace.write_text",
     ]);
   });
 
   it("refuses to execute without a grant, so the gateway cannot be skipped", async () => {
     const peer = scriptedPeer(async () => ({ text: "should never be reached" }));
-    const tool = buildTools(peer, new GrantLedger(), "run-1", "qwen2.5-coder-7b").find((t) => t.name === "search_documents")!;
+    const tool = buildTools(peer, new GrantLedger(), "run-1", "qwen2.5-coder-7b").find((t) => t.name === "knowledge.search_authorized")!;
 
     await expect(tool.execute("tc-unauthorised", { query: "x" })).rejects.toMatchObject({
       code: "refused",
@@ -139,7 +139,7 @@ describe("host tools", () => {
       calls.push({ method, params });
       return { text: "3 passages", details: { hits: 3 } };
     });
-    const tool = buildTools(peer, ledger, "run-1", "qwen2.5-coder-7b").find((t) => t.name === "search_documents")!;
+    const tool = buildTools(peer, ledger, "run-1", "qwen2.5-coder-7b").find((t) => t.name === "knowledge.search_authorized")!;
     ledger.put("tc-1", "g-1");
 
     const result = await tool.execute("tc-1", { query: "seal spec" });
@@ -151,7 +151,7 @@ describe("host tools", () => {
       params: {
         runId: "run-1",
         toolCallId: "tc-1",
-        tool: "search_documents",
+        tool: "knowledge.search_authorized",
         args: { query: "seal spec" },
         grant: "g-1",
         model: "qwen2.5-coder-7b",
@@ -164,7 +164,7 @@ describe("host tools", () => {
 
   it("describes the tool well enough for a model to know when to reach for it", () => {
     const peer = scriptedPeer(async () => ({}));
-    const tool = buildTools(peer, new GrantLedger(), "run-1", "qwen2.5-coder-7b").find((t) => t.name === "search_documents")!;
+    const tool = buildTools(peer, new GrantLedger(), "run-1", "qwen2.5-coder-7b").find((t) => t.name === "knowledge.search_authorized")!;
     expect(tool.description).toMatch(/permitted to read/i);
     expect(tool.description).toMatch(/do not answer such questions from memory/i);
   });

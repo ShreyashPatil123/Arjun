@@ -17,6 +17,7 @@ import { convertToLlm, type AgentMessage } from "@openclaw/agent-core";
 import { RpcPeer, type PeerTransport } from "./peer.js";
 import { withToolCallRepair } from "./repair.js";
 import { startRun, type ActiveRun, type RunRequest } from "./run.js";
+import { TOOL_DEFINITIONS } from "./catalogue.js";
 
 function chunk(delta: unknown, finishReason: string | null = null): string {
   return `data: ${JSON.stringify({
@@ -92,6 +93,28 @@ function modelServer(turns: string[][]): Promise<{
   });
 }
 
+/**
+ * The eligibility answer Rust gives a run with an ordinary plan.
+ *
+ * Built from this runtime's own catalogue so a tool added later is offered to
+ * these tests automatically — a fixed list here would silently stop exercising
+ * whatever was added after it was written.
+ */
+function eligibleTools() {
+  return {
+    tools: TOOL_DEFINITIONS.map((definition) => ({
+      name: definition.name,
+      summary: definition.label,
+      readOnly: definition.readOnly,
+      approvalClass: definition.readOnly ? "automatic" : "personBeforeEffect",
+      network: "none",
+      maxResponseBytes: 16 * 1024,
+      timeoutSeconds: 30,
+    })),
+    mode: "Work",
+  };
+}
+
 function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
   const calls: Array<{ method: string; params: unknown }> = [];
   const events: Array<{ runId: string; event: { type: string } }> = [];
@@ -100,7 +123,10 @@ function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
 
   peer.request = ((method: string, params: unknown) => {
     calls.push({ method, params });
-    const handler = handlers[method];
+    // Served by default so each test can be about its own property rather than
+    // about the one-off eligibility fetch every run makes. A test that cares
+    // what the catalogue said overrides it like any other handler.
+    const handler = handlers[method] ?? (method === "tool.catalogue" ? eligibleTools : undefined);
     if (!handler) return Promise.reject(new Error(`core stub has no ${method}`));
     return Promise.resolve(handler(params));
   }) as RpcPeer["request"];
@@ -108,7 +134,21 @@ function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
     if (method === "run.event") events.push(params as { runId: string; event: { type: string } });
   }) as RpcPeer["notify"];
 
-  return { peer, calls, events };
+  return {
+    peer,
+    calls,
+    events,
+    /**
+     * The methods this run called about tools, without the eligibility fetch.
+     *
+     * `calls` still holds every request, so nothing is hidden. This is what a
+     * test asserting a call *sequence* wants: the fetch happens once at start-up
+     * and says nothing about whether authorisation preceded execution.
+     */
+    get toolMethods() {
+      return calls.map((call) => call.method).filter((method) => method !== "tool.catalogue");
+    },
+  };
 }
 
 function request(baseUrl: string, prompt = "What is the seal specification?"): RunRequest {
@@ -120,7 +160,7 @@ function request(baseUrl: string, prompt = "What is the seal specification?"): R
   };
 }
 
-const allow = () => ({ outcome: "allow", tool: "search_documents", grant: "g" });
+const allow = () => ({ outcome: "allow", tool: "knowledge.search_authorized", grant: "g" });
 
 let server: Awaited<ReturnType<typeof modelServer>> | undefined;
 afterEach(async () => {
@@ -135,7 +175,7 @@ describe("repairing a tool call written as prose", () => {
     stopReason: "stop",
   });
 
-  function repairing(text: string, names: string[] = ["search_documents"]) {
+  function repairing(text: string, names: string[] = ["knowledge.search_authorized"]) {
     const inner = {
       [Symbol.asyncIterator]: async function* () {},
       result: async () => assistantSaying(text),
@@ -160,15 +200,15 @@ describe("repairing a tool call written as prose", () => {
    * knows the format the first model happened to emit.
    */
   it.each([
-    ["named bracket", `[search_documents]
-{"query":"seal spec"}[/search_documents]`],
-    ["tool bracket", `[tool:search_documents] {"query":"seal spec"}`],
-    ["legacy marker", `[search_documents]
+    ["named bracket", `[knowledge.search_authorized]
+{"query":"seal spec"}[/knowledge.search_authorized]`],
+    ["tool bracket", `[tool:knowledge.search_authorized] {"query":"seal spec"}`],
+    ["legacy marker", `[knowledge.search_authorized]
 {"query":"seal spec"}[END_TOOL_REQUEST]`],
   ])("promotes a %s call into a real one", async (_label, text) => {
     const toolCalls = await repaired(text);
     expect(toolCalls).toHaveLength(1);
-    expect(toolCalls[0]?.name).toBe("search_documents");
+    expect(toolCalls[0]?.name).toBe("knowledge.search_authorized");
     expect(toolCalls[0]?.arguments).toEqual({ query: "seal spec" });
   });
 
@@ -184,9 +224,9 @@ describe("repairing a tool call written as prose", () => {
     // a call. The gateway would refuse it; not manufacturing it means the
     // refusal never has to happen.
     const toolCalls = await repaired(
-      `[search_documents]
-{"query":"seal spec"}[/search_documents]`,
-      ["run_calculation"],
+      `[knowledge.search_authorized]
+{"query":"seal spec"}[/knowledge.search_authorized]`,
+      ["calculation.evaluate_with_units"],
     );
     expect(toolCalls).toHaveLength(0);
   });
@@ -202,9 +242,9 @@ describe("running independent tools together", () => {
   it("issues every authorisation and every execution for one turn", async () => {
     server = await modelServer([
       callTools([
-        { id: "call_1", name: "search_documents", args: { query: "seal" } },
-        { id: "call_2", name: "search_documents", args: { query: "gasket" } },
-        { id: "call_3", name: "search_documents", args: { query: "flange" } },
+        { id: "call_1", name: "knowledge.search_authorized", args: { query: "seal" } },
+        { id: "call_2", name: "knowledge.search_authorized", args: { query: "gasket" } },
+        { id: "call_3", name: "knowledge.search_authorized", args: { query: "flange" } },
       ]),
       say("Three passages found."),
     ]);
@@ -222,8 +262,8 @@ describe("running independent tools together", () => {
   it("still authorises each call separately, so parallelism buys no permission", async () => {
     server = await modelServer([
       callTools([
-        { id: "call_1", name: "search_documents", args: { query: "seal" } },
-        { id: "call_2", name: "search_documents", args: { query: "salary list" } },
+        { id: "call_1", name: "knowledge.search_authorized", args: { query: "seal" } },
+        { id: "call_2", name: "knowledge.search_authorized", args: { query: "salary list" } },
       ]),
       say("One was refused."),
     ]);
@@ -263,7 +303,7 @@ describe("steering a run in flight", () => {
     // The run makes a tool call, which gives the loop a steering point before
     // the next model turn.
     server = await modelServer([
-      callTool("call_1", "search_documents", { query: "seal" }),
+      callTool("call_1", "knowledge.search_authorized", { query: "seal" }),
       say("Using the 2019 revision."),
     ]);
     const core = coreStub({
@@ -290,7 +330,7 @@ describe("stopping a run part-way", () => {
     // The guidance exists so a continuation does not repeat a write that
     // already happened. It is a `custom` message, which the default converter
     // drops — this asserts it survives conversion, which is what makes it real.
-    server = await modelServer([callTool("call_1", "search_documents", { query: "seal" }), say("ok")]);
+    server = await modelServer([callTool("call_1", "knowledge.search_authorized", { query: "seal" }), say("ok")]);
     const core = coreStub({
       "tool.authorize": allow,
       "tool.execute": () => {

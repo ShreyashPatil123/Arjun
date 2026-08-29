@@ -25,6 +25,7 @@
 //! reviewed — from being pointed at vendor negotiations.
 
 pub mod discovery;
+pub mod fit_score;
 pub mod router;
 
 use std::collections::BTreeSet;
@@ -50,6 +51,30 @@ impl Runtime {
         match self {
             Runtime::LlamaCpp => "llama.cpp",
             Runtime::PythonSidecar => "Python sidecar",
+        }
+    }
+}
+
+/// Modalities a model can process.
+///
+/// Used as a hard gate in the router: a task requiring an unsupported modality
+/// is refused rather than routed to a model that cannot handle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    Video,
+}
+
+impl Modality {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Modality::Text => "text",
+            Modality::Image => "image",
+            Modality::Audio => "audio",
+            Modality::Video => "video",
         }
     }
 }
@@ -134,6 +159,10 @@ pub struct ModelEntry {
     pub sha256: Option<String>,
     pub runtime: Runtime,
     pub roles: Vec<ModelRole>,
+    /// Modalities this model supports (text, image, audio, video).
+    /// Used as a hard gate: a task requiring an unsupported modality is refused.
+    #[serde(default)]
+    pub modalities: Vec<Modality>,
     pub quantization: Option<String>,
     /// Total parameters in billions. For a mixture-of-experts model this is the
     /// total, with `activeParametersB` carrying what actually runs per token.
@@ -143,6 +172,10 @@ pub struct ModelEntry {
     pub context_length: u32,
     /// Size of the weights on disk, which is what has to fit in memory.
     pub weights_bytes: u64,
+    /// Whether this model supports structured output / tool calling.
+    /// Used as a hard gate for roles that require it (coding, tool-calling).
+    #[serde(default)]
+    pub supports_structured_output: bool,
     /// Classifications this model may be used on. Empty means none — a model
     /// nobody has reviewed is not usable, rather than usable on everything.
     #[serde(default)]
@@ -165,6 +198,10 @@ pub struct ModelEntry {
     /// not provision. See [`crate::serving::ServingSpec`].
     #[serde(default)]
     pub serving: Option<crate::serving::ServingSpec>,
+    /// Runtime profile required to run this model (e.g., "cuda", "vulkan", "cpu").
+    /// Used as a hard gate: the model is only eligible if the profile is available.
+    #[serde(default)]
+    pub required_runtime_profile: Option<String>,
     /// Administrators disable a model without deleting it.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -208,6 +245,50 @@ impl ModelEntry {
     pub fn meets_floor(&self, role: ModelRole) -> bool {
         let effective = self.active_parameters_b.unwrap_or(self.parameters_b);
         effective >= role.minimum_parameters_b()
+    }
+
+    /// Whether this model supports the required modality.
+    ///
+    /// A model with no declared modalities is treated as text-only for
+    /// backwards compatibility.
+    pub fn supports_modality(&self, modality: Modality) -> bool {
+        if self.modalities.is_empty() {
+            return modality == Modality::Text;
+        }
+        self.modalities.contains(&modality)
+    }
+
+    /// Whether this model supports structured output / tool calling.
+    pub fn supports_structured_output(&self) -> bool {
+        self.supports_structured_output
+    }
+
+    /// Whether the required runtime profile is available.
+    ///
+    /// If the model declares no required profile, it is assumed to run on any
+    /// profile (backwards compatibility).
+    pub fn runtime_profile_available(&self, available_profiles: &[String]) -> bool {
+        match &self.required_runtime_profile {
+            Some(required) => available_profiles.iter().any(|p| p == required),
+            None => true,
+        }
+    }
+
+    /// Whether the model's hash has been verified.
+    ///
+    /// A model without a declared hash cannot be verified and is treated as
+    /// unverified (not a hard failure, but reported).
+    pub fn hash_verified(&self) -> bool {
+        self.sha256.is_some()
+    }
+
+    /// Whether the model's license is in the allowed list.
+    /// An empty allowed list means no restriction (all licenses allowed).
+    pub fn license_allowed(&self, allowed_licenses: &[String]) -> bool {
+        if allowed_licenses.is_empty() {
+            return true;
+        }
+        allowed_licenses.iter().any(|l| l == &self.license)
     }
 }
 
@@ -341,10 +422,20 @@ impl ModelRegistry {
 
     /// Models that are enabled, serve this role, clear its floor, and are
     /// permitted for this material — the candidates the router chooses among.
+    ///
+    /// Additional hard gates:
+    /// - `required_modality`: the task's required modality (text, image, etc.)
+    /// - `require_structured_output`: whether the role requires structured output/tool calling
+    /// - `available_runtime_profiles`: runtime profiles available on this machine
+    /// - `allowed_licenses`: licenses permitted by policy
     pub fn candidates(
         &self,
         role: ModelRole,
         classification: Option<Classification>,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
     ) -> Vec<&ModelEntry> {
         self.entries
             .iter()
@@ -355,6 +446,22 @@ impl ModelRegistry {
                 Some(c) => e.permits(c),
                 None => true,
             })
+            .filter(|e| {
+                if let Some(modality) = required_modality {
+                    e.supports_modality(modality)
+                } else {
+                    true
+                }
+            })
+            .filter(|e| {
+                if require_structured_output {
+                    e.supports_structured_output()
+                } else {
+                    true
+                }
+            })
+            .filter(|e| e.runtime_profile_available(available_runtime_profiles))
+            .filter(|e| e.license_allowed(allowed_licenses))
             .collect()
     }
 }
@@ -372,11 +479,13 @@ pub(crate) mod tests {
             sha256: None,
             runtime: Runtime::LlamaCpp,
             roles,
+            modalities: vec![Modality::Text],
             quantization: Some("Q4_K_M".into()),
             parameters_b: params,
             active_parameters_b: None,
             context_length: 32_768,
             weights_bytes: (params * 0.6 * 1e9) as u64,
+            supports_structured_output: false,
             permitted_classifications: Classification::ALL.to_vec(),
             path: PathBuf::from(format!("{id}.gguf")),
             load: Some(LoadSpec {
@@ -385,6 +494,7 @@ pub(crate) mod tests {
                 quantization: "Q4_K_M".into(),
             }),
             serving: None,
+            required_runtime_profile: None,
             enabled: true,
         }
     }
@@ -423,7 +533,7 @@ pub(crate) mod tests {
             entry("coder", 8.0, vec![ModelRole::Coding]),
             entry("thinker", 8.0, vec![ModelRole::Reasoning]),
         ]);
-        let coding = registry.candidates(ModelRole::Coding, None);
+        let coding = registry.candidates(ModelRole::Coding, None, None, false, &[], &[]);
         assert_eq!(coding.len(), 1);
         assert_eq!(coding[0].id, "coder");
     }
@@ -433,9 +543,9 @@ pub(crate) mod tests {
     #[test]
     fn a_model_below_the_coding_floor_is_not_a_candidate() {
         let registry = registry(vec![entry("tiny", 3.0, vec![ModelRole::Coding])]);
-        assert!(registry.candidates(ModelRole::Coding, None).is_empty());
+        assert!(registry.candidates(ModelRole::Coding, None, None, false, &[], &[]).is_empty());
         // The same model is fine for reasoning, whose floor is lower.
-        assert_eq!(registry.candidates(ModelRole::Reasoning, None).len(), 0);
+        assert_eq!(registry.candidates(ModelRole::Reasoning, None, None, false, &[], &[]).len(), 0);
     }
 
     #[test]
@@ -444,8 +554,8 @@ pub(crate) mod tests {
             entry("embed", 0.3, vec![ModelRole::Embedding]),
             entry("docvlm", 1.2, vec![ModelRole::DocumentOcr]),
         ]);
-        assert_eq!(registry.candidates(ModelRole::Embedding, None).len(), 1);
-        assert_eq!(registry.candidates(ModelRole::DocumentOcr, None).len(), 1);
+        assert_eq!(registry.candidates(ModelRole::Embedding, None, None, false, &[], &[]).len(), 1);
+        assert_eq!(registry.candidates(ModelRole::DocumentOcr, None, None, false, &[], &[]).len(), 1);
     }
 
     /// A sparse model is judged on what actually runs per token.
@@ -464,7 +574,7 @@ pub(crate) mod tests {
         let mut disabled = entry("retired", 8.0, vec![ModelRole::Reasoning]);
         disabled.enabled = false;
         let registry = registry(vec![disabled]);
-        assert!(registry.candidates(ModelRole::Reasoning, None).is_empty());
+        assert!(registry.candidates(ModelRole::Reasoning, None, None, false, &[], &[]).is_empty());
         // But it is still listed, so an administrator can see and re-enable it.
         assert_eq!(registry.all().len(), 1);
     }
@@ -479,7 +589,7 @@ pub(crate) mod tests {
         for classification in Classification::ALL {
             assert!(
                 registry
-                    .candidates(ModelRole::Reasoning, Some(*classification))
+                    .candidates(ModelRole::Reasoning, Some(*classification), None, false, &[], &[])
                     .is_empty(),
                 "an unreviewed model should not be usable on {}",
                 classification.label()
@@ -495,12 +605,12 @@ pub(crate) mod tests {
 
         assert_eq!(
             registry
-                .candidates(ModelRole::Reasoning, Some(Classification::Internal))
+                .candidates(ModelRole::Reasoning, Some(Classification::Internal), None, false, &[], &[])
                 .len(),
             1
         );
         assert!(registry
-            .candidates(ModelRole::Reasoning, Some(Classification::Financial))
+            .candidates(ModelRole::Reasoning, Some(Classification::Financial), None, false, &[], &[])
             .is_empty());
     }
 

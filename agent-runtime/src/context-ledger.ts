@@ -41,7 +41,7 @@
  * a screen* rather than a run that compacts when it should not.
  */
 
-import { estimateContextTokens, type AgentMessage } from "@openclaw/agent-core";
+import { estimateContextTokens, estimateTokens, type AgentMessage } from "@openclaw/agent-core";
 
 /** The independently-growing parts of a context window. */
 export const CONTEXT_SECTIONS = [
@@ -126,9 +126,22 @@ export class ContextLedger {
    * pages to vision models, and counting a page image by its characters reads
    * it as ~0 tokens — which is how a ledger ends up claiming plenty of headroom
    * on the turn that overflows.
+   *
+   * Summed **per message** rather than measured with `estimateContextTokens`,
+   * and the difference is not cosmetic. That function short-circuits to the
+   * provider's own reported usage as soon as the list contains an assistant
+   * message carrying one — a sound reading of a whole context and a wrong one
+   * for a *part* of it. Two sections measured that way do not sum to the context
+   * they were cut from: whichever half caught the usage-bearing message reports
+   * the entire conversation, and the other reports only itself. A ledger whose
+   * parts exceed its whole cannot be used to decide anything, which is the only
+   * reason to keep one.
    */
   setMessages(section: ContextSection, messages: AgentMessage[]): void {
-    this.set(section, estimateContextTokens(messages).tokens);
+    this.set(
+      section,
+      messages.reduce((total, message) => total + estimateTokens(message), 0),
+    );
   }
 
   /** Adds to a section. For things that arrive one at a time, like passages. */

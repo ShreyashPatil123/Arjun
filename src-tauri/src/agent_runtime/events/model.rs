@@ -131,6 +131,18 @@ pub enum TaskEventType {
     ApprovalRequested,
     ApprovalDecided,
 
+    // -- Hooks ------------------------------------------------------------
+    /// A deterministic check ran at a lifecycle point.
+    ///
+    /// Written only when a check had something to say — a refusal, a failure,
+    /// or a note. A hook that passed silently is the overwhelmingly common case
+    /// and recording it would bury the ones that matter in a run's own noise.
+    ///
+    /// The payload carries the point, the hook's name, and its bounded reason.
+    /// Never the material the check was about: this record is read by people
+    /// who are not cleared for what the run was handling.
+    HookEvaluated,
+
     // -- Verification -----------------------------------------------------
     /// The answer is being checked against the evidence the run actually holds.
     VerificationStarted,
@@ -193,6 +205,7 @@ impl TaskEventType {
             TaskEventType::MemoryForgotten => "memory_forgotten",
             TaskEventType::ApprovalRequested => "approval_requested",
             TaskEventType::ApprovalDecided => "approval_decided",
+            TaskEventType::HookEvaluated => "hook_evaluated",
             TaskEventType::VerificationStarted => "verification_started",
             TaskEventType::RunCompleted => "run_completed",
             TaskEventType::RunFailed => "run_failed",
@@ -236,6 +249,7 @@ impl TaskEventType {
             "memory_forgotten" => TaskEventType::MemoryForgotten,
             "approval_requested" => TaskEventType::ApprovalRequested,
             "approval_decided" => TaskEventType::ApprovalDecided,
+            "hook_evaluated" => TaskEventType::HookEvaluated,
             "verification_started" => TaskEventType::VerificationStarted,
             "run_completed" => TaskEventType::RunCompleted,
             "run_failed" => TaskEventType::RunFailed,

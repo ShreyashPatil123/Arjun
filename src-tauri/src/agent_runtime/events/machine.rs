@@ -326,7 +326,11 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         // a transition would make a fan-out of four readers look like four
         // state changes.
         | E::SubagentStarted
-        | E::SubagentStopped => return Transition::Stays,
+        | E::SubagentStopped
+        // A hook firing says something about a call the run was making, not
+        // about where the run has got to. A refused call leaves the run
+        // running with one fewer option, exactly as a gateway refusal does.
+        | E::HookEvaluated => return Transition::Stays,
     };
 
     // A terminal event is always legal from any live state: a run can be

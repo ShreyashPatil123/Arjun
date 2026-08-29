@@ -336,7 +336,7 @@ mod tests {
         assert!(!verdict.is_allowed());
         assert!(verdict.message().contains("no tool called"));
         // Naming the alternatives is what lets an agent correct itself.
-        assert!(verdict.message().contains("search_documents"));
+        assert!(verdict.message().contains("knowledge.search_authorized"));
     }
 
     // ── Arguments ────────────────────────────────────────────────────────

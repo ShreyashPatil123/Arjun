@@ -11,6 +11,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod documents;
 pub mod health;
+pub mod hooks;
 pub mod identity;
 pub mod knowledge;
 pub mod agent_runtime;
@@ -37,6 +38,8 @@ pub mod lora;
 pub mod installer;
 pub mod plugins;
 pub mod memory_engine;
+pub mod media_adapter;
+pub mod sih_workflow;
 
 use std::sync::Arc;
 use tauri::Manager;

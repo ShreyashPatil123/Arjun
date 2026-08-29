@@ -61,8 +61,17 @@ impl ToolGrammar {
 }
 
 /// The rule name for one tool's call shape.
+///
+/// GBNF rule names admit letters, digits and hyphens — not the dot a namespaced
+/// tool name carries, nor the underscore. Both are folded to a hyphen, which
+/// keeps names distinct because no two tools differ only in that punctuation.
+/// The tool's real name still appears verbatim inside the rule body, where it is
+/// a quoted JSON string and any character is fine; only the identifier is
+/// rewritten. Getting this wrong does not fail a test — it emits a grammar
+/// llama.cpp rejects at parse time, which surfaces as a constrained turn that
+/// produces nothing at all.
 fn rule_name(tool: ToolName) -> String {
-    format!("call-{}", tool.as_str().replace('_', "-"))
+    format!("call-{}", tool.as_str().replace(['_', '.'], "-"))
 }
 
 /// The GBNF fragment matching one argument's value.
@@ -156,11 +165,15 @@ mod tests {
     fn a_grammar_admits_only_the_tools_it_was_given() {
         let grammar = build(&[ToolName::SearchDocuments, ToolName::RunCalculation]).unwrap();
 
-        assert!(grammar.gbnf.contains("search_documents"));
-        assert!(grammar.gbnf.contains("run_calculation"));
+        assert!(grammar.gbnf.contains("knowledge.search_authorized"));
+        assert!(grammar.gbnf.contains("calculation.evaluate_with_units"));
 
         // Nothing else exists as a spellable path.
-        for absent in ["execute_code", "write_scoped_file", "create_docx"] {
+        for absent in [
+            "sandbox.run_code",
+            "workspace.write_text",
+            "artifact.create_approval_note",
+        ] {
             assert!(
                 !grammar.gbnf.contains(absent),
                 "{absent} should not be reachable in this grammar"
@@ -173,7 +186,7 @@ mod tests {
     #[test]
     fn a_tool_outside_the_plan_is_unspellable() {
         let grammar = build(&[ToolName::SearchDocuments]).unwrap();
-        assert!(!grammar.gbnf.contains("execute_code"));
+        assert!(!grammar.gbnf.contains("sandbox.run_code"));
     }
 
     #[test]
@@ -198,9 +211,36 @@ mod tests {
     fn each_tool_has_its_own_complete_call_shape() {
         let grammar = build(&[ToolName::SearchDocuments, ToolName::ExecuteCode]).unwrap();
 
-        assert!(grammar.gbnf.contains("call-search-documents ::="));
-        assert!(grammar.gbnf.contains("call-execute-code ::="));
-        assert!(grammar.gbnf.starts_with("root ::= call-search-documents | call-execute-code"));
+        assert!(grammar.gbnf.contains("call-knowledge-search-authorized ::="));
+        assert!(grammar.gbnf.contains("call-sandbox-run-code ::="));
+        assert!(grammar
+            .gbnf
+            .starts_with("root ::= call-knowledge-search-authorized | call-sandbox-run-code"));
+    }
+
+    /// A rule name llama.cpp cannot parse produces a constrained turn that
+    /// emits nothing at all — a failure that looks like a hung model rather
+    /// than a malformed grammar, which is why it is asserted rather than left
+    /// to be noticed.
+    #[test]
+    fn no_rule_name_carries_a_character_gbnf_cannot_spell() {
+        for tool in ToolName::ALL {
+            let rule = rule_name(*tool);
+            assert!(
+                rule.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{} produces the unusable rule name {rule}",
+                tool.as_str()
+            );
+        }
+    }
+
+    /// Folding `.` and `_` to `-` must not make two tools share a rule name:
+    /// the second would silently replace the first in the alternation.
+    #[test]
+    fn every_tool_keeps_its_own_rule_name() {
+        let names: std::collections::BTreeSet<String> =
+            ToolName::ALL.iter().map(|t| rule_name(*t)).collect();
+        assert_eq!(names.len(), ToolName::ALL.len());
     }
 
     #[test]
@@ -253,17 +293,23 @@ mod tests {
         let grammar = build(&[ToolName::SearchDocuments, ToolName::RunCalculation]).unwrap();
         let preamble = grammar.preamble();
 
-        assert!(preamble.contains("search_documents"));
-        assert!(preamble.contains("run_calculation"));
-        assert!(!preamble.contains("execute_code"));
+        assert!(preamble.contains("knowledge.search_authorized"));
+        assert!(preamble.contains("calculation.evaluate_with_units"));
+        assert!(!preamble.contains("sandbox.run_code"));
     }
 
     /// It competes for attention with the task, so it stays short.
+    ///
+    /// The ceiling is against the whole catalogue, which is the worst case and
+    /// not the usual one: a grammar is built from the plan's permitted tools,
+    /// and a plan permits a handful. Namespaced names cost roughly ten
+    /// characters each over the old flat ones — paid back in the model reaching
+    /// for the right tool, which is worth more than the tokens.
     #[test]
     fn the_preamble_is_brief() {
         let grammar = build(ToolName::ALL).unwrap();
         assert!(
-            grammar.preamble().len() < 400,
+            grammar.preamble().len() < 600,
             "the preamble should not crowd out the task itself"
         );
     }

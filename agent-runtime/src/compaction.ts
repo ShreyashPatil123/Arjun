@@ -210,6 +210,41 @@ function toolResultIdOf(message: AgentMessage): string | undefined {
   return shape.role === "toolResult" ? shape.toolCallId : undefined;
 }
 
+/** A message's text blocks, concatenated. Empty for a message with none. */
+function textOf(message: AgentMessage): string {
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) =>
+      typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
+        ? (block as { text: string }).text
+        : "",
+    )
+    .join("");
+}
+
+/**
+ * Whether this message is retrieved evidence rather than conversation.
+ *
+ * A tool result carrying at least one `[E<n>]` marker: that is what the
+ * retrieval side stamps on every passage it returns, and on the reference stub
+ * left behind once the passage text is cleared. The stub form is why the
+ * pattern allows a list — a result that carried two passages is cleared to
+ * `[E1, E2]`, and insisting on a bracket straight after the digits would stop
+ * recognising exactly the results that retrieved the most.
+ *
+ * The distinction is the whole point of booking evidence separately. An
+ * operator told "transcript: 6,000 tokens" reaches for the only lever that
+ * phrasing offers — compact sooner — which shortens the conversation and
+ * degrades the run. Told "evidence: 5,200 tokens" they reach for the lever that
+ * costs nothing: ask for three pages instead of thirty, because the rest is
+ * still retrievable by marker. Same window, same overflow, opposite remedy.
+ */
+export function isEvidenceMessage(message: AgentMessage): boolean {
+  if ((message as ToolCallish).role !== "toolResult") return false;
+  return /\[E\d+(?:,\s*E\d+)*\]/.test(textOf(message));
+}
+
 /**
  * Whether every tool result in this window has the call that produced it.
  *
@@ -297,13 +332,7 @@ export function pruneStaleToolResults(
     const shape = message as ToolCallish & { content?: unknown };
     if (shape.role !== "toolResult" || !Array.isArray(shape.content)) return message;
 
-    const text = shape.content
-      .map((block) =>
-        typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
-          ? (block as { text: string }).text
-          : "",
-      )
-      .join("");
+    const text = textOf(message);
     if (!text) return message;
 
     // Every marker this result carried, and only markers that are durable.
@@ -575,10 +604,14 @@ export class RunCompactor {
   /**
    * Books the projected context into the ledger.
    *
-   * Only the sections this side can see: the summary, the notes, and the rest
-   * of the transcript. `system`, `skill` and `toolSchema` are set once by the
-   * caller that owns them, and are deliberately not recomputed here — this must
-   * not silently zero a section it has no view of.
+   * Only the sections this side can see: the summary, the notes, the retrieved
+   * evidence and the conversation around it. `system`, `skill` and
+   * `toolSchema` are set once by the caller that owns them, and are deliberately
+   * not recomputed here — this must not silently zero a section it has no view
+   * of.
+   *
+   * Recomputed from scratch on every call rather than adjusted, so a section
+   * cannot drift away from the projection it claims to describe over a long run.
    */
   #measure(projected: AgentMessage[]): void {
     const summaryTokens = this.#summary ? estimateContextTokens([projected[0]!]).tokens : 0;
@@ -587,18 +620,19 @@ export class RunCompactor {
     this.#ledger.setText("notes", notesText);
 
     const transcript = this.#summary ? projected.slice(1) : projected;
-    const withoutNotes = transcript.filter((message) => {
-      const content = (message as { content?: unknown }).content;
-      if (!Array.isArray(content)) return true;
-      const text = content
-        .map((block) =>
-          typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
-            ? (block as { text: string }).text
-            : "",
-        )
-        .join("");
-      return !notesText || !text.includes("## Working notes");
-    });
-    this.#ledger.setMessages("transcript", withoutNotes);
+    // The notes are already booked under `notes`; counting the message that
+    // carries them again here would report them twice and overstate the total
+    // the next turn has to fit inside.
+    const withoutNotes = transcript.filter(
+      (message) => !notesText || !textOf(message).includes("## Working notes"),
+    );
+
+    // Split rather than summed into one line. See `isEvidenceMessage`: the two
+    // halves have different remedies, and a single number names neither.
+    this.#ledger.setMessages("evidence", withoutNotes.filter(isEvidenceMessage));
+    this.#ledger.setMessages(
+      "transcript",
+      withoutNotes.filter((message) => !isEvidenceMessage(message)),
+    );
   }
 }

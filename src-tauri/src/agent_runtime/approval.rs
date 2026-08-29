@@ -238,7 +238,7 @@ mod tests {
         };
 
         assert_eq!(item.request.task_id, "run-42");
-        assert_eq!(item.request.tool, "create_docx");
+        assert_eq!(item.request.tool, "artifact.create_approval_note");
         assert_eq!(item.request.target, "note.docx");
         assert_eq!(item.request.requested_by, "priya");
         // The consequence, not just the name — an approver reading "create_docx"

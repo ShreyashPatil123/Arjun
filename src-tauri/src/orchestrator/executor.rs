@@ -371,7 +371,7 @@ mod tests {
             }
             other => panic!("expected a step, got {other:?}"),
         }
-        assert_eq!(runner.ran(), vec!["search_documents"]);
+        assert_eq!(runner.ran(), vec!["knowledge.search_authorized"]);
     }
 
     /// The most important behaviour here: a refusal comes back as the call's
@@ -471,7 +471,7 @@ mod tests {
 
         match state {
             TaskState::AwaitingApproval { tool, prompt } => {
-                assert_eq!(tool, "write_scoped_file");
+                assert_eq!(tool, "workspace.write_text");
                 assert!(prompt.contains("note.txt"));
                 assert!(prompt.contains("5 byte(s)"));
             }

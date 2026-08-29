@@ -19,6 +19,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RpcPeer, type PeerTransport } from "./peer.js";
 import { startRun, type RunRequest } from "./run.js";
+import { TOOL_DEFINITIONS } from "./catalogue.js";
 
 /** One SSE chunk in the shape an OpenAI-compatible server emits. */
 function chunk(delta: unknown, finishReason: string | null = null): string {
@@ -79,6 +80,28 @@ function modelServer(turns: string[][]): Promise<{
   });
 }
 
+/**
+ * The eligibility answer Rust gives a run with an ordinary plan.
+ *
+ * Built from this runtime's own catalogue so a tool added later is offered to
+ * these tests automatically — a fixed list here would silently stop exercising
+ * whatever was added after it was written.
+ */
+function eligibleTools() {
+  return {
+    tools: TOOL_DEFINITIONS.map((definition) => ({
+      name: definition.name,
+      summary: definition.label,
+      readOnly: definition.readOnly,
+      approvalClass: definition.readOnly ? "automatic" : "personBeforeEffect",
+      network: "none",
+      maxResponseBytes: 16 * 1024,
+      timeoutSeconds: 30,
+    })),
+    mode: "Work",
+  };
+}
+
 /** A peer standing in for the Rust core, scripted per method. */
 function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
   const calls: Array<{ method: string; params: unknown }> = [];
@@ -88,7 +111,10 @@ function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
 
   peer.request = ((method: string, params: unknown) => {
     calls.push({ method, params });
-    const handler = handlers[method];
+    // Served by default so each test can be about its own property rather than
+    // about the one-off eligibility fetch every run makes. A test that cares
+    // what the catalogue said overrides it like any other handler.
+    const handler = handlers[method] ?? (method === "tool.catalogue" ? eligibleTools : undefined);
     if (!handler) return Promise.reject(new Error(`core stub has no ${method}`));
     try {
       return Promise.resolve(handler(params));
@@ -101,7 +127,21 @@ function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
     if (method === "run.event") events.push(params);
   }) as RpcPeer["notify"];
 
-  return { peer, calls, events };
+  return {
+    peer,
+    calls,
+    events,
+    /**
+     * The methods this run called about tools, without the eligibility fetch.
+     *
+     * `calls` still holds every request, so nothing is hidden. This is what a
+     * test asserting a call *sequence* wants: the fetch happens once at start-up
+     * and says nothing about whether authorisation preceded execution.
+     */
+    get toolMethods() {
+      return calls.map((call) => call.method).filter((method) => method !== "tool.catalogue");
+    },
+  };
 }
 
 let server: Awaited<ReturnType<typeof modelServer>> | undefined;
@@ -132,7 +172,7 @@ describe("a run that uses a tool", () => {
               index: 0,
               id: "call_1",
               type: "function",
-              function: { name: "search_documents", arguments: '{"query":"seal specification"}' },
+              function: { name: "knowledge.search_authorized", arguments: '{"query":"seal specification"}' },
             },
           ],
         }),
@@ -145,20 +185,20 @@ describe("a run that uses a tool", () => {
 
   it("authorises before executing, and executes only with the grant it was given", async () => {
     const core = coreStub({
-      "tool.authorize": () => ({ outcome: "allow", tool: "search_documents", grant: "g-1" }),
+      "tool.authorize": () => ({ outcome: "allow", tool: "knowledge.search_authorized", grant: "g-1" }),
       "tool.execute": () => ({ text: "1 passage found. Maintenance SOP p.4: seal 9.0 mm." }),
     });
 
     const outcome = await startRun(core.peer, request(server!.baseUrl), () => {});
 
-    const methods = core.calls.map((call) => call.method);
+    const methods = core.toolMethods;
     expect(methods).toEqual(["tool.authorize", "tool.execute"]);
 
     // The grant issued by the authorise step is the one spent executing.
     expect(core.calls[1]!.params).toMatchObject({
       runId: "run-1",
       toolCallId: "call_1",
-      tool: "search_documents",
+      tool: "knowledge.search_authorized",
       grant: "g-1",
     });
     expect(outcome.text).toBe("The seal is 9.0 mm.");
@@ -166,7 +206,7 @@ describe("a run that uses a tool", () => {
 
   it("gives the model the tool result, so the answer is grounded in it", async () => {
     const core = coreStub({
-      "tool.authorize": () => ({ outcome: "allow", tool: "search_documents", grant: "g-1" }),
+      "tool.authorize": () => ({ outcome: "allow", tool: "knowledge.search_authorized", grant: "g-1" }),
       "tool.execute": () => ({ text: "1 passage found. Maintenance SOP p.4: seal 9.0 mm." }),
     });
 
@@ -180,7 +220,7 @@ describe("a run that uses a tool", () => {
 
   it("reports lifecycle to the operator without echoing tool arguments", async () => {
     const core = coreStub({
-      "tool.authorize": () => ({ outcome: "allow", tool: "search_documents", grant: "g-1" }),
+      "tool.authorize": () => ({ outcome: "allow", tool: "knowledge.search_authorized", grant: "g-1" }),
       "tool.execute": () => ({ text: "1 passage found." }),
     });
 
@@ -214,7 +254,7 @@ describe("a run whose tool call is refused", () => {
               index: 0,
               id: "call_1",
               type: "function",
-              function: { name: "search_documents", arguments: '{"query":"salary list"}' },
+              function: { name: "knowledge.search_authorized", arguments: '{"query":"salary list"}' },
             },
           ],
         }),
@@ -241,7 +281,7 @@ describe("a run whose tool call is refused", () => {
 
     const outcome = await startRun(core.peer, request(server!.baseUrl), () => {});
 
-    expect(core.calls.map((call) => call.method)).toEqual(["tool.authorize"]);
+    expect(core.toolMethods).toEqual(["tool.authorize"]);
     // The refusal reaches the model as a tool result, so it can say so rather
     // than stall — the run completes.
     expect(JSON.stringify(server!.requests[1])).toContain("SearchKnowledge");
@@ -260,7 +300,7 @@ describe("a run the gateway cannot be asked about", () => {
               index: 0,
               id: "call_1",
               type: "function",
-              function: { name: "search_documents", arguments: '{"query":"x"}' },
+              function: { name: "knowledge.search_authorized", arguments: '{"query":"x"}' },
             },
           ],
         }),
@@ -282,7 +322,7 @@ describe("a run the gateway cannot be asked about", () => {
 
     await startRun(core.peer, request(server!.baseUrl), () => {});
 
-    expect(core.calls.map((call) => call.method)).toEqual(["tool.authorize"]);
+    expect(core.toolMethods).toEqual(["tool.authorize"]);
     expect(JSON.stringify(server!.requests[1])).toContain("authorisation is unavailable");
   });
 });

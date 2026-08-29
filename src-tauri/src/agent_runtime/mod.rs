@@ -141,6 +141,13 @@ pub struct RuntimeDeps {
     /// this is a source of *descriptions*, and nothing reached through it can
     /// widen what a run may do.
     pub skills: Arc<crate::skills::SkillRegistry>,
+    /// The deterministic checks this deployment runs at its lifecycle points.
+    ///
+    /// Built from code at start-up and never from anything a prompt, a skill or
+    /// a retrieved document can reach — see [`crate::hooks`]. Held here so the
+    /// handlers can consult them without a global, which is also what keeps a
+    /// test able to install its own and drive the refusal path.
+    pub hooks: Arc<crate::hooks::HookRegistry>,
     /// What this machine remembers, and for whom.
     ///
     /// Scoped and access-controlled in [`memory`]; reachable by a model only
@@ -456,6 +463,7 @@ async fn handle(
     match method {
         "tool.authorize" => authorize(params, deps).await,
         "tool.execute" => execute(params, deps),
+        "tool.catalogue" => tool_catalogue(params, deps),
         "capability.search" => capability_search(params, deps),
         // The whole of a model's reach into memory. Both fill in identity,
         // project, classification and approval on this side; neither takes them
@@ -467,6 +475,87 @@ async fn handle(
             format!("no handler for {other}"),
         )),
     }
+}
+
+/// Which tools this run may be offered, as metadata rather than as schemas.
+///
+/// ## Why the runtime asks instead of knowing
+///
+/// The child process holds a static table of every tool's parameter schema, and
+/// it would be simpler for it to hand the model all of them. That is what it did
+/// before, and it costs twice over: the tool definitions are the second largest
+/// fixed thing in the context window after the system prompt, and a model shown
+/// a tool it may not use spends turns being refused by the gateway for asking.
+///
+/// So the eligible set is decided here, where the plan and the mode are, and the
+/// runtime loads schemas only for the names that come back. The plan is fixed
+/// before the model is told anything, so this cannot be widened by anything the
+/// model does afterwards.
+///
+/// ## Why a run with no plan gets the read-only set
+///
+/// The runtime's health probe belongs to no run and has no plan. Returning
+/// everything would make the probe the widest surface in the product; returning
+/// nothing would make it fail. The read-only tools are the honest middle: enough
+/// to prove the wire works, and nothing that can leave a trace.
+fn tool_catalogue(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+    use crate::orchestrator::tools::spec_for;
+
+    let run_id = params
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let planned: Option<Vec<ToolName>> = deps
+        .plans
+        .lock()
+        .ok()
+        .and_then(|plans| plans.get(run_id).map(|plan| plan.budget.permitted_tools.clone()));
+
+    let mode = crate::sovereignty::global_broker().mode();
+
+    let eligible: Vec<ToolName> = match planned {
+        Some(permitted) => permitted,
+        None => ToolName::ALL
+            .iter()
+            .copied()
+            .filter(|tool| tool.is_read_only())
+            .collect(),
+    }
+    .into_iter()
+    // Applied again here even though the plan was already filtered when it was
+    // made. The two are not the same check: a plan is fixed at the start of a
+    // run, and this is asked whenever the runtime starts a loop — including
+    // after a resumption, which may be happening in a different mode from the
+    // one the plan was written in.
+    .filter(|tool| spec_for(*tool).network.permitted_in(mode))
+    .collect();
+
+    let tools: Vec<Value> = eligible
+        .iter()
+        .map(|tool| {
+            let spec = spec_for(*tool);
+            json!({
+                "name": tool.as_str(),
+                "summary": tool.describe(),
+                // What decides whether the runtime may run it beside another.
+                "readOnly": tool.is_read_only(),
+                "approvalClass": spec.approval_class,
+                "approvalNote": spec.approval_class.describe(),
+                "network": spec.network,
+                "networkNote": spec.network.describe(),
+                "maxResponseBytes": spec.max_response_bytes,
+                "timeoutSeconds": spec.timeout.as_secs(),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "tools": tools,
+        "mode": mode.label(),
+        "note": "Metadata only. Load the parameter schema for a name in this list; \
+                 a name absent from it is refused by the gateway however it is called.",
+    }))
 }
 
 /// Concise metadata for the skills this run could use.
@@ -603,6 +692,15 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         return Ok(refused(deps, &call, reason));
     }
 
+    // The deployment's own checks, before the gateway and outside anything the
+    // model can address. A hook here can only refuse — it never issues a grant
+    // and never widens what the gateway would have allowed — so running it
+    // first costs nothing and means a deployment-specific rule is applied even
+    // to a call the gateway would have waved through.
+    if let Some(reason) = hook_refusal(&call, deps) {
+        return Ok(refused(deps, &call, reason));
+    }
+
     let verdict = decide(&call, deps, ApprovalState::NotRequested)?;
 
     let (tool, resolved_path) = match verdict {
@@ -702,6 +800,67 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
 /// that starts a run registers a plan first, and refusing every tool call for a
 /// run this table has never heard of would break the runtime's own health check
 /// rather than enforce anything.
+/// Runs the deployment's checks for one tool call, and records what they said.
+///
+/// ## Why this is separate from the gateway
+///
+/// The gateway answers "is this call permitted by the product's rules?" — a
+/// question with one right answer that every deployment shares. Hooks answer
+/// "does *this site* also forbid it?", which is a different question with a
+/// different owner. Folding them together would mean a site-specific rule and a
+/// product rule producing the same refusal text, and an operator being unable to
+/// tell which one they need to change.
+///
+/// ## Why an unknown tool passes
+///
+/// A name that resolves to no tool is refused by the gateway a moment later,
+/// with a message naming the tools that do exist. Refusing it here instead would
+/// replace that useful sentence with a hook's, and the model would lose the list
+/// it needs to correct itself.
+///
+/// The report is written to the durable record only when a hook had something to
+/// say. A run whose checks all passed silently produces no events, which is what
+/// keeps the ones that did fire worth reading.
+fn hook_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
+    let tool = ToolName::from_str(&call.tool)?;
+
+    let input = crate::hooks::HookInput::Tool {
+        run_id: call.run_id.clone(),
+        tool,
+        // Unresolved on purpose. The gateway resolves paths against the run's
+        // roots and has not run yet, and a second resolution here would be a
+        // weaker copy of that check — see the note on `hooks::policy`. A hook
+        // needing a resolved path belongs at `BeforeArtifactWrite`, which runs
+        // after the gateway has produced one.
+        path: None,
+        mode: crate::sovereignty::global_broker().mode(),
+        succeeded: None,
+    };
+
+    let report = deps
+        .hooks
+        .dispatch(crate::hooks::HookPoint::BeforeToolAuthorize, &input);
+
+    if report.blocked || !report.failed.is_empty() || !report.notes.is_empty() {
+        deps.remember(
+            &call.run_id,
+            events::TaskEventType::HookEvaluated,
+            serde_json::to_value(&report).unwrap_or_else(|_| {
+                // The report is plain data with no exotic types, so this cannot
+                // happen; recording that it did beats writing nothing, because
+                // a missing hook event reads as a check that never ran.
+                json!({
+                    "point": "before_tool_authorize",
+                    "blocked": report.blocked,
+                    "note": "the hook report could not be serialised",
+                })
+            }),
+        );
+    }
+
+    report.refusal()
+}
+
 fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
     let stopped = {
         // A poisoned table is a panic that happened while the budget was being
@@ -980,11 +1139,17 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
                 // count it is one a model repeating itself never reaches.
                 record_step(deps, &call.run_id, tool);
                 return match outcome {
+                    // Cut and sanitised exactly as a fresh result is. A replay
+                    // that came back longer than the same call did the first
+                    // time would make the two disagree about what happened.
                     Ok(text) => Ok(json!({
-                        "text": text,
+                        "text": crate::orchestrator::tools::truncate_response(tool, text),
                         "details": { "tool": tool.as_str(), "replayed": true },
                     })),
-                    Err(reason) => Err(WireError::new(code::TOOL_FAILED, reason)),
+                    Err(reason) => Err(WireError::new(
+                        code::TOOL_FAILED,
+                        crate::orchestrator::tools::sanitise_failure(&reason),
+                    )),
                 };
             }
 
@@ -1118,11 +1283,23 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
     record_step(deps, &call.run_id, tool);
 
     match outcome {
-        Ok(text) => Ok(json!({ "text": text, "details": { "tool": tool.as_str() } })),
+        // Cut to the tool's own ceiling on the way out, in one place. Doing it
+        // inside each tool would mean a tool added later returning whatever it
+        // liked, and the ceiling is what stops one call taking half the window.
+        Ok(text) => Ok(json!({
+            "text": crate::orchestrator::tools::truncate_response(tool, text),
+            "details": { "tool": tool.as_str() },
+        })),
         // A tool that fails says why, in words the model can act on. Returned as
         // an error frame so the runtime turns it into an error tool result
         // rather than passing it off as an answer.
-        Err(reason) => Err(WireError::new(code::TOOL_FAILED, reason)),
+        //
+        // Sanitised first: a failure carrying a backtrace or the operator's home
+        // directory is a failure the model will quote into a document.
+        Err(reason) => Err(WireError::new(
+            code::TOOL_FAILED,
+            crate::orchestrator::tools::sanitise_failure(&reason),
+        )),
     }
 }
 

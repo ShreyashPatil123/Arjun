@@ -670,10 +670,16 @@ fn a_loaded_skill_records_everything_the_manifest_needs() {
     assert_eq!(record.network, "none");
     assert_eq!(record.approval_class, "reviewer");
     assert_eq!(record.signature, Signature::TrustedHash);
-    assert_eq!(record.tools_granted, vec!["search_documents".to_string()]);
+    assert_eq!(
+        record.tools_granted,
+        vec!["knowledge.search_authorized".to_string()]
+    );
     // What it asked for and did not get is recorded too, so the trace can say
     // why the skill did less than its documentation describes.
-    assert_eq!(record.tools_refused, vec!["create_docx".to_string()]);
+    assert_eq!(
+        record.tools_refused,
+        vec!["artifact.create_approval_note".to_string()]
+    );
 }
 
 #[test]
