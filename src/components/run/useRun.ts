@@ -279,8 +279,18 @@ export function useRun() {
   }, [adopt]);
 
   const start = useCallback(
-    async (prompt: string, classification?: Classification) => {
-      const correlationId = crypto.randomUUID();
+    async (
+      prompt: string,
+      classification?: Classification,
+      options?: {
+        /** Caller-supplied correlation id. Used by the demo page so its
+         *  events are not misattributed to another window's run. */
+        correlationId?: string;
+        /** Override the default instructions. Scripted demonstrations only. */
+        systemPrompt?: string;
+      },
+    ) => {
+      const correlationId = options?.correlationId ?? crypto.randomUUID();
       correlationRef.current = correlationId;
       runIdRef.current = null;
       seqRef.current = 0;
@@ -289,7 +299,12 @@ export function useRun() {
       setState({ ...IDLE, phase: 'starting', prompt });
 
       try {
-        const summary = await agentService.start({ prompt, classification, correlationId });
+        const summary = await agentService.start({
+          prompt,
+          classification,
+          correlationId,
+          systemPrompt: options?.systemPrompt,
+        });
         // The summary is complete where the event stream is best-effort, so it
         // wins: the plan it carries is the one that was actually enforced.
         rememberRun(summary.runId);

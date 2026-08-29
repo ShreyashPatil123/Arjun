@@ -46,6 +46,12 @@ const LOOPBACK_CLIENT_FILES = new Map([
     'probes local inference servers (llama-server, vLLM, SGLang); refuses any URL '
       + 'whose host does not parse as a loopback address before the client is built',
   ],
+  [
+    'src-tauri/src/ai_engine/vision_bridge.rs',
+    'speaks the OpenAI vision schema to a local vLLM / llama.cpp server; the constructor '
+      + 'parses base_url and refuses any host that is not localhost, 127.0.0.1 or ::1 '
+      + 'before the client is built, so the client can only ever address loopback',
+  ],
 ]);
 
 /**

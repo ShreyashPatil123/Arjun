@@ -42,9 +42,46 @@ export interface Activity {
    * took — that one needs a person.
    */
   status: 'running' | 'done' | 'failed' | 'refused' | 'replayed' | 'unknown';
+  /** Wall-clock time the tool started, ms since epoch. */
+  startedAt?: number;
+  /** Wall-clock time the tool ended, ms since epoch. Set when status is terminal. */
+  endedAt?: number;
+  /**
+   * One-line description of what the tool was asked to do, in human terms.
+   *
+   * The backend redacts the raw arguments before they leave the
+   * `agent://event` channel (they can carry document text); what arrives
+   * here is a single sentence composed in Rust from the call's
+   * shape. Empty when the tool author did not supply one.
+   */
+  inputSummary?: string;
+  /**
+   * One-line description of what the tool returned, in human terms.
+   *
+   * Same redaction policy as `inputSummary`. Empty for tools whose
+   * outcome is fully captured by the artifact list or the trace.
+   */
+  outputSummary?: string;
+  /**
+   * Path of a file this tool produced or touched. Carried so the row
+   * can link the user to the artifact without a second lookup.
+   */
+  artifactPath?: string;
+  /** Human-readable failure message when status is `failed`. */
+  errorMessage?: string;
 }
 
-export type RunPhase = 'idle' | 'starting' | 'running' | 'finished' | 'failed';
+export type RunPhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'finished'
+  | 'failed'
+  /** A milestone the model finished. The plan pauses here so a
+   *  person can confirm the model is on the right track before the
+   *  next leg of work starts. The UI shows a gate; once the user
+   *  approves, the phase returns to `running`. */
+  | 'awaiting_milestone';
 
 export interface RunState_ {
   phase: RunPhase;
@@ -81,6 +118,17 @@ export interface RunViewState {
   historyIncomplete: boolean;
   /** Side effects nobody can account for. Each needs a person to go and look. */
   unknownEffects: UnknownEffect[];
+  /** Set when the run paused at a milestone checkpoint. The gate
+   *  holds the id and intent the model produced; the user can
+   *  approve to continue or reject to stop the run. */
+  milestone: MilestoneGate | null;
+}
+
+/** A milestone the model just finished, awaiting a human gate. */
+export interface MilestoneGate {
+  checkpointId: string;
+  ordinal: number;
+  summary: string;
 }
 
 /** Kept for callers that imported the old name. */
@@ -103,6 +151,7 @@ export const IDLE: RunViewState = {
   seq: 0,
   historyIncomplete: false,
   unknownEffects: [],
+  milestone: null,
 };
 
 /** What a recorded state means for the screen. */
@@ -223,15 +272,47 @@ function settle(
 ): RunViewState {
   const id = text(payload, 'toolCallId');
   if (!id) return state;
+  const inputSummary = text(payload, 'inputSummary') ?? undefined;
+  const outputSummary = text(payload, 'outputSummary') ?? undefined;
+  const artifactPath = text(payload, 'artifactPath') ?? undefined;
+  const errorMessage = text(payload, 'errorMessage') ?? undefined;
+  const at = text(payload, 'at');
+  const endedAt = at ? Date.parse(at) : Date.now();
+  const update = (item: Activity): Activity => {
+    const startedAt = item.startedAt ?? endedAt;
+    return {
+      ...item,
+      status,
+      startedAt,
+      endedAt,
+      inputSummary: inputSummary ?? item.inputSummary,
+      outputSummary: outputSummary ?? item.outputSummary,
+      artifactPath: artifactPath ?? item.artifactPath,
+      errorMessage: errorMessage ?? item.errorMessage,
+    };
+  };
   const known = state.activity.some(item => item.id === id);
   return {
     ...state,
     activity: known
-      ? state.activity.map(item => (item.id === id ? { ...item, status } : item))
+      ? state.activity.map(item => (item.id === id ? update(item) : item))
       : // A refusal is the first thing heard about that call — it never got as
         // far as being authorised. Dropping it would make the trace say the
         // policy never did anything.
-        [...state.activity, { id, tool: text(payload, 'tool') ?? 'unknown', status }],
+        [
+          ...state.activity,
+          {
+            id,
+            tool: text(payload, 'tool') ?? 'unknown',
+            status,
+            startedAt: endedAt,
+            endedAt,
+            inputSummary,
+            outputSummary,
+            artifactPath,
+            errorMessage,
+          },
+        ],
   };
 }
 
@@ -312,6 +393,32 @@ export function applyDurableEvent(state: RunViewState, event: DurableEvent): Run
       return { ...at, state: 'awaiting_approval' };
     case 'approvalDecided':
       return { ...at, state: 'running' };
+    case 'milestoneReached': {
+      // A milestone pauses the run. The phase flips to
+      // `awaiting_milestone` so the controls can show the gate; the
+      // gate object itself is what the user reads.
+      const id = text(payload, 'checkpointId');
+      const ordinal = count(payload, 'ordinal') ?? 0;
+      const summary = text(payload, 'summary') ?? '';
+      if (!id) return at;
+      return {
+        ...at,
+        phase: 'awaiting_milestone',
+        milestone: {
+          checkpointId: id,
+          ordinal,
+          summary,
+        },
+      };
+    }
+    case 'milestoneAcknowledged': {
+      // The user signed off. The phase goes back to running and
+      // the gate clears. We do not clear `state` here because the
+      // backend also emits a `runResumed` that brings the live
+      // state forward; either is enough, both are safe.
+      if (!at.milestone) return at;
+      return { ...at, phase: 'running', milestone: null };
+    }
     case 'toolAuthorized': {
       const id = text(payload, 'toolCallId');
       const next: RunViewState = { ...at, state: 'executing_tool' };
@@ -413,6 +520,25 @@ export function applyLiveEvent(state: RunViewState, event: AgentEvent): RunViewS
     case 'plan_stopped':
       return { ...state, stopped: event.reason };
 
+    case 'milestone_reached':
+      // The live stream and the durable stream both emit this; the
+      // reducer is the same. Whichever side gets there first sets
+      // the gate; the other side is a no-op.
+      return {
+        ...state,
+        phase: 'awaiting_milestone',
+        milestone: {
+          checkpointId: event.checkpointId,
+          ordinal: event.ordinal,
+          summary: event.summary,
+        },
+      };
+
+    case 'milestone_acknowledged':
+      // The user signed off. Return to running and clear the gate.
+      if (!state.milestone) return state;
+      return { ...state, phase: 'running', milestone: null };
+
     case 'tool_execution_start':
       return state.activity.some(item => item.id === event.toolCallId)
         ? state
@@ -420,7 +546,12 @@ export function applyLiveEvent(state: RunViewState, event: AgentEvent): RunViewS
             ...state,
             activity: [
               ...state.activity,
-              { id: event.toolCallId, tool: event.toolName, status: 'running' },
+              {
+                id: event.toolCallId,
+                tool: event.toolName,
+                status: 'running',
+                startedAt: Date.now(),
+              },
             ],
           };
 
@@ -433,11 +564,14 @@ export function applyLiveEvent(state: RunViewState, event: AgentEvent): RunViewS
         : event.executionStarted === false
           ? 'refused'
           : 'failed';
+      const endedAt = Date.now();
       return {
         ...state,
-        activity: state.activity.map(item =>
-          item.id === event.toolCallId ? { ...item, status } : item,
-        ),
+        activity: state.activity.map(item => {
+          if (item.id !== event.toolCallId) return item;
+          const startedAt = item.startedAt ?? endedAt;
+          return { ...item, status, startedAt, endedAt };
+        }),
       };
     }
 

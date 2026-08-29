@@ -123,7 +123,7 @@ async fn execution_without_a_grant_is_refused_even_though_the_call_is_permitted(
     // The whole point: `search_documents` would be allowed if asked for
     // properly. Skipping the asking is what gets refused.
     let (deps, _dir) = deps_with(signed_in_user());
-    let error = execute(search("x"), &deps).unwrap_err();
+    let error = execute(search("x"), &deps).await.unwrap_err();
     assert_eq!(error.code, code::REFUSED);
     assert!(error.message.contains("no authorisation grant"));
 }
@@ -133,7 +133,7 @@ async fn execution_with_an_invented_grant_is_refused() {
     let (deps, _dir) = deps_with(signed_in_user());
     let mut call = search("x");
     call["grant"] = json!("made-up");
-    let error = execute(call, &deps).unwrap_err();
+    let error = execute(call, &deps).await.unwrap_err();
     assert_eq!(error.code, code::REFUSED);
 }
 
@@ -144,7 +144,7 @@ async fn a_grant_earned_for_one_query_does_not_execute_another() {
 
     let mut swapped = search("salary list");
     swapped["grant"] = allow["grant"].clone();
-    let error = execute(swapped, &deps).unwrap_err();
+    let error = execute(swapped, &deps).await.unwrap_err();
 
     assert_eq!(error.code, code::REFUSED);
     assert!(error.message.contains("arguments"));
@@ -157,7 +157,7 @@ async fn an_authorised_search_runs_and_says_it_found_nothing_rather_than_staying
 
     let mut call = search("wall thickness");
     call["grant"] = allow["grant"].clone();
-    let result = execute(call, &deps).unwrap();
+    let result = execute(call, &deps).await.unwrap();
 
     // The index is empty, and the honest answer is to say so — PS Part C.
     let text = result["text"].as_str().unwrap();
@@ -173,8 +173,8 @@ async fn the_same_grant_cannot_execute_twice() {
     let mut call = search("x");
     call["grant"] = allow["grant"].clone();
 
-    assert!(execute(call.clone(), &deps).is_ok());
-    assert!(execute(call, &deps).is_err());
+    assert!(execute(call.clone(), &deps).await.is_ok());
+    assert!(execute(call, &deps).await.is_err());
 }
 
 /// A calculation is kept, so the workbook can show working rather than recall.
@@ -191,7 +191,7 @@ async fn a_calculation_is_recorded_for_the_workbook() {
 
     let mut with_grant = call;
     with_grant["grant"] = allow["grant"].clone();
-    execute(with_grant, &deps).expect("the calculation runs");
+    execute(with_grant, &deps).await.expect("the calculation runs");
 
     let table = deps.calculations.lock().expect("fresh lock");
     assert_eq!(table.get("r").map(Vec::len), Some(1));
@@ -278,7 +278,7 @@ async fn a_side_effecting_call_made_twice_is_performed_once() {
     let first = approve_next(deps.clone(), write("tc-1")).await;
     let mut call = write("tc-1");
     call["grant"] = first["grant"].clone();
-    let done = execute(call, &deps).expect("the write runs");
+    let done = execute(call, &deps).await.expect("the write runs");
     assert!(done["details"]["replayed"].is_null());
 
     let path = dir.path().join("runs").join("r").join("note.txt");
@@ -292,7 +292,7 @@ async fn a_side_effecting_call_made_twice_is_performed_once() {
     let second = approve_next(deps.clone(), write("tc-2")).await;
     let mut again = write("tc-2");
     again["grant"] = second["grant"].clone();
-    let replayed = execute(again, &deps).expect("the replay answers");
+    let replayed = execute(again, &deps).await.expect("the replay answers");
 
     assert_eq!(replayed["details"]["replayed"], json!(true));
     assert_eq!(replayed["text"], done["text"]);
@@ -430,7 +430,7 @@ async fn a_read_only_call_made_twice_is_performed_twice() {
             let allow = authorize(call.clone(), &deps).await.unwrap();
             let mut with_grant = call;
             with_grant["grant"] = allow["grant"].clone();
-            execute(with_grant, &deps).expect("the search runs")
+            execute(with_grant, &deps).await.expect("the search runs")
         }
     };
 
@@ -662,6 +662,7 @@ fn the_catalogue_is_exactly_the_tools_the_gateway_knows() {
             "calculation.evaluate_with_units",
             "capability.search",
             "knowledge.load_evidence_region",
+            "knowledge.multimodal_retrieve",
             "knowledge.search_authorized",
             "media.extract_findings",
             "memory.promote_approved",
@@ -774,7 +775,7 @@ async fn running_out_of_steps_stops_the_run_and_says_so() {
         let verdict = authorize(call.clone(), &deps).await.unwrap();
         assert_eq!(verdict["outcome"], "allow", "step {i} of {allowed}");
         call["grant"] = verdict["grant"].clone();
-        let _ = execute(call, &deps);
+        let _ = execute(call, &deps).await;
     }
 
     let refused = authorize(search("one more thing"), &deps).await.unwrap();
@@ -800,7 +801,7 @@ async fn the_same_call_over_and_over_is_stopped_as_going_in_circles() {
         outcomes.push(verdict["outcome"].as_str().unwrap().to_string());
         if verdict["outcome"] == "allow" {
             call["grant"] = verdict["grant"].clone();
-            let _ = execute(call, &deps);
+            let _ = execute(call, &deps).await;
         }
     }
 
@@ -837,7 +838,7 @@ async fn a_search_that_finds_nothing_records_no_evidence_to_cite() {
     let allow = authorize(search("wall thickness"), &deps).await.unwrap();
     let mut call = search("wall thickness");
     call["grant"] = allow["grant"].clone();
-    let result = execute(call, &deps).unwrap();
+    let result = execute(call, &deps).await.unwrap();
 
     assert!(result["text"].as_str().unwrap().contains("No passages matched"));
     assert!(retrieval::for_run(&deps.passages, "r").is_empty());

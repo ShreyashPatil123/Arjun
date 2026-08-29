@@ -29,6 +29,7 @@ import { TOOL_DEFINITIONS, definitionFor, type ToolDefinition } from "./catalogu
 const RUST_WIRE_NAMES: ReadonlySet<string> = new Set([
   "knowledge.search_authorized",
   "knowledge.load_evidence_region",
+  "knowledge.multimodal_retrieve",
   "media.extract_findings",
   "memory.recall_authorized",
   "memory.promote_approved",
@@ -72,6 +73,7 @@ const LEGACY_NAMES: ReadonlyMap<string, string> = new Map([
 const EXPECTED_READ_ONLY: ReadonlyMap<string, boolean> = new Map([
   ["knowledge.search_authorized", true],
   ["knowledge.load_evidence_region", true],
+  ["knowledge.multimodal_retrieve", true],
   ["media.extract_findings", true],
   ["memory.recall_authorized", true],
   ["memory.promote_approved", false],

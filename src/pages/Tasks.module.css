@@ -52,6 +52,24 @@
 }
 
 .row {
+  /* Layout only: this is now a flex <li> containing .rowOpen and .rowActions.
+   * The grid layout and the hover/focus states live on .rowOpen so the button
+   * itself is the interactive surface. */
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.row:hover { background: var(--bg-hover); border-color: var(--text-tertiary); }
+
+/* The button that opens the record. Holds the grid that lays out the
+ * prompt / meta / state. Kept on a single element so keyboard focus and
+ * screen-reader semantics follow the affordance people actually see. */
+.rowOpen {
+  flex: 1;
   display: grid;
   grid-template-columns: 1fr auto;
   grid-template-areas:
@@ -59,19 +77,19 @@
     'meta   state';
   align-items: center;
   gap: var(--space-1) var(--space-4);
-  width: 100%;
   padding: var(--space-4);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
+  background: transparent;
+  border: none;
   text-align: left;
   font-family: inherit;
   cursor: pointer;
-  transition: background var(--transition-fast), border-color var(--transition-fast);
+  color: inherit;
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
 }
-
-.row:hover { background: var(--bg-hover); border-color: var(--text-tertiary); }
-.row:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+.rowOpen:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
 
 .rowPrompt {
   grid-area: prompt;
@@ -562,4 +580,54 @@
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
   color: var(--text-secondary);
+}
+
+.rowActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-right: var(--space-3);
+  border-left: 1px solid var(--border-default);
+}
+
+.replayBtn,
+.openBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+.replayBtn:hover:not(:disabled),
+.openBtn:hover:not(:disabled) {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+.replayBtn:focus-visible,
+.openBtn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.replayBtn:disabled,
+.openBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.replayBtn {
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+.spin {
+  animation: tasks-spin 1s linear infinite;
+}
+@keyframes tasks-spin {
+  to { transform: rotate(360deg); }
 }

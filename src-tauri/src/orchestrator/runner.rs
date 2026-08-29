@@ -25,7 +25,10 @@ use super::executor::ToolRunner;
 use super::sandbox::{assess, SandboxPolicy, SandboxTier};
 use super::tools::{spec_for, ToolCall, ToolName};
 use crate::identity::Session;
-use crate::knowledge::{KnowledgeIndex, SearchResult};
+use crate::knowledge::{
+    ImageRegion, KnowledgeIndex, MultimodalIndex, SearchResult, TableChunk,
+};
+use crate::subagents::{InheritedPolicy, SubagentManager};
 
 /// How many passages a search returns to the model.
 ///
@@ -114,18 +117,84 @@ pub fn render_passages(query: &str, marked: &[(usize, &SearchResult)]) -> String
 
 pub struct LocalToolRunner<'a> {
     pub index: &'a KnowledgeIndex,
+    /// Multimodal index, for image regions and table rows. Optional because
+    /// the runner is constructed during early boot when the multimodal
+    /// database may not yet be open. A `None` here turns the multimodal
+    /// tool into a refusal that names the missing piece, rather than a
+    /// silent skip.
+    pub multimodal: Option<&'a MultimodalIndex>,
     pub session: &'a Session,
     pub sandbox_tier: SandboxTier,
     pub sandbox_policy: SandboxPolicy,
+    /// The subagent manager, for delegating to read-only workers. `None`
+    /// turns `agent.delegate_readonly` into a refusal that names the
+    /// missing piece — the alternative (silently doing nothing) is how a
+    /// model ends up quoting a result that was never produced.
+    pub subagents: Option<&'a SubagentManager>,
+    /// The policy that a delegated worker would inherit. Built from the
+    /// session and the run's permitted tools, so the worker's effective
+    /// policy is *narrower* than the parent's, never wider.
+    ///
+    /// `None` when no run context is in reach — the runner is then the
+    /// one built during early boot, before any run started.
+    pub inherited: Option<&'a InheritedPolicy>,
+    /// Where the run is writing. Workers inherit this as their workspace
+    /// root, so a child cannot reach files outside the run.
+    pub run_workspace: Option<&'a std::path::Path>,
 }
 
 impl<'a> LocalToolRunner<'a> {
     pub fn new(index: &'a KnowledgeIndex, session: &'a Session) -> Self {
         Self {
             index,
+            multimodal: None,
             session,
             sandbox_tier: super::sandbox::detect_tier(),
             sandbox_policy: SandboxPolicy::default(),
+            subagents: None,
+            inherited: None,
+            run_workspace: None,
+        }
+    }
+
+    /// Build a runner that has both the prose and the multimodal index in
+    /// reach. Used by the agent path once the database is open.
+    pub fn with_multimodal(
+        index: &'a KnowledgeIndex,
+        multimodal: &'a MultimodalIndex,
+        session: &'a Session,
+    ) -> Self {
+        Self {
+            index,
+            multimodal: Some(multimodal),
+            session,
+            sandbox_tier: super::sandbox::detect_tier(),
+            sandbox_policy: SandboxPolicy::default(),
+            subagents: None,
+            inherited: None,
+            run_workspace: None,
+        }
+    }
+
+    /// Build a runner that has the subagent manager and the run's inherited
+    /// policy in reach. Used once a run has been routed and a sub-task may
+    /// legitimately be delegated.
+    pub fn with_subagents(
+        index: &'a KnowledgeIndex,
+        session: &'a Session,
+        subagents: &'a SubagentManager,
+        inherited: &'a InheritedPolicy,
+        run_workspace: &'a std::path::Path,
+    ) -> Self {
+        Self {
+            index,
+            multimodal: None,
+            session,
+            sandbox_tier: super::sandbox::detect_tier(),
+            sandbox_policy: SandboxPolicy::default(),
+            subagents: Some(subagents),
+            inherited: Some(inherited),
+            run_workspace: Some(run_workspace),
         }
     }
 
@@ -240,6 +309,161 @@ impl<'a> LocalToolRunner<'a> {
         }
 
         Ok(render_passages(&query, &marked))
+    }
+
+    /// Multimodal retrieval: text passages, image regions, and table rows in
+    /// one ranked result set.
+    ///
+    /// Three subsearches (prose, image regions, tables) are run, and the
+    /// passages and regions are emitted side by side, each with its own
+    /// marker ([E1], [I1], [T1]). The model sees one document and one set of
+    /// citations, not three parallel ones it has to merge.
+    ///
+    /// The optional ``documentType`` argument lets a caller narrow by the
+    /// auto-detected type. ``P&ID``-shaped queries are the obvious case:
+    /// a model that asks about "PT-2201" wants the *symbol* region, and a
+    /// query for "design pressure 14 bar" wants the datasheet *table*. A
+    /// type filter skips the irrelevant subsearches and keeps the result
+    /// set coherent.
+    ///
+    /// ``documentSha256`` narrows to a single document, the way the prose
+    /// region's `LoadMoreEvidence` does. A model that has a passage and
+    /// wants the visual evidence on the same page uses this rather than
+    /// running a full multimodal search.
+    fn multimodal_retrieve(&self, call: &ToolCall) -> Result<String, String> {
+        let query = call.text("query").unwrap_or_default().to_string();
+        if query.trim().is_empty() {
+            return Err("knowledge.multimodal_retrieve needs a non-empty query.".into());
+        }
+
+        let Some(multimodal) = self.multimodal else {
+            return Err(
+                "The multimodal index is not available on this machine. Re-run a sync so the \
+                 image and table index is populated, then try again."
+                    .into(),
+            );
+        };
+
+        // The cap on each subsearch. The combined result is the sum, so the
+        // model gets up to 18 citations in one call — six of each kind.
+        // Larger than the prose-only search because multimodal retrieval is
+        // the only way to find regions and tables, and the cost of one
+        // truncated call is another turn of the loop.
+        let per_kind = call
+            .integer("maxResults")
+            .map(|n| (n as usize).clamp(1, 6))
+            .unwrap_or(4);
+
+        let document_filter: Option<&str> = call.text("documentSha256");
+        let document_type_filter: Option<&str> = call.text("documentType");
+
+        // Prose — the same search the text tool runs. We deliberately use
+        // the same index, the same clearance, and the same ranking so a
+        // passage that ranks well here is the same one the prose search
+        // would have returned, and a citation [E1] points to the same
+        // thing in either tool.
+        let mut hits = self
+            .index
+            .search(self.session, &query, per_kind)
+            .map_err(|e| format!("text search failed: {e}"))?;
+        if let Some(sha) = document_filter {
+            hits.retain(|hit| hit.document_sha256 == sha);
+        }
+        let passages: Vec<SearchResult> = hits;
+
+        // Image regions. FTS over captions, with the same sanitisation.
+        let mut regions: Vec<ImageRegion> = multimodal
+            .search_regions(self.session, &query, per_kind)
+            .map_err(|e| format!("image region search failed: {e}"))?;
+        if let Some(sha) = document_filter {
+            regions.retain(|r| r.document_sha256 == sha);
+        }
+        if let Some(doc_type) = document_type_filter {
+            // The region FTS does not index the document type directly.
+            // We use the per-document metadata to filter: a region whose
+            // document does not match the requested type is dropped.
+            regions.retain(|r| {
+                multimodal
+                    .document_meta(&r.document_sha256)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.document_type == doc_type)
+                    .unwrap_or(false)
+            });
+        }
+
+        // Tables. Same sanitisation; flat_text is the indexed form.
+        let mut tables: Vec<TableChunk> = multimodal
+            .search_tables(self.session, &query, per_kind)
+            .map_err(|e| format!("table search failed: {e}"))?;
+        if let Some(sha) = document_filter {
+            tables.retain(|t| t.document_sha256 == sha);
+        }
+        if let Some(doc_type) = document_type_filter {
+            tables.retain(|t| {
+                multimodal
+                    .document_meta(&t.document_sha256)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.document_type == doc_type)
+                    .unwrap_or(false)
+            });
+        }
+
+        if passages.is_empty() && regions.is_empty() && tables.is_empty() {
+            return Ok(format!(
+                "No text, image region, or table matched {query:?}. The connected collections \
+                 do not contain this, so do not assert it. Either try different wording, or \
+                 specify a documentSha256 to search within a known document."
+            ));
+        }
+
+        // Render. Markers are [E1..] for prose, [I1..] for image regions,
+        // [T1..] for tables. Distinct prefixes so a model citing one cannot
+        // accidentally cite another of the same number from a different
+        // kind.
+        let mut out = format!("Multimodal search: {query:?}.\n\n");
+        if !passages.is_empty() {
+            out.push_str(&format!("{} text passage(s):\n", passages.len()));
+            for (i, hit) in passages.iter().enumerate() {
+                out.push_str(&format!("[E{}] {}\n{}\n\n", i + 1, hit.citation(), hit.text));
+            }
+        }
+        if !regions.is_empty() {
+            out.push_str(&format!("{} image region(s):\n", regions.len()));
+            for (i, region) in regions.iter().enumerate() {
+                out.push_str(&format!(
+                    "[I{i}] {caption} ({kind:?}, page {page}, box [{l:.2},{t:.2}]-[{r:.2},{b:.2}], \
+                     confidence {conf:.2})\n  document: {doc}\n\n",
+                    i = i + 1,
+                    caption = region.caption,
+                    kind = region.kind,
+                    page = region.page,
+                    l = region.bbox.left,
+                    t = region.bbox.top,
+                    r = region.bbox.right,
+                    b = region.bbox.bottom,
+                    conf = region.box_confidence,
+                    doc = region.document_name,
+                ));
+            }
+        }
+        if !tables.is_empty() {
+            out.push_str(&format!("{} table(s):\n", tables.len()));
+            for (i, table) in tables.iter().enumerate() {
+                out.push_str(&format!(
+                    "[T{i}] {citation}\n{flat}\n\n",
+                    i = i + 1,
+                    citation = table.citation(),
+                    flat = table.flat_text,
+                ));
+            }
+        }
+        out.push_str(
+            "Cite text by [E#], image regions by [I#] (which gives the page and box, not the \
+             image itself), and tables by [T#]. A citation with no marker is not a citation.\n",
+        );
+        Ok(out)
     }
 
     /// Reports what a page range does and does not yield, rather than asserting.
@@ -536,10 +760,95 @@ impl<'a> LocalToolRunner<'a> {
 
         Ok(format!("{} exists and holds {size} byte(s).", path.display()))
     }
+
+    /// Hands a bounded, read-only sub-task to a worker.
+    ///
+    /// This is the model-facing surface of the subagent manager. The model
+    /// sees a profile name and a one-sentence objective; the runner turns
+    /// those into a packet, hands it to the manager, and renders the result
+    /// back in the form a model is meant to read and cite.
+    ///
+    /// The runner refuses clearly when anything required is missing. The
+    /// alternative — a silent no-op — is how a model ends up claiming a
+    /// worker answered a question nobody asked.
+    async fn delegate_to_subagent(&self, call: &ToolCall) -> Result<String, String> {
+        let profile = call
+            .text("profile")
+            .ok_or("agent.delegate_readonly needs a profile name; one of: knowledge-retriever, document-extractor, calculation-checker, artifact-reviewer.")?;
+        let task = call
+            .text("task")
+            .ok_or("agent.delegate_readonly needs a one-sentence task describing what to find out.")?;
+
+        let subagents = self.subagents.ok_or(
+            "Subagents are not available on this machine. The parent run was started without a \
+             subagent manager; check the deployment configuration.",
+        )?;
+        let inherited = self.inherited.ok_or(
+            "Subagent delegation is not wired into this run. The inherited policy was not \
+             provided; this is a build configuration error, not something to retry.",
+        )?;
+
+        // The model decides to delegate; Rust decides whether to let it.
+        // Capability is carried by the inherited policy, which the
+        // subagent manager narrows; no second check is needed here.
+        let profile_owned = profile.to_string();
+        let task_owned = task.to_string();
+        let inherited_clone = inherited.clone();
+        // The child uses the parent's model rather than picking a fresh
+        // one: requirement 4 says a child inherits the parent's policy,
+        // and the model is part of that. The routing decision here is
+        // the parent's own — recorded for the audit trail.
+        let decision = crate::subagents::certification::Decision {
+            model_id: String::from("parent-inherited"),
+            role: crate::registry::ModelRole::Reasoning,
+            cheaper_than_parent: true,
+            reason: "subagent inherits the parent's model and routing".to_string(),
+            tier: None,
+            score: None,
+        };
+        let result = subagents
+            .spawn(&profile_owned, &inherited_clone, &task_owned, Vec::new(), decision)
+            .await
+            .map_err(|refusal| refusal.explain())?;
+
+        let child = result.result();
+        // The shape the model sees: status, findings (or refusal text),
+        // and a one-line citation so a model citing the result has
+        // something concrete to point at.
+        let mut out = format!(
+            "Subagent {profile} ran as child {child_id} (status: {status}).\n\n",
+            profile = child.profile,
+            child_id = child.child_id,
+            status = child.status.as_str(),
+        );
+        if !child.findings.is_empty() {
+            out.push_str("Findings:\n");
+            for finding in &child.findings {
+                out.push_str(&format!("- {}\n", finding.statement));
+            }
+        }
+        if !child.uncertainty.is_empty() {
+            out.push_str("\nUncertainty:\n");
+            for note in &child.uncertainty {
+                out.push_str(&format!("- {}\n", note));
+            }
+        }
+        if let Some(detail) = &child.detail {
+            out.push_str(&format!("\nDetail:\n{detail}\n"));
+        }
+        if result.is_reused() {
+            out.push_str(
+                "\nNote: this result was reused from an earlier call with the same idempotency key. \
+                 No second child was started.\n",
+            );
+        }
+        Ok(out)
+    }
 }
 
+#[async_trait::async_trait]
 impl ToolRunner for LocalToolRunner<'_> {
-    fn run(
+    async fn run(
         &self,
         tool: ToolName,
         call: &ToolCall,
@@ -549,6 +858,7 @@ impl ToolRunner for LocalToolRunner<'_> {
             ToolName::SearchDocuments => self.search(call),
             ToolName::LoadMoreEvidence => self.load_more_evidence(call),
             ToolName::MediaExtractFindings => self.extract_findings(call),
+            ToolName::KnowledgeMultimodalRetrieve => self.multimodal_retrieve(call),
             ToolName::ReadScopedFile => self.read(call, resolved_path),
             ToolName::WriteScopedFile => self.write(call, resolved_path),
             ToolName::RunCalculation => self.calculate(call),
@@ -566,10 +876,15 @@ impl ToolRunner for LocalToolRunner<'_> {
             // permitted-tool list, the other needs the subagent manager and the
             // parent's inherited policy. Both are properties of the run rather
             // than of this machine, and this runner knows only the machine.
-            ToolName::CapabilitySearch | ToolName::AgentDelegateReadonly => Err(format!(
+            ToolName::CapabilitySearch => Err(format!(
                 "{} is served on the agent path, not by this runner.",
                 tool.as_str()
             )),
+            // The delegation tool IS the subagent manager's surface. Wired here
+            // rather than on the agent path so the executor's single-step
+            // model is preserved: a parent that delegates is still doing one
+            // step of its own, just one that returns a subagent's findings.
+            ToolName::AgentDelegateReadonly => self.delegate_to_subagent(call).await,
             // Phase 6. Said plainly so a model does not describe a document it
             // has not produced.
             ToolName::CreateDocx | ToolName::CreateXlsx => Err(format!(
@@ -628,24 +943,27 @@ mod tests {
     fn runner(f: &Fixture) -> LocalToolRunner<'_> {
         LocalToolRunner {
             index: &f.index,
+            multimodal: None,
             session: &f.session,
             sandbox_tier: SandboxTier::JobObject,
             sandbox_policy: SandboxPolicy::default(),
+            subagents: None,
+            inherited: None,
+            run_workspace: None,
         }
     }
 
     // ── Search ───────────────────────────────────────────────────────────
 
-    #[test]
-    fn a_search_returns_passages_with_their_citations() {
+    #[tokio::test]
+    async fn a_search_returns_passages_with_their_citations() {
         let f = fixture();
         let out = runner(&f)
             .run(
                 ToolName::SearchDocuments,
                 &ToolCall::new("search_documents", json!({ "query": "wall thickness" })),
                 None,
-            )
-            .unwrap();
+            ).await.unwrap();
 
         assert!(out.contains("1 passage(s) found"));
         assert!(out.contains("Maintenance SOP"));
@@ -654,16 +972,15 @@ mod tests {
 
     /// PS Part C: no source found must be said, not left as silence for the
     /// model to fill in.
-    #[test]
-    fn finding_nothing_says_so_and_tells_the_model_not_to_assert_it() {
+    #[tokio::test]
+    async fn finding_nothing_says_so_and_tells_the_model_not_to_assert_it() {
         let f = fixture();
         let out = runner(&f)
             .run(
                 ToolName::SearchDocuments,
                 &ToolCall::new("search_documents", json!({ "query": "sasquatch" })),
                 None,
-            )
-            .unwrap();
+            ).await.unwrap();
 
         assert!(out.contains("No passages matched"));
         assert!(out.contains("do not assert it"));
@@ -671,27 +988,25 @@ mod tests {
 
     // ── Read ─────────────────────────────────────────────────────────────
 
-    #[test]
-    fn reading_a_file_returns_its_text() {
+    #[tokio::test]
+    async fn reading_a_file_returns_its_text() {
         let f = fixture();
         let path = f.root.join("note.txt");
         std::fs::write(&path, "Wall thickness measured at 8.2 mm.").unwrap();
 
         let out = runner(&f)
-            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path))
-            .unwrap();
+            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path)).await.unwrap();
 
         assert_eq!(out, "Wall thickness measured at 8.2 mm.");
     }
 
-    #[test]
-    fn reading_a_missing_file_says_what_to_do_instead() {
+    #[tokio::test]
+    async fn reading_a_missing_file_says_what_to_do_instead() {
         let f = fixture();
         let missing = f.root.join("absent.txt");
 
         let error = runner(&f)
-            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&missing))
-            .unwrap_err();
+            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&missing)).await.unwrap_err();
 
         assert!(error.contains("does not exist"));
         assert!(error.contains("List what is in the workspace"));
@@ -699,29 +1014,27 @@ mod tests {
 
     /// A model that believes it has the whole file will confidently answer from
     /// the half it got.
-    #[test]
-    fn a_long_file_is_truncated_and_says_so() {
+    #[tokio::test]
+    async fn a_long_file_is_truncated_and_says_so() {
         let f = fixture();
         let path = f.root.join("long.txt");
         std::fs::write(&path, "x".repeat(READ_CHARS + 5_000)).unwrap();
 
         let out = runner(&f)
-            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path))
-            .unwrap();
+            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path)).await.unwrap();
 
         assert!(out.contains("was cut off here"));
         assert!(out.contains("not the whole thing"));
     }
 
-    #[test]
-    fn reading_a_binary_file_suggests_the_document_tools() {
+    #[tokio::test]
+    async fn reading_a_binary_file_suggests_the_document_tools() {
         let f = fixture();
         let path = f.root.join("image.bin");
         std::fs::write(&path, [0xff, 0xfe, 0x00, 0x80]).unwrap();
 
         let error = runner(&f)
-            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path))
-            .unwrap_err();
+            .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&path)).await.unwrap_err();
 
         assert!(error.contains("is not text"));
         assert!(error.contains("document tools"));
@@ -729,8 +1042,8 @@ mod tests {
 
     // ── Write ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn writing_creates_the_file_and_any_missing_directories() {
+    #[tokio::test]
+    async fn writing_creates_the_file_and_any_missing_directories() {
         let f = fixture();
         let path = f.root.join("out/deep/note.txt");
 
@@ -739,8 +1052,7 @@ mod tests {
                 ToolName::WriteScopedFile,
                 &ToolCall::new("write_scoped_file", json!({ "content": "hello" })),
                 Some(&path),
-            )
-            .unwrap();
+            ).await.unwrap();
 
         assert!(out.contains("Wrote 5 byte(s)"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
@@ -748,16 +1060,15 @@ mod tests {
 
     // ── Calculation ──────────────────────────────────────────────────────
 
-    #[test]
-    fn a_calculation_returns_the_figure_and_its_working() {
+    #[tokio::test]
+    async fn a_calculation_returns_the_figure_and_its_working() {
         let f = fixture();
         let out = runner(&f)
             .run(
                 ToolName::RunCalculation,
                 &ToolCall::new("run_calculation", json!({ "expression": "(8.2 mm - 9.0 mm) / 9.0 mm * 100" })),
                 None,
-            )
-            .unwrap();
+            ).await.unwrap();
 
         assert!(out.contains("-8.889"));
         assert!(out.contains("Working:"));
@@ -767,16 +1078,15 @@ mod tests {
 
     /// A bad expression comes back as a failure so the model fixes it, rather
     /// than as a result it might quote.
-    #[test]
-    fn an_impossible_calculation_is_an_error_not_a_result() {
+    #[tokio::test]
+    async fn an_impossible_calculation_is_an_error_not_a_result() {
         let f = fixture();
         let error = runner(&f)
             .run(
                 ToolName::RunCalculation,
                 &ToolCall::new("run_calculation", json!({ "expression": "8.2 mm + 9.0 kg" })),
                 None,
-            )
-            .unwrap_err();
+            ).await.unwrap_err();
 
         assert!(error.contains("units do not match"));
     }
@@ -785,31 +1095,29 @@ mod tests {
 
     /// The machine cannot isolate code, so nothing runs — and the model is told
     /// not to describe output that does not exist.
-    #[test]
-    fn running_code_on_a_weak_sandbox_refuses_and_forbids_inventing_output() {
+    #[tokio::test]
+    async fn running_code_on_a_weak_sandbox_refuses_and_forbids_inventing_output() {
         let f = fixture();
         let error = runner(&f)
             .run(
                 ToolName::ExecuteCode,
                 &ToolCall::new("execute_code", json!({ "language": "python", "source": "print(1)" })),
                 None,
-            )
-            .unwrap_err();
+            ).await.unwrap_err();
 
         assert!(error.contains("Code was not run"));
         assert!(error.contains("do not describe what the code would have produced"));
     }
 
-    #[test]
-    fn an_unbuilt_document_tool_says_no_file_exists() {
+    #[tokio::test]
+    async fn an_unbuilt_document_tool_says_no_file_exists() {
         let f = fixture();
         let error = runner(&f)
             .run(
                 ToolName::CreateDocx,
                 &ToolCall::new("create_docx", json!({})),
                 Some(&f.root.join("note.docx")),
-            )
-            .unwrap_err();
+            ).await.unwrap_err();
 
         assert!(error.contains("not built yet"));
         assert!(error.contains("none exists"));
@@ -817,31 +1125,197 @@ mod tests {
 
     // ── Validation ───────────────────────────────────────────────────────
 
-    #[test]
-    fn validating_reports_a_real_file() {
+    #[tokio::test]
+    async fn validating_reports_a_real_file() {
         let f = fixture();
         let path = f.root.join("note.txt");
         std::fs::write(&path, "content").unwrap();
 
         let out = runner(&f)
-            .run(ToolName::ValidateArtifact, &ToolCall::new("validate_artifact", json!({})), Some(&path))
-            .unwrap();
+            .run(ToolName::ValidateArtifact, &ToolCall::new("validate_artifact", json!({})), Some(&path)).await.unwrap();
 
         assert!(out.contains("7 byte(s)"));
     }
 
     /// An empty file exists but is not a usable artifact, and saying "it exists"
     /// would let a task report success on nothing.
-    #[test]
-    fn an_empty_file_fails_validation() {
+    #[tokio::test]
+    async fn an_empty_file_fails_validation() {
         let f = fixture();
         let path = f.root.join("empty.docx");
         std::fs::write(&path, "").unwrap();
 
         let error = runner(&f)
-            .run(ToolName::ValidateArtifact, &ToolCall::new("validate_artifact", json!({})), Some(&path))
-            .unwrap_err();
+            .run(ToolName::ValidateArtifact, &ToolCall::new("validate_artifact", json!({})), Some(&path)).await.unwrap_err();
 
         assert!(error.contains("empty"));
+    }
+
+    // ── Multimodal retrieval ─────────────────────────────────────────────
+
+    use crate::knowledge::multimodal::{
+        BBox, DocumentMeta, MultimodalIndex, NewRegion, NewTable,
+    };
+
+    /// Fixture that includes a multimodal index with one image region and
+    /// one table on the same document the prose index holds a passage on.
+    struct MultimodalFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        index: KnowledgeIndex,
+        multimodal: MultimodalIndex,
+        session: Session,
+    }
+
+    fn multimodal_fixture() -> MultimodalFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let index = KnowledgeIndex::open(&root).unwrap();
+        index
+            .index_document(
+                "Maintenance SOP",
+                Classification::Internal,
+                &[Chunk {
+                    id: "c1".into(),
+                    document_sha256: "sop".into(),
+                    ordinal: 0,
+                    text: "Minimum acceptable wall thickness is 9.0 mm.".into(),
+                    page: 4,
+                    section_path: vec!["4.2 Wall Thickness".into()],
+                    kind: ChunkKind::Prose,
+                    char_count: 44,
+                }],
+            )
+            .unwrap();
+        let multimodal = MultimodalIndex::open(&root).unwrap();
+        let meta = DocumentMeta {
+            sha256: "sop".into(),
+            name: "Maintenance SOP".into(),
+            document_type: "sop".into(),
+            type_confidence: 0.92,
+            type_abstained: false,
+            extraction_engine: "docling".into(),
+            classification: Classification::Internal,
+            page_count: 1,
+        };
+        let regions = vec![NewRegion {
+            id: "r1",
+            page: 4,
+            kind_str: "image",
+            bbox: BBox { left: 0.1, top: 0.2, right: 0.6, bottom: 0.8 },
+            caption: "schematic of wall thickness gauge",
+            label: Some("figure"),
+            box_confidence: 0.8,
+        }];
+        let headers = vec!["Parameter".into(), "Value".into()];
+        let rows = vec![
+            vec!["Wall thickness".into(), "9.0 mm".into()],
+            vec!["Material".into(), "SS 316".into()],
+        ];
+        let flat = "Parameter: Wall thickness | Value: 9.0 mm\nParameter: Material | Value: SS 316";
+        let tables = vec![NewTable {
+            id: "t1",
+            page: 4,
+            headers: &headers,
+            rows: &rows,
+            flat_text: flat,
+            bbox: BBox { left: 0.0, top: 0.0, right: 1.0, bottom: 1.0 },
+        }];
+        multimodal.index_document(&meta, &regions, &tables).unwrap();
+
+        MultimodalFixture {
+            _dir: dir,
+            root,
+            index,
+            multimodal,
+            session: Session::open(User::new("kiran", "Kiran", vec![Role::User])),
+        }
+    }
+
+    fn multimodal_runner(f: &MultimodalFixture) -> LocalToolRunner<'_> {
+        LocalToolRunner::with_multimodal(&f.index, &f.multimodal, &f.session)
+    }
+
+    #[tokio::test]
+    async fn multimodal_search_finds_text_regions_and_tables() {
+        let f = multimodal_fixture();
+        let out = multimodal_runner(&f)
+            .run(
+                ToolName::KnowledgeMultimodalRetrieve,
+                &ToolCall::new(
+                    "knowledge.multimodal_retrieve",
+                    json!({ "query": "wall thickness" }),
+                ),
+                None,
+            ).await.unwrap();
+        // All three modalities should be present.
+        assert!(out.contains("[E1]"), "expected a text passage marker, got {out}");
+        assert!(out.contains("[I1]"), "expected an image region marker, got {out}");
+        assert!(out.contains("[T1]"), "expected a table marker, got {out}");
+    }
+
+    #[tokio::test]
+    async fn multimodal_search_with_no_match_says_so() {
+        let f = multimodal_fixture();
+        let out = multimodal_runner(&f)
+            .run(
+                ToolName::KnowledgeMultimodalRetrieve,
+                &ToolCall::new(
+                    "knowledge.multimodal_retrieve",
+                    json!({ "query": "no-such-thing-anywhere" }),
+                ),
+                None,
+            ).await.unwrap();
+        assert!(out.contains("No text, image region, or table matched"));
+    }
+
+    #[tokio::test]
+    async fn multimodal_search_refuses_empty_query() {
+        let f = multimodal_fixture();
+        let error = multimodal_runner(&f)
+            .run(
+                ToolName::KnowledgeMultimodalRetrieve,
+                &ToolCall::new(
+                    "knowledge.multimodal_retrieve",
+                    json!({ "query": "" }),
+                ),
+                None,
+            ).await.unwrap_err();
+        assert!(error.contains("non-empty"));
+    }
+
+    #[tokio::test]
+    async fn multimodal_search_filters_by_document() {
+        let f = multimodal_fixture();
+        let out = multimodal_runner(&f)
+            .run(
+                ToolName::KnowledgeMultimodalRetrieve,
+                &ToolCall::new(
+                    "knowledge.multimodal_retrieve",
+                    json!({
+                        "query": "wall thickness",
+                        "documentSha256": "sop"
+                    }),
+                ),
+                None,
+            ).await.unwrap();
+        assert!(out.contains("Maintenance SOP"));
+    }
+
+    #[tokio::test]
+    async fn multimodal_search_without_index_refuses() {
+        let f = fixture();
+        // The base fixture has no multimodal index, so the runner is built
+        // with `multimodal: None`.
+        let error = runner(&f)
+            .run(
+                ToolName::KnowledgeMultimodalRetrieve,
+                &ToolCall::new(
+                    "knowledge.multimodal_retrieve",
+                    json!({ "query": "wall thickness" }),
+                ),
+                None,
+            ).await.unwrap_err();
+        assert!(error.contains("multimodal index is not available"));
     }
 }

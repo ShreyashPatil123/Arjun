@@ -29,6 +29,28 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use thiserror::Error;
+
+/// What can go wrong when the orchestrator or planner mutates a
+/// plan. Kept narrow: a step that does not exist is the only
+/// mutation that can fail by name. Other invariants are checked by
+/// the type system.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum PlanError {
+    #[error("no step with ordinal {ordinal} exists in this plan")]
+    NoSuchStep { ordinal: u32 },
+}
+
+/// A milestone step that has just been completed. Returned from
+/// [`PlanRun::record_step`] so the executor can pause the run for a
+/// human gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilestoneHit {
+    pub ordinal: u32,
+    pub checkpoint_id: Option<String>,
+    pub intent: String,
+}
+
 use serde::{Deserialize, Serialize};
 
 use super::tools::{ToolCall, ToolName};
@@ -90,6 +112,20 @@ pub struct PlanStep {
     /// What this step is for, in the user's terms.
     pub intent: String,
     pub done: bool,
+    /// If true, finishing this step is a checkpoint. The executor
+    /// pauses the run and emits `TaskState::MilestoneReached` so the
+    /// UI can ask a person to confirm before the next leg of work
+    /// starts. PS 26117 calls this "evidence-anchored decision
+    /// points" — the model says "I think we are here" and a human
+    /// signs off.
+    #[serde(default)]
+    pub milestone: bool,
+    /// Stable identifier the parent plan wrote when the plan was
+    /// drafted. The UI uses this to address the gate ("approve
+    /// milestone `mtn-2`"); the resume path uses it to know which
+    /// checkpoint was the last acknowledged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
 }
 
 /// Why a run ended.
@@ -184,6 +220,8 @@ impl PlanRun {
                     ordinal: i as u32 + 1,
                     intent,
                     done: false,
+                    milestone: false,
+                    checkpoint_id: None,
                 })
                 .collect(),
             budget,
@@ -192,6 +230,39 @@ impl PlanRun {
             seen: HashMap::new(),
             stopped: None,
         }
+    }
+
+    /// Marks an existing step as a milestone checkpoint.
+    ///
+    /// Call this when the plan is first drafted, before the run
+    /// starts. Marking a step *during* a run is also supported, in
+    /// case the model discovers partway through that the next leg of
+    /// work is a decision the user should make. The change is local
+    /// to this `PlanRun`; persistence is the caller's job.
+    pub fn mark_milestone(
+        &mut self,
+        ordinal: u32,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let step = self
+            .steps
+            .iter_mut()
+            .find(|s| s.ordinal == ordinal)
+            .ok_or(PlanError::NoSuchStep { ordinal })?;
+        step.milestone = true;
+        step.checkpoint_id = Some(checkpoint_id.into());
+        Ok(())
+    }
+
+    /// Returns the checkpoint id of the most recently completed
+    /// milestone, if any. Used by the resume path to know which gate
+    /// the human has already approved.
+    pub fn last_acknowledged_checkpoint(&self) -> Option<&str> {
+        self.steps
+            .iter()
+            .filter(|s| s.done && s.milestone)
+            .filter_map(|s| s.checkpoint_id.as_deref())
+            .next_back()
     }
 
     /// For tests and for resuming a run that waited on a person.
@@ -275,11 +346,30 @@ impl PlanRun {
     }
 
     /// Records that a step ran.
-    pub fn record_step(&mut self) {
+    ///
+    /// Returns the checkpoint id of any milestone that was just
+    /// completed, so the executor can pause for a human. The step is
+    /// always marked done; the milestone flag is a separate bit on
+    /// the same step.
+    pub fn record_step(&mut self) -> Option<MilestoneHit> {
         self.steps_taken += 1;
-        if let Some(next) = self.steps.iter_mut().find(|s| !s.done) {
-            next.done = true;
-        }
+        let hit = self
+            .steps
+            .iter_mut()
+            .find(|s| !s.done)
+            .and_then(|s| {
+                s.done = true;
+                if s.milestone {
+                    Some(MilestoneHit {
+                        ordinal: s.ordinal,
+                        checkpoint_id: s.checkpoint_id.clone(),
+                        intent: s.intent.clone(),
+                    })
+                } else {
+                    None
+                }
+            });
+        hit
     }
 
     /// Records that a tool call was spent, without claiming a step is finished.
@@ -558,5 +648,72 @@ mod tests {
         // The only way to change limits is to build a different plan.
         assert_eq!(run.budget.max_steps, budget.max_steps);
         assert_eq!(run.budget.permitted_tools, budget.permitted_tools);
+    }
+
+    // ── Milestone checkpoints ────────────────────────────────────────
+
+    #[test]
+    fn marking_a_step_as_milestone_stores_the_checkpoint_id() {
+        let mut run = run();
+        run.mark_milestone(2, "mtn-sop-look-up").unwrap();
+
+        let step = run.steps.iter().find(|s| s.ordinal == 2).unwrap();
+        assert!(step.milestone);
+        assert_eq!(step.checkpoint_id.as_deref(), Some("mtn-sop-look-up"));
+    }
+
+    #[test]
+    fn marking_an_unknown_step_is_an_error_not_a_panic() {
+        let mut run = run();
+        let err = run.mark_milestone(99, "nope").unwrap_err();
+        assert!(matches!(err, PlanError::NoSuchStep { ordinal: 99 }));
+    }
+
+    #[test]
+    fn completing_a_milestone_records_the_hit_with_its_intent() {
+        let mut run = run();
+        run.mark_milestone(1, "mtn-survey").unwrap();
+
+        let hit = run.record_step();
+        assert_eq!(
+            hit,
+            Some(MilestoneHit {
+                ordinal: 1,
+                checkpoint_id: Some("mtn-survey".to_string()),
+                intent: "Read the inspection report".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn completing_a_non_milestone_records_no_hit() {
+        let mut run = run();
+        let hit = run.record_step();
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn last_acknowledged_checkpoint_returns_the_most_recent_done_milestone() {
+        let mut run = run();
+        run.mark_milestone(1, "mtn-1").unwrap();
+        run.mark_milestone(3, "mtn-3").unwrap();
+
+        // First step done is a milestone.
+        let hit1 = run.record_step();
+        assert_eq!(hit1.unwrap().checkpoint_id.as_deref(), Some("mtn-1"));
+        // Second step is not a milestone.
+        let hit2 = run.record_step();
+        assert!(hit2.is_none());
+        // Third step done is also a milestone.
+        let hit3 = run.record_step();
+        assert_eq!(hit3.unwrap().checkpoint_id.as_deref(), Some("mtn-3"));
+
+        assert_eq!(run.last_acknowledged_checkpoint(), Some("mtn-3"));
+    }
+
+    #[test]
+    fn last_acknowledged_checkpoint_is_none_before_anything_completes() {
+        let run = run();
+        assert_eq!(run.last_acknowledged_checkpoint(), None);
     }
 }

@@ -1,11 +1,25 @@
 //! Model Intelligence Tauri IPC Commands
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
 use crate::adapter_manager::AdapterRegistry;
 use crate::model_intelligence::{
+    telemetry::{ModelAggregate, TelemetrySink},
     AdapterRouteResult, AdapterRouter, ModelIntelligenceManager, ModelProfile, InferenceParameters,
 };
+
+/// Reads the in-memory aggregate for the Model Health page. Bounded:
+/// one row per model id, with the most recent calls collapsed. The
+/// audit log is the source of truth for full history; this is the
+/// "what is right now" view.
+#[tauri::command]
+pub async fn model_health_snapshot(
+    state: tauri::State<'_, Arc<TelemetrySink>>,
+) -> Result<Vec<ModelAggregate>, String> {
+    Ok(state.snapshot())
+}
 
 #[tauri::command]
 pub async fn get_model_profile(

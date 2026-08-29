@@ -40,6 +40,8 @@ pub mod plugins;
 pub mod memory_engine;
 pub mod media_adapter;
 pub mod sih_workflow;
+pub mod voice;
+pub mod benchmarks;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -103,11 +105,25 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("the application data directory must resolve");
+            // Expose the resolved data dir to commands that need to read or
+            // write files outside the audit DB (e.g. the provenance HMAC key
+            // and tag files live here).
+            app.manage(data_dir.clone());
             match audit::AuditService::open(&data_dir) {
                 Ok(service) => {
                     let service = Arc::new(service);
                     sovereignty::global_broker().attach_audit(service.clone());
-                    app.manage(service);
+                    app.manage(service.clone());
+                    // The zero-trust gate is opened next to the audit log
+                    // because every gate decision is recorded in the log.
+                    match sovereignty::zero_trust::ZeroTrustGate::open(&data_dir, service) {
+                        Ok(gate) => {
+                            app.manage(Arc::new(gate));
+                        }
+                        Err(e) => {
+                            log::error!("[ZERO-TRUST] could not open the gate: {e}");
+                        }
+                    }
                 }
                 Err(e) => {
                     // Running without a durable record is a real degradation, so
@@ -169,6 +185,61 @@ pub fn run() {
 
             app.manage(Arc::new(orchestrator::approvals::ApprovalQueue::new()));
             app.manage(commands::governance::CurrentSession::default());
+            // The telemetry sink: per-model call records, written to the
+            // audit log on each call so the Model Health page reads from
+            // a single signed chain rather than a separate database.
+            let telemetry_sink =
+                Arc::new(model_intelligence::telemetry::TelemetrySink::new());
+            // Diagnostic: prove the sink is registered and the lookup
+            // from the inference path will resolve. If the page is
+            // empty after a chat, this log line is the first thing to
+            // check; the path that records calls goes through
+            // `app_handle.try_state::<Arc<TelemetrySink>>` and would
+            // hit the same lookup mechanism.
+            // `eprintln!` is used deliberately: the Tauri log plugin's
+            // flush is lazy, and `log::info!` from the `log` crate was
+            // observed to not reach `sarathi.log` for these new lines.
+            // `eprintln!` writes to stderr, which `Start-Process` on
+            // Windows exposes via the parent's handle when the parent
+            // is a console host. The PowerShell wrapper captures it.
+            eprintln!(
+                "[telemetry] sink registered; default seq = 0; \
+                 snapshot at startup = {} rows",
+                telemetry_sink.snapshot().len()
+            );
+
+            // Diagnostic: insert one synthetic row at startup so the
+            // Model Health page is guaranteed non-empty after launch.
+            // This is the baseline that proves the IPC + reducer + page
+            // chain is working end-to-end. Any real inference call
+            // adds a second row; if the synthetic row is missing, the
+            // page itself is broken; if only the synthetic row is
+            // there, the inference path is broken.
+            telemetry_sink.record(
+                None,
+                crate::model_intelligence::telemetry::ModelCallRecord {
+                    model_id: "<startup>".to_string(),
+                    task_id: "<startup>".to_string(),
+                    intent: "startup".to_string(),
+                    role: "diagnostic".to_string(),
+                    latency: std::time::Duration::from_millis(0),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    used_fallback: false,
+                    exit: crate::model_intelligence::telemetry::CallExit::Ok,
+                    note: Some("synthetic startup record inserted to prove \
+                              the IPC + reducer + page chain is wired"
+                        .to_string()),
+                    complexity: None,
+                },
+            );
+            eprintln!(
+                "[telemetry] synthetic startup record inserted; \
+                 snapshot now = {} rows",
+                telemetry_sink.snapshot().len()
+            );
+
+            app.manage(telemetry_sink);
             // Started on first run rather than here: the workbench must open for an
             // auditor, and on a machine where the runtime bundle was never built.
             app.manage(commands::agent::AgentRuntimeHandle::default());
@@ -197,6 +268,27 @@ pub fn run() {
             app.manage(commands::agent::RunCheckpoints::default());
             app.manage(agent_runtime::retrieval::RunPassages::default());
             app.manage(agent_runtime::artifacts::RunArtifacts::default());
+
+            // Chat conversations: persistent ordered transcripts that own
+            // one or more runs. Sits beside the task record; the two are
+            // complementary (the task record is the audit-grade proof a
+            // run happened; the conversation is the user-visible chat).
+            let conversation_store = std::sync::Arc::new(
+                agent_runtime::conversations::ConversationStore::open(&data_dir)
+                    .unwrap_or_else(|error| {
+                        // A conversation store that cannot be opened is a
+                        // real degradation. We still fall back to a temp
+                        // directory so the app does not refuse to start.
+                        log::error!("[CONVERSATIONS] the store could not be opened: {error}");
+                        let tmp = std::env::temp_dir().join("arjun-conversations-fallback");
+                        agent_runtime::conversations::ConversationStore::open(&tmp)
+                            .expect("a temp conversation store must open")
+                    }),
+            );
+            let run_to_conversation =
+                std::sync::Arc::new(agent_runtime::conversations::RunToConversation::new());
+            app.manage(commands::conversations::ConversationsState(conversation_store));
+            app.manage(commands::conversations::RunToConversationState(run_to_conversation));
 
             // The durable half of all of the above. Everything managed just
             // now dies with this process; this is what a run leaves behind
@@ -540,6 +632,7 @@ pub fn run() {
             commands::intelligence::update_model_profile,
             commands::intelligence::refresh_model_profile,
             commands::intelligence::route_prompt_capability,
+            commands::intelligence::model_health_snapshot,
 
             // Launch section — start coding tools already connected
 
@@ -556,6 +649,22 @@ pub fn run() {
             commands::agent::agent_task,
             commands::agent::agent_task_artifacts,
             commands::agent::agent_reveal_artifact,
+            commands::agent::artifact_preview,
+
+            // Chat conversations: persistent ordered transcripts that own
+            // one or more runs. The chat surface calls these to create a
+            // conversation, list previous ones, append a user turn (which
+            // also reserves the assistant cell and binds the run id), update
+            // the streaming content as tokens arrive, and mark the message
+            // complete when the run ends.
+            commands::conversations::agent_create_conversation,
+            commands::conversations::agent_get_conversation,
+            commands::conversations::agent_list_conversations,
+            commands::conversations::agent_append_turn,
+            commands::conversations::agent_update_streaming_content,
+            commands::conversations::agent_complete_message,
+            commands::conversations::agent_run_conversation,
+            commands::conversations::agent_get_message,
             // Recovering a run: the state a window reattaches to, the events
             // since that state, and which runs are still going at all.
             commands::agent::agent_run_resumability,
@@ -585,6 +694,21 @@ pub fn run() {
             commands::governance::current_permissions,
             commands::governance::recent_audit_entries,
             commands::governance::verify_audit_chain,
+            commands::governance::verify_audit_merkle,
+            commands::governance::sign_provenance,
+            commands::governance::verify_provenance,
+            commands::governance::read_zero_trust_config,
+            commands::governance::set_zero_trust_mode,
+            commands::governance::zero_trust_check_tool_call,
+            commands::governance::zero_trust_confirm_approval,
+            // Voice bridge (push-to-talk STT/TTS)
+            commands::voice::voice_transcribe,
+            commands::voice::voice_speak,
+            commands::voice::voice_status,
+            // Performance benchmarks for the System Health page
+            commands::benchmarks::run_benchmark,
+            commands::benchmarks::synthetic_benchmark,
+            commands::benchmarks::recent_benchmarks,
             commands::governance::authentication_status,
             commands::governance::set_initial_administrator_password,
             commands::governance::set_account_password,

@@ -1,0 +1,40 @@
+{
+  "_comment": "ARJUN Phase 2 default model registry. Drop this into <app_data>/models/registry.json (or merge it into your existing one). The parent agent model is OpenReasoning-Nemotron-7B Q4_K_M: the smallest dense reasoning model that clears the 7B coding floor, and the only candidate that fits a 4 GB VRAM card with partial CPU offload. Sub-agents inherit this model through their profile.",
+  "models": [
+    {
+      "id": "openreasoning-nemotron-7b",
+      "name": "OpenReasoning-Nemotron 7B",
+      "version": "1",
+      "license": "apache-2.0",
+      "runtime": "llamaCpp",
+      "roles": ["reasoning", "coding"],
+      "modalities": ["text"],
+      "parametersB": 7.0,
+      "contextLength": 32768,
+      "weightsBytes": 4360000000,
+      "quantization": "Q4_K_M",
+      "supportsStructuredOutput": true,
+      "permittedClassifications": ["internal", "processDiagram", "vendorNegotiation", "financial"],
+      "path": "F:/Models/Reasoning/OpenReasoning-Nemotron-7B"
+    },
+    {
+      "_comment": "Optional fallback: MoE 35B, very slow on 4 GB VRAM, kept enabled so a parent can fall back if Nemotron is not installed. Set enabled=false to remove.",
+      "id": "qwen3.6-35b-a3b",
+      "name": "Qwen3.6 35B A3B",
+      "version": "1",
+      "license": "apache-2.0",
+      "runtime": "llamaCpp",
+      "roles": ["reasoning", "coding"],
+      "modalities": ["text"],
+      "parametersB": 35.0,
+      "activeParametersB": 3.0,
+      "contextLength": 32768,
+      "weightsBytes": 20610000000,
+      "quantization": "UD-Q4_K_M",
+      "supportsStructuredOutput": true,
+      "permittedClassifications": ["internal", "processDiagram"],
+      "path": "F:/Models/Reasoning/Qwen3.6-35B-A3B",
+      "enabled": false
+    }
+  ]
+}

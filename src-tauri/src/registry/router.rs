@@ -216,10 +216,26 @@ impl ModelRouter {
         }
 
         // Step 4: largest first, so the first that fits is the best that fits.
+        // The sort key is (size desc, preferred desc, rank asc). The size
+        // band is the dominant factor; the tie-breakers only matter when
+        // two candidates have the same `parameters_b`. `preferred` is the
+        // operator-set "use this one" knob, and `rank_within_band` is the
+        // telemetry-driven ordering, so the deterministic default is
+        // preserved when both are absent.
         candidates.sort_by(|a, b| {
             b.parameters_b
                 .partial_cmp(&a.parameters_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.routing
+                        .preferred
+                        .cmp(&a.routing.preferred)
+                })
+                .then_with(|| {
+                    a.routing
+                        .rank_within_band
+                        .cmp(&b.routing.rank_within_band)
+                })
         });
 
         for entry in &candidates {
@@ -355,12 +371,44 @@ impl ModelRouter {
         }
 
         match classification {
-            Some(c) => format!(
-                "No {} model is cleared for {} material. An administrator clears one, having \
-                 checked it is appropriate for data of that sensitivity.",
-                role.label(),
-                c.label()
-            ),
+            Some(c) => {
+                // Name the model that needs administrator review rather
+                // than asking the operator to find one. The closest
+                // candidate is the one that clears every other gate
+                // (role, modality, floor, runtime, license) but not the
+                // classification — that is the one to inspect and
+                // either clear or refuse to clear on the record.
+                let closest = serving
+                    .iter()
+                    .find(|e| {
+                        e.enabled
+                            && e.meets_floor(role)
+                            && (required_modality.is_none()
+                                || e.supports_modality(required_modality.unwrap()))
+                            && (!require_structured_output || e.supports_structured_output())
+                            && (available_runtime_profiles.is_empty()
+                                || e.runtime_profile_available(available_runtime_profiles))
+                            && (allowed_licenses.is_empty()
+                                || e.license_allowed(allowed_licenses))
+                    })
+                    .map(|e| e.id.as_str());
+                match closest {
+                    Some(model_id) => format!(
+                        "No {} model is cleared for {} material. Ask an administrator to \
+                         review {} and add {} to its permitted classifications.",
+                        role.label(),
+                        c.label(),
+                        model_id,
+                        c.label()
+                    ),
+                    None => format!(
+                        "No {} model is cleared for {} material. An administrator clears one, \
+                         having checked it is appropriate for data of that sensitivity.",
+                        role.label(),
+                        c.label()
+                    ),
+                }
+            }
             None => format!("No {} model is available.", role.label()),
         }
     }
@@ -575,6 +623,39 @@ mod tests {
         assert!(failure.reason.contains("Vendor negotiation"), "{}", failure.reason);
     }
 
+    /// The contract from the prompt: when no model is cleared for the
+    /// material, the refusal must (a) name the classification, (b) name
+    /// the model that needs administrator review, and (c) not look
+    /// like a generic "no model" message. Each of those is what a
+    /// plant safety officer needs to act on the refusal in a hurry.
+    #[test]
+    fn refusal_names_the_classification_and_a_candidate_for_review() {
+        let mut cleared = entry("qwen-7b", 7.0, vec![ModelRole::Reasoning]);
+        cleared.permitted_classifications = vec![Classification::Internal];
+        let registry = registry(vec![cleared]);
+
+        let failure = ModelRouter::route(
+            &registry,
+            "Summarise the vendor's offer",
+            Some(Classification::VendorNegotiation),
+            24 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        let reason = &failure.reason;
+        assert!(
+            reason.contains("Vendor negotiation"),
+            "refusal must name the classification, got: {reason}"
+        );
+        assert!(
+            reason.contains("qwen-7b"),
+            "refusal must name a model an administrator can review, got: {reason}"
+        );
+    }
+
     /// Whatever else changes, a decision must always be explainable.
     #[test]
     fn every_successful_decision_carries_its_reasons() {
@@ -593,4 +674,81 @@ mod tests {
             );
         }
     }
-}
+    // ── Routing preferences: a deterministic tie-breaker ────────────────
+
+    /// "Always use the best model" is implemented as `routing.preferred`
+    /// on a model entry. Two same-size peers, one preferred, the
+    /// preferred one wins. The hard gates still run first — preferred
+    /// is a tie-break, not a bypass.
+    #[test]
+    fn the_preferred_model_wins_a_size_tie() {
+        let mut preferred = entry("qwen-7b", 7.0, vec![ModelRole::Reasoning]);
+        preferred.routing.preferred = true;
+        let other = entry("mistral-7b", 7.0, vec![ModelRole::Reasoning]);
+        let registry = registry(vec![preferred, other]);
+
+        let decision = ModelRouter::route(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            24 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(decision.model_id, "qwen-7b");
+    }
+
+    /// `rank_within_band` is the telemetry-driven tie-breaker. Lower
+    /// rank wins. The point is to let the per-model performance sink
+    /// influence routing without changing the hard gates.
+    #[test]
+    fn a_lower_rank_within_band_wins_among_same_size_peers() {
+        let mut faster = entry("qwen-7b", 7.0, vec![ModelRole::Reasoning]);
+        faster.routing.rank_within_band = 0;
+        let mut slower = entry("mistral-7b", 7.0, vec![ModelRole::Reasoning]);
+        slower.routing.rank_within_band = 5;
+        let registry = registry(vec![slower, faster]);
+
+        let decision = ModelRouter::route(
+            &registry,
+            "Summarise the inspection findings",
+            None,
+            24 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(decision.model_id, "qwen-7b");
+    }
+
+    /// Preferred is *only* a tie-breaker. A larger model that is not
+    /// preferred still wins over a smaller preferred one, because size
+    /// is the dominant sort key.
+    #[test]
+    fn preferred_does_not_bypass_the_size_band() {
+        let mut small_preferred = entry("qwen-7b", 7.0, vec![ModelRole::Reasoning]);
+        small_preferred.routing.preferred = true;
+        let big = entry("qwen-14b", 14.0, vec![ModelRole::Reasoning]);
+        let registry = registry(vec![small_preferred, big]);
+
+        let decision = ModelRouter::route(
+            &registry,
+            "Summarise the inspection findings",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.model_id, "qwen-14b",
+            "size dominates; preferred only breaks ties"
+        );
+    }}

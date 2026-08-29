@@ -205,6 +205,31 @@ pub struct ModelEntry {
     /// Administrators disable a model without deleting it.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Routing preferences. Used as a tie-breaker, never a hard gate:
+    /// a model marked `preferred` does not bypass the classification or
+    /// VRAM filters, it only wins a tie against a same-size peer.
+    #[serde(default)]
+    pub routing: RoutingPreference,
+}
+
+/// How the router should treat this model when it is one of several that
+/// all clear the hard gates. None of these widen permissions; they only
+/// change *which* of the already-eligible candidates is picked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingPreference {
+    /// True on the model that should win a tie against same-size peers.
+    /// The user-facing equivalent of "Always use the best model for me":
+    /// the operator marks one candidate per role as preferred, and the
+    /// router honours it after the hard gates.
+    #[serde(default)]
+    pub preferred: bool,
+    /// Tie-break order within a size band. Lower wins. Used by the
+    /// per-model performance telemetry to surface "this model is
+    /// consistently faster on my hardware" without inventing a number.
+    /// Tied with `preferred` only when telemetry is absent.
+    #[serde(default)]
+    pub rank_within_band: u32,
 }
 
 /// The coordinates the inference runtime loads a model by.
@@ -469,6 +494,7 @@ impl ModelRegistry {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::Value;
 
     pub(crate) fn entry(id: &str, params: f32, roles: Vec<ModelRole>) -> ModelEntry {
         ModelEntry {
@@ -496,6 +522,7 @@ pub(crate) mod tests {
             serving: None,
             required_runtime_profile: None,
             enabled: true,
+            routing: RoutingPreference::default(),
         }
     }
 
@@ -698,5 +725,83 @@ pub(crate) mod tests {
         // The manifest is still reported as broken when it is read on its own,
         // so nothing here quietly forgives a malformed file.
         assert!(ModelRegistry::load(&models_dir).is_err());
+    }
+
+    /// The manifest the system ships for a vision-language model.
+    ///
+    /// A real ARJUN deployment adds vision models by editing
+    /// ``registry.json``; this is what that entry looks like, captured as
+    /// a round-trip test so the JSON shape is exercised every time the
+    /// registry is touched. The fields that are specific to vision —
+    /// `roles: ["vision"]` and `modalities: ["text", "image"]` — are
+    /// what the multimodal retriever queries against.
+    #[test]
+    fn a_vision_model_manifest_round_trips() {
+        let json = r#"{
+            "models": [{
+                "id": "qwen2.5-vl-3b-instruct",
+                "name": "Qwen2.5-VL 3B Instruct",
+                "version": "1",
+                "license": "Apache-2.0",
+                "runtime": "llamaCpp",
+                "roles": ["vision"],
+                "modalities": ["text", "image"],
+                "parametersB": 3.0,
+                "contextLength": 32768,
+                "weightsBytes": 2000000000,
+                "quantization": "Q4_K_M",
+                "permittedClassifications": ["internal", "processDiagram"],
+                "supportsStructuredOutput": false,
+                "path": "models/qwen2.5-vl-3b-instruct"
+            }]
+        }"#;
+        let manifest: ModelManifest = serde_json::from_str(json).unwrap();
+        let registry =
+            ModelRegistry::from_manifest(manifest, PathBuf::from("registry.json")).unwrap();
+        let model = registry.find("qwen2.5-vl-3b-instruct").unwrap();
+
+        // The Vision role is what the multimodal tool queries.
+        assert!(model.serves(ModelRole::Vision));
+        // The image modality is what the runtime hard-gates on. A text-only
+        // model would not be eligible for a vision request even if its
+        // role were Vision.
+        assert!(model.supports_modality(Modality::Image));
+        // The runtime is the wire format the bridge expects to speak.
+        assert_eq!(model.runtime, Runtime::LlamaCpp);
+        // The classification gates what the model may see. A vision model
+        // cleared for internal and process-diagram material can read
+        // P&IDs but not vendor negotiations.
+        assert!(model.permits(Classification::Internal));
+        assert!(model.permits(Classification::ProcessDiagram));
+        assert!(!model.permits(Classification::VendorNegotiation));
+
+        // Round-trip: re-serialise the loaded manifest and confirm the
+        // image modality survives. This is what stops a future refactor
+        // from dropping the field on the way to JSON.
+        let reserialised = serde_json::to_value(&model).unwrap();
+        let modalities = reserialised.get("modalities").and_then(Value::as_array).unwrap();
+        assert!(modalities.iter().any(|v| v == "image"));
+    }
+
+    /// A vision request must filter to models that both serve the Vision
+    /// role *and* declare the image modality. A model with one but not
+    /// the other is not eligible, and the bridge would refuse it on
+    /// construction — the registry enforces the same constraint at the
+    /// candidate stage.
+    #[test]
+    fn vision_candidates_require_both_role_and_modality() {
+        let mut with_image = entry("vision-with-image", 3.0, vec![ModelRole::Vision]);
+        with_image.modalities = vec![Modality::Text, Modality::Image];
+        let registry = registry(vec![with_image]);
+
+        let vision_candidates: Vec<&ModelEntry> = registry
+            .all()
+            .iter()
+            .filter(|m: &&ModelEntry| {
+                m.serves(ModelRole::Vision) && m.supports_modality(Modality::Image)
+            })
+            .collect();
+        assert_eq!(vision_candidates.len(), 1);
+        assert_eq!(vision_candidates[0].id, "vision-with-image");
     }
 }

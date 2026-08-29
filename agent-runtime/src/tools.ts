@@ -37,10 +37,68 @@ export type Verdict =
   | { outcome: "needsApproval"; tool: string; summary: string; resolvedPath?: string | null }
   | { outcome: "refuse"; reason: string };
 
+/** A single image attached to a tool result.
+
+The agent-core API accepts image content parts in the same way
+OpenAI does — the runtime translates the in-memory representation
+into the chat schema the model is currently speaking. Keeping the
+field as a base64 data URI rather than a path means the
+representation is portable: it round-trips through any serialiser
+the runtime speaks, and the bytes are not silently fetched from a
+URL a model could not have verified.
+*/
+export interface ToolResultImage {
+  /** MIME type, e.g. "image/png". */
+  mime: string;
+  /** Base64-encoded image bytes. */
+  data: string;
+  /** Optional caption: a textual proxy the model can cite. */
+  caption?: string;
+  /** Optional bounding box, as fractions of the source page (0.0–1.0). */
+  bbox?: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+}
+
+/** A single table attached to a tool result.
+
+Preserved as structure, never flattened. The model sees the columns
+and rows in the format its input layer accepts, and a downstream
+verifier can check that a citation the model wrote actually exists
+in the table — which is what a table that arrived as prose cannot
+do.
+*/
+export interface ToolResultTable {
+  /** Column headers, in order. Same length as every row. */
+  headers: string[];
+  /** Rows, each the same length as `headers`. */
+  rows: string[][];
+  /** Where on the page the table sits, as fractions (0.0–1.0). */
+  bbox?: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+  /** Citation the model can read. The page number at minimum. */
+  citation: string;
+}
+
 /** What Rust returns from `tool.execute`. */
 export interface ToolExecution {
-  /** What the model sees. */
+  /** What the model sees. Always present — multimodal results still
+   *  carry a prose rendering so a model that does not understand
+   *  the structured fields gets a useful answer anyway. */
   text: string;
+  /** Optional images attached to the result. The agent-core content
+   *  array carries them as image parts alongside the text. */
+  images?: ToolResultImage[];
+  /** Optional tables attached to the result. The model sees the
+   *  prose rendering in `text` and the structured form here. */
+  tables?: ToolResultTable[];
   /** Structured detail for the audit record and the UI. Never shown to the model. */
   details?: unknown;
 }
@@ -202,8 +260,48 @@ function hostTool(options: {
         // Deliberately swallowed. See above.
       }
 
+      // Build the content array the agent-core API expects. Text first
+      // so a model that only reads `content[0].text` (a behaviour some
+      // older agent-core versions fall back to) still gets the answer;
+      // then the structured multimodal parts in declaration order, so
+      // a model that walks the array sees them grouped with their
+      // textual context.
+      const content: Array<
+        | { type: "text"; text: string }
+        | {
+            type: "image";
+            source: { type: "base64"; media_type: string; data: string };
+            // OpenAI-compatible vision input — some models accept a
+            // caption as a marker. The runtime's translator is free to
+            // ignore it on runtimes that do not.
+            caption?: string;
+          }
+        | {
+            type: "table";
+            headers: string[];
+            rows: string[][];
+            citation: string;
+          }
+      > = [{ type: "text", text: execution.text }];
+
+      for (const image of execution.images ?? []) {
+        content.push({
+          type: "image",
+          source: { type: "base64", media_type: image.mime, data: image.data },
+          ...(image.caption !== undefined ? { caption: image.caption } : {}),
+        });
+      }
+      for (const table of execution.tables ?? []) {
+        content.push({
+          type: "table",
+          headers: table.headers,
+          rows: table.rows,
+          citation: table.citation,
+        });
+      }
+
       return {
-        content: [{ type: "text", text: execution.text }],
+        content,
         details: execution.details ?? null,
       };
     },

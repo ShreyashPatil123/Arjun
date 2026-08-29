@@ -24,6 +24,31 @@
       "name": "artifact-verification",
       "sha256": "0a38fcddad864f6909227b34724bedb3f12af9e4c3a5bfab2922606b9e977f6e",
       "note": "Shipped with ARJUN 0.1.0; reviewed at the commit that introduced the skill system."
+    },
+    {
+      "name": "hazop-analyzer",
+      "sha256": "eeb965bea09d35c19046a55d7c33856da4452f00fa86735c4af5ea9a0cba00a2",
+      "note": "SIH 2026 industrial pack; HAZOP worksheet analyzer (IEC 61882)."
+    },
+    {
+      "name": "pid-reader",
+      "sha256": "e5fa59bab5b7c888bf10e0d56956d0fc4bdb64568453790657b200cafa145b9f",
+      "note": "SIH 2026 industrial pack; P&ID reader and line tracer."
+    },
+    {
+      "name": "equipment-lookup",
+      "sha256": "2fdca1c82891844ca6ecfd5ace7eff3d05554976cd36a17e560c727831c1942b",
+      "note": "SIH 2026 industrial pack; equipment tag cross-reference."
+    },
+    {
+      "name": "safety-compliance",
+      "sha256": "3feadefd549e0972289fa4568c0c8027789883b0437401ffc3f05a7bdd7924d3",
+      "note": "SIH 2026 industrial pack; IS 15656 / API 510 / OSHA clause checker."
+    },
+    {
+      "name": "vendor-evaluator",
+      "sha256": "b1f42a4f4a41d57be35d5c24f84d52a6f8cfba009cac90e9fa06cb3153bbffe2",
+      "note": "SIH 2026 industrial pack; vendor quote comparison and 3-y TCO."
     }
   ]
 }

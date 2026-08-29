@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "conversation": {
+    "id": "d0bf27bd-7df7-4d48-8155-d865c94a519a",
+    "title": "New conversation",
+    "createdAt": "2026-08-29T22:53:17.456720800+00:00",
+    "lastActivityAt": "2026-08-29T22:53:17.456720800+00:00",
+    "messages": [
+      {
+        "id": "sys-446d8d91-fc53-4176-b06d-83ba22d0567f",
+        "conversationId": "d0bf27bd-7df7-4d48-8155-d865c94a519a",
+        "role": "system",
+        "content": "Arjun is ready. Ask anything; nothing leaves this machine.",
+        "status": "done",
+        "createdAt": "2026-08-29T22:53:17.456720800+00:00",
+        "completedAt": "2026-08-29T22:53:17.456720800+00:00"
+      }
+    ],
+    "runs": [],
+    "compactions": 0
+  }
+}

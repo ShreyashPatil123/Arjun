@@ -426,7 +426,7 @@ impl FitScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{LoadSpec, ModelEntry, ModelRole, Runtime};
+    use crate::registry::{LoadSpec, ModelEntry, ModelRole, RoutingPreference, Runtime};
     use std::path::PathBuf;
 
     fn test_entry(id: &str, params: f32, roles: Vec<ModelRole>) -> ModelEntry {
@@ -455,6 +455,7 @@ mod tests {
             serving: None,
             required_runtime_profile: None,
             enabled: true,
+        routing: RoutingPreference::default(),
         }
     }
 

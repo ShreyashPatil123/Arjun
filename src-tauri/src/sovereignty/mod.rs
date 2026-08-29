@@ -8,8 +8,10 @@
 //!   connected to, so the claim does not rest on ARJUN reporting on itself.
 
 pub mod broker;
+pub mod enclave;
 pub mod mode;
 pub mod observer;
+pub mod zero_trust;
 
 pub use broker::{global_broker, BrokerError, EgressEvent, NetworkBroker};
 pub use mode::{OperatingMode, Refusal};

@@ -151,6 +151,9 @@ pub enum ToolName {
     AgentDelegateReadonly,
     /// Read this machine's own record of what it did and did not send.
     SovereigntyGetEvidence,
+    /// Search both the prose index and the multimodal index (image regions
+    /// and table rows), returning passages alongside their visual evidence.
+    KnowledgeMultimodalRetrieve,
 }
 
 impl ToolName {
@@ -170,6 +173,7 @@ impl ToolName {
         ToolName::CapabilitySearch,
         ToolName::AgentDelegateReadonly,
         ToolName::SovereigntyGetEvidence,
+        ToolName::KnowledgeMultimodalRetrieve,
     ];
 
     /// The wire name a model emits, and the only spelling ever written.
@@ -190,6 +194,7 @@ impl ToolName {
             ToolName::CapabilitySearch => "capability.search",
             ToolName::AgentDelegateReadonly => "agent.delegate_readonly",
             ToolName::SovereigntyGetEvidence => "sovereignty.get_evidence",
+            ToolName::KnowledgeMultimodalRetrieve => "knowledge.multimodal_retrieve",
         }
     }
 
@@ -216,7 +221,8 @@ impl ToolName {
             ToolName::MediaExtractFindings
             | ToolName::CapabilitySearch
             | ToolName::AgentDelegateReadonly
-            | ToolName::SovereigntyGetEvidence => None,
+            | ToolName::SovereigntyGetEvidence
+            | ToolName::KnowledgeMultimodalRetrieve => None,
         }
     }
 
@@ -246,7 +252,8 @@ impl ToolName {
             | ToolName::ValidateArtifact
             | ToolName::CapabilitySearch
             | ToolName::AgentDelegateReadonly
-            | ToolName::SovereigntyGetEvidence => true,
+            | ToolName::SovereigntyGetEvidence
+            | ToolName::KnowledgeMultimodalRetrieve => true,
             ToolName::MemoryPromoteApproved
             | ToolName::WriteScopedFile
             | ToolName::CreateDocx
@@ -273,6 +280,7 @@ impl ToolName {
             ToolName::CapabilitySearch => "list the skills this task could load",
             ToolName::AgentDelegateReadonly => "hand a read-only sub-task to a worker",
             ToolName::SovereigntyGetEvidence => "read this machine's own network record",
+            ToolName::KnowledgeMultimodalRetrieve => "search text, image regions, and tables together",
         }
     }
 }
@@ -409,6 +417,29 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             network: NetworkUse::Loopback,
             // A vision pass over a page is slow next to a text read.
             timeout: Duration::from_secs(90),
+            ..defaults(name)
+        },
+        ToolName::KnowledgeMultimodalRetrieve => ToolSpec {
+            // Reads the same shelf as `SearchDocuments`, applying the same
+            // clearance. The multimodal index carries the same classifications
+            // the prose index does, and a row the asker cannot see is not
+            // returned.
+            permission: SearchKnowledge,
+            arguments: &[
+                ArgumentSpec { name: "query", kind: Text },
+                ArgumentSpec { name: "documentType", kind: Text },
+                ArgumentSpec { name: "documentSha256", kind: Text },
+                ArgumentSpec { name: "page", kind: Integer },
+                ArgumentSpec { name: "maxResults", kind: Integer },
+            ],
+            // A search over a 200-page P&ID set is not as cheap as a text
+            // search. Allow more time before the budget trips.
+            timeout: Duration::from_secs(45),
+            // A larger response budget: this tool returns prose passages
+            // *and* image regions, each with its own citation. The model is
+            // expected to use it once and reason about a result, not to
+            // page through twenty of them.
+            max_response_bytes: 32 * 1024,
             ..defaults(name)
         },
         ToolName::MemoryRecallAuthorized => ToolSpec {

@@ -88,6 +88,16 @@ impl SearchResult {
 /// what the person meant. Internal quotes are doubled, which is how FTS5 escapes
 /// them, so no input can break out of the phrase and become an operator.
 fn to_match_expression(query: &str) -> Option<String> {
+    sanitise_fts(query)
+}
+
+/// Wraps an FTS5 query so the user's tokens are matched as adjacent phrases.
+///
+/// Public so the multimodal index can share the same sanitisation — a
+/// refinery user typing `PT-2201` should land on the right page whether
+/// the page is a passage, an image region, or a table row, and the FTS5
+/// expression that does the matching is the same in all three cases.
+pub fn sanitise_fts(query: &str) -> Option<String> {
     let phrases: Vec<String> = query
         .split_whitespace()
         .filter(|token| !token.trim_matches(|c: char| !c.is_alphanumeric()).is_empty())

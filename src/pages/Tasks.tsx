@@ -5,6 +5,9 @@ import {
   FileSpreadsheet,
   FileText,
   FolderOpen,
+  Loader2,
+  Play,
+  RotateCcw,
   ShieldCheck,
 } from 'lucide-react';
 import {
@@ -22,6 +25,8 @@ import {
   fitted,
   ledgerRows,
 } from '../components/run/context-ledger';
+import { useToast } from '../hooks/useToast';
+import { useRun, isBusy } from '../components/run/useRun';
 import styles from './Tasks.module.css';
 
 /**
@@ -564,10 +569,86 @@ function Detail({ runId, onBack }: { runId: string; onBack: () => void }) {
   );
 }
 
+/**
+ * Two affordances on every history row.
+ *
+ * "Open" reads the saved record — the right thing when the operator wants to
+ * audit what the run actually did. "Replay" starts a fresh run with the same
+ * prompt — the right thing when they want to see the answer again, or try a
+ * different model on the same input. The two are deliberately separate
+ * actions: a click that secretly started a long run would be worse than
+ * confusing.
+ *
+ * Replay is blocked while another run is in flight anywhere in the app, and
+ * it is blocked on a row whose run is still live — replaying a running task
+ * is the same as starting a duplicate.
+ */
+function TaskRowActions({
+  task,
+  onOpen,
+}: {
+  task: TaskSummary;
+  onOpen: (runId: string) => void;
+}) {
+  const { state, start } = useRun();
+  const { addToast } = useToast();
+  const busy = isBusy(state.phase);
+  const disabled = busy || task.live;
+  const onReplay = useCallback(async () => {
+    if (disabled) return;
+    try {
+      const summary = await start(task.prompt, undefined, {
+        correlationId: `replay-${task.runId}-${Date.now()}`,
+      });
+      if (summary) onOpen(summary.runId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addToast('error', `Replay failed: ${message}`);
+    }
+  }, [disabled, start, task.prompt, task.runId, onOpen, addToast]);
+
+  return (
+    <div className={styles.rowActions}>
+      <button
+        type="button"
+        className={styles.replayBtn}
+        onClick={() => void onReplay()}
+        disabled={disabled}
+        title={
+          task.live
+            ? 'This task is still running; wait for it to finish.'
+            : busy
+              ? 'Another run is in progress.'
+              : 'Run the same prompt again'
+        }
+        aria-label="Replay this task"
+      >
+        {disabled && task.live ? (
+          <Loader2 size={13} className={styles.spin} />
+        ) : (
+          <RotateCcw size={13} />
+        )}
+        <span>Replay</span>
+      </button>
+      <button
+        type="button"
+        className={styles.openBtn}
+        onClick={() => onOpen(task.runId)}
+        title="Open this task's record"
+        aria-label="Open this task's record"
+      >
+        <Play size={13} />
+        <span>Open</span>
+      </button>
+    </div>
+  );
+}
+
 export const Tasks = () => {
   const [tasks, setTasks] = useState<TaskSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  const { addToast } = useToast();
 
   const load = useCallback(async () => {
     try {
@@ -623,8 +704,12 @@ export const Tasks = () => {
       ) : (
         <ul className={styles.list}>
           {tasks.map(task => (
-            <li key={task.runId}>
-              <button className={styles.row} onClick={() => setOpen(task.runId)}>
+            <li key={task.runId} className={styles.row}>
+              <button
+                className={styles.rowOpen}
+                onClick={() => setOpen(task.runId)}
+                aria-label={`Open task ${task.prompt}`}
+              >
                 <span className={styles.rowPrompt}>{task.prompt}</span>
                 <span className={styles.rowMeta}>
                   {task.live ? 'started ' + when(task.startedAt) : when(task.finishedAt)} &middot;{' '}
@@ -643,6 +728,7 @@ export const Tasks = () => {
                   {statusLabel(task.state, task.ready)}
                 </span>
               </button>
+              <TaskRowActions task={task} onOpen={runId => setOpen(runId)} />
             </li>
           ))}
         </ul>

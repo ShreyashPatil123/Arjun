@@ -1,0 +1,58 @@
+﻿
+assertion `left == right` failed
+assertion `left == right` failed
+test 
+agent_runtime::tests::the_catalogue_is_exactly_the_tools_the_gateway_knows ... 
+FAILED
+test media_adapter::adapter::tests::fixture_extraction_has_typed_result_with_pa
+ge_and_region_references ... FAILED
+test skills::tests::every_shipped_skill_states_what_a_reader_needs ... FAILED
+test skills::tests::every_shipped_skill_validates_and_is_trusted ... FAILED
+test skills::tests::no_shipped_skill_asks_for_a_tool_the_product_does_not_have 
+... FAILED
+test skills::tests::no_shipped_skill_asks_for_the_network ... FAILED
+test 
+subagents::tests::a_child_cannot_drop_the_approval_requirement_it_inherited 
+... FAILED
+test subagents::tests::a_child_cannot_handle_material_above_its_ceiling ... 
+FAILED
+test subagents::tests::a_child_cannot_start_a_child_of_its_own ... FAILED
+test subagents::tests::a_child_is_refused_when_the_person_is_not_cleared_for_it
+s_material ... FAILED
+test subagents::tests::a_child_never_receives_a_tool_the_parent_does_not_hold 
+... FAILED
+test subagents::tests::a_child_receives_only_the_tools_the_parent_and_profile_a
+gree_on ... FAILED
+test subagents::tests::a_child_that_hangs_is_stopped_and_reported_as_timed_out 
+... FAILED
+test subagents::tests::a_child_with_nothing_in_common_with_its_parent_is_refuse
+d_rather_than_started ... FAILED
+test subagents::tests::a_child_writes_only_inside_its_own_directory ... FAILED
+test subagents::tests::a_packet_carries_no_document_text ... FAILED
+test subagents::tests::a_parent_records_the_child_manifest_and_the_result_hash 
+... FAILED
+test subagents::tests::a_profile_cannot_raise_the_ceiling_the_run_set ... 
+FAILED
+test subagents::tests::a_profiles_denylist_wins_over_the_parents_grant ... 
+FAILED
+test subagents::tests::a_read_only_child_may_write_nowhere_at_all ... FAILED
+test subagents::tests::a_role_with_no_worker_says_nothing_ran ... FAILED
+test subagents::tests::a_timed_out_child_is_recorded_as_incomplete ... FAILED
+test subagents::tests::a_worker_answering_a_different_question_is_a_failure 
+... FAILED
+test 
+subagents::tests::a_worker_that_fails_becomes_a_failure_rather_than_an_error 
+... FAILED
+test 
+subagents::tests::different_work_under_one_profile_produces_different_children 
+... FAILED
+test subagents::tests::every_shipped_profile_compiles ... FAILED
+test subagents::tests::only_read_only_workers_are_concurrent ... FAILED
+test subagents::tests::several_read_only_children_run_at_once_and_agree ... 
+FAILED
+test subagents::tests::the_same_work_asked_for_twice_produces_one_child ... 
+FAILED
+test subagents::tests::two_children_of_one_run_do_not_share_a_directory ... 
+FAILED
+
+

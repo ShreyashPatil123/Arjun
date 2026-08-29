@@ -3,6 +3,15 @@
 Engines are tried in order of preference and the first available one wins. The
 choice is reported with every result, so a deployment running on the fallback
 never looks like one running on the real thing.
+
+## Multimodal engine selection
+
+A P&ID is a particular kind of document. The P&ID engine has tag detection
+and a layout-aware reader that the generic Docling / text-layer engines do
+not bother with, so the router checks the document type *first* and, when
+it is a P&ID, runs the P&ID engine. The check is on the cheap text layer
+only — a P&ID whose page is image-only is reported as unread, not routed to
+the wrong engine.
 """
 
 import os
@@ -11,11 +20,21 @@ from typing import Any, Dict, List, Optional, Type
 import escalation
 import injection
 from engines.base import DocumentEngine
+from engines.doc_type import detect as detect_type
 from engines.docling_engine import DoclingEngine
+from engines.pid_engine import PidEngine
 from engines.text_layer import TextLayerEngine
 
-#: Best first. Adding an engine is adding a class here.
+#: Best first. Adding an engine is adding a class here. The P&ID engine is
+#: added with a sentinel preference so it can be selected by document type
+#: rather than by ordering.
 ENGINE_PREFERENCE: List[Type[DocumentEngine]] = [DoclingEngine, TextLayerEngine]
+
+#: Engines that are selected by document type, not by the global preference
+#: list. Each is matched against the verdict of the document-type detector.
+TYPE_ROUTED_ENGINES: Dict[str, Type[DocumentEngine]] = {
+    "pid": PidEngine,
+}
 
 #: Refuse anything larger rather than exhausting memory on a laptop. A refinery
 #: drawing set can be very large, and failing clearly beats failing by swapping.
@@ -78,7 +97,73 @@ class DocumentRouter:
         if method == "extract":
             return self._extract(params)
 
+        if method == "classify":
+            return self._classify(params)
+
         raise ValueError(f"unknown method {method!r}")
+
+    def _classify(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Classify a document without extracting it.
+
+        Used by callers that want to know what kind of document this is before
+        deciding how to ingest it. Reads the text layer, runs the detector
+        over it, and returns the verdict. The actual file is not opened for
+        layout, so the call is cheap and the verdict is best-effort.
+        """
+        path = params.get("path")
+        if not path:
+            raise ValueError("classify requires a 'path'")
+        if not os.path.isfile(path):
+            raise ValueError(f"no file at {path!r}")
+
+        # Pull just enough text to detect. pypdf is what the fallback engine
+        # uses, so it is available wherever classify is called.
+        import pypdf
+
+        try:
+            reader = pypdf.PdfReader(path)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ready": True,
+                "label": "unknown",
+                "confidence": 0.0,
+                "abstained": True,
+                "abstentionReason": f"the file could not be opened as a PDF: {exc}",
+                "signals": [],
+            }
+
+        if getattr(reader, "is_encrypted", False):
+            return {
+                "ready": True,
+                "label": "unknown",
+                "confidence": 0.0,
+                "abstained": True,
+                "abstentionReason": "the PDF is encrypted and could not be classified",
+                "signals": [],
+            }
+
+        # Read the first few pages — a detector that needs the whole document
+        # is not a cheap detector. Cap at 10 to keep the cost bounded.
+        try:
+            texts: List[str] = []
+            for page in list(reader.pages)[:10]:
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            texts = []
+
+        joined = "\n\n".join(texts)
+        verdict = detect_type(joined)
+        return {
+            "ready": True,
+            "label": verdict.label if not verdict.abstained else "unknown",
+            "confidence": verdict.confidence,
+            "abstained": verdict.abstained,
+            "abstentionReason": verdict.abstention_reason,
+            "signals": verdict.signals,
+        }
 
     def _extract(self, params: Dict[str, Any]) -> Dict[str, Any]:
         path = params.get("path")
@@ -100,7 +185,13 @@ class DocumentRouter:
                 "No document engine is available on this machine, so nothing can be read."
             )
 
-        result = self._engine.extract(path)
+        # Pick the engine: the document type may override the global preference
+        # for documents that have a dedicated engine (P&ID, today). The
+        # type-routed engine is used only if it is available on this machine
+        # and the document is plausibly of that type — both checked below.
+        engine = self._select_engine_for(path)
+
+        result = engine.extract(path)
         payload = result.to_dict()
         payload["sourcePath"] = path
         payload["sourceBytes"] = size
@@ -121,6 +212,37 @@ class DocumentRouter:
             escalation.describe_unmet(plan, available=self._available_capabilities())
         )
         return payload
+
+    def _select_engine_for(self, path: str) -> DocumentEngine:
+        """Choose the engine for ``path``.
+
+        The default is the highest-preference engine that is available. When
+        the document type detector says this looks like a P&ID — and the P&ID
+        engine is available — the P&ID engine is used instead, since its
+        tag detection is what makes the extraction useful.
+
+        The detection is done on a cheap read of the first pages. If it
+        abstains, the global preference stands.
+        """
+        # Cheap read: just the first page's text. The detector is robust
+        # enough that one page is enough to recognise a P&ID — a P&ID's
+        # title block alone carries the signals.
+        try:
+            verdict = self._classify({"path": path})
+            if not verdict.get("abstained", True) and verdict.get("label") in TYPE_ROUTED_ENGINES:
+                engine_class = TYPE_ROUTED_ENGINES[verdict["label"]]
+                if engine_class.available():
+                    return engine_class()
+        except Exception:  # noqa: BLE001
+            # Detector failure is not a reason to refuse. Fall through to
+            # the default preference.
+            pass
+
+        # At this point we have already proven that ``self._engine`` is not
+        # None in the calling context, but the type-checker does not know
+        # that. Re-assert it so the type is unambiguous.
+        assert self._engine is not None
+        return self._engine
 
     def _available_capabilities(self) -> List[str]:
         """Capabilities any installed engine could supply for a second pass."""

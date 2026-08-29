@@ -4,9 +4,16 @@
 //! dynamic capability management, intent detection, and dynamic adapter routing.
 
 pub mod adapter_router;
+pub mod complexity;
 pub mod extractor;
 pub mod intent;
 pub mod profile;
+pub mod telemetry;
+
+pub use complexity::{
+    AttachmentKind, Complexity, ComplexityBreakdown, ComplexityEstimator, TaskSignals,
+};
+pub use telemetry::{CallExit, ModelAggregate, ModelCallRecord, TelemetrySink};
 
 use anyhow::Result;
 use std::fs;

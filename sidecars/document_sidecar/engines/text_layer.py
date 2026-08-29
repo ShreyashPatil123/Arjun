@@ -13,7 +13,8 @@ confidently summarising a document it never read.
 
 from typing import List
 
-from .base import DocumentEngine, EngineCapabilities, ExtractionResult, PageResult
+from .base import DocumentEngine, DocumentTypeInfo, EngineCapabilities, ExtractionResult, PageResult
+from .doc_type import detect as detect_type
 
 #: Below this many characters, a page almost certainly has no usable text layer.
 #: A genuinely near-empty page (a divider, a photo plate) also lands here, and
@@ -48,7 +49,14 @@ class TextLayerEngine(DocumentEngine):
         # Everything false, deliberately and accurately. This engine reads what
         # is already there; it recognises nothing.
         return EngineCapabilities(
-            ocr=False, layout=False, tables=False, formulas=False, handwriting=False
+            ocr=False, layout=False, tables=False, formulas=False, handwriting=False,
+            # The text layer is a free win: every P&ID tag printed in the
+            # title block or line list is on the page, and recognising the
+            # pattern does not require a vision model. The P&ID engine does
+            # the bbox layout; this engine just attests that the
+            # classification is available.
+            pid_symbols=False,
+            image_captioning=False,
         )
 
     def extract(self, path: str) -> ExtractionResult:
@@ -91,6 +99,20 @@ class TextLayerEngine(DocumentEngine):
             pages.append(self._judge(index, text))
 
         result.pages = pages
+
+        # Run the document type detector. The verdict is held on the result
+        # so a downstream caller can decide what to do with the extraction
+        # without re-running the detector.
+        joined = "\n\n".join(p.text for p in pages)
+        verdict = detect_type(joined)
+        label = verdict.label if not verdict.abstained else "unknown"
+        result.document_type = DocumentTypeInfo(
+            label=label,
+            confidence=verdict.confidence,
+            abstained=verdict.abstained,
+            abstention_reason=verdict.abstention_reason,
+            signals=list(verdict.signals),
+        )
 
         scanned = sum(1 for p in pages if p.confidence == 0.0)
         if scanned and scanned == len(pages):

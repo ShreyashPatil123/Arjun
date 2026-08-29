@@ -105,6 +105,15 @@ pub struct StartRunRequest {
     /// started, which matters as soon as two windows are open at once.
     #[serde(default)]
     pub correlation_id: Option<String>,
+    /// The conversation this turn belongs to, when the caller is following
+    /// up. `None` means "this is the first turn of a new conversation", and
+    /// the command will create one and return its id.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// The id the caller reserved for the assistant message via
+    /// `agent_append_turn`. Required when `conversationId` is set.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +132,15 @@ pub struct RunSummary {
     pub verification: Option<VerificationReport>,
     /// The files it produced, each re-opened and checked.
     pub artifacts: Vec<ArtifactReport>,
+    /// The conversation this run was started in, when the caller asked for
+    /// one (every run is now in a conversation; older callers will see
+    /// `None` and the front-end will fall back to a one-off task view).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// The id of the assistant message this run produced, so the front-end
+    /// can correlate `message_end` with the right `Message` cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// What the model is told it is, and what it must not do.
@@ -324,6 +342,8 @@ pub async fn agent_start_run(
     skills: State<'_, Skills>,
     memory: State<'_, AgentMemory>,
     checkpoints: State<'_, RunCheckpoints>,
+    conversations: State<'_, super::conversations::ConversationsState>,
+    run_to_conversation: State<'_, super::conversations::RunToConversationState>,
 ) -> Result<RunSummary, String> {
     // Checked here as well as in the runtime's handlers. Here it gives the
     // person a clear reason before anything starts; there it stops a call whose
@@ -893,7 +913,88 @@ pub async fn agent_start_run(
     }
 
     // Returned last, so a run that failed still left its record behind first.
+    let run_failed = outcome.is_err();
     outcome?;
+
+    // Bind this run to a conversation so the chat surface can route the
+    // streaming message events for it to the right assistant cell. The
+    // caller may have already created a conversation via
+    // `agent_create_conversation` and `agent_append_turn` (a follow-up);
+    // when it has not, this is the first turn of a new conversation, and
+    // we create one here so the chat surface has somewhere to write the
+    // user message and the streaming assistant message.
+    let started_at_rfc = started_at.to_rfc3339();
+    let _ = started_at_rfc; // reserved for future per-step timing
+    let elapsed_ms = chrono::Utc::now()
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    let conversation_id;
+    let message_id;
+    match request.conversation_id.as_deref() {
+        Some(existing_id) => {
+            conversation_id = existing_id.to_string();
+            // The front-end already called `agent_append_turn` to reserve
+            // the assistant cell. Find the message id it passed in.
+            message_id = request
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("a-{}", run_id));
+            run_to_conversation.0.bind(&run_id, &conversation_id);
+        }
+        None => {
+            // First turn: create the conversation now, with a title derived
+            // from the prompt's first line. Persisting it before the run
+            // resolves is fine — the existing record is what the front-end
+            // will reload on remount anyway.
+            let title = request
+                .prompt
+                .lines()
+                .next()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .unwrap_or_else(|| "New conversation".to_string());
+            let title = title.chars().take(80).collect::<String>();
+            let new_message_id = format!("a-{}", run_id);
+            let conversation = conversations
+                .0
+                .create(title, "Arjun is ready. Ask anything; nothing leaves this machine.".to_string())
+                .map_err(|error| format!("the conversation could not be created: {error}"))?;
+            conversation_id = conversation.id.clone();
+            let _ = conversations.0.append_user_turn(
+                &conversation_id,
+                &request.prompt,
+                &new_message_id,
+                &run_id,
+            );
+            message_id = new_message_id;
+            run_to_conversation.0.bind(&run_id, &conversation_id);
+        }
+    }
+
+    // Mark the assistant message as complete on the conversation. The
+    // front-end can also call `agent_complete_message` itself when it
+    // receives `message_end`; we write the final state here too so a
+    // remount that lands on this run while the front-end is reconnecting
+    // sees a coherent terminal state.
+    let final_content = if run_failed {
+        None
+    } else {
+        Some(answer.as_str())
+    };
+    let _ = conversations.0.record_message_completion(
+        &conversation_id,
+        &message_id,
+        &run_id,
+        final_content,
+        Some(elapsed_ms),
+        Some(routing.model_name.as_str()),
+        Some(routing.role.label()),
+        Some(routing.used_fallback),
+        None,
+        run_failed,
+    );
+    run_to_conversation.0.unbind(&run_id);
 
     Ok(RunSummary {
         run_id,
@@ -904,6 +1005,8 @@ pub async fn agent_start_run(
         plan: final_plan,
         verification,
         artifacts: produced_files,
+        conversation_id: Some(conversation_id),
+        message_id: Some(message_id),
     })
 }
 
@@ -1477,6 +1580,47 @@ pub async fn agent_reveal_artifact(
         .ok_or_else(|| format!("{name} has no containing folder."))?;
     open_folder(workspace)
         .map_err(|error| format!("that task's folder could not be opened: {error}"))
+}
+
+/// Returns a safe, *preview-only* rendering of a produced artifact.
+///
+/// The preview lets the user *see* what ARJUN wrote without opening
+/// another application. It is not a substitute for opening the file
+/// in its native app — the rendering is plain text for Office
+/// documents, and the user is told that. The reader is conservative:
+/// it does not execute macros, follow external references, or load
+/// remote resources. See
+/// [`crate::commands::artifact_preview`] for the full contract.
+#[tauri::command]
+pub async fn artifact_preview(
+    app: AppHandle,
+    run_id: String,
+    name: String,
+    session: State<'_, CurrentSession>,
+) -> Result<crate::commands::artifact_preview::ArtifactPreview, String> {
+    let signed_in = require_session(&session)?;
+    let record = tasks::load(&app_data_dir(&app)?, &run_id)?;
+    if !may_read(&signed_in, &record.user_id) {
+        return Err("That task was run by somebody else.".to_string());
+    }
+    let artifact = record
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .ok_or_else(|| format!("{name} is not one of that task's files."))?;
+
+    let path = std::path::PathBuf::from(&artifact.path);
+    if !path.exists() {
+        return Err(format!("{name} is no longer where the task wrote it."));
+    }
+
+    let kind_hint = match artifact.kind {
+        crate::agent_runtime::artifacts::Kind::Document => "docx",
+        crate::agent_runtime::artifacts::Kind::Workbook => "xlsx",
+        crate::agent_runtime::artifacts::Kind::Text => "text",
+    };
+    crate::commands::artifact_preview::preview(&path, kind_hint)
+        .map_err(|e| format!("could not preview {name}: {e}"))
 }
 
 /// Opens a directory in the platform's file manager.

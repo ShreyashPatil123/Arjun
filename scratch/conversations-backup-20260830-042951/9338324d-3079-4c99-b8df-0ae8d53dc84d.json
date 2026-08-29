@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "conversation": {
+    "id": "9338324d-3079-4c99-b8df-0ae8d53dc84d",
+    "title": "Synthetic vendor quotes for a 75 kW centrifugal pump attached (Quote A and Quote",
+    "createdAt": "2026-08-29T22:57:03.288113700+00:00",
+    "lastActivityAt": "2026-08-29T22:57:03.300219300+00:00",
+    "messages": [
+      {
+        "id": "sys-91db9059-e4bf-4e48-86a0-563c787d4003",
+        "conversationId": "9338324d-3079-4c99-b8df-0ae8d53dc84d",
+        "role": "system",
+        "content": "Arjun is ready. Ask anything; nothing leaves this machine.",
+        "status": "done",
+        "createdAt": "2026-08-29T22:57:03.288113700+00:00",
+        "completedAt": "2026-08-29T22:57:03.288113700+00:00"
+      },
+      {
+        "id": "u-433e1103-e28d-4374-adee-721b4e26a58d",
+        "conversationId": "9338324d-3079-4c99-b8df-0ae8d53dc84d",
+        "role": "user",
+        "content": "Synthetic vendor quotes for a 75 kW centrifugal pump attached (Quote A and Quote B). Compare against the standard procurement template, flag the unusual terms, and produce an approval memo.",
+        "status": "done",
+        "createdAt": "2026-08-29T22:57:03.300219300+00:00",
+        "completedAt": "2026-08-29T22:57:03.300219300+00:00"
+      },
+      {
+        "id": "a-52c2adcf-9acb-4a2f-9032-4ab51276bfa5",
+        "conversationId": "9338324d-3079-4c99-b8df-0ae8d53dc84d",
+        "role": "assistant",
+        "content": "",
+        "status": "streaming",
+        "runId": "6f9b56c1-2a5c-48a6-8ed8-11b8fb566d1d",
+        "createdAt": "2026-08-29T22:57:03.300219300+00:00"
+      }
+    ],
+    "runs": [
+      {
+        "runId": "6f9b56c1-2a5c-48a6-8ed8-11b8fb566d1d",
+        "messageId": "a-52c2adcf-9acb-4a2f-9032-4ab51276bfa5",
+        "startedAt": "2026-08-29T22:57:03.300219300+00:00",
+        "live": true
+      }
+    ],
+    "compactions": 0
+  }
+}

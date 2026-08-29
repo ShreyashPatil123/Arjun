@@ -44,12 +44,31 @@ use crate::system_analyzer::process_utils::create_hidden_command;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Region {
-    /// text, table, figure, formula, heading.
+    /// text, table, figure, formula, heading, image, symbol.
     pub kind: String,
     pub left: f32,
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
+    /// Optional caption for image / figure regions. Used by the multimodal
+    /// retriever to attach a textual proxy to an image, so a search for
+    /// "reactor feed pump" can find an image of one even when the page has
+    /// no running text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Bounding-box label for P&ID symbols (e.g. "pump", "valve_gate",
+    /// "instrument_bubble"). Only set by engines that know what they saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Confidence for the bounding box itself. 1.0 for hand-laid regions,
+    /// lower when a detector placed it. Distinct from the page-level
+    /// `confidence`, which is about text fidelity.
+    #[serde(default = "default_box_confidence")]
+    pub box_confidence: f32,
+}
+
+fn default_box_confidence() -> f32 {
+    1.0
 }
 
 /// One page, and how much of it was actually read.
@@ -503,6 +522,9 @@ mod tests {
             top: 0.2,
             right: 0.9,
             bottom: 0.45,
+            caption: None,
+            label: None,
+            box_confidence: 1.0,
         });
         assert!(page.has_precise_location());
     }

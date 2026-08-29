@@ -7,6 +7,7 @@ import { ToastProvider } from './contexts/ToastContext';
 import { AppShell } from './components/layout';
 import { Workbench } from './pages/Workbench';
 import { Tasks } from './pages/Tasks';
+import { Conversations } from './pages/Conversations';
 import { Placeholder } from './pages/Placeholder';
 import { AuditNetwork } from './pages/AuditNetwork';
 import { SignIn } from './pages/SignIn';
@@ -16,7 +17,10 @@ import { SystemInfo } from './pages/SystemInfo';
 import { Browse } from './pages/Browse';
 import { Storage } from './pages/Storage';
 import { Health } from './pages/Health';
+import { ModelHealth } from './pages/ModelHealth';
 import { Approvals } from './pages/Approvals';
+import { Demo } from './pages/Demo';
+import { SIHDashboard } from './pages/SIHDashboard';
 
 /**
  * Everything below the shell assumes a signed-in user: the policy gateway
@@ -67,6 +71,7 @@ function App() {
                   <Route index element={<Workbench />} />
 
                   <Route path="tasks" element={<Tasks />} />
+                <Route path="conversations" element={<Conversations />} />
 
                   {/* Surfaces PS 26117 requires that do not exist yet. Routed and
                     * named now so the shell is complete and the gaps are visible. */}
@@ -83,6 +88,9 @@ function App() {
                   <Route path="approvals" element={<Approvals />} />
                   <Route path="audit" element={<AuditNetwork />} />
                   <Route path="health" element={<Health />} />
+                  <Route path="model-health" element={<ModelHealth />} />
+                  <Route path="demo" element={<Demo />} />
+                  <Route path="sih" element={<SIHDashboard />} />
 
                   {/* Carried over from Sarathi. */}
                   <Route path="models" element={<Storage />} />

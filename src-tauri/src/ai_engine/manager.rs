@@ -126,7 +126,14 @@ impl InferenceManager {
             });
         };
 
-        self.load_installed_model_internal(app_data_dir, provider_id, model_id, quantization, Some(status_cb))
+        self.load_installed_model_internal(
+            Some(app_handle),
+            app_data_dir,
+            provider_id,
+            model_id,
+            quantization,
+            Some(status_cb),
+        )
     }
 
     /// Loads an installed model without requiring a Tauri AppHandle (for tests & backend validation).
@@ -137,11 +144,19 @@ impl InferenceManager {
         model_id: &str,
         quantization: &str,
     ) -> Result<LoadedModelInfo> {
-        self.load_installed_model_internal::<fn(&str, Option<&str>)>(app_data_dir, provider_id, model_id, quantization, None)
+        self.load_installed_model_internal::<fn(&str, Option<&str>)>(
+            None,
+            app_data_dir,
+            provider_id,
+            model_id,
+            quantization,
+            None,
+        )
     }
 
     fn load_installed_model_internal<F>(
         &self,
+        app_handle: Option<&tauri::AppHandle>,
         app_data_dir: &std::path::Path,
         provider_id: &str,
         model_id: &str,
@@ -180,6 +195,66 @@ impl InferenceManager {
                 err
             })?;
         log::info!("[STAGE 3 MANAGER] Resolved GGUF path: '{}' (exists: {})", gguf_path, std::path::Path::new(&gguf_path).exists());
+
+        // Hash-on-load check. Compares the weights file against the
+        // registry entry's recorded SHA-256; refuses to load on a
+        // mismatch and writes a tamper-detected event to the audit
+        // log. See `audit::model_integrity` for the security claim
+        // (no Ed25519; we cannot anchor a real trust key in this
+        // air-gapped topology, so the strongest honest check is a
+        // hash the administrator recorded).
+        //
+        // `Undeclared` (the registry has no entry, or the entry has
+        // no hash) is **permitted** with an audit-log note: refusing
+        // to load an unregistered model would make the system
+        // unbootable on a fresh install, and the operator needs the
+        // load to succeed to copy the observed hash into the
+        // registry in the first place. The audit row carries the
+        // observed hash so the operator can record it.
+        let registry = app_handle.and_then(|h| {
+            h.try_state::<std::sync::Arc<crate::registry::ModelRegistry>>()
+        });
+        // Look up the model entry; clone what we need so the borrow
+        // of `app_handle` is released before we hand the entry to the
+        // check function.
+        let entry: Option<crate::registry::ModelEntry> = registry
+            .as_deref()
+            .and_then(|r| r.find(model_id).cloned());
+        let integrity = crate::audit::model_integrity::verify_against_entry(
+            std::path::Path::new(&gguf_path),
+            entry.as_ref(),
+            None::<fn(u64)>,
+        );
+        crate::audit::model_integrity::audit_outcome(None, model_id, &integrity);
+        log::info!(
+            "[STAGE 3 MANAGER] integrity check: result={} observed={} expected={} bytes={}",
+            integrity.result.label(),
+            integrity.observed_sha256.as_deref().unwrap_or("?"),
+            integrity.expected_sha256.as_deref().unwrap_or("?"),
+            integrity.bytes_hashed
+        );
+        if !integrity.result.is_load_safe() {
+            // Hard refusal: only `Mismatch`, `IoError`, and
+            // `HashingError` land here. `Undeclared` is permitted
+            // by `is_load_safe()` so the system stays bootable
+            // before the operator has had a chance to record
+            // hashes.
+            let err = anyhow!(
+                "[STAGE 3 MANAGER ERROR] model integrity check failed: {}",
+                integrity.detail
+            );
+            log::error!("{}", err);
+            return Err(err);
+        }
+        if integrity.result == crate::audit::model_integrity::IntegrityResult::Undeclared {
+            log::warn!(
+                "[STAGE 3 MANAGER] model {} has no recorded hash; load proceeding. \
+                 Observed hash: {}. Add it to the registry entry before the next load \
+                 to enable the strict check.",
+                model_id,
+                integrity.observed_sha256.as_deref().unwrap_or("?")
+            );
+        }
 
         let profile = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest)
             .unwrap_or_else(|_| crate::model_intelligence::ModelProfile::new(&manifest.package_id, model_id, &manifest.base_model.model_name));
@@ -373,6 +448,19 @@ impl InferenceManager {
         params: GenerationParams,
         manual_capability: Option<String>,
     ) -> Result<()> {
+        // Diagnostic: log every entry so the next chat send shows in
+        // the log. If Model Health stays empty after a chat, this line
+        // is the first thing to look for; if it does not appear, the
+        // chat did not reach this function. `eprintln!` writes to
+        // stderr which Start-Process on Windows exposes to the parent
+        // console host; the `log::info!` calls were observed not to
+        // reach `sarathi.log` for these new lines.
+        eprintln!(
+            "[telemetry] send_chat_message entered; messages={}, capability_override={:?}",
+            messages.len(),
+            manual_capability
+        );
+
         // Emit generating status
         let _ = app_handle.emit("inference:status", InferenceStatusPayload {
             status: "Generating".to_string(),
@@ -387,6 +475,22 @@ impl InferenceManager {
         let (final_messages, final_params, capability_backend) =
             self.prepare_capability_turn(app_handle, &messages, &params, manual_capability.as_deref());
 
+        // Model Health: capture the loaded model id and an honest word-count
+        // estimate of the prompt before the call. tokens_out is left at 0
+        // because the streaming callback does not currently sum generated
+        // tokens; recording 0 is preferable to fabricating a number.
+        let model_id = self
+            .get_loaded_model_info()
+            .map(|m| m.model_id)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let tokens_in_estimate: u32 = final_messages
+            .iter()
+            .map(|m| m.content.split_whitespace().count() as u32)
+            .sum::<u32>()
+            .saturating_mul(13)
+            / 10;
+        let started = std::time::Instant::now();
+
         let app_handle_clone = app_handle.clone();
         let result = {
             let mut runtime = self.runtime.lock().unwrap();
@@ -399,6 +503,50 @@ impl InferenceManager {
                 },
             )
         };
+
+        // Model Health: record the call to the in-memory telemetry sink so
+        // the /model-health page can show real numbers after the first call.
+        // This is a best-effort write: a failure here must never affect the
+        // call's reported success.
+        let (exit, used_fallback) = match &result {
+            Ok(_) => (crate::model_intelligence::telemetry::CallExit::Ok, false),
+            Err(_) => (
+                crate::model_intelligence::telemetry::CallExit::OtherFailure,
+                false,
+            ),
+        };
+        let sink_state =
+            app_handle.try_state::<Arc<crate::model_intelligence::telemetry::TelemetrySink>>();
+        eprintln!(
+            "[telemetry] sink lookup result: present={}, model_id={}, exit={:?}, \
+             tokens_in_estimate={}",
+            sink_state.is_some(),
+            model_id,
+            exit,
+            tokens_in_estimate
+        );
+        if let Some(sink) = sink_state {
+            sink.record(
+                None, // the audit row is written by the existing audit calls around this site
+                crate::model_intelligence::telemetry::ModelCallRecord {
+                    model_id: model_id.clone(),
+                    task_id: "<chat>".to_string(),
+                    intent: "chat".to_string(),
+                    role: "reasoning".to_string(),
+                    latency: started.elapsed(),
+                    tokens_in: tokens_in_estimate,
+                    tokens_out: 0,
+                    used_fallback,
+                    exit,
+                    note: Some(
+                        "tokens_in is a word-count estimate; tokens_out is 0 \
+                         because the streaming path does not sum generated tokens"
+                            .to_string(),
+                    ),
+                    complexity: None,
+                },
+            );
+        }
 
         match result {
             Ok(_) => {

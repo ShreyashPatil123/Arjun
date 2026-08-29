@@ -42,8 +42,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 use crate::ai_engine::vram_planner::GpuOffloadPlan;
-use crate::registry::{ModelEntry, Runtime};
+use crate::registry::{ModelEntry, RoutingPreference, Runtime};
 
 pub use probe::{probe, ProbeOutcome};
 
@@ -266,7 +271,8 @@ impl ModelServers {
         }
 
         let plan = plan_launch(entry, &weights, gpu, free_port()?);
-        let child = Command::new(&plan.program)
+        let mut child_cmd = Command::new(&plan.program);
+        child_cmd
             .args(&plan.args)
             // Inherited proxy settings would send a loopback request out of the
             // machine. Removed here as well as in the agent runtime, because
@@ -279,7 +285,18 @@ impl ModelServers {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Same fix as the agent runtime: a Windows release build is
+        // `windows_subsystem = "windows"`, but the OS still opens a
+        // console window for any console application the process
+        // spawns (the inference server is a console binary). The
+        // CREATE_NO_WINDOW flag suppresses the popup. Off-Windows the
+        // flag does not exist and the comment is the only difference.
+        #[cfg(target_os = "windows")]
+        {
+            child_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = child_cmd
             .spawn()
             .map_err(|error| ServingError::LaunchFailed(error.to_string()))?;
 
@@ -408,6 +425,7 @@ mod tests {
             serving: None,
             required_runtime_profile: None,
             enabled: true,
+        routing: RoutingPreference::default(),
         }
     }
 

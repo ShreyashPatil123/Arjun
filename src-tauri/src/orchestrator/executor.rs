@@ -41,8 +41,16 @@ use crate::audit::{AuditKind, AuditService};
 /// model wrote. The runner must use it rather than re-deriving the path from the
 /// call: two pieces of code resolving the same string separately will eventually
 /// disagree, and the one that disagrees here is the one holding a file handle.
+///
+/// Async because one of the tools — `agent.delegate_readonly` — must wait on a
+/// child runtime, and a sync trait there would force either a blocking runtime
+/// handle (panics inside a runtime) or a second non-async surface that
+/// duplicates the code. The executor and the agent runtime are both already
+/// inside a tokio runtime, so this is just a type-level acknowledgement of
+/// what is already true at the call sites.
+#[async_trait::async_trait]
 pub trait ToolRunner {
-    fn run(
+    async fn run(
         &self,
         tool: ToolName,
         call: &ToolCall,
@@ -71,11 +79,40 @@ pub struct StepOutcome {
 pub enum TaskState {
     /// The step ran. Feed `outcome.result` back and ask for the next call.
     Stepped { outcome: StepOutcome },
+    /// Several steps ran in one parallel batch. The agent-runtime turns
+    /// this into one assistant turn carrying every outcome, in input
+    /// order. The batch counts as one step against the plan budget.
+    SteppedBatch {
+        /// Every outcome, in the order the calls were submitted. A
+        /// refusal is included so the model sees the full picture.
+        outcomes: Vec<StepOutcome>,
+        /// True when every call in the batch was declared parallel-safe.
+        /// False when the model mixed parallel and sequential calls; the
+        /// executor still ran the allowed ones concurrently but
+        /// surfaces the mismatch so a caller knows to attribute
+        /// surprises to the right call.
+        all_parallel: bool,
+    },
     /// A person has to answer before this can proceed.
     AwaitingApproval {
         tool: String,
         /// Target, arguments and consequence, ready to show.
         prompt: String,
+    },
+    /// A milestone step just finished. The plan pauses here so a
+    /// person can confirm the model is on the right track before the
+    /// next leg of work starts. The UI renders this as a gate.
+    MilestoneReached {
+        /// The checkpoint id the parent plan wrote. Stable across a
+        /// resume; the resume path uses it to know which gate was
+        /// approved.
+        checkpoint_id: String,
+        /// Ordinal of the step that produced the milestone.
+        ordinal: u32,
+        /// The intent text, ready to show a human. The agent-runtime
+        /// may append a short reason ("drafted 3 pages, 2 facts
+        /// pending") before emitting.
+        summary: String,
     },
     /// Nothing more will happen.
     Finished {
@@ -108,7 +145,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Takes one step: check the budget, check the gateway, then run or pause.
-    pub fn step(
+    pub async fn step(
         &mut self,
         run: &mut PlanRun,
         context: &TaskContext<'_>,
@@ -145,15 +182,14 @@ impl<'a> Executor<'a> {
 
                 // Handed back as the call's result. The step is counted, because
                 // a refused attempt still consumed a turn of the model's budget.
-                run.record_step();
-                TaskState::Stepped {
-                    outcome: StepOutcome {
-                        tool: call.tool.clone(),
-                        result: reason,
-                        permitted: false,
-                        took_ms: started.elapsed().as_millis() as u64,
-                    },
-                }
+                let hit = run.record_step();
+                let outcome = StepOutcome {
+                    tool: call.tool.clone(),
+                    result: reason,
+                    permitted: false,
+                    took_ms: started.elapsed().as_millis() as u64,
+                };
+                self.step_finished_state(hit, Some(outcome), Vec::new(), false)
             }
 
             GatewayVerdict::NeedsApproval { tool, summary, .. } => {
@@ -171,7 +207,7 @@ impl<'a> Executor<'a> {
                 tool,
                 ref resolved_path,
             } => {
-                let result = match self.runner.run(tool, call, resolved_path.as_deref()) {
+                let result = match self.runner.run(tool, call, resolved_path.as_deref()).await {
                     Ok(output) => {
                         self.consecutive_refusals = 0;
                         output
@@ -185,18 +221,219 @@ impl<'a> Executor<'a> {
                 };
 
                 self.record(context, call, true, &result);
-                run.record_step();
+                let hit = run.record_step();
+                let outcome = StepOutcome {
+                    tool: call.tool.clone(),
+                    result,
+                    permitted: true,
+                    took_ms: started.elapsed().as_millis() as u64,
+                };
+                self.step_finished_state(hit, Some(outcome), Vec::new(), false)
+            }
+        }
+    }
 
-                TaskState::Stepped {
-                    outcome: StepOutcome {
+    /// If the step just completed is a milestone, returns
+    /// `MilestoneReached` instead of `Stepped` / `SteppedBatch` so
+    /// the UI can pause for a human gate. The same rule applies
+    /// inside a parallel batch: if finishing a single step is a
+    /// checkpoint, the batch pauses.
+    fn step_finished_state(
+        &self,
+        hit: Option<crate::orchestrator::plan::MilestoneHit>,
+        single_outcome: Option<StepOutcome>,
+        batch_outcomes: Vec<StepOutcome>,
+        all_parallel: bool,
+    ) -> TaskState {
+        if let Some(milestone) = hit {
+            let checkpoint_id = milestone
+                .checkpoint_id
+                .unwrap_or_else(|| format!("step-{}", milestone.ordinal));
+            return TaskState::MilestoneReached {
+                checkpoint_id,
+                ordinal: milestone.ordinal,
+                summary: milestone.intent,
+            };
+        }
+        if let Some(outcome) = single_outcome {
+            TaskState::Stepped { outcome }
+        } else {
+            TaskState::SteppedBatch {
+                outcomes: batch_outcomes,
+                all_parallel,
+            }
+        }
+    }
+
+    /// Runs several parallel-safe calls concurrently and reports the
+    /// aggregated outcome as a single step.
+    ///
+    /// The plan counts this as **one** step regardless of how many calls
+    /// it contained. PS 26117 is explicit: a parallel fan-out is one
+    /// step, because "sum of parallel calls counts as 1 step" is the
+    /// budget's only honest reading. A task that asked for three searches
+    /// and got them in one step has spent one step of its budget, and
+    /// the budget counter is the source of truth, not the call counter.
+    ///
+    /// Each call is gateway-checked individually. A refusal in the
+    /// batch is the same as a refusal outside it: the model gets the
+    /// refusal text as the result for that call. The batch as a whole
+    /// still counts as one step.
+    ///
+    /// The agent-runtime's `buildTools` already declares which tools are
+    /// parallel-safe via `executionMode: "parallel"`. This executor
+    /// additionally checks the static property: read-only tools may run
+    /// in parallel; anything that writes, produces a file, or asks a
+    /// person runs sequentially. Mixed batches are detected and the
+    /// executor surfaces a warning in the result so a caller knows
+    /// the batch was not what it asked for.
+    pub async fn step_batch(
+        &mut self,
+        run: &mut PlanRun,
+        context: &TaskContext<'_>,
+        calls: &[ToolCall],
+    ) -> TaskState {
+        if calls.is_empty() {
+            return self.finish(
+                run,
+                StopReason::Failed {
+                    detail: "an empty batch is not a step".to_string(),
+                },
+                context,
+            );
+        }
+
+        // Budget check: a fan-out is one step. If the plan has room
+        // for a step at all, it has room for the fan-out.
+        if let Some(first) = calls.first() {
+            if let Continuation::Stop(reason) = run.may_call(first) {
+                return self.finish(run, reason, context);
+            }
+        }
+
+        // Parallel-safety is read-only: a tool that does not change
+        // anything cannot be racing itself.
+        let all_parallel = calls.iter().all(|call| {
+            let name = ToolName::from_str(&call.tool);
+            name.map(|tool| tool.is_read_only()).unwrap_or(false)
+        });
+
+        // First pass: split into refused, approval-paused, allowed.
+        // Verdicts and audit writes are sequential, by design, so the
+        // audit log keeps causal order.
+        let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(calls.len());
+        let mut approval_needed: Option<(String, String)> = None;
+        let mut refused = 0;
+        let mut allowed_calls: Vec<(ToolCall, ToolName, Option<std::path::PathBuf>)> =
+            Vec::new();
+
+        for call in calls {
+            let verdict = ToolGateway::decide(call, context);
+            match verdict {
+                GatewayVerdict::Refuse { reason } => {
+                    refused += 1;
+                    self.consecutive_refusals += 1;
+                    self.record(context, call, false, &reason);
+                    outcomes.push(StepOutcome {
                         tool: call.tool.clone(),
-                        result,
-                        permitted: true,
-                        took_ms: started.elapsed().as_millis() as u64,
-                    },
+                        result: reason,
+                        permitted: false,
+                        took_ms: 0,
+                    });
+                }
+                GatewayVerdict::NeedsApproval { tool, summary, .. } => {
+                    run.await_approval(tool);
+                    self.record(context, call, false, "awaiting approval");
+                    if approval_needed.is_none() {
+                        approval_needed =
+                            Some((tool.as_str().to_string(), summary));
+                    }
+                }
+                GatewayVerdict::Allow { tool, ref resolved_path } => {
+                    allowed_calls.push((
+                        call.clone(),
+                        tool,
+                        resolved_path.as_ref().map(|p| p.to_path_buf()),
+                    ));
                 }
             }
         }
+
+        // Concurrent fan-out via futures::future::join_all. A
+        // long-running tool in the batch does not hold the rest up.
+        // Borrow the runner out of self so the closure can capture
+        // only a shared reference; capturing self mutably here would
+        // move self into the future and prevent the post-fan-out
+        // record/consecutive_refusals updates.
+        let runner: &dyn ToolRunner = self.runner;
+        let concurrent_handles: Vec<_> = allowed_calls
+            .iter()
+            .map(|(call, tool, resolved_path)| {
+                let call = call.clone();
+                let tool = *tool;
+                let path = resolved_path.clone();
+                async move {
+                    let started = Instant::now();
+                    let result = runner
+                        .run(tool, &call, path.as_deref())
+                        .await;
+                    (call, started, result)
+                }
+            })
+            .collect();
+
+        let concurrent_results: Vec<(ToolCall, Instant, Result<String, String>)> =
+            futures_util::future::join_all(concurrent_handles).await;
+
+        for (call, started, result) in concurrent_results {
+            let took_ms = started.elapsed().as_millis() as u64;
+            self.record(
+                context,
+                &call,
+                true,
+                result.as_deref().unwrap_or(&String::new()),
+            );
+            if result.is_ok() {
+                self.consecutive_refusals = 0;
+            }
+            outcomes.push(StepOutcome {
+                tool: call.tool.clone(),
+                result: result
+                    .unwrap_or_else(|e| format!("The tool ran but failed: {e}")),
+                permitted: true,
+                took_ms,
+            });
+        }
+
+        // Three-refusal ceiling: if the *whole* batch is refused,
+        // the ceiling still fires. A single refusal in a batch of
+        // three allowed calls is not a stuck model and is not a stop.
+        if refused > 0
+            && refused == calls.len()
+            && self.consecutive_refusals >= CONSECUTIVE_REFUSAL_LIMIT
+        {
+            let stop = StopReason::Failed {
+                detail: format!(
+                    "every call in the batch was refused and the task was not adapting.                      The last reason was: {}",
+                    outcomes
+                        .last()
+                        .map(|o| o.result.clone())
+                        .unwrap_or_default()
+                ),
+            };
+            return self.finish(run, stop, context);
+        }
+
+        // One step for the whole batch. The budget counter sees one
+        // decrement, regardless of how many calls ran. PS 26117
+        // says: "sum of parallel calls counts as 1 step".
+        let hit = run.record_step();
+
+        if let Some((tool, prompt)) = approval_needed {
+            return TaskState::AwaitingApproval { tool, prompt };
+        }
+
+        self.step_finished_state(hit, None, outcomes, all_parallel)
     }
 
     /// Resumes a task after a person approved the pending action.
@@ -306,8 +543,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ToolRunner for FakeRunner {
-        fn run(
+        async fn run(
             &self,
             tool: ToolName,
             _call: &ToolCall,
@@ -351,6 +589,25 @@ mod tests {
         }
     }
 
+    /// Runs an async future on a tokio runtime, for sync tests.
+    ///
+    /// The real call sites are inside a tokio runtime; the unit tests are
+    /// not. A single-threaded tokio runtime is built lazily and held in
+    /// a `OnceLock`, so test cost is paid once across the whole suite
+    /// rather than once per test. Using `Handle::block_on` would require
+    /// the test to be inside a runtime, which it is not.
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        use std::sync::OnceLock;
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the test runtime must build")
+        });
+        runtime.block_on(future)
+    }
+
     fn search(query: &str) -> ToolCall {
         ToolCall::new("search_documents", json!({ "query": query }))
     }
@@ -362,7 +619,7 @@ mod tests {
         let s = session(vec![Role::User]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
-        let state = executor.step(&mut run(), &context(&s, &roots), &search("wall thickness"));
+        let state = block(executor.step(&mut run(), &context(&s, &roots), &search("wall thickness")));
 
         match state {
             TaskState::Stepped { outcome } => {
@@ -384,11 +641,11 @@ mod tests {
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
-        let state = executor.step(
+        let state = block(executor.step(
             &mut plan,
             &context(&s, &roots),
             &ToolCall::new("read_scoped_file", json!({ "path": "C:/Windows/System32/config" })),
-        );
+        ));
 
         match state {
             TaskState::Stepped { outcome } => {
@@ -416,10 +673,10 @@ mod tests {
             )
         };
 
-        assert!(!executor.step(&mut plan, &context(&s, &roots), &bad(1)).is_finished());
-        assert!(!executor.step(&mut plan, &context(&s, &roots), &bad(2)).is_finished());
+        assert!(!block(executor.step(&mut plan, &context(&s, &roots), &bad(1))).is_finished());
+        assert!(!block(executor.step(&mut plan, &context(&s, &roots), &bad(2))).is_finished());
 
-        match executor.step(&mut plan, &context(&s, &roots), &bad(3)) {
+        match block(executor.step(&mut plan, &context(&s, &roots), &bad(3))) {
             TaskState::Finished { reason, .. } => {
                 let text = reason.explain();
                 assert!(text.contains("3 times in a row"), "{text}");
@@ -441,12 +698,12 @@ mod tests {
 
         let bad = ToolCall::new("read_scoped_file", json!({ "path": "C:/Windows/x" }));
 
-        executor.step(&mut plan, &context(&s, &roots), &bad);
-        executor.step(&mut plan, &context(&s, &roots), &search("progress"));
-        executor.step(&mut plan, &context(&s, &roots), &bad);
+        block(executor.step(&mut plan, &context(&s, &roots), &bad));
+        block(executor.step(&mut plan, &context(&s, &roots), &search("progress")));
+        block(executor.step(&mut plan, &context(&s, &roots), &bad));
 
         assert!(
-            !executor.step(&mut plan, &context(&s, &roots), &bad).is_finished(),
+            !block(executor.step(&mut plan, &context(&s, &roots), &bad)).is_finished(),
             "the counter should have been reset by the successful step"
         );
     }
@@ -460,14 +717,14 @@ mod tests {
         let s = session(vec![Role::User]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
-        let state = executor.step(
+        let state = block(executor.step(
             &mut run(),
             &context(&s, &roots),
             &ToolCall::new(
                 "write_scoped_file",
                 json!({ "path": "C:/arjun/tasks/1/note.txt", "content": "hello" }),
             ),
-        );
+        ));
 
         match state {
             TaskState::AwaitingApproval { tool, prompt } => {
@@ -490,14 +747,14 @@ mod tests {
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
-        executor.step(
+        block(executor.step(
             &mut plan,
             &context(&s, &roots),
             &ToolCall::new(
                 "write_scoped_file",
                 json!({ "path": "C:/arjun/tasks/1/note.txt", "content": "hello" }),
             ),
-        );
+        ));
         assert_eq!(plan.steps_taken(), 0);
     }
 
@@ -514,13 +771,13 @@ mod tests {
             json!({ "path": "C:/arjun/tasks/1/note.txt", "content": "hello" }),
         );
 
-        executor.step(&mut plan, &context(&s, &roots), &call);
+        block(executor.step(&mut plan, &context(&s, &roots), &call));
         executor.approved(&mut plan);
 
         let mut granted = context(&s, &roots);
         granted.approval = ApprovalState::Granted;
 
-        match executor.step(&mut plan, &granted, &call) {
+        match block(executor.step(&mut plan, &granted, &call)) {
             TaskState::Stepped { outcome } => assert!(outcome.permitted),
             other => panic!("expected the write to proceed, got {other:?}"),
         }
@@ -558,9 +815,9 @@ mod tests {
             Budget { max_steps: 1, ..Budget::standard(tools()) },
         );
 
-        executor.step(&mut plan, &context(&s, &roots), &search("first"));
+        block(executor.step(&mut plan, &context(&s, &roots), &search("first")));
 
-        match executor.step(&mut plan, &context(&s, &roots), &search("second")) {
+        match block(executor.step(&mut plan, &context(&s, &roots), &search("second"))) {
             TaskState::Finished { unfinished, .. } => {
                 assert_eq!(unfinished, vec!["Draft the note"]);
             }
@@ -576,7 +833,7 @@ mod tests {
         let s = session(vec![Role::User]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
-        match executor.step(&mut run(), &context(&s, &roots), &search("anything")) {
+        match block(executor.step(&mut run(), &context(&s, &roots), &search("anything"))) {
             TaskState::Stepped { outcome } => {
                 assert!(outcome.permitted, "it was permitted; it simply failed");
                 assert!(outcome.result.contains("the index was unavailable"));
@@ -594,7 +851,282 @@ mod tests {
         let mut ctx = context(&s, &roots);
         ctx.confidential_work_permitted = false;
 
-        executor.step(&mut run(), &ctx, &search("anything"));
+        block(executor.step(&mut run(), &ctx, &search("anything")));
         assert!(runner.ran().is_empty());
+    }
+
+    /// PS 26117, Phase 2: a parallel fan-out counts as a single step.
+    /// Three read-only search calls run together and the budget only
+    /// moves by one.
+    #[test]
+    fn a_parallel_batch_runs_three_reads_and_costs_one_step() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let mut plan = PlanRun::new(
+            "task-parallel",
+            vec!["Triangulate three sources".into()],
+            Budget::standard(tools()),
+        );
+        let before = plan.steps_taken();
+        let calls = vec![
+            search("wall thickness"),
+            search("hydrotest interval"),
+            search("shutdown 2024"),
+        ];
+
+        let state = block(executor.step_batch(
+            &mut plan,
+            &context(&s, &roots),
+            &calls,
+        ));
+
+        match state {
+            TaskState::SteppedBatch { outcomes, all_parallel } => {
+                assert!(all_parallel, "read-only calls must mark the batch parallel");
+                assert_eq!(outcomes.len(), 3);
+                assert!(outcomes.iter().all(|o| o.permitted));
+            }
+            other => panic!("expected a parallel batch, got {other:?}"),
+        }
+        assert_eq!(runner.ran().len(), 3, "every call in the batch must run");
+        assert_eq!(
+            plan.steps_taken(),
+            before + 1,
+            "the whole batch is exactly one step",
+        );
+    }
+
+    /// A single refusal inside a batch that has allowed siblings is
+    /// NOT a stuck model. The step counts, the refused call comes
+    /// back as a result, and the others are recorded.
+    #[test]
+    fn a_single_refusal_in_a_batch_does_not_stop_the_task() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let calls = vec![
+            search("wall thickness"),
+            ToolCall::new(
+                "read_scoped_file",
+                json!({ "path": "C:/Windows/System32/config" }),
+            ),
+            search("shutdown 2024"),
+        ];
+
+        let state = block(executor.step_batch(
+            &mut run(),
+            &context(&s, &roots),
+            &calls,
+        ));
+
+        match state {
+            TaskState::SteppedBatch { outcomes, .. } => {
+                assert_eq!(outcomes.len(), 3);
+                let refused = outcomes.iter().filter(|o| !o.permitted).count();
+                assert_eq!(refused, 1, "exactly the path-traversal call was refused");
+            }
+            other => panic!("expected a batch result, got {other:?}"),
+        }
+        // Two siblings ran, the refused one didn't.
+        assert_eq!(runner.ran().len(), 2);
+    }
+
+    /// If every call in a batch is refused three times in a row, the
+    /// ceiling fires regardless of batch size. The stop reason names
+    /// the last refusal.
+    #[test]
+    fn an_all_refused_batch_eventually_stops_with_a_named_reason() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        // Path-traversal: refused for every call, every batch.
+        let calls = vec![
+            ToolCall::new(
+                "read_scoped_file",
+                json!({ "path": "C:/Windows/System32/config" }),
+            ),
+            ToolCall::new(
+                "read_scoped_file",
+                json!({ "path": "C:/Windows/System32/secret" }),
+            ),
+        ];
+
+        let mut plan = run();
+        // First batch: 2 refusals, no ceiling yet.
+        let _ = block(executor.step_batch(
+            &mut plan,
+            &context(&s, &roots),
+            &calls,
+        ));
+        // Second batch: 4 refusals total, ceiling at 3 fires.
+        let state = block(executor.step_batch(
+            &mut plan,
+            &context(&s, &roots),
+            &calls,
+        ));
+        match state {
+            TaskState::Finished { reason, .. } => {
+                let detail = format!("{reason:?}");
+                assert!(detail.contains("refused"));
+            }
+            other => panic!("expected a stop after the all-refused ceiling, got {other:?}"),
+        }
+    }
+
+    /// Empty batches are not a no-op; they are a malformed model
+    /// output and stop the task.
+    #[test]
+    fn an_empty_batch_is_not_a_step() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let state = block(executor.step_batch(
+            &mut run(),
+            &context(&s, &roots),
+            &[],
+        ));
+        match state {
+            TaskState::Finished { reason, .. } => {
+                let detail = format!("{reason:?}");
+                assert!(detail.contains("empty batch"));
+            }
+            other => panic!("empty batch must stop the task, got {other:?}"),
+        }
+        assert!(runner.ran().is_empty());
+    }
+
+    /// PS 26117, Phase 2: a step flagged as a milestone pauses the
+    /// run for human approval before the next leg. The state carries
+    /// the checkpoint id, ordinal and intent so the UI can render
+    /// the gate without re-reading the plan.
+    #[test]
+    fn finishing_a_milestone_step_pauses_the_run_for_a_human_gate() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let mut plan = PlanRun::new(
+            "task-milestone",
+            vec!["Survey the SOPs".into(), "Draft the note".into()],
+            Budget::standard(tools()),
+        );
+        plan.mark_milestone(1, "mtn-survey").unwrap();
+
+        let state = block(executor.step(
+            &mut plan,
+            &context(&s, &roots),
+            &search("wall thickness"),
+        ));
+        match state {
+            TaskState::MilestoneReached {
+                checkpoint_id,
+                ordinal,
+                summary,
+            } => {
+                assert_eq!(checkpoint_id, "mtn-survey");
+                assert_eq!(ordinal, 1);
+                assert!(summary.contains("Survey"));
+            }
+            other => panic!("expected a milestone gate, got {other:?}"),
+        }
+        assert_eq!(runner.ran().len(), 1, "the tool still ran");
+    }
+
+    /// A non-milestone step is not a gate; the run continues
+    /// normally.
+    #[test]
+    fn a_non_milestone_step_does_not_pause() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let state = block(executor.step(
+            &mut run(),
+            &context(&s, &roots),
+            &search("wall thickness"),
+        ));
+        match state {
+            TaskState::Stepped { outcome } => assert!(outcome.permitted),
+            other => panic!("expected a normal step, got {other:?}"),
+        }
+    }
+
+    /// A milestone inside a parallel batch still pauses; the model
+    /// cannot smuggle a checkpoint past the gate by fanning out.
+    #[test]
+    fn a_milestone_inside_a_parallel_batch_pauses_anyway() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        let mut plan = PlanRun::new(
+            "task-parallel-milestone",
+            vec!["Triangulate".into(), "Write up".into()],
+            Budget::standard(tools()),
+        );
+        plan.mark_milestone(1, "mtn-triangulate").unwrap();
+
+        let state = block(executor.step_batch(
+            &mut plan,
+            &context(&s, &roots),
+            &[search("a"), search("b")],
+        ));
+        match state {
+            TaskState::MilestoneReached { checkpoint_id, .. } => {
+                assert_eq!(checkpoint_id, "mtn-triangulate");
+            }
+            other => panic!("a parallel batch hitting a milestone must pause, got {other:?}"),
+        }
+    }
+
+    /// A milestone without an explicit checkpoint id still falls
+    /// back to a stable name (`step-N`) so the resume path has
+    /// something to address.
+    #[test]
+    fn a_milestone_with_no_checkpoint_id_falls_back_to_step_n() {
+        let runner = FakeRunner::working();
+        let mut executor = Executor::new(&runner, None);
+        let s = session(vec![Role::User]);
+        let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
+
+        // Reach into the plan directly to flag a milestone without
+        // a checkpoint id. The public API requires an id, so we use
+        // the constructor's default to simulate a future caller that
+        // forgets to set one.
+        let mut plan = PlanRun::new(
+            "task-fallback",
+            vec!["Survey".into()],
+            Budget::standard(tools()),
+        );
+        plan.steps[0].milestone = true;
+
+        let state = block(executor.step(
+            &mut plan,
+            &context(&s, &roots),
+            &search("x"),
+        ));
+        match state {
+            TaskState::MilestoneReached {
+                checkpoint_id,
+                ordinal,
+                ..
+            } => {
+                assert_eq!(checkpoint_id, "step-1");
+                assert_eq!(ordinal, 1);
+            }
+            other => panic!("expected a milestone with a fallback id, got {other:?}"),
+        }
     }
 }

@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use crate::registry::{LoadSpec, ModelEntry, ModelRole, Modality, Runtime};
+use crate::registry::{LoadSpec, ModelEntry, ModelRole, Modality, RoutingPreference, Runtime};
 
 /// Reads a parameter count out of a model name.
 ///
@@ -177,6 +177,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 serving: None,
                 required_runtime_profile: None,
                 enabled: true,
+                routing: RoutingPreference::default(),
             }
         })
         .collect()
@@ -249,6 +250,7 @@ mod tests {
             serving: None,
             required_runtime_profile: None,
             enabled: true,
+            routing: RoutingPreference::default(),
         };
         assert!(!entry.meets_floor(ModelRole::Coding));
         assert!(!entry.meets_floor(ModelRole::Reasoning));
@@ -321,6 +323,7 @@ mod tests {
             serving: None,
             required_runtime_profile: None,
             enabled: true,
+            routing: RoutingPreference::default(),
         };
 
         for classification in Classification::ALL {

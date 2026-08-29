@@ -179,3 +179,113 @@
 
 .stateUnknown .cardState { color: var(--text-tertiary); }
 .stateUnknown .cardValue { color: var(--text-tertiary); }
+
+.benchSection {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.benchHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.benchHeader h2 {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--color-text);
+  flex: 1;
+}
+
+.syntheticTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--color-amber, #f59e0b);
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.benchButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.35rem 0.65rem;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.benchGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem;
+}
+
+@media (max-width: 900px) {
+  .benchGrid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.benchStat {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.benchLabel {
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.benchValue {
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--color-amber, #f59e0b);
+  font-family: var(--font-mono, monospace);
+}
+
+.benchNote {
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+}
+
+.benchMeta {
+  margin: 0.75rem 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.benchMeta code {
+  font-family: var(--font-mono, monospace);
+  background: var(--color-surface-2);
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
+.benchEmpty {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}

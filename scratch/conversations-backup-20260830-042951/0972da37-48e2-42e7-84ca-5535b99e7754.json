@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "conversation": {
+    "id": "0972da37-48e2-42e7-84ca-5535b99e7754",
+    "title": "New conversation",
+    "createdAt": "2026-08-29T22:54:33.276359100+00:00",
+    "lastActivityAt": "2026-08-29T22:56:08.124722400+00:00",
+    "messages": [
+      {
+        "id": "sys-f6faf258-2033-41de-bec3-0a69b40bfeea",
+        "conversationId": "0972da37-48e2-42e7-84ca-5535b99e7754",
+        "role": "system",
+        "content": "Arjun is ready. Ask anything; nothing leaves this machine.",
+        "status": "done",
+        "createdAt": "2026-08-29T22:54:33.276359100+00:00",
+        "completedAt": "2026-08-29T22:54:33.276359100+00:00"
+      },
+      {
+        "id": "u-23174e3e-a699-4f62-9e02-0082a7c23ea0",
+        "conversationId": "0972da37-48e2-42e7-84ca-5535b99e7754",
+        "role": "user",
+        "content": "hi",
+        "status": "done",
+        "createdAt": "2026-08-29T22:54:35.891450900+00:00",
+        "completedAt": "2026-08-29T22:54:35.891450900+00:00"
+      },
+      {
+        "id": "a-fa21afd9-d0c0-4eba-b738-26bbdc2e6913",
+        "conversationId": "0972da37-48e2-42e7-84ca-5535b99e7754",
+        "role": "assistant",
+        "content": "Hello! How may I assist you with internal procedures, specifications, drawings, or correspondence today?",
+        "status": "done",
+        "runId": "4582d97e-2540-4e25-b411-65545edaec00",
+        "createdAt": "2026-08-29T22:54:35.891450900+00:00",
+        "completedAt": "2026-08-29T22:56:08.124722400+00:00",
+        "elapsedMs": 75488,
+        "modelName": "gemma-4-E4B-it",
+        "modelRole": "reasoning",
+        "usedFallback": false
+      }
+    ],
+    "runs": [
+      {
+        "runId": "4582d97e-2540-4e25-b411-65545edaec00",
+        "messageId": "a-fa21afd9-d0c0-4eba-b738-26bbdc2e6913",
+        "startedAt": "2026-08-29T22:54:35.891450900+00:00",
+        "live": true
+      }
+    ],
+    "compactions": 0
+  }
+}

@@ -15,6 +15,12 @@
   border-bottom: 1px solid var(--border-default);
 }
 
+.headActions {
+  display: flex;
+  gap: var(--space-2);
+  flex: none;
+}
+
 /* The task as it was asked, kept verbatim. A paraphrase here would quietly
  * change what the rest of the screen is evidence about. */
 .prompt {
@@ -185,14 +191,98 @@
 
 .activityItem {
   display: flex;
-  align-items: center;
-  gap: var(--space-3);
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
   font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
+.activityRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
 .activityLabel { flex: 1; min-width: 0; }
 .activityStatus { font-size: var(--text-xs); color: var(--text-tertiary); }
+
+/* Numeric-ish column: durations line up so a reader can scan for the slow one. */
+.activityDuration {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+  min-width: 5em;
+  text-align: right;
+}
+
+.activityExpand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.activityExpand:hover { background: var(--bg-hover); color: var(--text-primary); }
+.activityExpand:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+/* Status icon coloring. Using icons (not dots) makes the row scannable when
+ * the list is long and reads cleanly at small sizes. */
+.statusIcon_running { color: var(--info); animation: pulse 1.4s ease-in-out infinite; }
+.statusIcon_done { color: var(--success); }
+.statusIcon_failed { color: var(--error); }
+.statusIcon_refused { color: var(--text-tertiary); }
+.statusIcon_replayed { color: var(--success); }
+.statusIcon_unknown { color: var(--warning, var(--text-tertiary)); }
+
+.activityDetail {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-secondary);
+  border-left: 2px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  line-height: var(--leading-relaxed);
+}
+
+.activityDetail dt {
+  color: var(--text-tertiary);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  padding-top: 1px;
+}
+
+.activityDetail dd {
+  margin: 0;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.activityPath {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.activityError {
+  color: var(--error);
+}
 
 .dot_running,
 .dot_done,
@@ -316,6 +406,84 @@
 }
 .revealBtn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .revealBtn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+/*
+ * Two buttons in a column so opening a preview does not push the row wider
+ * than the file's name needs.
+ */
+.artifactActions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.previewPane {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.previewPre,
+.previewMarkdown {
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  max-height: 320px;
+  overflow: auto;
+  font-size: var(--text-xs);
+  line-height: var(--leading-relaxed);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+
+.previewPre {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.previewMarkdown {
+  font-family: inherit;
+}
+
+.previewPre[data-truncated],
+.previewMarkdown[data-truncated] {
+  /* Subtle bottom fade so the user can tell there is more they are not seeing. */
+  mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+}
+
+.previewImage {
+  max-width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+.previewNote {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 
 /* --- Checked ---------------------------------------------------------- */
 

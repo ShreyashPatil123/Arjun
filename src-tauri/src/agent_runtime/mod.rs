@@ -31,6 +31,7 @@
 
 pub mod approval;
 pub mod artifacts;
+pub mod conversations;
 pub mod events;
 pub mod grants;
 pub mod memory;
@@ -53,6 +54,11 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 use crate::identity::Session;
 use crate::knowledge::KnowledgeIndex;
@@ -286,7 +292,8 @@ impl AgentRuntime {
             return Err(RuntimeError::BundleMissing(bundle));
         }
 
-        let mut child = Command::new("node")
+        let mut child = Command::new("node");
+        child
             .arg(&bundle)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -301,9 +308,18 @@ impl AgentRuntime {
             .env_remove("https_proxy")
             .env_remove("ALL_PROXY")
             .env_remove("NPM_CONFIG_PROXY")
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(RuntimeError::Spawn)?;
+            .kill_on_drop(true);
+        // Without `CREATE_NO_WINDOW`, Windows opens a console window for
+        // the spawned `node.exe` every time the user sends a chat message,
+        // because the Tauri release build is `windows_subsystem = "windows"`
+        // and the OS does not auto-suppress console windows for the children
+        // it spawns. The same flag is set in the document and memory
+        // sidecars; this is the matching setting for the agent runtime.
+        #[cfg(target_os = "windows")]
+        {
+            child.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = child.spawn().map_err(RuntimeError::Spawn)?;
 
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -445,8 +461,25 @@ async fn dispatch(
                 // turn count and a compaction are not. The compaction in
                 // particular is a caveat on everything the run says afterwards,
                 // and a trace that lost it would overstate its own grounding.
-                remember_loop_event(deps, &params);
-                emit(params);
+                //
+                // `message_start` / `message_update` / `message_end` are
+                // *streaming* events: not durable, but forwarded on the live
+                // channel so a chat surface can show tokens as they arrive. A
+                // half-streamed sentence that arrives on remount as text is
+                // misleading; the durable record is the final `Message.content`
+                // row, not these deltas.
+                let event_type = params
+                    .get("event")
+                    .and_then(|v| v.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if matches!(event_type, "message_start" | "message_update" | "message_end") {
+                    // Live channel only. Drop on slow consumer.
+                    emit(params);
+                } else {
+                    remember_loop_event(deps, &params);
+                    emit(params);
+                }
             } else {
                 log::debug!("[agent-runtime] unhandled notification {method}");
             }
@@ -462,7 +495,7 @@ async fn handle(
 ) -> Result<Value, WireError> {
     match method {
         "tool.authorize" => authorize(params, deps).await,
-        "tool.execute" => execute(params, deps),
+        "tool.execute" => execute(params, deps).await,
         "tool.catalogue" => tool_catalogue(params, deps),
         "capability.search" => capability_search(params, deps),
         // The whole of a model's reach into memory. Both fill in identity,
@@ -1025,7 +1058,7 @@ fn anchor_path(call: ToolCall, roots: &[PathBuf]) -> ToolCall {
 }
 
 /// Redeems the grant, re-derives the verdict, then runs the tool.
-fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
     let call = read_call(&params)?;
     let grant = params
         .get("grant")
@@ -1241,11 +1274,11 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
         .map(|value| render_memory(&value))
         .map_err(|error| error.message),
         ToolName::ValidateArtifact => {
-            validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call)
+            validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call).await
         }
         _ => {
             let runner = LocalToolRunner::new(deps.index.as_ref(), &session);
-            let result = runner.run(tool, &tool_call, resolved_path.as_deref());
+            let result = runner.run(tool, &tool_call, resolved_path.as_deref()).await;
             // A successful calculation is kept, so the workbook can show the
             // working rather than the model's memory of it.
             if tool == ToolName::RunCalculation && result.is_ok() {
@@ -1311,7 +1344,7 @@ fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
 /// remembered it — so `validate_artifact` on a document opens the package and
 /// checks the sections are really there, which is what PS step 30 asks for and
 /// what the tool's own description promises the model.
-fn validate(
+async fn validate(
     deps: &Arc<RuntimeDeps>,
     run_id: &str,
     resolved_path: Option<&Path>,
@@ -1329,7 +1362,7 @@ fn validate(
         // against and no claim to make beyond what is on disk. The runner's
         // existence-and-size check is then the honest answer.
         let runner = LocalToolRunner::new(deps.index.as_ref(), session);
-        return runner.run(ToolName::ValidateArtifact, tool_call, resolved_path);
+        return runner.run(ToolName::ValidateArtifact, tool_call, resolved_path).await;
     };
 
     let report = artifacts::check(&produced);
@@ -1496,6 +1529,8 @@ pub fn catalogue() -> Vec<&'static str> {
 }
 
 
+#[cfg(test)]
+mod conversations_tests;
 #[cfg(test)]
 mod memory_boundary_tests;
 #[cfg(test)]

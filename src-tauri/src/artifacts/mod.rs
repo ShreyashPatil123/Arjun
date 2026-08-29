@@ -10,11 +10,20 @@
 //! - [`production`]: compose, render, re-open, verify — revising, never
 //!   overwriting.
 //! - [`verifier`]: the check between a draft and something somebody signs.
+//! - [`visible_watermark`]: the printed provenance claim stamped onto every
+//!   generated document. See the module docs for the honest scope: this is
+//!   traceability, not attribution; the steganographic alternative is
+//!   deliberately not implemented.
+//! - [`stego_watermark`]: the *refused* counterpart to the visible watermark.
+//!   Always returns an error; see its module docs for the written-out
+//!   reasoning so the refusal survives the contributor who inherits it.
 
 pub mod docx;
 pub mod ooxml;
 pub mod pptx;
 pub mod production;
+pub mod stego_watermark;
+pub mod visible_watermark;
 pub mod xlsx;
 pub mod verifier;
 

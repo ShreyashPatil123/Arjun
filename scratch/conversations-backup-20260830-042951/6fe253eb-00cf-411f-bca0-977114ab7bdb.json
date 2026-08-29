@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "conversation": {
+    "id": "6fe253eb-00cf-411f-bca0-977114ab7bdb",
+    "title": "Safety Incident Analysis",
+    "createdAt": "2026-08-29T22:57:16.557244400+00:00",
+    "lastActivityAt": "2026-08-29T22:57:16.557244400+00:00",
+    "messages": [
+      {
+        "id": "sys-9f9d7c99-0795-4f79-8617-f36915bacd46",
+        "conversationId": "6fe253eb-00cf-411f-bca0-977114ab7bdb",
+        "role": "system",
+        "content": "Arjun is ready. Ask anything; nothing leaves this machine.",
+        "status": "done",
+        "createdAt": "2026-08-29T22:57:16.557244400+00:00",
+        "completedAt": "2026-08-29T22:57:16.557244400+00:00"
+      }
+    ],
+    "runs": [],
+    "compactions": 0
+  }
+}

@@ -9,7 +9,12 @@ use std::sync::{Arc, RwLock};
 
 use tauri::State;
 
+use crate::audit::merkle::MerkleVerification;
+use crate::audit::provenance_hmac::{self, OfflineVerifyReport, SignedProvenance};
 use crate::audit::{AuditEntry, AuditKind, AuditService, ChainVerification};
+use crate::sovereignty::zero_trust::{
+    GateDecision, ToolCallRequest, ZeroTrustConfig, ZeroTrustGate, ZeroTrustMode,
+};
 use crate::identity::{
     AuthenticationStatus, CredentialStore, Permission, Role, Session, User, UserDirectory,
 };
@@ -248,4 +253,106 @@ pub async fn verify_audit_chain(
 ) -> Result<ChainVerification, String> {
     require_permission(&session, Permission::ViewAuditLog)?;
     audit.verify_chain().map_err(|e| e.to_string())
+}
+
+/// Mints an HMAC tag for a provenance block under the operator-set key
+/// stored in `app_data_dir`. Returns the tag, the algorithm, the message
+/// digest, and whether the key was actually present. See
+/// `audit::provenance_hmac` for the honest security claim — this is a
+/// *checkpoint*, not a digital signature.
+#[tauri::command]
+pub async fn sign_provenance(
+    session: State<'_, CurrentSession>,
+    app_data_dir: State<'_, std::path::PathBuf>,
+    provenance: crate::sih_workflow::evidence_package::Provenance,
+) -> Result<SignedProvenance, String> {
+    require_permission(&session, Permission::ModifyPolicy)?;
+    provenance_hmac::sign(&app_data_dir, &provenance).map_err(|e| e.to_string())
+}
+
+/// Re-derives an HMAC tag for a previously signed provenance block
+/// using the on-disk key, and returns the diff between the stored tag
+/// and the recomputed one. Inspectors run this in a clean environment
+/// to confirm a package has not been tampered with since signing.
+#[tauri::command]
+pub async fn verify_provenance(
+    session: State<'_, CurrentSession>,
+    app_data_dir: State<'_, std::path::PathBuf>,
+    signed: SignedProvenance,
+) -> Result<OfflineVerifyReport, String> {
+    require_permission(&session, Permission::ViewAuditLog)?;
+    provenance_hmac::offline_report(&app_data_dir, &signed).map_err(|e| e.to_string())
+}
+
+/// Reads the current zero-trust configuration. Available to any
+/// authenticated user — there is no privacy in *what mode the toggle is
+/// in*, only in the audit log it writes.
+#[tauri::command]
+pub async fn read_zero_trust_config(
+    session: State<'_, CurrentSession>,
+    gate: State<'_, Arc<ZeroTrustGate>>,
+) -> Result<ZeroTrustConfig, String> {
+    require_session(&session)?;
+    gate.read().map_err(|e| e.to_string())
+}
+
+/// Changes the zero-trust configuration. Requires `ModifyPolicy`; the
+/// change itself is recorded in the audit log.
+#[tauri::command]
+pub async fn set_zero_trust_mode(
+    session: State<'_, CurrentSession>,
+    gate: State<'_, Arc<ZeroTrustGate>>,
+    mode: ZeroTrustMode,
+    reauth_window_seconds: u32,
+    reason: Option<String>,
+) -> Result<ZeroTrustConfig, String> {
+    let who = require_permission(&session, Permission::ModifyPolicy)?;
+    gate.set(&who.user.id, mode, reauth_window_seconds, reason)
+        .map_err(|e| e.to_string())
+}
+
+/// Asks the gate whether a tool call should proceed. Returns a
+/// `GateDecision`; the UI either lets the call run, surfaces a
+/// confirmation dialog, or hard-denies the call.
+#[tauri::command]
+pub async fn zero_trust_check_tool_call(
+    session: State<'_, CurrentSession>,
+    gate: State<'_, Arc<ZeroTrustGate>>,
+    request: ToolCallRequest,
+) -> Result<GateDecision, String> {
+    let who = require_session(&session)?;
+    gate.check_tool_call(&who.user.id, &request).map_err(|e| e.to_string())
+}
+
+/// Records the human's response to a `RequireHumanApproval` decision.
+/// Writes a second audit row referencing the original request row.
+#[tauri::command]
+pub async fn zero_trust_confirm_approval(
+    session: State<'_, CurrentSession>,
+    gate: State<'_, Arc<ZeroTrustGate>>,
+    approval_id: i64,
+    approved: bool,
+) -> Result<(), String> {
+    let who = require_session(&session)?;
+    gate.confirm_approval(&who.user.id, approval_id, approved)
+        .map_err(|e| e.to_string())
+}
+
+/// Verifies the audit log against the last recorded Merkle snapshot.
+///
+/// The chain can still pass a per-row recompute while being *silently
+/// rewritten* — an attacker who can edit the file can rewrite rows in
+/// matching pairs that re-seal to the same hash, then break the seal of
+/// the row after to hide what they did. A Merkle root is the second witness:
+/// it was written outside the chain, and a recorded root that disagrees
+/// with what the chain now reproduces is the strongest in-process signal
+/// we can offer that something has been rewritten.
+#[tauri::command]
+pub async fn verify_audit_merkle(
+    session: State<'_, CurrentSession>,
+    audit: State<'_, Arc<AuditService>>,
+) -> Result<MerkleVerification, String> {
+    require_permission(&session, Permission::ViewAuditLog)?;
+    let conn = audit.connection_handle();
+    crate::audit::merkle::verify(&conn).map_err(|e| e.to_string())
 }

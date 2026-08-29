@@ -149,3 +149,53 @@
   margin: var(--space-2) var(--space-1);
   background: var(--border-default);
 }
+
+/* ── Recent conversations ──────────────────────────────────────────────
+ * Compact rows. Title takes the width, time is fixed-width so columns
+ * line up. Truncate aggressively — the menu is not a search box. */
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  font-size: 10px;
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+
+.recentItem {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-align: left;
+  font-size: var(--text-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.recentItem:hover { background: var(--bg-hover); color: var(--text-primary); }
+.recentItem:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+
+.recentTitle {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recentTime {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}

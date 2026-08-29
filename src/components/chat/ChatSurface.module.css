@@ -1,0 +1,846 @@
+/* ------------------------------------------------------------------ *
+ * Chat surface layout.
+ *
+ * Three columns wide: sidebar (history), main (log + composer), and a
+ * modal inspector that floats over the main column. The chat log
+ * scrolls independently; the composer sticks to the bottom; the
+ * "↓ N new messages" pill sits above the composer when the user has
+ * scrolled upward.
+ *
+ * The colour palette is intentionally neutral: the chat surface is
+ * the conversational surface, the workbench panels are not in scope
+ * here, and the inspection overlay uses the existing dark glass.
+ * ------------------------------------------------------------------ */
+
+.chatRoot {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-primary, #0a0a0a);
+  color: var(--text-primary, #e4e4e7);
+}
+
+.chatMain {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  max-width: 64rem;
+  width: 100%;
+  /* A subtle hairline on the sides on wide windows keeps the chat
+   *  column readable without adding a permanent sidebar. */
+  border-left: 1px solid var(--border-default, #27272a);
+  border-right: 1px solid var(--border-default, #27272a);
+}
+
+.chatScroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-6, 24px) var(--space-6, 24px) var(--space-3, 12px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 16px);
+  min-height: 0;
+  scroll-behavior: smooth;
+}
+
+.emptyState {
+  margin: auto;
+  color: var(--text-tertiary, #71717a);
+  font-size: var(--text-sm, 13px);
+  font-style: italic;
+  text-align: center;
+  max-width: 36em;
+}
+
+.unseenPill {
+  position: absolute;
+  bottom: calc(var(--space-3, 12px) + 92px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1, 4px);
+  padding: 4px var(--space-2, 8px);
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-full, 999px);
+  color: var(--text-primary, #e4e4e7);
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+  z-index: 2;
+}
+.unseenPill:hover { background: var(--bg-hover, #27272a); }
+
+/* ------------------------------------------------------------------ *
+ * Message cells — user and system.
+ * ------------------------------------------------------------------ */
+
+.userRow {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.userBubble {
+  max-width: 78%;
+  padding: 10px 14px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 14px 14px 4px 14px;
+  color: var(--text-primary, #e4e4e7);
+  font-size: var(--text-sm, 13px);
+  line-height: 1.5;
+}
+
+.userText {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.systemRow {
+  text-align: center;
+  color: var(--text-tertiary, #71717a);
+  font-size: var(--text-xs, 11px);
+  font-style: italic;
+  padding: var(--space-2, 8px) 0;
+}
+
+.systemText {
+  margin: 0;
+  display: inline-block;
+  max-width: 80%;
+}
+
+/* ------------------------------------------------------------------ *
+ * Assistant cell.
+ * ------------------------------------------------------------------ */
+
+.assistantRow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  padding: var(--space-3, 12px);
+  background: transparent;
+  border-radius: var(--radius-md, 6px);
+  max-width: 92%;
+}
+
+.assistantHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  font-size: var(--text-xs, 11px);
+  color: var(--text-tertiary, #a1a1aa);
+}
+
+.modelBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-primary, #e4e4e7);
+  font-weight: 500;
+}
+
+.modelRole {
+  font-size: 10px;
+  color: var(--text-tertiary, #71717a);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+
+.fallback {
+  font-size: 10px;
+  padding: 1px 4px;
+  background: var(--warning-bg, #422006);
+  color: var(--warning, #fbbf24);
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.statusLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.assistantBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+}
+
+.assistantText {
+  margin: 0;
+  font-size: var(--text-sm, 13px);
+  line-height: 1.55;
+  color: var(--text-primary, #e4e4e7);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.caret {
+  display: inline-block;
+  width: 0;
+  margin-left: 1px;
+  color: var(--text-primary, #e4e4e7);
+  animation: chat-caret 1s steps(1, end) infinite;
+}
+@keyframes chat-caret {
+  50% { opacity: 0; }
+}
+
+.errorLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--error-bg, #450a0a);
+  color: var(--error, #fca5a5);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--text-xs, 11px);
+  line-height: 1.4;
+}
+
+.retryBtn {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-primary, #e4e4e7);
+  font-family: inherit;
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+}
+.retryBtn:hover { background: var(--bg-hover, #27272a); }
+
+.detailsBtn {
+  align-self: flex-start;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #a1a1aa);
+  font-family: inherit;
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.detailsBtn:hover { color: var(--text-primary, #e4e4e7); }
+
+/* ------------------------------------------------------------------ *
+ * Tool activity list (compact, in the assistant cell).
+ * ------------------------------------------------------------------ */
+
+.toolBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.toolSummary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-tertiary, #a1a1aa);
+  font-family: inherit;
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+}
+.toolSummary:hover { background: var(--bg-secondary, #18181b); }
+
+.toolSummaryText { color: var(--text-secondary, #d4d4d8); }
+
+.toolList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toolRow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--text-xs, 11px);
+  color: var(--text-secondary, #d4d4d8);
+}
+
+.toolRowMain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.toolName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toolStatus { color: var(--text-tertiary, #a1a1aa); }
+.toolDuration { color: var(--text-tertiary, #71717a); font-variant-numeric: tabular-nums; flex: none; }
+
+.statusIcon_running { color: var(--info, #3b82f6); animation: chat-pulse 1.4s ease-in-out infinite; }
+.statusIcon_done { color: var(--success, #22c55e); }
+.statusIcon_failed { color: var(--error, #ef4444); }
+.statusIcon_refused { color: var(--text-tertiary, #a1a1aa); }
+.statusIcon_replayed { color: var(--success, #22c55e); }
+.statusIcon_unknown { color: var(--warning, #fbbf24); }
+@keyframes chat-pulse { 50% { opacity: 0.4; } }
+
+.toolExpand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-tertiary, #a1a1aa);
+  cursor: pointer;
+}
+.toolExpand:hover { background: var(--bg-hover, #27272a); }
+
+.toolDetail {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-primary, #0a0a0a);
+  border-left: 2px solid var(--border-default, #27272a);
+  border-radius: 3px;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.toolDetail dt {
+  color: var(--text-tertiary, #71717a);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.toolDetail dd {
+  margin: 0;
+  color: var(--text-primary, #e4e4e7);
+  overflow-wrap: anywhere;
+}
+.toolPath {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--text-secondary, #d4d4d8);
+}
+.toolErrorLine { color: var(--error, #fca5a5); }
+
+/* ------------------------------------------------------------------ *
+ * Artifact list (compact, in the assistant cell).
+ * ------------------------------------------------------------------ */
+
+.artifactList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.artifactRow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--text-xs, 11px);
+}
+
+.artifactRowMain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.artifactIcon { flex: none; color: var(--text-tertiary, #a1a1aa); }
+.artifactName { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifactSize { color: var(--text-tertiary, #71717a); }
+
+.tagSound,
+.tagUnsound {
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.tagSound { background: var(--success-bg, #052e16); color: var(--success, #22c55e); }
+.tagUnsound { background: var(--error-bg, #450a0a); color: var(--error, #ef4444); }
+
+.artifactActions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+}
+
+.iconBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 3px;
+  color: var(--text-tertiary, #a1a1aa);
+  cursor: pointer;
+  outline: none;
+}
+.iconBtn:hover { background: var(--bg-hover, #27272a); color: var(--text-primary, #e4e4e7); }
+.iconBtn:focus,
+.iconBtn:focus-visible {
+  outline: none;
+  border-color: var(--text-tertiary, #52525b);
+}
+
+.previewPane {
+  margin-top: 4px;
+  padding: 8px 10px;
+  background: var(--bg-primary, #0a0a0a);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--text-xs, 11px);
+  color: var(--text-secondary, #d4d4d8);
+}
+
+.previewPre,
+.previewMarkdown {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 3px;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary, #e4e4e7);
+}
+.previewPre { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.previewImage {
+  max-width: 100%;
+  max-height: 240px;
+  object-fit: contain;
+  background: var(--bg-primary, #0a0a0a);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 3px;
+}
+.previewNote { margin: 0; font-size: 10px; color: var(--text-tertiary, #71717a); font-style: italic; }
+
+/* ------------------------------------------------------------------ *
+ * Composer.
+ *
+ * The composer has two interactive elements that take focus: the
+ * textarea and the buttons. The webview (WebView2 on Windows)
+ * draws a 2–3px white ring around any focused control by default,
+ * which clashes with the dark UI. The ring is suppressed everywhere
+ * it would be jarring, replaced by a calm border on the whole
+ * composer on `:focus-within` and a 1px ring on keyboard nav only.
+ * ------------------------------------------------------------------ */
+
+.composerWrap {
+  flex: none;
+  padding: var(--space-3, 12px) var(--space-4, 16px) var(--space-4, 16px);
+  background: var(--bg-primary, #0a0a0a);
+  border-top: 1px solid var(--border-default, #27272a);
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 8px 10px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 14px;
+  transition: border-color var(--transition-fast, 120ms),
+    box-shadow var(--transition-fast, 120ms);
+}
+.composer:focus-within {
+  border-color: var(--text-tertiary, #52525b);
+  /* A dim inner glow rather than a webview focus ring. The webview
+   *  default is overridden below on the textarea itself. */
+  box-shadow: 0 0 0 1px var(--border-default, #27272a) inset;
+}
+.composer[data-disabled] { opacity: 0.7; }
+
+.attachmentList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.attachmentChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--bg-primary, #0a0a0a);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: 999px;
+  font-size: var(--text-xs, 11px);
+  color: var(--text-secondary, #d4d4d8);
+}
+
+.attachmentName { max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.attachmentRemove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #71717a);
+  cursor: pointer;
+  padding: 0;
+}
+.attachmentRemove:hover { color: var(--text-primary, #e4e4e7); }
+
+.composerInput {
+  width: 100%;
+  resize: none;
+  background: transparent;
+  /* The `none` here is what removes the webview's default white focus
+   *  ring on the input. The composer's own :focus-within border
+   *  gives the visible focus state. */
+  border: none;
+  outline: none;
+  color: var(--text-primary, #e4e4e7);
+  font-family: inherit;
+  font-size: var(--text-sm, 13px);
+  line-height: 1.5;
+  padding: 4px 6px;
+  min-height: 22px;
+  max-height: 200px;
+  overflow-y: auto;
+  caret-color: var(--text-primary, #e4e4e7);
+}
+/* Belt-and-braces: the webview ignores `outline: none` on
+ *  focused textarea in some configurations, so explicitly zero every
+ *  outline-* property here. */
+.composerInput:focus,
+.composerInput:focus-visible,
+.composerInput:active {
+  outline: none !important;
+  outline-color: transparent;
+  outline-width: 0;
+  box-shadow: none;
+}
+.composerInput::placeholder { color: var(--text-tertiary, #71717a); }
+
+.composerControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.composerRight { display: flex; align-items: center; gap: 4px; }
+
+.sendBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: var(--text-primary, #e4e4e7);
+  border: 1px solid var(--text-primary, #e4e4e7);
+  border-radius: 999px;
+  color: var(--bg-primary, #0a0a0a);
+  cursor: pointer;
+  outline: none;
+}
+.sendBtn:hover:not(:disabled) { opacity: 0.9; }
+.sendBtn:focus,
+.sendBtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-primary, #0a0a0a),
+    0 0 0 3px var(--text-tertiary, #52525b);
+}
+.sendBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.refusalLine {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--error-bg, #450a0a);
+  color: var(--error, #fca5a5);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--text-xs, 11px);
+}
+
+.spin { animation: chat-spin 1s linear infinite; }
+@keyframes chat-spin { to { transform: rotate(360deg); } }
+
+/* ------------------------------------------------------------------ *
+ * Inspector overlay.
+ * ------------------------------------------------------------------ */
+
+.inspectorOverlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  z-index: 50;
+}
+
+.inspectorBackdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.inspectorPanel {
+  position: relative;
+  width: min(720px, 96vw);
+  height: 100%;
+  background: var(--bg-primary, #0a0a0a);
+  border-left: 1px solid var(--border-default, #27272a);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.inspectorHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  border-bottom: 1px solid var(--border-default, #27272a);
+}
+
+.inspectorTitle {
+  margin: 0;
+  font-size: var(--text-sm, 13px);
+  color: var(--text-primary, #e4e4e7);
+  font-weight: 600;
+}
+
+.inspectorClose {
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-secondary, #d4d4d8);
+  font-family: inherit;
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+}
+.inspectorClose:hover { background: var(--bg-hover, #27272a); }
+
+.inspectorBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* --- Context panel chip + card ----------------------------------- */
+
+.contextChip,
+.contextChipIdle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-secondary, #d4d4d8);
+  font-family: inherit;
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+}
+.contextChip[data-state="ok"] { color: var(--success, #22c55e); }
+.contextChip[data-state="tight"] { color: var(--warning, #fbbf24); }
+.contextChip[data-state="critical"] { color: var(--error, #fca5a5); }
+.contextChipIdle { color: var(--text-tertiary, #71717a); }
+
+.contextCompactCount {
+  font-size: 10px;
+  padding: 0 4px;
+  background: var(--bg-primary, #0a0a0a);
+  border-radius: 999px;
+  color: var(--text-tertiary, #a1a1aa);
+}
+
+.contextCard {
+  position: absolute;
+  top: 56px;
+  right: var(--space-4, 16px);
+  width: 360px;
+  background: var(--bg-secondary, #18181b);
+  border: 1px solid var(--border-default, #27272a);
+  border-radius: var(--radius-md, 6px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: var(--space-3, 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 5;
+}
+
+.contextCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--text-sm, 13px);
+  color: var(--text-primary, #e4e4e7);
+}
+
+.contextCardClose {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #71717a);
+  cursor: pointer;
+  padding: 0;
+}
+.contextCardClose:hover { color: var(--text-primary, #e4e4e7); }
+
+.contextDiagnosis {
+  margin: 0;
+  font-size: var(--text-xs, 11px);
+  line-height: 1.5;
+  color: var(--text-secondary, #d4d4d8);
+}
+
+.contextWillNotFit {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--error-bg, #450a0a);
+  color: var(--error, #fca5a5);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--text-xs, 11px);
+}
+
+.contextCompactionLine {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-tertiary, #71717a);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.contextList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.contextRow {
+  display: grid;
+  grid-template-columns: 110px 1fr 60px;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-secondary, #d4d4d8);
+}
+
+.contextRowReserved { color: var(--text-tertiary, #71717a); }
+
+.contextRowLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.contextRowBar {
+  position: relative;
+  height: 4px;
+  background: var(--bg-primary, #0a0a0a);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.contextRowFill {
+  position: absolute;
+  inset: 0;
+  background: var(--text-tertiary, #52525b);
+  border-radius: 2px;
+}
+
+.contextRowTokens {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary, #71717a);
+}
+
+/* --- Chat header (above the message log) ------------------------- */
+
+.chatHeader {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  border-bottom: 1px solid var(--border-default, #27272a);
+  background: var(--bg-primary, #0a0a0a);
+  gap: var(--space-3, 12px);
+}
+
+.chatHeaderLeft {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chatHeaderTitle {
+  font-size: var(--text-sm, 13px);
+  font-weight: 500;
+  color: var(--text-primary, #e4e4e7);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 36ch;
+}
+
+.chatHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}

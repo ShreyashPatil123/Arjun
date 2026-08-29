@@ -895,9 +895,37 @@ pub struct RunMemory {
     pub next_action: String,
     /// Side effects that already happened. Read before a resumed run acts.
     pub completed: Vec<CompletedEffect>,
+    /// Milestone checkpoints the run has crossed, in order. The
+    /// resume path reads the last entry to know which gate the human
+    /// approved last; the UI reads the same list to render the
+    /// decision history alongside the run.
+    ///
+    /// PS 26117 calls these "evidence-anchored decision points".
+    /// The model says "I think we are here" and a human signs off;
+    /// that signature is the durable artefact, not the model's text.
+    #[serde(default)]
+    pub milestones: Vec<MilestoneRecord>,
     /// How many entries the runtime's caps dropped, per list.
     #[serde(default)]
     pub dropped: HashMap<String, u32>,
+}
+
+/// A milestone the run crossed, signed off by a person.
+///
+/// `at` is RFC 3339, UTC. `acknowledged_by` is the human's user id,
+/// not their display name; the resume path uses it to attribute the
+/// decision. `intent` is the step's user-visible text, copied into
+/// the record so a later audit can show what was approved without
+/// re-reading the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MilestoneRecord {
+    pub checkpoint_id: String,
+    pub ordinal: u32,
+    pub intent: String,
+    pub acknowledged_by: String,
+    /// RFC 3339, UTC.
+    pub at: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -947,6 +975,7 @@ impl RunMemory {
             && self.artifact_ids.is_empty()
             && self.open_questions.is_empty()
             && self.completed.is_empty()
+            && self.milestones.is_empty()
     }
 }
 

@@ -23,6 +23,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+
+pub mod merkle;
+pub mod model_integrity;
+pub mod provenance_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -158,8 +162,10 @@ impl AuditService {
         Self::from_connection(conn)
     }
 
-    /// Used by the tests against an in-memory database.
-    fn from_connection(conn: Connection) -> Result<Self> {
+    /// Used by the tests against an in-memory database, and by other
+    /// modules in the audit family (e.g. the zero-trust gate) that need
+    /// to share a connection with the live audit service.
+    pub(crate) fn from_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -192,6 +198,9 @@ impl AuditService {
             ",
         )
         .context("could not prepare the audit schema")?;
+
+        merkle::install_schema(&conn)
+            .context("could not install the Merkle snapshot schema")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -255,6 +264,18 @@ impl AuditService {
                     hash
                 ],
             )?;
+
+            // Take a Merkle snapshot every Nth row, in the same transaction
+            // so a snapshot can never be out of step with the rows it covers.
+            if seq % merkle::SNAPSHOT_EVERY == 0 {
+                if let Err(e) = merkle::take_snapshot(&conn, seq, &hash) {
+                    log::warn!(
+                        "[AUDIT] merkle snapshot failed at seq={}: {:#}",
+                        seq,
+                        e
+                    );
+                }
+            }
 
             Ok(AuditEntry {
                 seq,
@@ -390,6 +411,15 @@ impl AuditService {
                 format!("All {checked} entries match their seals and follow in an unbroken chain.")
             },
         })
+    }
+
+    /// Hands out a borrow of the underlying connection. Used by companion
+    /// modules (e.g. the Merkle verifier) that need to run their own
+    /// read-only SQL against the same database while the audit service
+    /// is alive. The caller must NOT keep the borrow past the lifetime
+    /// of `&self`.
+    pub fn connection_handle(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("audit lock poisoned")
     }
 }
 

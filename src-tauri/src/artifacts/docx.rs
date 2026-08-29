@@ -148,6 +148,21 @@ fn document_xml(
         None,
     ));
 
+    // The visible watermark (see `artifacts::visible_watermark`) is stamped
+    // onto the body itself rather than into a header/footer relationship
+    // part, so it survives copy-paste and shows up in any reader, not just
+    // ones that render page margins. It carries the same fields a reviewer
+    // would look for in the audit log, so a watermark that disagrees with
+    // the audit entry is itself a discrepancy worth investigating.
+    let stamp = super::visible_watermark::stamp_from_metadata(
+        &metadata.task_id,
+        &metadata.model,
+        &metadata.created_at,
+        &metadata.classification,
+        metadata.is_draft,
+    );
+    body = super::visible_watermark::apply_to_docx_body(&body, &stamp);
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">

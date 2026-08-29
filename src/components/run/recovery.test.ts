@@ -259,7 +259,7 @@ describe('catching up on the events after a snapshot', () => {
       event(5, 'toolRefused', { toolCallId: 'c9', tool: 'execute_code' }),
     );
     expect(state.activity).toHaveLength(3);
-    expect(state.activity[2]).toEqual({ id: 'c9', tool: 'execute_code', status: 'refused' });
+    expect(state.activity[2]).toMatchObject({ id: 'c9', tool: 'execute_code', status: 'refused' });
   });
 
   it('marks a replayed side effect as not repeated', () => {
@@ -408,5 +408,95 @@ describe('what reaches the screen', () => {
     const rendered = JSON.stringify(state);
     expect(rendered).not.toContain('abc123');
     expect(rendered).toContain('create_docx');
+  });
+});
+
+// == Milestone gates =====================================================
+
+describe('milestone checkpoints', () => {
+  it('a milestoneReached event opens a gate with the checkpoint id and intent', () => {
+    const state = applyDurableEvent(
+      fromSnapshot(snapshot()),
+      event(5, 'milestoneReached', {
+        checkpointId: 'mtn-survey',
+        ordinal: 1,
+        summary: 'Surveyed the SOPs',
+      }),
+    );
+    expect(state.phase).toBe('awaiting_milestone');
+    expect(state.milestone).toEqual({
+      checkpointId: 'mtn-survey',
+      ordinal: 1,
+      summary: 'Surveyed the SOPs',
+    });
+  });
+
+  it('a milestoneReached event with no id is a no-op, not a stuck gate', () => {
+    const state = applyDurableEvent(
+      fromSnapshot(snapshot()),
+      event(5, 'milestoneReached', { ordinal: 1, summary: 'Surveyed' }),
+    );
+    // Phase does not flip; the gate stays closed.
+    expect(state.phase).toBe('running');
+    expect(state.milestone).toBeNull();
+  });
+
+  it('a milestoneAcknowledged event returns the run to running and clears the gate', () => {
+    const opened = applyDurableEvent(
+      fromSnapshot(snapshot()),
+      event(5, 'milestoneReached', {
+        checkpointId: 'mtn-survey',
+        ordinal: 1,
+        summary: 'Surveyed',
+      }),
+    );
+    const closed = applyDurableEvent(
+      opened,
+      event(6, 'milestoneAcknowledged', {
+        checkpointId: 'mtn-survey',
+        acknowledgedBy: 'priya',
+      }),
+    );
+    expect(closed.phase).toBe('running');
+    expect(closed.milestone).toBeNull();
+  });
+
+  it('the live channel opens the same gate the durable channel does', () => {
+    const live = applyLiveEvent(fromSnapshot(snapshot()), {
+      type: 'milestone_reached',
+      checkpointId: 'mtn-survey',
+      ordinal: 1,
+      summary: 'Surveyed',
+    });
+    expect(live.phase).toBe('awaiting_milestone');
+    expect(live.milestone?.checkpointId).toBe('mtn-survey');
+  });
+
+  it('the live channel closes the same gate the durable channel does', () => {
+    const opened = applyLiveEvent(fromSnapshot(snapshot()), {
+      type: 'milestone_reached',
+      checkpointId: 'mtn-survey',
+      ordinal: 1,
+      summary: 'Surveyed',
+    });
+    const closed = applyLiveEvent(opened, {
+      type: 'milestone_acknowledged',
+      checkpointId: 'mtn-survey',
+      acknowledgedBy: 'priya',
+    });
+    expect(closed.phase).toBe('running');
+    expect(closed.milestone).toBeNull();
+  });
+
+  it('a milestoneAcknowledged event with no open gate is a no-op', () => {
+    const state = applyDurableEvent(
+      fromSnapshot(snapshot()),
+      event(5, 'milestoneAcknowledged', {
+        checkpointId: 'mtn-survey',
+        acknowledgedBy: 'priya',
+      }),
+    );
+    expect(state.phase).toBe('running');
+    expect(state.milestone).toBeNull();
   });
 });

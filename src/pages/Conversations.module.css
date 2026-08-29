@@ -1,0 +1,110 @@
+/* --- Conversation list page ---------------------------------------- */
+
+.page {
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.head { margin-bottom: var(--space-2); }
+
+.title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-2xl, 1.5rem);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.subtitle {
+  margin: 0;
+  font-size: var(--text-sm, 13px);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.failure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 6px 10px;
+  background: var(--error-bg);
+  color: var(--error);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs, 12px);
+}
+
+.dim { color: var(--text-tertiary); font-size: var(--text-sm); }
+
+.empty {
+  margin: 0;
+  padding: var(--space-6);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+  text-align: center;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.item { margin: 0; }
+
+.itemBtn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: var(--space-4);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.itemBtn:hover {
+  background: var(--bg-hover);
+  border-color: var(--text-tertiary);
+}
+.itemBtn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.itemTitle {
+  font-size: var(--text-base, 14px);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.itemPreview {
+  font-size: var(--text-sm, 13px);
+  color: var(--text-secondary);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.itemMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs, 11px);
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+.itemWhen { margin-left: auto; }

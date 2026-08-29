@@ -109,16 +109,21 @@ describe("host tools", () => {
     // Rust's `ToolName` enum is the authority; a name here that is absent
     // there is refused by the gateway regardless of what this declares.
     expect(names.slice().sort()).toEqual([
+      "agent.delegate_readonly",
       "artifact.create_approval_note",
       "artifact.create_calculation_workbook",
-      "sandbox.run_code",
+      "artifact.verify_docx",
+      "calculation.evaluate_with_units",
+      "capability.search",
       "knowledge.load_evidence_region",
+      "knowledge.multimodal_retrieve",
+      "knowledge.search_authorized",
+      "media.extract_findings",
       "memory.promote_approved",
       "memory.recall_authorized",
+      "sandbox.run_code",
+      "sovereignty.get_evidence",
       "workspace.read_text",
-      "calculation.evaluate_with_units",
-      "knowledge.search_authorized",
-      "artifact.verify_docx",
       "workspace.write_text",
     ]);
   });
@@ -167,5 +172,46 @@ describe("host tools", () => {
     const tool = buildTools(peer, new GrantLedger(), "run-1", "qwen2.5-coder-7b").find((t) => t.name === "knowledge.search_authorized")!;
     expect(tool.description).toMatch(/permitted to read/i);
     expect(tool.description).toMatch(/do not answer such questions from memory/i);
+  });
+
+  it("forwards multimodal tool results as structured content parts", async () => {
+    const ledger = new GrantLedger();
+    const peer = scriptedPeer(async () => ({
+      text: "1 passage, 1 region, 1 table.",
+      images: [{
+        mime: "image/png",
+        data: "BASE64",
+        caption: "PT-2201 on a P&ID",
+        bbox: { left: 0.1, top: 0.2, right: 0.3, bottom: 0.4 },
+      }],
+      tables: [{
+        headers: ["K", "V"],
+        rows: [["design pressure", "14 bar"]],
+        citation: "Pump Manual, page 4 (table)",
+      }],
+    }));
+    const tool = buildTools(peer, ledger, "run-1", "qwen2.5-vl-3b")
+      .find((t) => t.name === "knowledge.multimodal_retrieve")!;
+    ledger.put("tc-mm", "g-mm");
+
+    const result = await tool.execute("tc-mm", { query: "PT-2201" });
+
+    // The content array is text first, then images, then tables. Order
+    // matters because some agent-core versions read the first part as
+    // the answer and the rest as supplementary.
+    expect(result.content).toEqual([
+      { type: "text", text: "1 passage, 1 region, 1 table." },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "BASE64" },
+        caption: "PT-2201 on a P&ID",
+      },
+      {
+        type: "table",
+        headers: ["K", "V"],
+        rows: [["design pressure", "14 bar"]],
+        citation: "Pump Manual, page 4 (table)",
+      },
+    ]);
   });
 });

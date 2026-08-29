@@ -8,6 +8,8 @@
 //! - `gguf_meta`: Model geometry read from the GGUF header, before loading
 //! - `residency`: which model is in VRAM, and when to swap or release it
 //! - `activation`: performs the swap, and keeps it from happening mid-task
+//! - `vision_bridge`: takes image paths + a query and produces a structured
+//!   description via a local VLM, in the OpenAI-compatible vision schema.
 
 pub mod traits;
 pub mod runtime;
@@ -19,7 +21,9 @@ pub mod activation;
 pub mod residency;
 pub mod vram_planner;
 pub mod gguf_meta;
+pub mod vision_bridge;
 
 pub use traits::*;
 pub use manager::InferenceManager;
 pub use session::*;
+pub use vision_bridge::{VisionLanguageBridge, VisionRequest, VisionResponse};

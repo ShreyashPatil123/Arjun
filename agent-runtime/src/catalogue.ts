@@ -191,6 +191,65 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   },
 
   {
+    name: "knowledge.multimodal_retrieve",
+    label: "Search text, image regions, and tables",
+    readOnly: true,
+    description:
+      "Searches the text index, the image-region index, and the table index together, and returns " +
+      "matching passages alongside matching image regions and tables in one result. " +
+      "Use it when a question is about something on a page that text alone cannot find: a tag on " +
+      "a P&ID, a row in a datasheet, a symbol on a scanned drawing. " +
+      "Do not use it where a plain text search would do — knowledge.search_authorized is faster and " +
+      "does not pull image regions the model will then have to read. " +
+      "Effects: none. It only reads, needs nobody's approval, and touches no network. " +
+      "Limits: at most 4 passages, 4 image regions, and 4 tables per call. Each result carries its " +
+      "own citation marker: [E#] for a text passage, [I#] for an image region (with page and " +
+      "bounding box), [T#] for a table (with headers and rows preserved as structure). " +
+      "If it returns nothing: nothing matched. The same clearance that filters the prose index " +
+      "filters the multimodal index, so an empty result may also mean the matching material is " +
+      "outside what the signed-in person is cleared to read — say no source was found rather than " +
+      "guessing.",
+    parameters: closed({
+      query: Type.String({
+        description:
+          "What to look for, in natural language. Specific technical terms retrieve better than paraphrase.",
+        minLength: 1,
+      }),
+      documentType: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("pid"),
+            Type.Literal("datasheet"),
+            Type.Literal("sop"),
+            Type.Literal("vendor_quote"),
+            Type.Literal("report"),
+          ],
+          {
+            description:
+              "Optional: narrow to one document type. Use this for P&ID-specific queries " +
+              "(instrument tag, valve, line number) and for datasheet queries that are " +
+              "looking for a table cell, not prose.",
+          },
+        ),
+      ),
+      documentSha256: Type.Optional(
+        Type.String({
+          description: "Optional: limit the search to a single document the asker has already cited.",
+          minLength: 1,
+        }),
+      ),
+      maxResults: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 6,
+          description:
+            "How many results of each kind (text, image, table) to return. Defaults to 4.",
+        }),
+      ),
+    }),
+  },
+
+  {
     name: "memory.recall_authorized",
     label: "Read remembered notes",
     readOnly: true,
