@@ -21,6 +21,7 @@
 //! person can act on. [`ExtractedDocument::needs_human_review`] is what the
 //! orchestrator checks before letting a page's contents inform a decision.
 
+pub mod sandbox;
 pub mod store;
 
 pub use store::{DocumentStore, StoredDocument};
@@ -260,6 +261,22 @@ impl DocumentService {
 
         let script_dir = script.parent().unwrap_or(&cwd).to_path_buf();
 
+        // Restrict the sidecar's writable scratch area. A bug in a PDF parser
+        // could otherwise hand the attacker `/tmp` (or, on Windows, the
+        // user's Temp folder, which is also where Office puts lock files and
+        // where many installers drop payloads). Forcing TMPDIR / TEMP to a
+        // subdirectory of `app_data_dir` keeps any escape confined to a
+        // place we already control, and lets the operator inspect it after
+        // a suspicious run.
+        let sidecar_temp = app_data_dir.join("sidecar_temp");
+        if let Err(error) = std::fs::create_dir_all(&sidecar_temp) {
+            log::warn!(
+                "[DOCUMENTS] could not create sidecar temp dir at {}: {error}; \
+                 the sidecar will fall back to the system default",
+                sidecar_temp.display(),
+            );
+        }
+
         // Hidden, or a console window pops open every launch in the GUI build.
         let mut command = create_hidden_command("python");
         command.arg(&script);
@@ -269,6 +286,20 @@ impl DocumentService {
         // Inherited so the sidecar's startup line, which reports the engine it
         // selected, lands in the same log as everything else.
         command.stderr(Stdio::inherit());
+        // Pin the sidecar's temp directory *before* applying the platform
+        // sandbox, so a Python library that reads TMPDIR at startup sees the
+        // restricted path rather than the system default.
+        command.env("TMPDIR", &sidecar_temp);
+        command.env("TEMP", &sidecar_temp);
+        command.env("TMP", &sidecar_temp);
+
+        // Tighten the sidecar's privilege surface where the platform allows
+        // it. On Linux this sets PR_SET_NO_NEW_PRIVS in the child, blocking
+        // setuid escalation. On Windows and macOS it is a no-op — the temp
+        // directory restriction and the kill-on-drop handle are the layered
+        // defences for those platforms. See `documents::sandbox` for what
+        // is and is not covered.
+        crate::documents::sandbox::apply_sandbox(&mut command);
 
         let mut child = command
             .spawn()
@@ -341,7 +372,27 @@ impl DocumentService {
     }
 
     /// Reads one document.
+    ///
+    /// The path is validated to be absolute before being sent to the sidecar.
+    /// A relative path here would have two failure modes:
+    ///
+    /// 1. The sidecar would resolve it against its own current working
+    ///    directory, which is whatever Rust happened to launch it from —
+    ///    a value the operator has no way to know in advance.
+    /// 2. The Python parser would then see and parse a file the operator
+    ///    never intended to expose to it.
+    ///
+    /// A full implementation would also check the path against a whitelist
+    /// of collection roots the operator has approved for this run. That
+    /// check is upstream of the call to `extract` in the agent runtime —
+    /// it would belong in the gateway, not here.
     pub fn extract(&self, path: &Path) -> Result<ExtractedDocument> {
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "document path must be absolute, got {}",
+                path.display(),
+            );
+        }
         let value = self.call("extract", json!({ "path": path.to_string_lossy() }))?;
         Ok(serde_json::from_value(value)?)
     }

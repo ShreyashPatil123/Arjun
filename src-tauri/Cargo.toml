@@ -93,6 +93,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 argon2 = "0.5"
 # CSPRNG for per-password salts.
 rand_core = { version = "0.6", features = ["std"] }
+# Used by `documents::sandbox` to call `prctl(PR_SET_NO_NEW_PRIVS)` in the
+# document sidecar child process, removing the setuid/setgid escalation
+# path for the untrusted-input parser stack.
+libc = "0.2"
 # Reads PEFT adapter weights so they can be converted to GGUF locally. Pure
 # Rust with no C toolchain, which is what makes conversion possible without
 # shipping Python and torch for llama.cpp's `convert_lora_to_gguf.py`.

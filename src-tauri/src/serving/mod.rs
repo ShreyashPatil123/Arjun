@@ -39,6 +39,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
@@ -258,8 +261,19 @@ impl ModelServers {
         models_dir: &Path,
         gpu: &GpuOffloadPlan,
     ) -> Result<Endpoint, ServingError> {
-        if let Some(existing) = self.running(&entry.id) {
-            return Ok(existing);
+        // RACE FIX: hold the lock across the entire check-and-insert critical
+        // section so two concurrent callers for the same model cannot both
+        // pass the "not running" check, spawn duplicate llama-server
+        // processes, and orphan the first one when the second insert
+        // overwrites it. The lock is released before `wait_until_ready` so a
+        // slow server load does not stall `stop()` / `stop_all()`.
+        let mut table = self
+            .managed
+            .lock()
+            .map_err(|_| ServingError::LaunchFailed("the server table is poisoned".into()))?;
+
+        if let Some(existing) = table.get(&entry.id) {
+            return Ok(existing.endpoint.clone());
         }
 
         let weights = models_dir.join(&entry.path);
@@ -268,6 +282,20 @@ impl ModelServers {
                 model: entry.name.clone(),
                 path: weights,
             });
+        }
+
+        // If the manifest declared a hash, refuse to load a file that does
+        // not match it. A model without a declared hash is loaded as before;
+        // the check is opt-in by the manifest, and refusing an unhashed
+        // model would break every deployment that pre-dates the integrity
+        // feature. See `registry::integrity` for the threat model and the
+        // streaming hash function.
+        if let Some(expected_sha) = &entry.sha256 {
+            crate::registry::integrity::verify(&weights, expected_sha).map_err(|error| {
+                ServingError::LaunchFailed(format!(
+                    "model integrity check failed: {error}"
+                ))
+            })?;
         }
 
         let plan = plan_launch(entry, &weights, gpu, free_port()?);
@@ -307,10 +335,19 @@ impl ModelServers {
             runtime: entry.runtime,
         };
 
-        self.managed
-            .lock()
-            .map_err(|_| ServingError::LaunchFailed("the server table is poisoned".into()))?
-            .insert(entry.id.clone(), Managed { child, endpoint: endpoint.clone() });
+        table.insert(
+            entry.id.clone(),
+            Managed {
+                child,
+                endpoint: endpoint.clone(),
+            },
+        );
+
+        // Drop the lock before the unbounded async health-check. Holding it
+        // across `.await` would block `stop()` from reclaiming the server if
+        // it never becomes ready, and block any other caller from observing
+        // the entry we just inserted.
+        drop(table);
 
         match wait_until_ready(&plan.base_url).await {
             Ok(()) => Ok(endpoint),
@@ -327,14 +364,6 @@ impl ModelServers {
                 })
             }
         }
-    }
-
-    fn running(&self, model_id: &str) -> Option<Endpoint> {
-        self.managed
-            .lock()
-            .ok()?
-            .get(model_id)
-            .map(|server| server.endpoint.clone())
     }
 
     /// Stops one server. Idempotent.
@@ -602,5 +631,70 @@ mod tests {
     #[test]
     fn nothing_is_running_before_anything_starts() {
         assert!(ModelServers::new().running_endpoints().is_empty());
+    }
+
+    /// The race fix holds the lock across the check-and-insert critical
+    /// section. A meaningful end-to-end demonstration would need a real
+    /// `llama-server` (or a test stand-in) that actually binds the port and
+    /// accepts health checks, because the duplicate spawn only occurs when
+    /// the spawn succeeds — otherwise both callers fail at the same step and
+    /// the map stays empty regardless of whether the lock was held.
+    ///
+    /// What this test *does* prove: under concurrent `endpoint_for` calls
+    /// for the same model, the server table never grows past one entry. The
+    /// buggy version (`self.running()` → drop → spawn → re-lock → insert)
+    /// would, in a hypothetical world where spawn succeeds, push a second
+    /// entry over the first; the fixed version cannot, because the second
+    /// caller either finds the table empty and re-checks under the lock, or
+    /// finds the table populated and returns the existing endpoint.
+    ///
+    /// With no `llama-server` on PATH, both calls return `LaunchFailed` and
+    /// the table is empty. The `<= 1` assertion is therefore trivially true
+    /// here, but documents the invariant the fix upholds and will catch a
+    /// regression that reintroduces duplicate insertions once the
+    /// integration test stand-in is in place.
+    #[tokio::test]
+    async fn concurrent_managed_endpoints_never_duplicate_table_entries() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // Placeholder weights so the `weights.exists()` check passes and
+        // both callers reach the spawn point. The spawn will fail because
+        // `llama-server` is not on PATH in the test environment, which is
+        // exactly what we want — the table must still hold zero or one.
+        let weights_path = tmp.path().join("qwen.gguf");
+        fs::write(&weights_path, b"placeholder").unwrap();
+
+        let mut entry = gguf_entry();
+        entry.path = weights_path.file_name().unwrap().to_owned().into();
+
+        let servers = std::sync::Arc::new(ModelServers::new());
+        let dir = tmp.path().to_path_buf();
+
+        let s1 = servers.clone();
+        let e1 = entry.clone();
+        let d1 = dir.clone();
+        let h1 = tokio::spawn(async move { s1.endpoint_for(&e1, &d1, &plan(0)).await });
+
+        let s2 = servers.clone();
+        let e2 = entry.clone();
+        let d2 = dir.clone();
+        let h2 = tokio::spawn(async move { s2.endpoint_for(&e2, &d2, &plan(0)).await });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        // Both calls fail to spawn `llama-server` in the test environment;
+        // the assertion that matters is on the table, not on the result
+        // values.
+        assert!(r1.is_err(), "spawn must fail without a real server binary");
+        assert!(r2.is_err(), "spawn must fail without a real server binary");
+
+        let running = servers.running_endpoints();
+        assert!(
+            running.len() <= 1,
+            "concurrent calls duplicated a managed server entry: {running:?}",
+        );
     }
 }

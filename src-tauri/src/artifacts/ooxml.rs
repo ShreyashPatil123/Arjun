@@ -18,6 +18,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Maximum uncompressed size of a single part we will read into memory.
+///
+/// 50 MB is generous for any one XML part in a Word/Excel/PowerPoint file —
+/// the largest is the chart data, and even that is in the low single-digit
+/// megabytes. Going higher would make this module a viable zip-bomb target.
+/// The cap applies to *decompressed* bytes, which is what the allocation is
+/// proportional to; a multi-gigabyte compressed entry that decompresses to a
+/// few hundred kilobytes is fine.
+const MAX_PART_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Escapes a value for XML.
 ///
 /// Control characters are dropped rather than encoded, because they are invalid
@@ -60,6 +70,19 @@ pub fn write_parts(path: &Path, parts: &[(&str, String)]) -> Result<()> {
 }
 
 /// Reads one part out of an Office package, for checking a file after writing it.
+///
+/// The read is bounded so a malicious package cannot exhaust memory by
+/// declaring a small entry and streaming a multi-gigabyte decompressed
+/// payload — the classic zip-bomb shape. The check has two layers because a
+/// single layer is not enough:
+///
+/// 1. The entry's *declared* uncompressed size (read from the ZIP central
+///    directory) must not exceed [`MAX_PART_BYTES`]. A truthful header is
+///    the common case and this is the fast path.
+/// 2. The actual read is also capped, because the declared size is a
+///    counter-controlled field the attacker can lie about. The read loop
+///    bails out as soon as the running total would exceed the limit, so the
+///    allocation is bounded regardless of what the header claimed.
 pub fn read_part(path: &Path, part: &str) -> Result<String> {
     use std::io::Read;
 
@@ -71,9 +94,49 @@ pub fn read_part(path: &Path, part: &str) -> Result<String> {
         .by_name(part)
         .with_context(|| format!("the package has no {part}"))?;
 
-    let mut body = String::new();
-    entry.read_to_string(&mut body)?;
-    Ok(body)
+    // First line of defence: a well-behaved package declares its part sizes,
+    // and a part larger than the cap is by definition not a Word/Excel part.
+    if entry.size() > MAX_PART_BYTES {
+        anyhow::bail!(
+            "zip part {part} declares {} bytes, exceeding the {} byte safety limit",
+            entry.size(),
+            MAX_PART_BYTES
+        );
+    }
+
+    // Second line of defence: a hostile package can lie in the header, so the
+    // declared size check is necessary but not sufficient. Read in a manual
+    // loop and bail out the moment the running total would exceed the cap.
+    //
+    // `std::io::Read::take(limit)` is *not* enough on its own — its `read`
+    // returns `Ok(0)` once the limit is reached, not an error, so callers
+    // that use `read_to_string` on a `Take` get a silently truncated string
+    // rather than a refusal. We therefore drive the loop by hand and check
+    // the running total.
+    let mut body = String::with_capacity(entry.size().min(8 * 1024) as usize);
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let n = entry
+            .read(&mut buf)
+            .with_context(|| format!("could not read zip part {part}"))?;
+        if n == 0 {
+            return Ok(body);
+        }
+        // Reject as soon as adding this chunk would breach the cap. We
+        // append-then-check on the *post-append* total, because the
+        // alternative (subtracting back) would still leave the attacker
+        // able to push us up to `MAX_PART_BYTES` of allocation per request;
+        // a real OOXML part never legitimately sits at the boundary.
+        let incoming = std::str::from_utf8(&buf[..n])
+            .with_context(|| format!("zip part {part} is not valid UTF-8"))?;
+        if body.len() + incoming.len() > MAX_PART_BYTES as usize {
+            anyhow::bail!(
+                "zip part {part} exceeds the {} byte safety limit after decompression",
+                MAX_PART_BYTES
+            );
+        }
+        body.push_str(incoming);
+    }
 }
 
 /// Lists the parts inside an Office package.
@@ -151,5 +214,26 @@ mod tests {
 
         assert!(read_part(&path, "anything").is_err());
         assert!(list_parts(&path).is_err());
+    }
+
+    /// The cap is 50 MB. If this changes, every reviewer of `read_part`'s
+    /// memory bound needs to revisit the trade-off: too low and legitimate
+    /// parts are refused; too high and a small `.docx` can still OOM the
+    /// process. The number is written here, not in the constant, so a
+    /// well-meaning rename or unit typo is caught by a test.
+    #[test]
+    fn the_part_size_cap_is_fifty_megabytes() {
+        assert_eq!(MAX_PART_BYTES, 50 * 1024 * 1024);
+    }
+
+    /// A normal part is read in full. The cap only triggers when the cap is
+    /// actually breached, so a 1 kB XML part must round-trip.
+    #[test]
+    fn a_small_part_is_returned_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.docx");
+        write_parts(&path, &[("word/document.xml", "<w:doc/>".to_string())]).unwrap();
+        let body = read_part(&path, "word/document.xml").unwrap();
+        assert_eq!(body, "<w:doc/>");
     }
 }

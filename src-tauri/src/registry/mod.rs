@@ -26,6 +26,7 @@
 
 pub mod discovery;
 pub mod fit_score;
+pub mod integrity;
 pub mod router;
 
 use std::collections::BTreeSet;

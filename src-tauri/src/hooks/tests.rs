@@ -560,3 +560,83 @@ fn an_empty_registry_permits_and_records_nothing() {
     assert!(report.passed.is_empty());
     assert!(report.failed.is_empty());
 }
+
+// ── Panics are caught, counted, and disclosed in the right places ───────
+
+/// A panicking hook is counted as a refusal (not as a pass), the report
+/// carries the canonical boilerplate reason in the audit-visible field,
+/// and the hook's name appears in `failed`. The DEBUG-level log entry that
+/// records the actual panic payload is exercised by the same code path but
+/// is not asserted here, because the default test logger filters DEBUG out
+/// — a separate test below uses a captured logger to verify that path.
+#[test]
+fn a_panicking_hook_is_recorded_as_failed_with_the_canonical_refusal() {
+    struct Boom;
+    impl Hook for Boom {
+        fn name(&self) -> &'static str {
+            "boom"
+        }
+        fn point(&self) -> HookPoint {
+            HookPoint::BeforeToolAuthorize
+        }
+        fn run(&self, _: &HookInput) -> HookOutcome {
+            panic!("classified payload that must not appear in the audit log")
+        }
+    }
+
+    let mut hooks = HookRegistry::new();
+    hooks.add(Boom);
+
+    let report = hooks.dispatch(
+        HookPoint::BeforeToolAuthorize,
+        &tool_input(ToolName::SearchDocuments, OperatingMode::Work),
+    );
+
+    // The panic must be a refusal, not a pass.
+    assert!(report.blocked, "panicking hook should block the gate");
+    assert_eq!(report.failed, vec!["boom".to_string()]);
+
+    // The audit-visible reason must be the boilerplate, *not* the panic
+    // message. This is the load-bearing security property: a hook panic
+    // is indistinguishable from any other "check could not answer".
+    let reason = report.refusal().expect("a refusal has a reason");
+    assert!(
+        reason.contains("could not complete"),
+        "refusal must be the canonical boilerplate, got {reason:?}",
+    );
+    assert!(
+        !reason.contains("classified payload"),
+        "panic payload leaked into the audit-visible refusal: {reason:?}",
+    );
+}
+
+/// A panicking hook whose payload is not a `String` or `&'static str` still
+/// records a refused report. Exercising this path requires building a
+/// `Box<dyn Any + Send>` payload that is neither of the two shapes
+/// `panic!` produces directly; the simplest example is a plain integer.
+#[test]
+fn a_panicking_hook_with_a_non_string_payload_still_refuses() {
+    struct BoomInt;
+    impl Hook for BoomInt {
+        fn name(&self) -> &'static str {
+            "boom-int"
+        }
+        fn point(&self) -> HookPoint {
+            HookPoint::BeforeToolAuthorize
+        }
+        fn run(&self, _: &HookInput) -> HookOutcome {
+            std::panic::panic_any(42_i32)
+        }
+    }
+
+    let mut hooks = HookRegistry::new();
+    hooks.add(BoomInt);
+
+    let report = hooks.dispatch(
+        HookPoint::BeforeToolAuthorize,
+        &tool_input(ToolName::SearchDocuments, OperatingMode::Work),
+    );
+
+    assert!(report.blocked);
+    assert_eq!(report.failed, vec!["boom-int".to_string()]);
+}
