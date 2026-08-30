@@ -73,13 +73,19 @@ impl Workspace {
     /// Included in the system prompt, because a model that does not know it has
     /// a workspace writes to plausible-sounding absolute paths and collects
     /// refusals instead of doing the work.
+    ///
+    /// The description deliberately omits the absolute path. Including it
+    /// would put the OS username, the application data directory layout, and
+    /// any network-mounted prefix (e.g. `\\fileserver\users\...`) into a
+    /// string that the model — and any logging or telemetry that captures
+    /// the prompt — would then retain and forward. A run that needs to know
+    /// its own path can ask the gateway for it through the tools it provides,
+    /// not the prompt it is constructed from.
     pub fn describe(&self) -> String {
-        format!(
-            "You have a working directory for this task at {}. Read and write files only there; \
-             paths outside it are refused. Use relative names such as \"approval-note.docx\" \
-             rather than absolute paths.",
-            self.root.display()
-        )
+        "You have a working directory for this task. Read and write files only there; \
+         paths outside it are refused. Use relative names such as \"approval-note.docx\" \
+         rather than absolute paths."
+            .to_string()
     }
 }
 
@@ -123,8 +129,18 @@ mod tests {
         let workspace = Workspace::create(dir.path(), "run-1").expect("created");
         let described = workspace.describe();
 
-        assert!(described.contains(&workspace.root().display().to_string()));
-        // Both halves matter: where, and that absolute paths will be refused.
+        // The absolute path must not appear in the description: it would put
+        // the OS username, app data layout, and any network-mounted prefix
+        // into a string the model — and any prompt-logging path downstream
+        // of it — would then retain and forward.
+        let path_reveal = workspace.root().display().to_string();
+        assert!(
+            !described.contains(&path_reveal),
+            "describe() leaked the workspace path: {described:?}",
+        );
+        // The behavioural instructions still have to reach the model. A
+        // description that says nothing about how to name files is no
+        // better than the old one that said too much.
         assert!(described.contains("refused"));
         assert!(described.contains("relative"));
     }

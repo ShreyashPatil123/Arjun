@@ -481,11 +481,12 @@ impl HookRegistry {
                 Ok(HookOutcome::Block { reason }) => {
                     Self::record_block(&mut report, point, name, cap(reason, MAX_REASON_CHARS));
                 }
-                Err(_) => {
-                    // The fail-closed path. The panic payload is deliberately
-                    // not read: it is arbitrary text from a failing component,
-                    // and this report is persisted where people without
-                    // clearance read it.
+                Err(panic_payload) => {
+                    // The fail-closed path. The block reason that lands in the
+                    // persistent report is the same boilerplate refusal it
+                    // always has been, so a panic in a hook is indistinguishable
+                    // from any other "check could not answer" — that is the
+                    // property the audit log needs.
                     report.failed.push(name.to_string());
                     Self::record_block(
                         &mut report,
@@ -496,6 +497,29 @@ impl HookRegistry {
                              proceed. A check that cannot answer has not said yes."
                         ),
                     );
+
+                    // Separately, surface the panic payload to the *debug* log
+                    // so a developer can see why the hook died. The debug
+                    // level is load-bearing: the audit event stream is built
+                    // from this report, not from the log, and DEBUG is below
+                    // the default filter on every sink the application
+                    // configures. A deployment that has flipped DEBUG on is
+                    // doing so deliberately, on a host the operator already
+                    // has shell access to, which is the trust boundary the
+                    // payload is appropriate for.
+                    //
+                    // The payload is `Box<dyn Any + Send>`. We downcast to
+                    // the two shapes `panic!` and `std::panic::panic_any`
+                    // produce directly — `String` and `&'static str` — and
+                    // log a generic line for anything else rather than
+                    // format-printing the unknown payload.
+                    if let Some(message) = panic_payload.downcast_ref::<String>() {
+                        log::debug!("hook {name} panicked at {point:?}: {message}");
+                    } else if let Some(message) = panic_payload.downcast_ref::<&'static str>() {
+                        log::debug!("hook {name} panicked at {point:?}: {message}");
+                    } else {
+                        log::debug!("hook {name} panicked at {point:?} with a non-string payload");
+                    }
                 }
             }
         }

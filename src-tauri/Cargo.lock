@@ -3933,6 +3933,8 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "hmac",
+ "libc",
  "llama-cpp-2",
  "log",
  "minijinja",
