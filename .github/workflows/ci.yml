@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install agent-runtime dependencies
+        run: npm --prefix agent-runtime ci
+
+      - name: Build agent-runtime
+        run: npm run runtime:build
+
+      - name: Verify runtime bundle exists
+        run: |
+          if [ ! -f "agent-runtime/dist/arjun-agent-runtime.mjs" ]; then
+            echo "ERROR: agent-runtime/dist/arjun-agent-runtime.mjs not found"
+            exit 1
+          fi
+          echo "Runtime bundle found at agent-runtime/dist/arjun-agent-runtime.mjs"
+
+      - name: Build main project
+        run: npm run build
+
+      - name: Verify dist folder exists
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "ERROR: dist/ folder not found"
+            exit 1
+          fi
+          echo "dist/ folder found"
+
+      - name: Run bundle check
+        run: npm run check:bundle
+
+      - name: Fetch Rust dependencies for offline check
+        run: cargo fetch --manifest-path src-tauri/Cargo.toml
+
+      - name: Run offline build check
+        run: npm run check:offline
+
+      - name: Run Rust tests
+        run: npm run test:rust
+
+      - name: Run integration tests
+        run: npm run test:integration
