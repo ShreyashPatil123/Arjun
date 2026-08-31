@@ -146,7 +146,11 @@ export function AssistantMessageCell({
     <div className={styles.assistantRow}>
       {/* Meta footer — model identity, timing, and token metrics. */}
       <div className={styles.assistantMeta}>
-        <StatusPill state={status} elapsedText={elapsedText} runningTools={runningTools} />
+        <StatusPill
+          state={status}
+          metrics={tokenMetrics}
+          runningTools={runningTools}
+        />
         <span className={styles.assistantMetaSep}>·</span>
         <span className={styles.assistantModel}>
           {modelName}
@@ -247,7 +251,7 @@ export function AssistantMessageCell({
 
 function StatusPill({
   state,
-  elapsedText,
+  metrics,
   runningTools,
 }: {
   state:
@@ -257,7 +261,7 @@ function StatusPill({
     | 'verifying'
     | 'verified'
     | 'failed';
-  elapsedText: string | null;
+  metrics: { tokensIn: number; tokensOut: number; speed: number; elapsedMs: number };
   runningTools: number;
 }) {
   const labels: Record<typeof state, string> = {
@@ -271,6 +275,12 @@ function StatusPill({
     verified: 'Verified',
     failed: 'Failed',
   };
+
+  const elapsedText =
+    metrics.elapsedMs > 0
+      ? formatDuration(metrics.elapsedMs)
+      : null;
+
   return (
     <span className={styles.statusPill} data-state={state}>
       {state === 'thinking' || state === 'usingTool' || state === 'composing' || state === 'verifying' ? (
@@ -281,8 +291,13 @@ function StatusPill({
         <X size={11} />
       )}
       <span>{labels[state]}</span>
-      {state === 'composing' && elapsedText && (
+      {elapsedText && (
         <span className={styles.statusPillSub}>· {elapsedText}</span>
+      )}
+      {(state === 'composing' || state === 'verified') && metrics.speed > 0 && (
+        <span className={styles.statusPillSub}>
+          · {metrics.tokensOut} tok · {metrics.speed} tok/s
+        </span>
       )}
     </span>
   );

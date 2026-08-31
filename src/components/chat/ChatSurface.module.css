@@ -1169,3 +1169,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.statusPillSub {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.chatOrb {
+  display: block;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
