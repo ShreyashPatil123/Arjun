@@ -1,14 +1,17 @@
 # Builds the frontend, then launches the Sarathi/Arjun Tauri app.
 #
 # The app is a Tauri 2 desktop app. The release binary at
-# `target/release/sarathi.exe` loads its UI from `dist/` (a static
-# frontend bundle). If `dist/` is stale, the webview inside the
-# app shows a blank page or fails to connect.
+# `target/release/sarathi.exe` embeds the frontend from `dist/`
+# at build time. If `dist/` is stale, the webview inside the
+# app shows "localhost refused to connect" because the binary
+# still has the old bundle embedded.
 #
 # This script:
 # 1. Stops any running Sarathi app.
 # 2. Builds the frontend (`npm run build`) so dist/ is current.
-# 3. Launches the release binary.
+# 3. Builds the Tauri release binary via `npx tauri build --no-bundle`
+#    so the new dist/ is embedded in the binary.
+# 4. Launches the release binary.
 
 $ErrorActionPreference = "Stop"
 Set-Location "c:\Users\lenovo\Desktop\Arjun-1"
@@ -23,6 +26,10 @@ Start-Sleep -Seconds 1
 Write-Host ""
 Write-Host "Building frontend dist..." -ForegroundColor Yellow
 npm run build 2>&1 | Select-Object -Last 5
+
+Write-Host ""
+Write-Host "Building Tauri release binary (embeds the new dist/)..." -ForegroundColor Yellow
+npx tauri build --no-bundle 2>&1 | Select-Object -Last 5
 
 Write-Host ""
 Write-Host "Launching Sarathi app..." -ForegroundColor Green
