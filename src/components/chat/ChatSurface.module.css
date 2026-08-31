@@ -123,23 +123,25 @@
 .unseenPill:hover { background: var(--bg-hover); }
 
 /* ------------------------------------------------------------------ *
- * Message cells — user and system.
+ * Message cells — user and system. (FIX 7: polish, accent color.)
  * ------------------------------------------------------------------ */
 
 .userRow {
   display: flex;
   justify-content: flex-end;
+  margin: 4px 0 12px;
 }
 
 .userBubble {
   max-width: 78%;
   padding: 10px 14px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
+  background: var(--accent-bg, #1e3a5f);
+  border: 1px solid var(--accent-border, #2563eb);
   border-radius: 14px 14px 4px 14px;
-  color: var(--text-primary);
-  font-size: var(--text-sm);
+  color: var(--text-primary, #f5f5f5);
+  font-size: var(--text-sm, 14px);
   line-height: 1.55;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 .userText {
@@ -154,6 +156,7 @@
   font-size: var(--text-xs);
   font-style: italic;
   padding: 8px 0;
+  margin: 4px 0;
 }
 
 .systemText {
@@ -171,7 +174,7 @@
   flex-direction: row;
   align-items: flex-start;
   gap: 12px;
-  padding: 0;
+  padding: 4px 0 16px;
   background: transparent;
   border-radius: 0;
   max-width: 100%;
@@ -347,8 +350,15 @@
   font-size: var(--text-base, 15px);
   line-height: 1.6;
   color: var(--text-primary);
-  white-space: pre-wrap;
+  /* No white-space:pre-wrap here — the markdown renderer owns its own
+   * whitespace handling. This is what FIX 1 (no duplication) and FIX 6
+   * (proper paragraph rendering) require. */
   overflow-wrap: anywhere;
+}
+
+.assistantPlaceholder {
+  color: var(--text-tertiary);
+  letter-spacing: 0.05em;
 }
 
 .caret {
@@ -1575,4 +1585,145 @@
 
 .thinkingChildLink:hover {
   text-decoration: underline;
+}
+
+/* ------------------------------------------------------------------ *
+ * Markdown rendering (FIX 6: proper paragraphs, lists, code blocks).
+ * ------------------------------------------------------------------ */
+.markdown {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: var(--text-base, 15px);
+  line-height: 1.65;
+  color: var(--text-primary);
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+.markdown > *:first-child { margin-top: 0; }
+.markdown > *:last-child { margin-bottom: 0; }
+
+.mdParagraph {
+  margin: 0;
+}
+
+.mdHeading {
+  margin: 14px 0 6px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.mdHeading[data-level="1"] { font-size: 20px; }
+.mdHeading[data-level="2"] { font-size: 18px; }
+.mdHeading[data-level="3"] { font-size: 16px; }
+.mdHeading[data-level="4"],
+.mdHeading[data-level="5"],
+.mdHeading[data-level="6"] { font-size: 15px; }
+
+.mdList {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mdList li { margin: 0; }
+
+.mdCode {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.88em;
+  background: var(--bg-tertiary, #1a1a1a);
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+}
+
+.mdCodeBlock {
+  margin: 0;
+  padding: 12px 14px;
+  background: var(--bg-tertiary, #141414);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: auto;
+  color: var(--text-primary);
+  white-space: pre;
+}
+.mdCodeBlock code {
+  font-family: inherit;
+  background: transparent;
+  padding: 0;
+  border: none;
+}
+
+.mdLink {
+  color: var(--info, #3b82f6);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.mdLink:hover { color: var(--text-primary); }
+
+.mdBlockquote {
+  margin: 0;
+  padding: 4px 12px;
+  border-left: 3px solid var(--border-default);
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* ------------------------------------------------------------------ *
+ * ThinkingSummary (FIX 4: collapses once the answer is streaming)
+ * ------------------------------------------------------------------ */
+.thinkingSummary {
+  margin-bottom: 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--bg-secondary, #181818);
+  overflow: hidden;
+}
+
+.thinkingSummaryHeader {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+.thinkingSummaryHeader:hover { color: var(--text-secondary); background: var(--bg-tertiary, #1f1f1f); }
+
+.thinkingSummaryBody {
+  padding: 0 12px 10px;
+  border-top: 1px solid var(--border-default);
+}
+
+.thinkingReasoningText {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--bg-primary, #0d0d0d);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.thinkingDoneIcon {
+  color: var(--success, #22c55e);
 }
