@@ -17,7 +17,9 @@
 //! useful, this says so plainly rather than filling the space.
 
 use serde::Serialize;
+use tauri::State;
 
+use crate::commands::governance::{require_session, CurrentSession};
 use crate::model_providers::huggingface::card::{
     categorize, datasets_from_tags, license_from_tags, ModelCategory,
 };
@@ -126,7 +128,13 @@ pub(crate) fn suggested_skills(name: &str) -> Vec<ModelCategory> {
 
 /// Looks up one adapter and explains what it does.
 #[tauri::command]
-pub async fn get_adapter_details(repo_id: String) -> Result<AdapterDetails, String> {
+pub async fn get_adapter_details(
+    repo_id: String,
+    session: State<'_, CurrentSession>,
+) -> Result<AdapterDetails, String> {
+    // Read-only inspection of an adapter's metadata. The matrix does not
+    // gate this beyond sign-in.
+    require_session(&session)?;
     let token = crate::config::hf_token::get();
 
     // Through the broker, which owns the only outbound client in the process

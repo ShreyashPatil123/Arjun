@@ -28,6 +28,8 @@ pub mod discovery;
 pub mod fit_score;
 pub mod integrity;
 pub mod router;
+pub mod scan;
+pub mod categorize;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -308,6 +310,13 @@ impl ModelEntry {
         self.sha256.is_some()
     }
 
+    /// The declared sha256 of the weights, if any. Used by the
+    /// orchestrator path resolver (TODO 3) to refuse a model
+    /// whose on-disk bytes do not match the registry.
+    pub fn sha256(&self) -> Option<&str> {
+        self.sha256.as_deref()
+    }
+
     /// Whether the model's license is in the allowed list.
     /// An empty allowed list means no restriction (all licenses allowed).
     pub fn license_allowed(&self, allowed_licenses: &[String]) -> bool {
@@ -489,6 +498,121 @@ impl ModelRegistry {
             .filter(|e| e.runtime_profile_available(available_runtime_profiles))
             .filter(|e| e.license_allowed(allowed_licenses))
             .collect()
+    }
+
+    /// The model entry tagged as the orchestrator — the model
+    /// that runs the chat. The product assumes there is exactly
+    /// one such model; this is the lookup the orchestrator
+    /// resolver uses to find its `sha256` for verification.
+    ///
+    /// The marker is the first model whose `id` starts with
+    /// `"orchestrator"` (i.e. `"orchestrator"` itself, or
+    /// `"orchestrator.qwen3-4b"` etc.). A more elaborate
+    /// tagging scheme can replace this without breaking
+    /// callers.
+    pub fn orchestrator_entry(&self) -> Option<&ModelEntry> {
+        self.entries.iter().find(|e| {
+            e.id == "orchestrator" || e.id.starts_with("orchestrator.")
+        })
+    }
+
+    /// The (family, quantisation) tuple the orchestrator
+    /// resolver should look for in the library scan. Falls
+    /// back to the standard Qwen3-4B / Q6_K if no orchestrator
+    /// is registered — the resolver then reports NotFound
+    /// rather than guessing.
+    pub fn orchestrator_identity(&self) -> Option<(String, String)> {
+        let entry = self.orchestrator_entry()?;
+        let family = entry
+            .id
+            .strip_prefix("orchestrator")
+            .map(|s| s.trim_start_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| entry.name.clone());
+        let quant = entry
+            .quantization
+            .clone()
+            .unwrap_or_else(|| "Q6_K".to_string());
+        Some((family, quant))
+    }
+
+    /// The root of the model library on disk. The orchestrator
+    /// resolver scans this directory when the contract path
+    /// is missing. The default is the registry's `models_dir`,
+    /// which is the directory the manifest lives in.
+    pub fn library_root(&self, app_data_dir: &Path) -> PathBuf {
+        // The user may have installed models under the app
+        // data dir (the default), or under a separate library
+        // location. The latter is honoured by an environment
+        // variable so an operator can point ARJUN at a
+        // pre-existing library without copying files.
+        if let Ok(custom) = std::env::var("ARJUN_MODEL_LIBRARY") {
+            return PathBuf::from(custom);
+        }
+        app_data_dir.join("models")
+    }
+
+    /// The registered entry that owns a given on-disk path.
+    /// Returns `None` for a path that no entry declared —
+    /// a file the library scan picked up but the manifest
+    /// does not list. The caller is then free to load the
+    /// file as an unregistered model if its policy allows.
+    pub fn entry_for_path(&self, path: &Path) -> Option<&ModelEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.path == path || path.ends_with(&e.path))
+    }
+
+    /// Writes the manifest to disk atomically. The file is
+    /// written to `<manifest_path>.tmp`, fsynced, and renamed
+    /// over `<manifest_path>`. A reader that opens during the
+    /// write sees either the old or the new file, never a
+    /// half-written one.
+    ///
+    /// TODO 4: this is the manifest writer the orchestrator
+    /// path resolver and the auto-categorization pipeline
+    /// both use. Atomic writes matter because a corrupted
+    /// manifest makes the registry refuse to load every
+    /// model on the machine.
+    pub fn save_manifest(&self) -> Result<(), String> {
+        let manifest = ModelManifest {
+            models: self.entries.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("manifest could not be serialised: {e}"))?;
+        let final_path = self.manifest_path.clone();
+        let tmp_path = final_path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)
+                .map_err(|e| format!("manifest tmp file could not be created: {e}"))?;
+            file.write_all(&bytes)
+                .map_err(|e| format!("manifest could not be written: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("manifest could not be fsynced: {e}"))?;
+        }
+        std::fs::rename(&tmp_path, &final_path)
+            .map_err(|e| format!("manifest could not be renamed: {e}"))?;
+        Ok(())
+    }
+
+    /// Replaces the current entries with `new_entries` and
+    /// writes the manifest. Used by the auto-categorization
+    /// pipeline (TODO 5) to commit a re-classified library
+    /// in one step.
+    pub fn replace_and_save(&mut self, new_entries: Vec<ModelEntry>) -> Result<(), String> {
+        // Refuse duplicates the same way `from_manifest` does.
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &new_entries {
+            if !seen.insert(entry.id.clone()) {
+                return Err(format!(
+                    "the model manifest registers {:?} more than once",
+                    entry.id
+                ));
+            }
+        }
+        self.entries = new_entries;
+        self.save_manifest()
     }
 }
 
@@ -804,5 +928,120 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(vision_candidates.len(), 1);
         assert_eq!(vision_candidates[0].id, "vision-with-image");
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic manifest write tests (TODO 4 of the 7-step plan).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_manifest_writes_a_valid_json_file() {
+        // Build a registry with a known entry list, save it,
+        // and re-load it. The round trip is the proof.
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-registry-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("registry.json");
+        let registry = ModelRegistry::from_manifest(
+            ModelManifest {
+                models: vec![entry("qwen-8b", 8.0, vec![ModelRole::Reasoning])],
+            },
+            manifest_path.clone(),
+        )
+        .expect("registry");
+        registry.save_manifest().expect("save");
+        // Reload from disk.
+        let reloaded = ModelRegistry::load(&dir).expect("reload");
+        assert_eq!(reloaded.all().len(), 1);
+        assert_eq!(reloaded.all()[0].id, "qwen-8b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_manifest_leaves_no_tmp_file_behind() {
+        // The atomic write is `<path>.tmp` → fsync → rename.
+        // A successful save must not leave the tmp file in
+        // place; a reader who walks the directory would
+        // otherwise find a stale half-written file.
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-registry-tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = ModelRegistry::from_manifest(
+            ModelManifest::default(),
+            dir.join("registry.json"),
+        )
+        .expect("registry");
+        registry.save_manifest().expect("save");
+        let tmp = dir.join("registry.json.tmp");
+        assert!(!tmp.exists(), "tmp file must be renamed away");
+        let real = dir.join("registry.json");
+        assert!(real.exists(), "the real manifest must exist");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_and_save_refuses_duplicate_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-registry-dup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ModelRegistry::from_manifest(
+            ModelManifest::default(),
+            dir.join("registry.json"),
+        )
+        .expect("registry");
+        let result = registry.replace_and_save(vec![
+            entry("qwen-8b", 8.0, vec![ModelRole::Reasoning]),
+            entry("qwen-8b", 7.0, vec![ModelRole::Reasoning]),
+        ]);
+        assert!(result.is_err());
+        // The registry state is unchanged on error.
+        assert_eq!(registry.all().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_and_save_persists_the_new_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-registry-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ModelRegistry::from_manifest(
+            ModelManifest::default(),
+            dir.join("registry.json"),
+        )
+        .expect("registry");
+        registry
+            .replace_and_save(vec![
+                entry("qwen-8b", 8.0, vec![ModelRole::Reasoning]),
+                entry("gemma-12b", 12.0, vec![ModelRole::Reasoning]),
+            ])
+            .expect("replace");
+        // Reload from disk.
+        let reloaded = ModelRegistry::load(&dir).expect("reload");
+        assert_eq!(reloaded.all().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

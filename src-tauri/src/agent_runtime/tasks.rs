@@ -588,8 +588,16 @@ pub fn save(app_data_dir: &Path, record: &TaskRecord) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// Reads one record back.
-pub fn load(app_data_dir: &Path, run_id: &str) -> Result<TaskRecord, String> {
+/// Reads one record back. `owner_user_id` is the per-user isolation
+/// boundary from TODO 2: a request from a different user returns
+/// `Err` (the same shape as a missing file, so the UI sees a
+/// "task not found" rather than a 403-style leak). `None` is the
+/// unrestricted form, used by tests and the audit log.
+pub fn load(
+    app_data_dir: &Path,
+    run_id: &str,
+    owner_user_id: Option<&str>,
+) -> Result<TaskRecord, String> {
     // Checked as a single component: a run id is a UUID this process generated,
     // but a task id arriving from the UI should not be able to name a path.
     let name = format!("{run_id}.json");
@@ -599,15 +607,22 @@ pub fn load(app_data_dir: &Path, run_id: &str) -> Result<TaskRecord, String> {
     let path = directory(app_data_dir).join(name);
     let body = std::fs::read(&path)
         .map_err(|error| format!("that task's record could not be read: {error}"))?;
-    serde_json::from_slice(&body)
-        .map_err(|error| format!("that task's record could not be understood: {error}"))
+    let record: TaskRecord = serde_json::from_slice(&body)
+        .map_err(|error| format!("that task's record could not be understood: {error}"))?;
+    if let Some(owner) = owner_user_id {
+        if record.user_id != owner {
+            return Err(format!("that task was not found for {owner}."));
+        }
+    }
+    Ok(record)
 }
 
-/// Every task, newest first.
+/// Every task, newest first. `owner_user_id` is the per-user filter;
+/// `None` returns every record (used by tests and the audit log).
 ///
 /// A record that will not parse is skipped rather than failing the listing. One
 /// unreadable file from an older build should cost its own row, not the screen.
-pub fn list(app_data_dir: &Path) -> Vec<TaskSummary> {
+pub fn list(app_data_dir: &Path, owner_user_id: Option<&str>) -> Vec<TaskSummary> {
     let Ok(entries) = std::fs::read_dir(directory(app_data_dir)) else {
         // No directory yet simply means no task has been run.
         return Vec::new();
@@ -619,6 +634,10 @@ pub fn list(app_data_dir: &Path) -> Vec<TaskSummary> {
         .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
         .filter_map(|path| std::fs::read(&path).ok())
         .filter_map(|body| serde_json::from_slice::<TaskRecord>(&body).ok())
+        .filter(|record| match owner_user_id {
+            Some(owner) => record.user_id == owner,
+            None => true,
+        })
         .map(|record| TaskSummary::from(&record))
         .collect();
 
@@ -689,7 +708,7 @@ mod tests {
         let written = record("run-1", "2026-08-27T10:00:42+00:00");
         save(dir.path(), &written).expect("saved");
 
-        let read = load(dir.path(), "run-1").expect("loaded");
+        let read = load(dir.path(), "run-1", None).expect("loaded");
         assert_eq!(read.prompt, written.prompt);
         assert_eq!(read.routing.model_name, "Qwen2.5 7B");
         assert_eq!(read.plan.permitted_tools, vec!["knowledge.search_authorized"]);
@@ -701,7 +720,7 @@ mod tests {
         save(dir.path(), &record("old", "2026-08-27T09:00:00+00:00")).expect("saved");
         save(dir.path(), &record("new", "2026-08-27T11:00:00+00:00")).expect("saved");
 
-        let listed = list(dir.path());
+        let listed = list(dir.path(), None);
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].run_id, "new");
     }
@@ -710,7 +729,7 @@ mod tests {
     fn no_tasks_yet_is_an_empty_list_and_not_an_error() {
         // The Tasks screen opens before anything has ever been run.
         let dir = tempfile::tempdir().expect("temp dir");
-        assert!(list(dir.path()).is_empty());
+        assert!(list(dir.path(), None).is_empty());
     }
 
     #[test]
@@ -720,7 +739,7 @@ mod tests {
         std::fs::write(directory(dir.path()).join("broken.json"), b"{ not json")
             .expect("wrote the broken one");
 
-        let listed = list(dir.path());
+        let listed = list(dir.path(), None);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "good");
     }
@@ -772,7 +791,7 @@ mod tests {
         )
         .expect("the old record");
 
-        let listed = list(dir.path());
+        let listed = list(dir.path(), None);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "old-run");
         assert_eq!(listed[0].model_name, "Qwen2.5 7B");
@@ -781,7 +800,7 @@ mod tests {
         assert_eq!(listed[0].state, crate::agent_runtime::events::RunState::Completed);
         assert!(!listed[0].live);
 
-        let opened = load(dir.path(), "old-run").expect("it opens");
+        let opened = load(dir.path(), "old-run", None).expect("it opens");
         assert_eq!(opened.answer, "The seal is worn beyond the limit [E1].");
     }
 
@@ -793,7 +812,7 @@ mod tests {
         save(dir.path(), &written).expect("saved");
 
         assert_eq!(
-            list(dir.path())[0].state,
+            list(dir.path(), None)[0].state,
             crate::agent_runtime::events::RunState::Failed
         );
     }
@@ -833,7 +852,7 @@ mod tests {
     #[test]
     fn a_task_id_cannot_name_a_path() {
         let dir = tempfile::tempdir().expect("temp dir");
-        assert!(load(dir.path(), "../../secrets").is_err());
+        assert!(load(dir.path(), "../../secrets", None).is_err());
     }
 
     #[test]
@@ -885,13 +904,60 @@ mod tests {
         written.failure = Some("the agent runtime stopped".to_string());
         save(dir.path(), &written).expect("saved");
 
-        let listed = list(dir.path());
+        let listed = list(dir.path(), None);
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].ready);
         assert_eq!(
             listed[0].failure.as_deref(),
             Some("the agent runtime stopped")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-user isolation tests (TODO 2 of the 7-step plan).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_user_does_not_see_another_users_tasks_in_the_listing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut by_priya = record("priya-1", "2026-08-27T10:00:00+00:00");
+        by_priya.user_id = "modeladmin".to_string(); // S. Kulkarni
+        let mut by_ravi = record("ravi-1", "2026-08-27T11:00:00+00:00");
+        by_ravi.user_id = "admin".to_string(); // R. Nair
+        save(dir.path(), &by_priya).expect("saved priya");
+        save(dir.path(), &by_ravi).expect("saved ravi");
+
+        // S. Kulkarni asks for her own tasks: she sees one.
+        let priya_view = list(dir.path(), Some("modeladmin"));
+        assert_eq!(priya_view.len(), 1);
+        assert_eq!(priya_view[0].run_id, "priya-1");
+        // R. Nair asks for his own: he sees the other one.
+        let ravi_view = list(dir.path(), Some("admin"));
+        assert_eq!(ravi_view.len(), 1);
+        assert_eq!(ravi_view[0].run_id, "ravi-1");
+        // The unrestricted form returns both, for the audit log.
+        let all = list(dir.path(), None);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn a_user_cannot_load_another_users_task_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut by_priya = record("priya-1", "2026-08-27T10:00:00+00:00");
+        by_priya.user_id = "modeladmin".to_string();
+        save(dir.path(), &by_priya).expect("saved");
+
+        // R. Nair asks for S. Kulkarni's task by id. The store
+        // refuses at the function boundary, before any payload
+        // is read into the response.
+        let result = load(dir.path(), "priya-1", Some("admin"));
+        assert!(
+            result.is_err(),
+            "loading a stranger's task must fail at the store boundary"
+        );
+        // S. Kulkarni can still load her own.
+        let result = load(dir.path(), "priya-1", Some("modeladmin"));
+        assert!(result.is_ok());
     }
 }
 

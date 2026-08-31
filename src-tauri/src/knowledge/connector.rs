@@ -452,8 +452,12 @@ mod tests {
     fn a_collection_inherits_its_classifications_clearance() {
         let dir = tempfile::tempdir().unwrap();
         let c = collection(dir.path(), Classification::VendorNegotiation);
-        assert!(c.readable_by(&[Role::User]));
-        assert!(!c.readable_by(&[Role::KnowledgeAdministrator]));
+        // In the 2-role model both Administrator and Employee are cleared
+        // for every classification tier.
+        assert!(c.readable_by(&[Role::Administrator]));
+        assert!(c.readable_by(&[Role::Employee]));
+        // A legacy role is not cleared for anything in the active product.
+        assert!(!c.readable_by(&[Role::Auditor]));
     }
 
     /// A collection setting narrows access; it can never widen it.
@@ -462,11 +466,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut c = collection(dir.path(), Classification::Internal);
 
-        // Internal is readable by user, knowledge admin and reviewer.
-        assert_eq!(c.effective_roles().len(), 3);
+        // Internal is readable by every active role: both Administrator
+        // and Employee are in the classification's clearance set.
+        assert_eq!(c.effective_roles().len(), 2);
 
-        c.restricted_to_roles = vec![Role::Reviewer];
-        assert_eq!(c.effective_roles(), vec![Role::Reviewer]);
+        c.restricted_to_roles = vec![Role::Employee];
+        assert_eq!(c.effective_roles(), vec![Role::Employee]);
 
         // Naming a role the classification does not clear grants nothing.
         c.restricted_to_roles = vec![Role::Auditor];

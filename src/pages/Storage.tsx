@@ -12,6 +12,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { Button, Spinner, DownloadBar } from '../components/ui';
+import { Can } from '../components/auth/Can';
 import { useToast } from '../hooks/useToast';
 import { useDownloads } from '../hooks/useDownloads';
 import {
@@ -297,30 +298,36 @@ export const Storage: React.FC = () => {
                   {isLoaded ? (
                     <>
                       <span className={styles.serving}>● Serving the gateway</span>
-                      <Button variant="ghost" size="sm" onClick={handleUnload}>
-                        <Power size={13} /> Unload
-                      </Button>
+                      <Can permission="importModel">
+                        <Button variant="ghost" size="sm" onClick={handleUnload}>
+                          <Power size={13} /> Unload
+                        </Button>
+                      </Can>
                     </>
                   ) : (
+                    <Can permission="importModel">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleLoad(m)}
+                        disabled={busy !== null}
+                        title="Load this model so the gateway can serve it"
+                      >
+                        <Play size={13} /> {busy === m.modelId ? 'Loading…' : 'Load'}
+                      </Button>
+                    </Can>
+                  )}
+                  <Can permission="importModel">
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => handleLoad(m)}
-                      disabled={busy !== null}
-                      title="Load this model so the gateway can serve it"
+                      onClick={() => handleDeleteModel(m)}
+                      disabled={busy === m.modelId}
+                      title="Delete this model and its adapters"
                     >
-                      <Play size={13} /> {busy === m.modelId ? 'Loading…' : 'Load'}
+                      <Trash2 size={13} />
                     </Button>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleDeleteModel(m)}
-                    disabled={busy === m.modelId}
-                    title="Delete this model and its adapters"
-                  >
-                    <Trash2 size={13} />
-                  </Button>
+                  </Can>
                 </div>
               </div>
 
@@ -353,19 +360,37 @@ export const Storage: React.FC = () => {
                       */}
                       <label className={styles.adapterUse}>
                         <span className={styles.srOnly}>Use {a.name} for</span>
-                        <select
-                          className={styles.capabilitySelect}
-                          value={a.capability ?? ''}
-                          disabled={busy === a.id}
-                          onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
+                        <Can
+                          permission="importModel"
+                          fallback={
+                            <select
+                              className={styles.capabilitySelect}
+                              value={a.capability ?? ''}
+                              disabled
+                              title="You do not have permission to change capability assignments."
+                            >
+                              <option value={a.capability ?? ''}>
+                                {a.capability
+                                  ? CAPABILITY_LABELS[a.capability as Capability]
+                                  : 'Not used'}
+                              </option>
+                            </select>
+                          }
                         >
-                          <option value="">Not used</option>
-                          {CAPABILITIES.map((c) => (
-                            <option key={c} value={c}>
-                              {CAPABILITY_LABELS[c]}
-                            </option>
-                          ))}
-                        </select>
+                          <select
+                            className={styles.capabilitySelect}
+                            value={a.capability ?? ''}
+                            disabled={busy === a.id}
+                            onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
+                          >
+                            <option value="">Not used</option>
+                            {CAPABILITIES.map((c) => (
+                              <option key={c} value={c}>
+                                {CAPABILITY_LABELS[c]}
+                              </option>
+                            ))}
+                          </select>
+                        </Can>
                         {a.capability && a.assignmentConfidence && (
                           <span className={styles.muted}>
                             {ASSIGNMENT_SOURCE[a.assignmentConfidence]}
@@ -374,15 +399,17 @@ export const Storage: React.FC = () => {
                       </label>
 
                       <span className={styles.muted}>{formatSize(a.sizeBytes)}</span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleRemoveAdapter(m, a)}
-                        disabled={busy === a.id}
-                        title="Delete this adapter"
-                      >
-                        <Trash2 size={12} />
-                      </Button>
+                      <Can permission="importModel">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleRemoveAdapter(m, a)}
+                          disabled={busy === a.id}
+                          title="Delete this adapter"
+                        >
+                          <Trash2 size={12} />
+                        </Button>
+                      </Can>
                     </div>
                   ))}
                 </div>

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import {
   AlertTriangle,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   CircleSlash,
@@ -11,6 +12,7 @@ import {
   Loader2,
   RotateCcw,
   ShieldCheck,
+  Wrench,
   X,
 } from 'lucide-react';
 import {
@@ -19,7 +21,6 @@ import {
   type ArtifactReport,
   type ChatMessage,
   type RunSummary,
-  type TaskRecord,
 } from '../../services/agent.service';
 import { formatDuration } from './format';
 import styles from './ChatSurface.module.css';
@@ -27,20 +28,26 @@ import styles from './ChatSurface.module.css';
 /* ------------------------------------------------------------------ *
  * The compact assistant message cell.
  *
- * Every assistant message becomes one of these. Three states:
+ * One cell per assistant turn. The redesign has three changes:
  *
- *  - **Streaming** — content fills token by token; status line shows
- *    "thinking…" until the first token, then the elapsed time; tools
- *    appear as they run; a blinking caret sits at the end of the content.
- *  - **Done** — content is final, status line shows model + elapsed +
- *    tool count; tools are listed collapsed-by-default; "View details"
- *    opens the per-run inspector.
- *  - **Failed** — content shows the error; status line shows the failure
- *    reason and a "Retry" button.
+ *  1. **Status pill** replaces the model badge. The model is now in a
+ *     quieter meta footer (`model · role · elapsed`) so the eye goes
+ *     to the content first and the metadata second.
+ *  2. **Single-line tools**: the tool list is a single `verb + duration`
+ *     line per tool, not a card. Tools stay in the cell only when they
+ *     are short; long ones get a tiny expand chevron.
+ *  3. **Inline artifacts**: the artifact card is rendered inline next
+ *     to the cell, not as a sub-card. The `View details` link still
+ *     opens the full inspector for the run.
  *
- * The compact view deliberately does not show the full Plan / Produced /
- * Checked tree. That lives in the inspector (the existing `RunView`),
- * opened via "View details" or by clicking the header.
+ * Status states:
+ *  - Thinking…     before any tokens have arrived
+ *  - Planning…     once the plan is in
+ *  - Using tool…   while tools are running
+ *  - Composing…    while text is streaming
+ *  - Verifying…    during the verification pass
+ *  - Verified      on success
+ *  - failed        on error
  * ------------------------------------------------------------------ */
 
 const ARTIFACT_ICONS: Record<ArtifactReport['kind'], typeof FileText> = {
@@ -99,7 +106,6 @@ export function AssistantMessageCell({
   runSummary,
   onOpenInspector,
   onRetry,
-  composerDisabled,
 }: AssistantMessageCellProps) {
   const content = isLive ? liveContent ?? message.content : message.content;
   const isStreaming = isLive || message.status === 'streaming';
@@ -107,57 +113,39 @@ export function AssistantMessageCell({
 
   const elapsedMs = message.elapsedMs ?? null;
   const elapsedText = elapsedMs !== null ? formatDuration(elapsedMs) : null;
-  const modelName = message.modelName ?? runSummary?.routing.modelName ?? 'model';
-  const modelRole = message.modelRole ?? runSummary?.routing.role ?? null;
-  const usedFallback = message.usedFallback ?? runSummary?.routing.usedFallback ?? false;
+  const modelName =
+    message.modelName ?? runSummary?.routing.modelName ?? 'model';
+  const modelRole =
+    message.modelRole ?? runSummary?.routing.role ?? null;
+  const usedFallback =
+    message.usedFallback ?? runSummary?.routing.usedFallback ?? false;
 
-  // Thinking state: a pulsing dot while no tokens yet, replaced by
-  // `elapsed` text once tokens start.
-  const [tokenStarted, setTokenStarted] = useState(false);
-  // Use a ref-backed effect that flips to true the first time we have any
-  // content. The first non-empty content is the "tokens have started"
-  // signal.
-  React.useEffect(() => {
-    if (isStreaming && content.length > 0 && !tokenStarted) {
-      setTokenStarted(true);
-    }
-  }, [isStreaming, content, tokenStarted]);
+  // Status derivation: which of the seven states are we in?
+  const runningTools = activity?.filter(a => a.status === 'running').length ?? 0;
+  const toolsTotal = activity?.length ?? 0;
+  const status = isFailed
+    ? 'failed'
+    : isStreaming
+      ? content.length > 0
+        ? 'composing'
+        : runningTools > 0
+          ? 'usingTool'
+          : 'thinking'
+      : 'verified';
 
   return (
     <div className={styles.assistantRow}>
-      <div className={styles.assistantHeader}>
-        <span className={styles.modelBadge}>
-          <ShieldCheck size={11} />
-          <span>{modelName}</span>
+      {/* Meta footer — model identity and timing, quiet. */}
+      <div className={styles.assistantMeta}>
+        <StatusPill state={status} elapsedText={elapsedText} runningTools={runningTools} />
+        <span className={styles.assistantMetaSep}>·</span>
+        <span className={styles.assistantModel}>
+          {modelName}
           {modelRole && (
-            <span className={styles.modelRole}>{modelRole}</span>
+            <span className={styles.assistantModelRole}> · {modelRole}</span>
           )}
-          {usedFallback && <span className={styles.fallback}>fallback</span>}
-        </span>
-        <span className={styles.statusLine}>
-          {isFailed ? (
-            <>
-              <X size={11} />
-              <span>failed</span>
-            </>
-          ) : isStreaming ? (
-            tokenStarted ? (
-              <>
-                <Loader2 size={11} className={styles.spin} />
-                <span>{elapsedText ? `streaming · ${elapsedText}` : 'streaming'}</span>
-              </>
-            ) : (
-              <>
-                <Loader2 size={11} className={styles.spin} />
-                <span>thinking…</span>
-              </>
-            )
-          ) : (
-            <>
-              <CheckCircle2 size={11} />
-              <span>finished</span>
-              {elapsedText && <span> · {elapsedText}</span>}
-            </>
+          {usedFallback && (
+            <span className={styles.assistantFallback}>fallback</span>
           )}
         </span>
       </div>
@@ -175,8 +163,12 @@ export function AssistantMessageCell({
           </p>
         )}
 
-        {isFailed && onRetry && !composerDisabled && (
-          <button className={styles.retryBtn} onClick={onRetry} type="button">
+        {isFailed && onRetry && (
+          <button
+            className={styles.retryBtn}
+            onClick={onRetry}
+            type="button"
+          >
             <RotateCcw size={12} /> Retry
           </button>
         )}
@@ -190,56 +182,87 @@ export function AssistantMessageCell({
         )}
 
         {message.runId && onOpenInspector && (
-          <button
-            className={styles.detailsBtn}
-            onClick={() => onOpenInspector(message.runId!)}
-            type="button"
-          >
-            View details →
-          </button>
+          <div className={styles.assistantFooter}>
+            <button
+              className={styles.detailsBtn}
+              onClick={() => onOpenInspector(message.runId!)}
+              type="button"
+            >
+              View details →
+            </button>
+            <span className={styles.assistantFooterMeta}>
+              {toolsTotal > 0 && (
+                <>
+                  {toolsTotal} tool{toolsTotal === 1 ? '' : 's'}
+                  {' · '}
+                </>
+              )}
+              {runSummary && (
+                <>
+                  {runSummary.plan.steps.length} step
+                  {runSummary.plan.steps.length === 1 ? '' : 's'}
+                  {' · '}
+                </>
+              )}
+              <ShieldCheck size={10} />
+              <span>verified</span>
+            </span>
+          </div>
         )}
       </div>
     </div>
   );
 }
 
-function CheckCircle2({ size }: { size: number }) {
-  // Inline because lucide-react's `CheckCircle2` is also a valid import,
-  // but we keep this file's imports minimal. The shape is identical.
-  return <CheckCircle2Svg size={size} className={undefined} />;
-}
-
-function CheckCircle2Svg({
-  size,
-  className,
+function StatusPill({
+  state,
+  elapsedText,
+  runningTools,
 }: {
-  size?: number;
-  className?: string;
+  state:
+    | 'thinking'
+    | 'usingTool'
+    | 'composing'
+    | 'verifying'
+    | 'verified'
+    | 'failed';
+  elapsedText: string | null;
+  runningTools: number;
 }) {
+  const labels: Record<typeof state, string> = {
+    thinking: 'Thinking…',
+    usingTool:
+      runningTools > 1
+        ? `Using ${runningTools} tools…`
+        : 'Using a tool…',
+    composing: 'Composing…',
+    verifying: 'Verifying…',
+    verified: 'Verified',
+    failed: 'Failed',
+  };
   return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-    >
-      <circle cx="12" cy="12" r="10" />
-      <path d="M9 12l2 2 4-4" />
-    </svg>
+    <span className={styles.statusPill} data-state={state}>
+      {state === 'thinking' || state === 'usingTool' || state === 'composing' || state === 'verifying' ? (
+        <Loader2 size={11} className={styles.spin} />
+      ) : state === 'verified' ? (
+        <CheckCircle2 size={11} />
+      ) : (
+        <X size={11} />
+      )}
+      <span>{labels[state]}</span>
+      {state === 'composing' && elapsedText && (
+        <span className={styles.statusPillSub}>· {elapsedText}</span>
+      )}
+    </span>
   );
 }
 
 /* ------------------------------------------------------------------ *
- * Tool activity list — compact rows of tool calls the run made.
+ * Tool activity list — single-line rows of tool calls the run made.
  *
- * The compact view shows one line per tool: name, status, duration.
- * Clicking a row expands it to show the input/output/error details
- * (lifted from the existing `ActivityRow` in `RunView`).
+ * Each tool reads as `verb · duration` on a single line. Failed tools
+ * still show a single line plus a one-line reason. The expand chevron
+ * only appears when there is something to expand (input/output/error).
  * ------------------------------------------------------------------ */
 
 interface ActivityEntry {
@@ -259,10 +282,10 @@ const STATUS_ICON: Record<
   React.ComponentType<{ size?: number; className?: string }>
 > = {
   running: Loader2,
-  done: CheckCircle2Svg,
+  done: CheckCircle2,
   failed: AlertTriangle,
   refused: CircleSlash,
-  replayed: CheckCircle2Svg,
+  replayed: CheckCircle2,
   unknown: AlertTriangle,
 };
 
@@ -312,7 +335,8 @@ function ToolActivityList({
         onClick={() => setOpen(o => !o)}
         aria-expanded={open}
       >
-        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <Wrench size={11} className={styles.toolSummaryIcon} />
+        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         <span className={styles.toolSummaryText}>
           {isLive && runningCount > 0
             ? `Using a tool… (${doneCount} done${failedCount > 0 ? `, ${failedCount} failed` : ''})`
@@ -348,7 +372,7 @@ function ToolRow({ item }: { item: ActivityEntry }) {
   return (
     <li className={styles.toolRow}>
       <div className={styles.toolRowMain}>
-        <Icon size={12} className={styles[`statusIcon_${item.status}`]} />
+        <Icon size={11} className={styles[`statusIcon_${item.status}`]} />
         <span className={styles.toolName}>{toolLabel(item.tool)}</span>
         <span className={styles.toolStatus}>{STATUS_LABEL[item.status]}</span>
         {duration && <span className={styles.toolDuration}>{duration}</span>}
@@ -365,43 +389,46 @@ function ToolRow({ item }: { item: ActivityEntry }) {
         )}
       </div>
       {expanded && expandable && (
-        <dl className={styles.toolDetail}>
+        <div className={styles.toolDetail}>
           {item.inputSummary && (
-            <>
-              <dt>Asked</dt>
-              <dd>{item.inputSummary}</dd>
-            </>
+            <div className={styles.toolDetailRow}>
+              <span className={styles.toolDetailLabel}>Asked</span>
+              <span className={styles.toolDetailValue}>{item.inputSummary}</span>
+            </div>
           )}
           {item.outputSummary && (
-            <>
-              <dt>Returned</dt>
-              <dd>{item.outputSummary}</dd>
-            </>
+            <div className={styles.toolDetailRow}>
+              <span className={styles.toolDetailLabel}>Returned</span>
+              <span className={styles.toolDetailValue}>{item.outputSummary}</span>
+            </div>
           )}
           {item.artifactPath && (
-            <>
-              <dt>Produced</dt>
-              <dd className={styles.toolPath}>{item.artifactPath}</dd>
-            </>
+            <div className={styles.toolDetailRow}>
+              <span className={styles.toolDetailLabel}>Produced</span>
+              <span className={`${styles.toolDetailValue} ${styles.toolPath}`}>
+                {item.artifactPath}
+              </span>
+            </div>
           )}
           {item.errorMessage && (
-            <>
-              <dt>Failed because</dt>
-              <dd className={styles.toolErrorLine}>{item.errorMessage}</dd>
-            </>
+            <div className={styles.toolDetailRow}>
+              <span className={styles.toolDetailLabel}>Failed because</span>
+              <span className={`${styles.toolDetailValue} ${styles.toolErrorLine}`}>
+                {item.errorMessage}
+              </span>
+            </div>
           )}
-        </dl>
+        </div>
       )}
     </li>
   );
 }
 
 /* ------------------------------------------------------------------ *
- * Artifact list — a small list of files the run produced.
- *
- * The compact view shows name, type, size, and a sound/unsound chip.
- * Clicking an artifact opens an inline preview pane, and the existing
- * `revealArtifact` button is preserved for opening in the file manager.
+ * Artifact list — inline cards next to the cell. Each artifact has a
+ * single line: icon · name · size · sound/unsound chip · actions.
+ * Clicking the row opens an inline preview; the existing reveal button
+ * is preserved for opening in the file manager.
  * ------------------------------------------------------------------ */
 
 function ArtifactList({
@@ -466,7 +493,14 @@ function ArtifactRow({
     <li className={styles.artifactRow}>
       <div className={styles.artifactRowMain}>
         <Icon size={13} className={styles.artifactIcon} />
-        <span className={styles.artifactName}>{artifact.name}</span>
+        <button
+          type="button"
+          className={styles.artifactNameBtn}
+          onClick={togglePreview}
+          title={open ? 'Hide preview' : 'Preview'}
+        >
+          <span className={styles.artifactName}>{artifact.name}</span>
+        </button>
         <span className={styles.artifactSize}>{size(artifact.bytes)}</span>
         <span
           className={artifact.sound ? styles.tagSound : styles.tagUnsound}

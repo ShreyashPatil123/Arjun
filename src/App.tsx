@@ -4,7 +4,9 @@ import { AppStateProvider } from './contexts/AppStateContext';
 import { ConfigProvider } from './contexts/ConfigContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
+import { PermissionsProvider, usePermissions } from './contexts/PermissionsContext';
 import { AppShell } from './components/layout';
+import { RequirePermission } from './components/auth/RequirePermission';
 import { Workbench } from './pages/Workbench';
 import { Tasks } from './pages/Tasks';
 import { Conversations } from './pages/Conversations';
@@ -54,6 +56,10 @@ function App() {
     return (
       <ThemeProvider>
         <ToastProvider>
+          {/* SignIn hands the new session back via `onSignedIn`. The
+            * PermissionsProvider below is mounted on the next render,
+            * and its own mount-time `refresh` reads the freshly-stored
+            * session from the back-end. */}
           <SignIn onSignedIn={setSession} />
         </ToastProvider>
       </ThemeProvider>
@@ -65,41 +71,87 @@ function App() {
       <ConfigProvider>
         <ThemeProvider>
           <ToastProvider>
-            <BrowserRouter>
-              <Routes>
-                <Route path="/" element={<AppShell />}>
-                  <Route index element={<Workbench />} />
+            <PermissionsProvider>
+              <BrowserRouter>
+                <Routes>
+                  <Route path="/" element={<AppShell />}>
+                    <Route index element={<Workbench />} />
 
-                  <Route path="tasks" element={<Tasks />} />
-                <Route path="conversations" element={<Conversations />} />
+                    <Route path="tasks" element={<Tasks />} />
+                    <Route path="conversations" element={<Conversations />} />
 
-                  {/* Surfaces PS 26117 requires that do not exist yet. Routed and
-                    * named now so the shell is complete and the gaps are visible. */}
-                  <Route
-                    path="knowledge"
-                    element={
-                      <Placeholder
-                        title="Knowledge"
-                        purpose="Connected collections of manuals, SOPs, inspection reports and past correspondence — indexed on this machine, from a local folder or an internal network share."
-                        phase="Phase 4 — knowledge service and connectors"
-                      />
-                    }
-                  />
-                  <Route path="approvals" element={<Approvals />} />
-                  <Route path="audit" element={<AuditNetwork />} />
-                  <Route path="health" element={<Health />} />
-                  <Route path="model-health" element={<ModelHealth />} />
-                  <Route path="demo" element={<Demo />} />
-                  <Route path="sih" element={<SIHDashboard />} />
+                    {/* Surfaces PS 26117 requires that do not exist yet. Routed and
+                      * named now so the shell is complete and the gaps are visible. */}
+                    <Route
+                      path="knowledge"
+                      element={
+                        <Placeholder
+                          title="Knowledge"
+                          purpose="Connected collections of manuals, SOPs, inspection reports and past correspondence — indexed on this machine, from a local folder or an internal network share."
+                          phase="Phase 4 — knowledge service and connectors"
+                        />
+                      }
+                    />
+                    {/* Approvals queue: gated on `ApproveOutput`, which in the
+                      * 2-role model only `Administrator` holds. (An Employee can
+                      * decide approvals for tasks they themselves own, but cannot
+                      * see the cross-account queue.) */}
+                    <Route
+                      path="approvals"
+                      element={
+                        <RequirePermission permission="approveOutput">
+                          <Approvals />
+                        </RequirePermission>
+                      }
+                    />
+                    {/* Audit + sovereignty read surface: `ViewAuditLog`. */}
+                    <Route
+                      path="audit"
+                      element={
+                        <RequirePermission permission="viewAuditLog">
+                          <AuditNetwork />
+                        </RequirePermission>
+                      }
+                    />
+                    <Route path="health" element={<Health />} />
+                    {/* Model Health is model-management metadata, so `ImportModel`. */}
+                    <Route
+                      path="model-health"
+                      element={
+                        <RequirePermission permission="importModel">
+                          <ModelHealth />
+                        </RequirePermission>
+                      }
+                    />
+                    <Route path="demo" element={<Demo />} />
+                    <Route path="sih" element={<SIHDashboard />} />
 
-                  {/* Carried over from Sarathi. */}
-                  <Route path="models" element={<Storage />} />
-                  <Route path="browse" element={<Browse />} />
-                  <Route path="system" element={<SystemInfo />} />
-                  <Route path="settings" element={<Settings />} />
-                </Route>
-              </Routes>
-            </BrowserRouter>
+                    {/* Carried over from Sarathi. Model-management surfaces:
+                      * installing, deleting, and loading a model is `ImportModel`,
+                      * which in the 2-role model only `Administrator` holds, so
+                      * the catalogue and the storage page are gated on it. */}
+                    <Route
+                      path="models"
+                      element={
+                        <RequirePermission permission="importModel">
+                          <Storage />
+                        </RequirePermission>
+                      }
+                    />
+                    <Route
+                      path="browse"
+                      element={
+                        <RequirePermission permission="importModel">
+                          <Browse />
+                        </RequirePermission>
+                      }
+                    />
+                    <Route path="system" element={<SystemInfo />} />
+                    <Route path="settings" element={<Settings />} />
+                  </Route>
+                </Routes>
+              </BrowserRouter>
+            </PermissionsProvider>
           </ToastProvider>
         </ThemeProvider>
       </ConfigProvider>

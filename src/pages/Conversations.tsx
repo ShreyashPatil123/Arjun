@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { AlertTriangle, MessageSquare } from 'lucide-react';
+import { AlertTriangle, MessageSquare, Trash2 } from 'lucide-react';
 import { agentService, type Conversation } from '../services/agent.service';
 import styles from './Conversations.module.css';
 
@@ -13,11 +13,19 @@ import styles from './Conversations.module.css';
  * Clicking a row opens the conversation in the workbench (`/`) and
  * switches the active conversation via `useConversation`'s last-id
  * memory so a reload lands here too.
+ *
+ * The delete button on each row is the affordance for the
+ * "delete from history" action: it asks for confirmation, calls
+ * `agent_delete_conversation`, and re-loads the list. A delete of the
+ * conversation that is currently being read is refused (the workbench
+ * is the only place that should hold the last-opened id, so the
+ * sign-out flow is unaffected).
  */
 export const Conversations = () => {
   const navigate = useNavigate();
   const [list, setList] = useState<Conversation[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -42,6 +50,35 @@ export const Conversations = () => {
       navigate('/');
     },
     [navigate],
+  );
+
+  const remove = useCallback(
+    async (id: string, title: string) => {
+      const ok = window.confirm(
+        `Delete "${title || 'Untitled chat'}" from the conversation history?\n\nThis removes the on-disk file. It cannot be undone.`,
+      );
+      if (!ok) return;
+      setBusyId(id);
+      setError(null);
+      try {
+        await agentService.deleteConversation(id);
+        // If the user just deleted the conversation they were reading,
+        // clear the last-opened pointer so the workbench lands on a
+        // fresh chat on next visit.
+        try {
+          const last = sessionStorage.getItem('arjun.conversation.last');
+          if (last === id) sessionStorage.removeItem('arjun.conversation.last');
+        } catch {
+          // ignored
+        }
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [load],
   );
 
   return (
@@ -74,11 +111,13 @@ export const Conversations = () => {
             const lastAssistant = [...conv.messages]
               .reverse()
               .find(m => m.role === 'assistant');
+            const isBusy = busyId === conv.id;
             return (
               <li key={conv.id} className={styles.item}>
                 <button
                   className={styles.itemBtn}
                   onClick={() => open(conv.id)}
+                  disabled={isBusy}
                 >
                   <span className={styles.itemTitle}>{conv.title}</span>
                   {firstUser && (
@@ -106,6 +145,18 @@ export const Conversations = () => {
                       {when(conv.lastActivityAt)}
                     </span>
                   </span>
+                </button>
+                <button
+                  className={styles.itemDelete}
+                  onClick={e => {
+                    e.stopPropagation();
+                    void remove(conv.id, conv.title);
+                  }}
+                  disabled={isBusy}
+                  aria-label={`Delete "${conv.title || 'Untitled chat'}"`}
+                  title="Delete from history"
+                >
+                  <Trash2 size={14} />
                 </button>
               </li>
             );

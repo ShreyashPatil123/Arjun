@@ -616,7 +616,7 @@ mod tests {
     fn a_permitted_call_runs_and_returns_its_output() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let state = block(executor.step(&mut run(), &context(&s, &roots), &search("wall thickness")));
@@ -637,7 +637,7 @@ mod tests {
     fn a_refusal_is_handed_back_as_the_result_and_the_task_continues() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -662,7 +662,7 @@ mod tests {
     fn repeated_refusals_stop_the_task_and_name_the_reason() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -692,7 +692,7 @@ mod tests {
     fn a_successful_step_resets_the_refusal_counter() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -714,7 +714,7 @@ mod tests {
     fn a_write_pauses_for_a_person_with_a_prompt_worth_reading() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let state = block(executor.step(
@@ -743,7 +743,7 @@ mod tests {
     fn waiting_for_approval_consumes_no_steps() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -762,7 +762,7 @@ mod tests {
     fn approving_lets_the_write_proceed() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -788,7 +788,7 @@ mod tests {
     fn rejecting_stops_the_task_cleanly_and_names_who_stopped_it() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = run();
 
@@ -807,7 +807,7 @@ mod tests {
     fn an_exhausted_budget_finishes_and_lists_what_was_never_reached() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut plan = PlanRun::new(
             "task-1",
@@ -830,7 +830,7 @@ mod tests {
     fn a_tool_failure_comes_back_as_a_result_rather_than_ending_the_task() {
         let runner = FakeRunner::failing();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         match block(executor.step(&mut run(), &context(&s, &roots), &search("anything"))) {
@@ -846,7 +846,7 @@ mod tests {
     fn nothing_runs_while_the_network_is_reachable() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
         let mut ctx = context(&s, &roots);
         ctx.confidential_work_permitted = false;
@@ -862,7 +862,7 @@ mod tests {
     fn a_parallel_batch_runs_three_reads_and_costs_one_step() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let mut plan = PlanRun::new(
@@ -906,7 +906,7 @@ mod tests {
     fn a_single_refusal_in_a_batch_does_not_stop_the_task() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let calls = vec![
@@ -943,7 +943,7 @@ mod tests {
     fn an_all_refused_batch_eventually_stops_with_a_named_reason() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         // Path-traversal: refused for every call, every batch.
@@ -986,7 +986,7 @@ mod tests {
     fn an_empty_batch_is_not_a_step() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let state = block(executor.step_batch(
@@ -1012,7 +1012,7 @@ mod tests {
     fn finishing_a_milestone_step_pauses_the_run_for_a_human_gate() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let mut plan = PlanRun::new(
@@ -1048,7 +1048,7 @@ mod tests {
     fn a_non_milestone_step_does_not_pause() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let state = block(executor.step(
@@ -1068,7 +1068,7 @@ mod tests {
     fn a_milestone_inside_a_parallel_batch_pauses_anyway() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         let mut plan = PlanRun::new(
@@ -1098,7 +1098,7 @@ mod tests {
     fn a_milestone_with_no_checkpoint_id_falls_back_to_step_n() {
         let runner = FakeRunner::working();
         let mut executor = Executor::new(&runner, None);
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/1")];
 
         // Reach into the plan directly to flag a milestone without

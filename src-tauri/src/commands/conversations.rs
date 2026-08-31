@@ -19,6 +19,7 @@ use tauri::State;
 use crate::agent_runtime::conversations::{
     Conversation, ConversationStore, Message, MessageStatus, RunToConversation,
 };
+use crate::commands::governance::{require_session, CurrentSession};
 
 /// Tauri-managed wrapper around the conversation store.
 pub struct ConversationsState(pub Arc<ConversationStore>);
@@ -32,13 +33,15 @@ pub fn agent_create_conversation(
     title: String,
     welcome: Option<String>,
     state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Conversation, String> {
+    let session = require_session(&session)?;
     let welcome = welcome.unwrap_or_else(|| {
         "Arjun is ready. Ask anything; nothing leaves this machine.".to_string()
     });
     state
         .0
-        .create(title, welcome)
+        .create(title, welcome, &session.user.id)
         .map_err(|error| format!("the conversation could not be created: {error}"))
 }
 
@@ -50,16 +53,57 @@ pub fn agent_create_conversation(
 pub fn agent_get_conversation(
     id: String,
     state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<Conversation>, String> {
-    state.0.get(&id).map_err(|e| e.to_string())
+    let session = require_session(&session)?;
+    // Per-user isolation: a different user gets `None`, not the
+    // contents. The front-end treats `None` as "no such
+    // conversation", which is the honest answer for any caller
+    // who is not the owner.
+    state
+        .0
+        .get(&id, Some(&session.user.id))
+        .map_err(|e| e.to_string())
 }
 
 /// All conversations, newest first by `lastActivityAt`.
 #[tauri::command]
 pub fn agent_list_conversations(
     state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Vec<Conversation>, String> {
-    state.0.list().map_err(|e| e.to_string())
+    let session = require_session(&session)?;
+    // Per-user isolation: a user sees only their own
+    // conversations. Administrators have no special visibility
+    // here either — the audit log is the place to see
+    // cross-account activity, not the chat sidebar.
+    state
+        .0
+        .list(Some(&session.user.id))
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a conversation by id. Idempotent: a delete of a missing id
+/// returns `Ok(false)` rather than an error, so the chat surface can
+/// retry without surfacing a misleading "not found" to the user.
+///
+/// The deletion removes the on-disk JSON file for the conversation. The
+/// in-memory `RunToConversation` index is left alone — the index is
+/// rebuilt lazily on the next `agent_append_turn` for a run, and a run
+/// whose conversation has been deleted will simply resolve to `None`
+/// when the front-end asks the back-end "which conversation is this
+/// run in?".
+#[tauri::command]
+pub fn agent_delete_conversation(
+    id: String,
+    state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
+) -> Result<bool, String> {
+    let session = require_session(&session)?;
+    state
+        .0
+        .delete(&id, &session.user.id)
+        .map_err(|e| e.to_string())
 }
 
 /// The user has sent a new message in an existing conversation.
@@ -92,10 +136,18 @@ pub fn agent_append_turn(
     user_prompt: String,
     conversations: State<'_, ConversationsState>,
     run_to_conversation: State<'_, RunToConversationState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<Conversation>, String> {
+    let session = require_session(&session)?;
     let updated = conversations
         .0
-        .append_user_turn(&conversation_id, &user_prompt, &message_id, &run_id)
+        .append_user_turn(
+            &conversation_id,
+            &user_prompt,
+            &message_id,
+            &run_id,
+            &session.user.id,
+        )
         .map_err(|e| e.to_string())?;
     if updated.is_some() {
         run_to_conversation.0.bind(&run_id, &conversation_id);
@@ -115,10 +167,17 @@ pub fn agent_update_streaming_content(
     message_id: String,
     content: String,
     state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<Conversation>, String> {
+    let session = require_session(&session)?;
     state
         .0
-        .update_streaming_content(&conversation_id, &message_id, &content)
+        .update_streaming_content(
+            &conversation_id,
+            &message_id,
+            &content,
+            &session.user.id,
+        )
         .map_err(|e| e.to_string())
 }
 
@@ -141,7 +200,9 @@ pub fn agent_complete_message(
     failed: bool,
     conversations: State<'_, ConversationsState>,
     run_to_conversation: State<'_, RunToConversationState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<Conversation>, String> {
+    let session = require_session(&session)?;
     let updated = conversations
         .0
         .record_message_completion(
@@ -155,6 +216,7 @@ pub fn agent_complete_message(
             used_fallback,
             error.as_deref(),
             failed,
+            &session.user.id,
         )
         .map_err(|e| e.to_string())?;
     run_to_conversation.0.unbind(&run_id);
@@ -171,7 +233,15 @@ pub fn agent_complete_message(
 pub fn agent_run_conversation(
     run_id: String,
     run_to_conversation: State<'_, RunToConversationState>,
+    session: State<'_, CurrentSession>,
 ) -> Option<String> {
+    // require_session returns an error string; for an Option-returning command
+    // we return None for an unauthenticated caller so the front-end treats
+    // it as "no conversation known for this run", which is the same shape
+    // it already handles for a run whose conversation has been deleted.
+    if require_session(&session).is_err() {
+        return None;
+    }
     run_to_conversation.0.lookup(&run_id)
 }
 
@@ -199,7 +269,12 @@ pub fn agent_get_message(
     conversation_id: String,
     message_id: String,
     state: State<'_, ConversationsState>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<Message>, String> {
-    let conv = state.0.get(&conversation_id).map_err(|e| e.to_string())?;
+    let session = require_session(&session)?;
+    let conv = state
+        .0
+        .get(&conversation_id, Some(&session.user.id))
+        .map_err(|e| e.to_string())?;
     Ok(conv.and_then(|c| c.messages.into_iter().find(|m| m.id == message_id)))
 }

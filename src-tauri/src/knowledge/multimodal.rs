@@ -713,7 +713,7 @@ mod tests {
             box_confidence: 0.7,
         }];
         idx.index_document(&m, &regions, &[]).unwrap();
-        let results = idx.search_regions(&session(vec![Role::User]), "PT-2201", 5).unwrap();
+        let results = idx.search_regions(&session(vec![Role::Employee]), "PT-2201", 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].caption, "PT-2201");
         assert_eq!(results[0].label.as_deref(), Some("instrument"));
@@ -739,7 +739,7 @@ mod tests {
             bbox: BBox { left: 0.0, top: 0.0, right: 1.0, bottom: 1.0 },
         }];
         idx.index_document(&m, &[], &tables).unwrap();
-        let results = idx.search_tables(&session(vec![Role::User]), "design pressure", 5).unwrap();
+        let results = idx.search_tables(&session(vec![Role::Employee]), "design pressure", 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].headers, headers);
         assert_eq!(results[0].rows, rows);
@@ -762,8 +762,8 @@ mod tests {
         }];
         idx.index_document(&m, &second, &[]).unwrap();
         // The old region is gone; the new one is searchable.
-        let by_old = idx.search_regions(&session(vec![Role::User]), "old", 5).unwrap();
-        let by_new = idx.search_regions(&session(vec![Role::User]), "new", 5).unwrap();
+        let by_old = idx.search_regions(&session(vec![Role::Employee]), "old", 5).unwrap();
+        let by_new = idx.search_regions(&session(vec![Role::Employee]), "new", 5).unwrap();
         assert!(by_old.is_empty(), "old region should be replaced");
         assert_eq!(by_new.len(), 1);
     }
@@ -779,7 +779,9 @@ mod tests {
             caption: "secret tag", label: None, box_confidence: 1.0,
         }];
         idx.index_document(&m, &regions, &[]).unwrap();
-        // Auditor is not cleared for vendor material.
+        // The legacy Auditor role is not cleared for any classification.
+        // Pinned here so a regression that re-enables a legacy role is
+        // caught at the search level.
         let s = session(vec![Role::Auditor]);
         let results = idx.search_regions(&s, "secret", 5).unwrap();
         assert!(results.is_empty(), "clearance must filter the row out");
@@ -807,7 +809,7 @@ mod tests {
         }];
         idx.index_document(&m, &regions, &[]).unwrap();
         idx.retire_document("doc-6").unwrap();
-        let results = idx.search_regions(&session(vec![Role::User]), "tag", 5).unwrap();
+        let results = idx.search_regions(&session(vec![Role::Employee]), "tag", 5).unwrap();
         assert!(results.is_empty());
         assert!(idx.document_meta("doc-6").unwrap().is_none());
     }

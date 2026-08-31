@@ -30,8 +30,6 @@ pub mod provenance_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub mod provenance_hmac;
-
 /// The kind of thing that happened. Kept coarse — detail belongs in `detail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

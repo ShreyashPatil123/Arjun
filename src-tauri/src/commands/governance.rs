@@ -67,7 +67,11 @@ pub fn require_session(session: &CurrentSession) -> Result<Session, String> {
 }
 
 /// Reads the current session and checks one permission on it.
-fn require_permission(session: &CurrentSession, permission: Permission) -> Result<Session, String> {
+///
+/// `pub` so other command modules (model management, agents, memory) can
+/// gate their Tauri commands on the same matrix the governance commands
+/// use, without re-implementing the check.
+pub fn require_permission(session: &CurrentSession, permission: Permission) -> Result<Session, String> {
     let session = require_session(session)?;
     if !session.holds(permission) {
         return Err(format!(
@@ -442,11 +446,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn audit_in_memory() -> Arc<AuditService> {
-        AuditService::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+        Arc::new(AuditService::from_connection(Connection::open_in_memory().unwrap()).unwrap())
     }
 
     fn credentials_in_memory() -> Arc<CredentialStore> {
-        CredentialStore::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+        Arc::new(CredentialStore::from_connection(Connection::open_in_memory().unwrap()).unwrap())
     }
 
     /// The sign-in helper under test calls `credential.verify(...)`, which on
@@ -591,5 +595,4 @@ mod tests {
         assert_eq!(new_session.user.id, "admin");
         assert_eq!(session.read().unwrap().as_ref().unwrap().user.id, "admin");
     }
->>>>>>> 9c5a444c141d9a766f79961d9dda74fd0bcb8350
 }

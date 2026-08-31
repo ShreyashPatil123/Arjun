@@ -1,59 +1,67 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  ChevronDown, Clock, BookOpen, Boxes, ShieldCheck, Activity, HeartPulse, Cpu, Settings, Plus, UserRound, LogOut, MessageSquare,
+  ChevronDown, BookOpen, Boxes, ShieldCheck, Activity, HeartPulse, Cpu, Settings, UserRound, LogOut, MessageSquare, ListTodo, Plus,
 } from 'lucide-react';
 import {
   governanceService,
-  ROLE_LABELS,
+  headlineRole,
+  isActiveRole,
   type Session,
 } from '../../services/governance.service';
-import {
-  agentService,
-  type Conversation,
-} from '../../services/agent.service';
-import { relativeTime } from '../../utils/relativeTime';
 import styles from './AppMenu.module.css';
 
-/** A menu entry. `shortcut` is the modifier-less key; the modifier is rendered
- *  per-platform so Windows shows Ctrl rather than the mac command glyph. */
 interface MenuItem {
   label: string;
   icon: React.ReactNode;
   path: string;
   shortcut: string;
-  /** Drawn above this item, to separate creating work from reviewing it. */
-  dividerBefore?: boolean;
+  /** When omitted, the item is visible to both roles. */
+  requires?: 'administrator';
 }
 
-/* Navigation is shaped by what PS 26117 has to make visible, not by a generic
- * assistant shell. Every judging criterion needs somewhere to live:
- * Approvals covers the human-in-the-loop gate, and Audit & Network is where
- * the zero-egress claim is actually demonstrated rather than asserted.
+interface Section {
+  label: string;
+  icon: React.ReactNode;
+  items: MenuItem[];
+}
+
+/**
+ * Sections in the ARJUN dropdown. The workbench lives in the trigger
+ * itself (a `+ New conversation` button) — the dropdown is for
+ * navigation and account.
  *
- * History lives here, in the dropdown, rather than as a separate "Conversations"
- * route: the user already had a dedicated sidebar before, and replacing it
- * with another full-page list would just re-create the same prominence.
- * Recent chats are surfaced as a short list at the top of this menu. */
-const ITEMS: MenuItem[] = [
-  { label: 'New Chat',         icon: <Plus size={17} />,         path: '/',           shortcut: 'N' },
-  { label: 'Tasks',            icon: <Clock size={17} />,        path: '/tasks',      shortcut: 'H' },
-  { label: 'Knowledge',        icon: <BookOpen size={17} />,     path: '/knowledge',  shortcut: 'K' },
-  { label: 'Models',           icon: <Boxes size={17} />,        path: '/models',     shortcut: 'M' },
-  { label: 'Approvals',        icon: <ShieldCheck size={17} />,  path: '/approvals',  shortcut: 'R' },
-  { label: 'Audit & Network',  icon: <Activity size={17} />,     path: '/audit',      shortcut: 'L' },
-  { label: 'Health',           icon: <HeartPulse size={17} />,   path: '/health',     shortcut: 'J' },
-  { label: 'Model Health',     icon: <Cpu size={17} />,          path: '/model-health', shortcut: 'O', dividerBefore: true },
-  { label: 'SIH Demo',         icon: <Plus size={17} />,         path: '/demo',       shortcut: 'D' },
-  { label: 'SIH Dashboard',    icon: <Activity size={17} />,     path: '/sih',        shortcut: 'P' },
-  { label: 'Settings',         icon: <Settings size={17} />,     path: '/settings',   shortcut: 'A' },
+ * The full conversation history lives at `/conversations`, reachable
+ * from the Workbench section below; it is intentionally not duplicated
+ * here, so the dropdown stays a navigation surface and not a history
+ * surface. Items with `requires: 'administrator'` are hidden from
+ * Employees.
+ */
+const SECTIONS: Section[] = [
+  {
+    label: 'Workbench',
+    icon: <ListTodo size={11} />,
+    items: [
+      { label: 'New conversation', icon: <Plus size={15} />,         path: '/',              shortcut: 'N' },
+      { label: 'Tasks',            icon: <ListTodo size={15} />,      path: '/tasks',         shortcut: 'H' },
+      { label: 'Conversations',    icon: <MessageSquare size={15} />, path: '/conversations', shortcut: 'Y' },
+      { label: 'Knowledge',        icon: <BookOpen size={15} />,      path: '/knowledge',     shortcut: 'K' },
+    ],
+  },
+  {
+    label: 'Administration',
+    icon: <Settings size={11} />,
+    items: [
+      { label: 'Models',          icon: <Boxes size={15} />,       path: '/models',       shortcut: 'M', requires: 'administrator' },
+      { label: 'Approvals',       icon: <ShieldCheck size={15} />, path: '/approvals',    shortcut: 'R', requires: 'administrator' },
+      { label: 'Audit & Network', icon: <Activity size={15} />,     path: '/audit',        shortcut: 'L', requires: 'administrator' },
+      { label: 'Health',          icon: <HeartPulse size={15} />,  path: '/health',       shortcut: 'J', requires: 'administrator' },
+      { label: 'Model Health',    icon: <Cpu size={15} />,         path: '/model-health', shortcut: 'O', requires: 'administrator' },
+      { label: 'Settings',        icon: <Settings size={15} />,    path: '/settings',     shortcut: 'A', requires: 'administrator' },
+    ],
+  },
 ];
 
-/** Cap on the number of recent conversations listed in the dropdown. More
- *  than this and the menu starts feeling like a second sidebar. */
-const RECENT_CONVERSATIONS_LIMIT = 6;
-
-/** True on macOS, where the modifier is rendered as the command glyph. */
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 const MOD_LABEL = IS_MAC ? '\u2318' : 'Ctrl';
 
@@ -61,7 +69,6 @@ export const AppMenu = () => {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
-  const [recent, setRecent] = useState<Conversation[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -69,33 +76,21 @@ export const AppMenu = () => {
       try {
         setSession(await governanceService.currentSession());
       } catch {
-        // Backend unavailable in a browser-only dev run. The menu still
-        // navigates; it just cannot name who is signed in.
+        /* noop */
       }
     })();
   }, []);
 
-  // Conversation history is fetched lazily so opening the menu does not pay
-  // for the network round-trip on every page load. A failed read is silent:
-  // the menu still works, it just shows no recent chats.
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const list = await agentService.listConversations();
-        if (cancelled) return;
-        setRecent(list.slice(0, RECENT_CONVERSATIONS_LIMIT));
-      } catch {
-        if (cancelled) return;
-        setRecent([]);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [open]);
+  // The single "what to call this account" role for the menu. The
+  // back-end hands us a role list; the user sees one of two
+  // possibilities: Administrator or Employee.
+  const role = useMemo<'administrator' | 'employee' | null>(() => {
+    if (!session) return null;
+    const active = session.user.roles.filter(isActiveRole);
+    if (active.length === 0) return 'employee';
+    return headlineRole(active);
+  }, [session]);
 
-  // Signing out reloads rather than clearing local state, so every screen is
-  // rebuilt for the next person instead of inheriting the last one's data.
   const signOut = async () => {
     try {
       await governanceService.signOut();
@@ -109,19 +104,7 @@ export const AppMenu = () => {
     navigate(path);
   }, [navigate]);
 
-  // Opening a chat from history: pin the conversation id so Workbench
-  // reattaches to it on mount. Removing the key (a no-op here, since the
-  // key is set by useConversation) would only matter if the user wanted a
-  // brand-new chat, which is "New Chat" — useConversation already handles
-  // that on first mount when no key is present.
-  const openConversation = useCallback((id: string) => {
-    setOpen(false);
-    try { sessionStorage.setItem('arjun.conversation.last', id); } catch { /* noop */ }
-    navigate('/');
-  }, [navigate]);
-
-  // Close on Escape, and on a click landing outside the menu. Both listeners
-  // are only attached while open so the app is not paying for them at rest.
+  // Close on Escape, and on a click landing outside the menu.
   useEffect(() => {
     if (!open) return;
 
@@ -140,19 +123,44 @@ export const AppMenu = () => {
     };
   }, [open]);
 
-  // Global shortcuts. These fire whether or not the menu is open, so the menu
-  // is a discoverability aid rather than the only way in.
+  // Global shortcuts. Only fire for items the current role can see;
+  // the route's own guard handles the rest.
   useEffect(() => {
+    const isAdmin = role === 'administrator';
+    const allItems = SECTIONS.flatMap(s => s.items).filter(
+      (i) => isAdmin || !i.requires,
+    );
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      const hit = ITEMS.find(i => i.shortcut.toLowerCase() === e.key.toLowerCase());
+      const hit = allItems.find(i => i.shortcut.toLowerCase() === e.key.toLowerCase());
       if (!hit) return;
       e.preventDefault();
       go(hit.path);
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
+  }, [go, role]);
+
+  // `Ctrl+N` is reserved by the browser for "new window" on some
+  // platforms; the menu's "New conversation" is `Ctrl+Shift+N`.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      if (e.shiftKey && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        go('/');
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
   }, [go]);
+
+  // Per-role visibility. The default `employee` view hides every
+  // section whose label is "Administration". Both roles see "Workbench".
+  const visibleSections = useMemo(() => {
+    if (role === 'administrator') return SECTIONS;
+    return SECTIONS.filter(s => s.label !== 'Administration');
+  }, [role]);
 
   return (
     <div className={styles.root} ref={rootRef}>
@@ -161,25 +169,48 @@ export const AppMenu = () => {
         onClick={() => setOpen(o => !o)}
         aria-haspopup="menu"
         aria-expanded={open}
+        title="Menu"
       >
         <span className={styles.wordmark}>ARJUN</span>
-        <ChevronDown size={15} className={open ? styles.chevronOpen : styles.chevron} />
+        <ChevronDown size={13} className={open ? styles.chevronOpen : styles.chevron} />
       </button>
 
       {open && (
         <div className={styles.panel} role="menu">
-          {/* Who is acting. Every permission check downstream is against this
-            * account, so it belongs at the top of the menu rather than buried
-            * in settings. */}
+          {visibleSections.map(section => (
+            <div key={section.label} className={styles.sectionGroup}>
+              <div className={styles.sectionHeader}>
+                {section.icon}
+                <span>{section.label}</span>
+              </div>
+              {section.items.map(item => (
+                <button
+                  key={item.path + item.label}
+                  className={styles.item}
+                  role="menuitem"
+                  onClick={() => go(item.path)}
+                >
+                  <span className={styles.itemIcon}>{item.icon}</span>
+                  <span className={styles.itemLabel}>{item.label}</span>
+                  <span className={styles.itemShortcut}>{MOD_LABEL} {item.shortcut}</span>
+                </button>
+              ))}
+            </div>
+          ))}
+
+          {/* Account at the bottom. */}
+          <div className={styles.divider} />
           <div className={styles.account}>
-            <span className={styles.accountIcon}><UserRound size={16} /></span>
+            <span className={styles.accountIcon}><UserRound size={14} /></span>
             <span className={styles.accountText}>
               <span className={styles.accountName}>
                 {session ? session.user.displayName : 'Not signed in'}
               </span>
               <span className={styles.accountRoles}>
-                {session
-                  ? session.user.roles.map(r => ROLE_LABELS[r] ?? r).join(' · ')
+                {session && role
+                  ? role === 'administrator'
+                    ? 'Administrator'
+                    : 'Employee'
                   : 'No permissions are held'}
               </span>
             </span>
@@ -188,46 +219,12 @@ export const AppMenu = () => {
                 className={styles.accountSwitch}
                 onClick={() => void signOut()}
                 aria-label="Sign out"
+                title="Sign out"
               >
                 <LogOut size={13} />
               </button>
             )}
           </div>
-
-          {/* Recent chats live here, not in a side rail. Cap is small
-            * (RECENT_CONVERSATIONS_LIMIT) so the dropdown stays a dropdown. */}
-          {recent.length > 0 && (
-            <>
-              <div className={styles.sectionHeader}>
-                <MessageSquare size={12} />
-                <span>Recent chats</span>
-              </div>
-              {recent.map(c => (
-                <button
-                  key={c.id}
-                  className={styles.recentItem}
-                  role="menuitem"
-                  onClick={() => openConversation(c.id)}
-                  title={c.title}
-                >
-                  <span className={styles.recentTitle}>{c.title || 'Untitled chat'}</span>
-                  <span className={styles.recentTime}>{relativeTime(c.lastActivityAt)}</span>
-                </button>
-              ))}
-              <div className={styles.divider} />
-            </>
-          )}
-
-          {ITEMS.map(item => (
-            <React.Fragment key={item.path + item.label}>
-              {item.dividerBefore && <div className={styles.divider} />}
-              <button className={styles.item} role="menuitem" onClick={() => go(item.path)}>
-                <span className={styles.itemIcon}>{item.icon}</span>
-                <span className={styles.itemLabel}>{item.label}</span>
-                <span className={styles.itemShortcut}>{MOD_LABEL} {item.shortcut}</span>
-              </button>
-            </React.Fragment>
-          ))}
         </div>
       )}
     </div>

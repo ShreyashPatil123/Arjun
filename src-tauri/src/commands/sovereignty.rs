@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::audit::{AuditKind, AuditService};
-use crate::commands::governance::{require_session, CurrentSession};
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::identity::Permission;
 use crate::sovereignty::{
     observe_own_connections, EgressEvent, NetworkBroker, ObservationReport, OperatingMode,
@@ -16,7 +16,13 @@ use crate::sovereignty::{
 
 /// The mode ARJUN is currently in.
 #[tauri::command]
-pub async fn get_operating_mode(broker: State<'_, Arc<NetworkBroker>>) -> Result<OperatingMode, String> {
+pub async fn get_operating_mode(
+    broker: State<'_, Arc<NetworkBroker>>,
+    session: State<'_, CurrentSession>,
+) -> Result<OperatingMode, String> {
+    // Read-only inspection of the current mode. The matrix does not
+    // gate this beyond sign-in.
+    require_session(&session)?;
     Ok(broker.mode())
 }
 
@@ -92,7 +98,13 @@ pub async fn set_operating_mode(
 #[tauri::command]
 pub async fn recent_egress_events(
     broker: State<'_, Arc<NetworkBroker>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Vec<EgressEvent>, String> {
+    // The egress log is part of the audit record. The matrix puts it
+    // under `ViewAuditLog`. A `User` who wants to know "did anything
+    // leave this machine" is the right question, but the answer is
+    // for an auditor or reviewer.
+    require_permission(&session, Permission::ViewAuditLog)?;
     Ok(broker.recent_events())
 }
 
@@ -103,7 +115,10 @@ pub async fn recent_egress_events(
 #[tauri::command]
 pub async fn run_egress_canary(
     broker: State<'_, Arc<NetworkBroker>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<EgressEvent, String> {
+    // The canary is an audit/test operation. Same gate as the egress log.
+    require_permission(&session, Permission::ViewAuditLog)?;
     Ok(broker.run_canary())
 }
 
@@ -113,7 +128,13 @@ pub async fn run_egress_canary(
 /// refused everything is ARJUN vouching for itself; this is a second, unrelated
 /// vantage point, and the two disagreeing is exactly the finding worth having.
 #[tauri::command]
-pub async fn observe_process_connections() -> Result<ObservationReport, String> {
+pub async fn observe_process_connections(
+    session: State<'_, CurrentSession>,
+) -> Result<ObservationReport, String> {
+    // Process observation is an audit-class read. Same gate as the
+    // egress log: it answers "what left the machine" and that is
+    // for the people who own the audit story.
+    require_permission(&session, Permission::ViewAuditLog)?;
     Ok(observe_own_connections())
 }
 

@@ -7,6 +7,9 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use tauri::State;
+
+use crate::commands::governance::{require_session, CurrentSession};
 use crate::model_providers::huggingface::card::{build_card, ModelCard, ModelCategory};
 use crate::model_providers::huggingface::discovery::GgufRepo;
 use crate::model_providers::huggingface::live_catalog;
@@ -164,7 +167,13 @@ fn tally_categories(cards: &[ModelCard]) -> Vec<CategoryCount> {
 /// listing: the cache holds only the popular sweep, and someone searching for a
 /// specific fine-tune would otherwise be told it does not exist.
 #[tauri::command]
-pub async fn browse_model_cards(query: Option<String>) -> Result<CatalogPage, String> {
+pub async fn browse_model_cards(
+    query: Option<String>,
+    session: State<'_, CurrentSession>,
+) -> Result<CatalogPage, String> {
+    // Catalog browsing is a model-management read. The matrix does not
+    // gate it beyond sign-in; downloading a card is its own command.
+    require_session(&session)?;
     let token = crate::config::hf_token::get();
     let search = query.as_deref().map(str::trim).filter(|q| !q.is_empty());
 
@@ -250,7 +259,11 @@ pub struct AdapterPage {
 /// Looks up HuggingFace's `base_model:adapter:` tag, which adapter authors set
 /// to declare their parent — a real relationship, not a name-similarity guess.
 #[tauri::command]
-pub async fn find_model_adapters(base_model_id: String) -> Result<AdapterPage, String> {
+pub async fn find_model_adapters(
+    base_model_id: String,
+    session: State<'_, CurrentSession>,
+) -> Result<AdapterPage, String> {
+    require_session(&session)?;
     let token = crate::config::hf_token::get();
 
     let adapters = live_catalog::find_adapters(&base_model_id, 20, token.as_deref())
@@ -277,11 +290,12 @@ pub async fn find_model_adapters(base_model_id: String) -> Result<AdapterPage, S
 /// Every category the app knows about, for a sidebar that stays stable while
 /// results load.
 #[tauri::command]
-pub fn list_model_categories() -> Vec<CategoryCount> {
-    ModelCategory::all()
+pub fn list_model_categories(session: State<'_, CurrentSession>) -> Result<Vec<CategoryCount>, String> {
+    require_session(&session)?;
+    Ok(ModelCategory::all()
         .iter()
         .map(|c| CategoryCount { category: *c, label: c.label().to_string(), count: 0 })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

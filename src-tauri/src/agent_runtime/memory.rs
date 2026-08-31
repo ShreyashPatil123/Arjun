@@ -1015,7 +1015,7 @@ mod tests {
         // read Project A's terminology has crossed it, and nothing in the audit
         // record would say so.
         let store = MemoryStore::in_memory();
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
 
         store
             .remember(term("project-a", "hot-tap", "A tap made on a live line."))
@@ -1038,7 +1038,7 @@ mod tests {
         // while working on Project B must not succeed either, or the confinement
         // would only be a matter of which key the caller happened to use.
         let store = MemoryStore::in_memory();
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         store
             .remember(term("project-a", "hot-tap", "…"))
             .expect("stored");
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn one_runs_memory_is_not_anothers() {
         let store = MemoryStore::in_memory();
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         store
             .remember(Remember {
                 scope: MemoryScope::Run {
@@ -1105,7 +1105,7 @@ mod tests {
 
         assert!(matches!(refusal, MemoryError::PromotionNeedsApproval { .. }));
         // And nothing was stored on the way to being refused.
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         assert!(store
             .recall(&workspace("project-a"), &reader, Some("project-a"))
             .is_empty());
@@ -1147,6 +1147,10 @@ mod tests {
 
         // Approval permits the entry; it does not widen who may read it.
         assert_eq!(stored.classification, Classification::VendorNegotiation);
+        // The legacy KnowledgeAdministrator role (kept on the enum for
+        // compatibility with the historical test surface) is not a reader
+        // of vendor material. Pinned here so a regression that re-enables
+        // the role is caught at the ACL level.
         assert!(!stored
             .acl
             .cleared_roles
@@ -1216,7 +1220,7 @@ mod tests {
         }
 
         // And nothing was written on the way to any of those refusals.
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         assert!(store
             .recall(&workspace("project-a"), &reader, Some("project-a"))
             .is_empty());
@@ -1234,7 +1238,7 @@ mod tests {
         }
 
         let reopened = MemoryStore::open(dir.path());
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         let recalled = reopened
             .recall_one(&workspace("project-a"), "unit-price", &reader, Some("project-a"))
             .expect("the promoted item survives");
@@ -1255,7 +1259,7 @@ mod tests {
         lapsed.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
         store.remember(lapsed).expect("stored");
 
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         assert!(store
             .recall(&workspace("project-a"), &reader, Some("project-a"))
             .is_empty());
@@ -1271,7 +1275,7 @@ mod tests {
         broken.expires_at = Some("whenever".to_string());
         store.remember(broken).expect("stored");
 
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         assert!(store
             .recall(&workspace("project-a"), &reader, Some("project-a"))
             .is_empty());
@@ -1291,7 +1295,7 @@ mod tests {
         }
 
         let reopened = MemoryStore::open(dir.path());
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         let held = reopened.recall(&scope, &reader, Some("project-a"));
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].key, "kept");
@@ -1304,13 +1308,15 @@ mod tests {
         let store = MemoryStore::in_memory();
         store.remember(term("project-a", "hot-tap", "…")).expect("stored");
 
-        let outsider = session("ravi", vec![Role::Auditor]);
+        // An outsider with no role for this material — they cannot see it, so
+        // they cannot delete it either.
+        let outsider = session("ravi", vec![]);
         assert!(matches!(
             store.forget(&workspace("project-a"), "hot-tap", &outsider, Some("project-a")),
             Err(MemoryError::NotFound { .. })
         ));
 
-        let cleared = session("kiran", vec![Role::User]);
+        let cleared = session("kiran", vec![Role::Employee]);
         assert!(store
             .forget(&workspace("project-a"), "hot-tap", &cleared, Some("project-a"))
             .is_ok());
@@ -1326,7 +1332,7 @@ mod tests {
         // next start quietly reverts it.
         let dir = tempfile::tempdir().expect("temp dir");
         let store = MemoryStore::open(dir.path());
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         store
             .remember(term("project-a", "hot-tap", "first"))
             .expect("the first write lands");
@@ -1359,7 +1365,7 @@ mod tests {
     fn a_failed_overwrite_leaves_the_previous_value_in_place() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = MemoryStore::open(dir.path());
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         store
             .remember(term("project-a", "hot-tap", "first"))
             .expect("the first write lands");
@@ -1495,7 +1501,7 @@ mod tests {
             })
             .expect("stored");
 
-        let someone_else = session("asha", vec![Role::User]);
+        let someone_else = session("asha", vec![Role::Employee]);
         assert!(store
             .recall(
                 &MemoryScope::User {
@@ -1537,10 +1543,13 @@ mod tests {
             })
             .expect("stored");
 
-        // An auditor reads the record, and nothing else.
-        let auditor = session("ravi", vec![Role::Auditor]);
+        // The legacy "auditor" role grants nothing in the active product
+        // and is not cleared for any classification; the assertion that
+        // this outsider reads nothing catches a regression that re-enables
+        // a legacy role.
+        let outsider = session("ravi", vec![Role::Auditor]);
         assert!(store
-            .recall(&workspace("project-a"), &auditor, Some("project-a"))
+            .recall(&workspace("project-a"), &outsider, Some("project-a"))
             .is_empty());
     }
 
@@ -1568,7 +1577,7 @@ mod tests {
     #[test]
     fn writing_a_key_twice_updates_it_rather_than_storing_two_answers() {
         let store = MemoryStore::in_memory();
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
         store
             .remember(term("project-a", "hot-tap", "first"))
             .expect("stored");
@@ -1584,7 +1593,7 @@ mod tests {
     #[test]
     fn durable_memory_survives_a_restart_and_run_memory_does_not() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let reader = session("kiran", vec![Role::User]);
+        let reader = session("kiran", vec![Role::Employee]);
 
         {
             let store = MemoryStore::open(dir.path());

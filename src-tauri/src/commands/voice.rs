@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::State;
 
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 use crate::voice::{self, SpeakRequest, TranscribeResult};
 
 /// What the sidecar *would* do for a given request, before any
@@ -30,7 +32,9 @@ pub struct VoiceStatus {
 #[tauri::command]
 pub async fn voice_status(
     app_data_dir: State<'_, PathBuf>,
+    session: State<'_, CurrentSession>,
 ) -> Result<VoiceStatus, String> {
+    require_session(&session)?;
     Ok(VoiceStatus {
         sidecar_present: voice::sidecar_path().exists(),
         whisper_model_present: voice::has_whisper_model(&app_data_dir),
@@ -52,9 +56,12 @@ pub async fn voice_status(
 #[tauri::command]
 pub async fn voice_transcribe(
     app_data_dir: State<'_, PathBuf>,
+    session: State<'_, CurrentSession>,
     audio: Vec<u8>,
     stub_only: Option<bool>,
 ) -> Result<TranscribeResult, String> {
+    // Transcribing audio runs the speech-to-text model. UseModel.
+    require_permission(&session, Permission::UseModel)?;
     voice::transcribe(&app_data_dir, &audio, stub_only.unwrap_or(false)).await
 }
 
@@ -64,7 +71,10 @@ pub async fn voice_transcribe(
 #[tauri::command]
 pub async fn voice_speak(
     app_data_dir: State<'_, PathBuf>,
+    session: State<'_, CurrentSession>,
     request: SpeakRequest,
 ) -> Result<PathBuf, String> {
+    // Synthesising speech runs the text-to-speech model. UseModel.
+    require_permission(&session, Permission::UseModel)?;
     voice::speak(&app_data_dir, &request).await
 }

@@ -30,7 +30,7 @@ use crate::agent_runtime::{artifacts, planning, retrieval, tasks};
 use crate::agent_runtime::{AgentRuntime, RuntimeDeps, AGENT_DURABLE_EVENT, AGENT_EVENT};
 use crate::artifacts::{verify, Evidence, VerificationReport};
 use crate::audit::{AuditKind, AuditService};
-use crate::commands::governance::{require_session, CurrentSession};
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::identity::{Permission, Session};
 use crate::knowledge::KnowledgeIndex;
 use crate::orchestrator::approvals::ApprovalQueue;
@@ -348,7 +348,7 @@ pub async fn agent_start_run(
     // Checked here as well as in the runtime's handlers. Here it gives the
     // person a clear reason before anything starts; there it stops a call whose
     // session ended mid-run.
-    let signed_in = require_session(&session)?;
+    let signed_in = require_permission(&session, Permission::UseModel)?;
 
     // Read from the live hardware rather than a stored figure: the right model
     // on a workstation is the wrong one on a laptop. The largest GPU wins on a
@@ -550,13 +550,24 @@ pub async fn agent_start_run(
     // holds only that compactions happened. A run whose record was never
     // written has nothing to resume from, and saying so honestly is better than
     // reconstructing a plausible set of notes nobody actually recorded.
-    let resumed_notes = tasks::load(&app_data_dir(&app)?, &run_id)
-        .ok()
-        .and_then(|previous| previous.working_notes)
-        .filter(|notes| !notes.is_empty());
+    let resumed_notes = tasks::load(
+        &app_data_dir(&app)?,
+        &run_id,
+        Some(&signed_in.user.id),
+    )
+    .ok()
+    .and_then(|previous| previous.working_notes)
+    .filter(|notes| !notes.is_empty());
 
     let params = json!({
         "runId": run_id,
+        // The assistant `Message` id the front-end reserved via
+        // `agent_append_turn`. The runtime attaches it to every
+        // `message_start` / `message_update` / `message_end` event so the chat
+        // surface can route each token to the right cell. Without this the
+        // translator in the runtime has nothing to bind to and the chat
+        // would drop every streaming event.
+        "messageId": request.message_id,
         "prompt": request.prompt,
         "systemPrompt": format!(
             "{}\n\n{workspace_note}\n\n{plan_note}",
@@ -956,9 +967,17 @@ pub async fn agent_start_run(
                 .unwrap_or_else(|| "New conversation".to_string());
             let title = title.chars().take(80).collect::<String>();
             let new_message_id = format!("a-{}", run_id);
+            // TODO 2: the conversation is owned by the signed-in
+            // user. The first turn of a brand-new conversation
+            // therefore belongs to the user who started the run,
+            // not to a global "default" account.
             let conversation = conversations
                 .0
-                .create(title, "Arjun is ready. Ask anything; nothing leaves this machine.".to_string())
+                .create(
+                    title,
+                    "Arjun is ready. Ask anything; nothing leaves this machine.".to_string(),
+                    &signed_in.user.id,
+                )
                 .map_err(|error| format!("the conversation could not be created: {error}"))?;
             conversation_id = conversation.id.clone();
             let _ = conversations.0.append_user_turn(
@@ -966,6 +985,7 @@ pub async fn agent_start_run(
                 &request.prompt,
                 &new_message_id,
                 &run_id,
+                &signed_in.user.id,
             );
             message_id = new_message_id;
             run_to_conversation.0.bind(&run_id, &conversation_id);
@@ -993,6 +1013,7 @@ pub async fn agent_start_run(
         Some(routing.used_fallback),
         None,
         run_failed,
+        &signed_in.user.id,
     );
     run_to_conversation.0.unbind(&run_id);
 
@@ -1076,7 +1097,12 @@ pub async fn agent_steer_run(
     run_id: String,
     text: String,
     handle: State<'_, AgentRuntimeHandle>,
+    session: State<'_, CurrentSession>,
 ) -> Result<bool, String> {
+    // A correction is part of running a model. The matrix puts it under
+    // `UseModel`. The orchestrator rejects no-longer-running runs, so
+    // this is a sign-in + UseModel gate plus the runtime's own check.
+    require_permission(&session, Permission::UseModel)?;
     if text.trim().is_empty() {
         return Err("A correction with no text would do nothing.".to_string());
     }
@@ -1114,9 +1140,13 @@ pub async fn agent_abort_run(
     session: State<'_, CurrentSession>,
     events: State<'_, TaskEvents>,
 ) -> Result<bool, String> {
-    let by = require_session(&session)
-        .map(|signed_in| signed_in.user.id)
-        .unwrap_or_else(|_| SYSTEM_ACTOR.to_string());
+    // Aborting your own in-flight run uses the model. The matrix puts
+    // that under `UseModel`. The previous fallback to SYSTEM_ACTOR is
+    // removed: the orchestrator's own internal cancellation goes
+    // through a different code path (the runtime's `cancel` request),
+    // not this command. Only a signed-in caller may stop a run from
+    // the webview.
+    let by = require_permission(&session, Permission::UseModel)?.user.id;
 
     // Only for a run the record has heard of. A run id arrives from the UI, and
     // writing an ending for one that has no beginning would let any caller
@@ -1180,6 +1210,10 @@ pub async fn agent_runtime_health(
     memory: State<'_, AgentMemory>,
     checkpoints: State<'_, RunCheckpoints>,
 ) -> Result<Value, String> {
+    // The health probe is a read; the matrix does not gate it beyond
+    // sign-in. The runtime may also start the agent if it is down, so
+    // sign-in is required to attribute the start.
+    require_session(&session)?;
     let state = RuntimeState {
         index: &index,
         session: &session,
@@ -1233,7 +1267,10 @@ pub async fn agent_task_history(
     // ones still going, and the ones the process took down with it. Before
     // this, those simply did not appear, and a task list silently missing the
     // interrupted runs is the list that misleads.
-    let mut all = tasks::list(&app_data_dir(&app)?);
+    // TODO 2: per-user isolation. The history screen shows the
+    // signed-in user's runs only; cross-account views live in the
+    // audit log, not here.
+    let mut all = tasks::list(&app_data_dir(&app)?, Some(&signed_in.user.id));
     let recorded: std::collections::HashSet<String> =
         all.iter().map(|task| task.run_id.clone()).collect();
 
@@ -1499,7 +1536,7 @@ pub async fn agent_task(
     session: State<'_, CurrentSession>,
 ) -> Result<TaskRecord, String> {
     let signed_in = require_session(&session)?;
-    let record = tasks::load(&app_data_dir(&app)?, &run_id)?;
+    let record = tasks::load(&app_data_dir(&app)?, &run_id, None)?;
     if !may_read(&signed_in, &record.user_id) {
         // Phrased as "not yours" rather than "does not exist": the person
         // holding a task id already knows it exists, and pretending otherwise
@@ -1522,7 +1559,7 @@ pub async fn agent_task_artifacts(
     session: State<'_, CurrentSession>,
 ) -> Result<Vec<ArtifactReport>, String> {
     let signed_in = require_session(&session)?;
-    let record = tasks::load(&app_data_dir(&app)?, &run_id)?;
+    let record = tasks::load(&app_data_dir(&app)?, &run_id, None)?;
     if !may_read(&signed_in, &record.user_id) {
         return Err("That task was run by somebody else.".to_string());
     }
@@ -1558,7 +1595,7 @@ pub async fn agent_reveal_artifact(
     session: State<'_, CurrentSession>,
 ) -> Result<(), String> {
     let signed_in = require_session(&session)?;
-    let record = tasks::load(&app_data_dir(&app)?, &run_id)?;
+    let record = tasks::load(&app_data_dir(&app)?, &run_id, None)?;
     if !may_read(&signed_in, &record.user_id) {
         return Err("That task was run by somebody else.".to_string());
     }
@@ -1599,7 +1636,7 @@ pub async fn artifact_preview(
     session: State<'_, CurrentSession>,
 ) -> Result<crate::commands::artifact_preview::ArtifactPreview, String> {
     let signed_in = require_session(&session)?;
-    let record = tasks::load(&app_data_dir(&app)?, &run_id)?;
+    let record = tasks::load(&app_data_dir(&app)?, &run_id, None)?;
     if !may_read(&signed_in, &record.user_id) {
         return Err("That task was run by somebody else.".to_string());
     }
@@ -1727,7 +1764,7 @@ pub async fn agent_resume_run(
 ) -> Result<crate::agent_runtime::resume::Attempt, String> {
     use crate::agent_runtime::events::Resumability;
 
-    let signed_in = require_session(&session)?;
+    let signed_in = require_permission(&session, Permission::UseModel)?;
 
     // Assessed and refused before anything else happens. A resumption that
     // records its own intent and then discovers it may not proceed has written a

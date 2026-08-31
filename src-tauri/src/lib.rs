@@ -660,6 +660,7 @@ pub fn run() {
             commands::conversations::agent_create_conversation,
             commands::conversations::agent_get_conversation,
             commands::conversations::agent_list_conversations,
+            commands::conversations::agent_delete_conversation,
             commands::conversations::agent_append_turn,
             commands::conversations::agent_update_streaming_content,
             commands::conversations::agent_complete_message,

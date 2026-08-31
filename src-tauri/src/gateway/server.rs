@@ -224,6 +224,13 @@ fn submit(
             // silently can break output they depend on.
             capability: None,
             origin: JobOrigin::Gateway { client: client.to_string() },
+            // TODO 6: gateway traffic currently does not
+            // carry a per-request user id (the gateway
+            // serves one logical user — the operator
+            // running the gateway). The registry integration
+            // is opt-in and kicks in when the agent runtime
+            // sets `context` to a `RequestContext`.
+            context: None,
         })
         .map_err(|e| {
             (

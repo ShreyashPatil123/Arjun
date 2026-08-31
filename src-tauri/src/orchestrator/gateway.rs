@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn an_unknown_tool_is_refused_and_the_real_ones_are_named() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new("delete_all_records", json!({})),
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_missing_argument_says_which_one() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict =
             ToolGateway::decide(&ToolCall::new("search_documents", json!({})), &context(&s, &roots));
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_wrongly_typed_argument_says_what_was_expected_and_what_arrived() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new("search_documents", json!({ "query": 42 })),
@@ -365,7 +365,7 @@ mod tests {
     /// An empty path resolves to the workspace root, which a write would clobber.
     #[test]
     fn an_empty_path_is_refused() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new("read_scoped_file", json!({ "path": "   " })),
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_read_inside_the_workspace_is_allowed() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new("read_scoped_file", json!({ "path": "C:/arjun/tasks/42/report.txt" })),
@@ -390,7 +390,7 @@ mod tests {
     /// The check that stops a model writing over the operating system.
     #[test]
     fn a_path_outside_the_workspace_is_refused() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         for hostile in [
             "C:/Windows/System32/drivers/etc/hosts",
@@ -409,7 +409,7 @@ mod tests {
     /// A sibling that merely shares a prefix is not inside the workspace.
     #[test]
     fn a_sibling_directory_with_a_shared_prefix_is_not_inside() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/4")];
         let verdict = ToolGateway::decide(
             &ToolCall::new("read_scoped_file", json!({ "path": "C:/arjun/tasks/42/secret.txt" })),
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_task_with_no_workspace_can_touch_no_files_at_all() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let verdict = ToolGateway::decide(
             &ToolCall::new("read_scoped_file", json!({ "path": "C:/anything.txt" })),
             &context(&s, &[]),
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn content_above_the_size_limit_is_refused_with_both_numbers() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let huge = "x".repeat(40 * 1024 * 1024);
         let verdict = ToolGateway::decide(
@@ -450,6 +450,9 @@ mod tests {
 
     #[test]
     fn a_user_without_the_permission_is_refused() {
+        // The legacy Auditor role grants nothing in the active product;
+        // pinned here so a regression that re-enables a legacy role is
+        // caught at the gateway level.
         let s = session(vec![Role::Auditor]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
@@ -464,7 +467,7 @@ mod tests {
     /// from a fully entitled user.
     #[test]
     fn nothing_runs_while_the_network_is_reachable() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let mut ctx = context(&s, &roots);
         ctx.confidential_work_permitted = false;
@@ -481,7 +484,7 @@ mod tests {
 
     #[test]
     fn a_write_waits_for_a_person() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new(
@@ -495,7 +498,7 @@ mod tests {
 
     #[test]
     fn an_approved_write_proceeds() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let mut ctx = context(&s, &roots);
         ctx.approval = ApprovalState::Granted;
@@ -513,7 +516,7 @@ mod tests {
     /// A prompt saying only "allow this?" trains people to say yes.
     #[test]
     fn the_approval_prompt_shows_the_target_and_the_consequence() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new(
@@ -531,7 +534,7 @@ mod tests {
 
     #[test]
     fn the_write_prompt_states_how_much_will_be_written() {
-        let s = session(vec![Role::User]);
+        let s = session(vec![Role::Employee]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new(
@@ -552,7 +555,7 @@ mod tests {
     /// would not have helped.
     #[test]
     fn the_most_fundamental_refusal_wins() {
-        let s = session(vec![Role::Auditor]);
+        let s = session(vec![Role::Administrator]);
         let roots = workspace();
         let verdict = ToolGateway::decide(
             &ToolCall::new("run_calculation", json!({})),

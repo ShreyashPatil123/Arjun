@@ -1071,6 +1071,20 @@ export const agentService = {
   },
 
   /**
+   * Delete a conversation by id. Idempotent: a delete of a missing
+   * id resolves to `false` rather than an error, so the UI can retry
+   * without surfacing a misleading "not found" toast.
+   *
+   * The on-disk JSON file is removed. The in-memory run→conversation
+   * index is rebuilt lazily on the next `appendTurn` for a run, so
+   * a deleted conversation has no lingering references on the
+   * back-end side.
+   */
+  deleteConversation(id: string): Promise<boolean> {
+    return getBackendService().invoke<boolean>('agent_delete_conversation', { id });
+  },
+
+  /**
    * Reserve the user message and the streaming assistant cell for a new
    * turn. The assistant cell is empty and `Streaming`; the front-end
    * accumulates tokens into it as `message_update` events arrive.

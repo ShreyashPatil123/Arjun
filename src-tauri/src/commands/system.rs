@@ -3,8 +3,11 @@
 use serde_json::json;
 use tauri::AppHandle;
 use tauri::Manager;
+use tauri::State;
 
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::core::app_state::{get_app_state, AppStateData};
+use crate::identity::Permission;
 use crate::system_analyzer::{get_system_analyzer_manager, HardwareProfile, SystemValidationResult};
 
 /// Returns basic application info
@@ -37,7 +40,15 @@ pub async fn log_activity(
     action: String,
     category: String,
     details: Option<String>,
+    session: State<'_, CurrentSession>,
 ) -> Result<(), String> {
+    // Require a session so an unauthenticated process cannot
+    // pollute the in-process log with arbitrary strings tagged
+    // "Activity". Permission gating is not required because
+    // log_activity is a no-op sink today, but the call has to
+    // be authenticated for it to mean anything in the audit
+    // record tomorrow.
+    let _session = require_session(&session)?;
     log::info!("Activity: {} [{}] - {:?}", action, category, details);
     Ok(())
 }
@@ -61,20 +72,32 @@ pub async fn analyze_system() -> Result<HardwareProfile, String> {
     .map_err(|e| format!("Task join error: {}", e))?
 }
 
-/// Applies a manual override to a hardware/software profile field
+/// Applies a manual override to a hardware/software profile field.
+///
+/// Administrator only — the hardware profile gates what ARJUN thinks
+/// it can run, and a forged override (e.g. claiming 24GB VRAM on a
+/// 6GB card) is a denial-of-service against the launcher. This is
+/// gated on `ModifyPolicy` so the change is traceable to one account.
 #[tauri::command]
 pub async fn override_hardware_value(
     field_path: String,
     value: serde_json::Value,
+    session: State<'_, CurrentSession>,
 ) -> Result<HardwareProfile, String> {
+    require_permission(&session, Permission::ModifyPolicy)?;
     get_system_analyzer_manager()
         .override_value(&field_path, value)
         .map_err(|e| e.to_string())
 }
 
-/// Reverts a hardware/software field override back to detected value
+/// Reverts a hardware/software field override back to detected value.
+/// Administrator only for the same reason as `override_hardware_value`.
 #[tauri::command]
-pub async fn revert_hardware_override(field_path: String) -> Result<HardwareProfile, String> {
+pub async fn revert_hardware_override(
+    field_path: String,
+    session: State<'_, CurrentSession>,
+) -> Result<HardwareProfile, String> {
+    require_permission(&session, Permission::ModifyPolicy)?;
     get_system_analyzer_manager()
         .revert_override(&field_path)
         .map_err(|e| e.to_string())

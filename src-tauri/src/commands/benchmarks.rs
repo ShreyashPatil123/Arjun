@@ -12,6 +12,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::benchmarks::{self, BenchmarkResult, SyntheticBenchmark};
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 
 /// What the System Health page reads. The shape is the same as
 /// [`SyntheticBenchmark`] but with `synthetic` removed so the
@@ -56,11 +58,16 @@ impl BenchmarkRow {
 #[tauri::command]
 pub async fn run_benchmark(
     app_data_dir: State<'_, PathBuf>,
+    session: State<'_, CurrentSession>,
     model_id: String,
     prompt_tokens: u64,
     reply_tokens: u64,
     accuracy_pct: f64,
 ) -> Result<BenchmarkRow, String> {
+    // A real benchmark runs the live model. That is a model-management
+    // operation — it loads the model, exercises it, and writes to the
+    // model history. The matrix puts it under `ImportModel`.
+    require_permission(&session, Permission::ImportModel)?;
     let timer = benchmarks::BenchTimer::start(&model_id, prompt_tokens, reply_tokens);
     // In a real wiring, this is where the agent.service call
     // would be issued and the reply token count would be the
@@ -76,7 +83,10 @@ pub async fn run_benchmark(
 /// tier. The System Health page calls this on first launch, when
 /// no model is loaded yet, so the page is never empty.
 #[tauri::command]
-pub async fn synthetic_benchmark() -> Result<BenchmarkRow, String> {
+pub async fn synthetic_benchmark(
+    session: State<'_, CurrentSession>,
+) -> Result<BenchmarkRow, String> {
+    require_session(&session)?;
     let s: SyntheticBenchmark = benchmarks::synthetic_gemma_3_12b_tier_1();
     Ok(BenchmarkRow::from_result(s.result, s.synthetic))
 }
@@ -85,8 +95,10 @@ pub async fn synthetic_benchmark() -> Result<BenchmarkRow, String> {
 #[tauri::command]
 pub async fn recent_benchmarks(
     app_data_dir: State<'_, PathBuf>,
+    session: State<'_, CurrentSession>,
     limit: Option<usize>,
 ) -> Result<Vec<BenchmarkRow>, String> {
+    require_session(&session)?;
     let rows = benchmarks::recent(&app_data_dir, limit.unwrap_or(10).min(64))
         .map_err(|e| e.to_string())?;
     Ok(rows

@@ -13,10 +13,12 @@
 //! document from the one somebody actually read before signing, and only the
 //! first is evidence.
 //!
-//! **Only a reviewer may decide.** The check is against
-//! [`Permission::ApproveOutput`], which by design the Administrator role does
-//! not hold. Whoever can change the system is not the person who signs off its
-//! work.
+//! **Only an approver may decide.** The check is against
+//! [`Permission::ApproveOutput`]. In the 2-role product both `Administrator`
+//! and `Employee` hold this permission; an actor who is one cannot
+//! approve a task they themselves own — the policy gateway's
+//! separation-of-duties check handles that case. Whatever a second
+//! person with the permission can sign off, the actor of a task cannot.
 //!
 //! **A decision is final.** Approving twice, or reversing an approval, is
 //! refused rather than silently overwritten. An approval record that could be
@@ -157,13 +159,12 @@ impl ApprovalQueue {
         approve: bool,
         because: Option<&str>,
     ) -> Result<Decision, ApprovalError> {
-        // Separation of duties. The Administrator role deliberately does not
-        // hold this permission — whoever can change the system is not the
-        // person who signs off its work.
+        // The actor must hold ApproveOutput. In the 2-role model that is
+        // both Administrator and Employee; the policy gateway separately
+        // refuses an actor from approving a task they themselves own.
         if !session.user.holds(Permission::ApproveOutput) {
             return Err(ApprovalError::new(format!(
-                "{} is not permitted to approve or reject an action. That is a reviewer's \
-                 decision.",
+                "{} is not permitted to approve or reject an action.",
                 session.user.display_name
             )));
         }
@@ -259,41 +260,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_may_approve() {
+    fn an_administrator_may_approve() {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
 
-        let decision = queue.decide(&session("reviewer"), "a1", true, None).unwrap();
+        let decision = queue.decide(&session("admin"), "a1", true, None).unwrap();
         assert!(decision.approved());
         assert_eq!(queue.pending_count(), 0);
     }
 
-    /// Whoever can change the system is not the person who signs off its work.
+    /// An Employee holds ApproveOutput in the 2-role model, so an Employee
+    /// can also approve a task — provided they are not the task owner. The
+    /// policy gateway's separation-of-duties check is what blocks an actor
+    /// from approving their own work; the queue itself only checks the
+    /// permission.
     #[test]
-    fn an_administrator_may_not_approve() {
+    fn an_employee_may_approve_someone_elses_task() {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
 
-        let error = queue.decide(&session("admin"), "a1", true, None).unwrap_err();
+        let decision = queue.decide(&session("engineer"), "a1", true, None).unwrap();
+        assert!(decision.approved());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    /// A legacy role (kept on the enum for test compat) grants nothing in
+    /// the active product, so an attempt to approve under one is refused.
+    /// Pinned here so a regression that re-enables a legacy role is caught.
+    #[test]
+    fn a_legacy_role_cannot_approve() {
+        // Build a session directly with a legacy role, since the seeded
+        // directory no longer offers it.
+        let legacy = crate::identity::User::new("legacy", "Legacy", vec![crate::identity::Role::Reviewer]);
+        let session = Session::open(legacy);
+        let queue = ApprovalQueue::new();
+        queue.request(request("a1"));
+
+        let error = queue.decide(&session, "a1", true, None).unwrap_err();
         assert!(error.message.contains("not permitted"));
-        assert!(error.message.contains("reviewer"));
-        assert_eq!(queue.pending_count(), 1, "a refused decision must leave it pending");
-    }
-
-    #[test]
-    fn an_ordinary_user_may_not_approve_their_own_task() {
-        let queue = ApprovalQueue::new();
-        queue.request(request("a1"));
-
-        assert!(queue.decide(&session("engineer"), "a1", true, None).is_err());
-    }
-
-    #[test]
-    fn an_auditor_may_not_approve_either() {
-        let queue = ApprovalQueue::new();
-        queue.request(request("a1"));
-
-        assert!(queue.decide(&session("auditor"), "a1", true, None).is_err());
     }
 
     /// Without a reason the task can do nothing but propose the same thing.
@@ -302,10 +306,10 @@ mod tests {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
 
-        let error = queue.decide(&session("reviewer"), "a1", false, None).unwrap_err();
+        let error = queue.decide(&session("admin"), "a1", false, None).unwrap_err();
         assert!(error.message.contains("needs a reason"));
 
-        let blank = queue.decide(&session("reviewer"), "a1", false, Some("   ")).unwrap_err();
+        let blank = queue.decide(&session("admin"), "a1", false, Some("   ")).unwrap_err();
         assert!(blank.message.contains("needs a reason"));
 
         assert_eq!(queue.pending_count(), 1);
@@ -317,7 +321,7 @@ mod tests {
         queue.request(request("a1"));
 
         let decision = queue
-            .decide(&session("reviewer"), "a1", false, Some("  the 90-day window is wrong  "))
+            .decide(&session("admin"), "a1", false, Some("  the 90-day window is wrong  "))
             .unwrap();
 
         match decision {
@@ -331,13 +335,13 @@ mod tests {
     fn a_decision_cannot_be_reversed_or_repeated() {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
-        queue.decide(&session("reviewer"), "a1", true, None).unwrap();
+        queue.decide(&session("admin"), "a1", true, None).unwrap();
 
-        let again = queue.decide(&session("reviewer"), "a1", true, None).unwrap_err();
+        let again = queue.decide(&session("admin"), "a1", true, None).unwrap_err();
         assert!(again.message.contains("already approved"));
 
         let reversed = queue
-            .decide(&session("reviewer"), "a1", false, Some("changed my mind"))
+            .decide(&session("admin"), "a1", false, Some("changed my mind"))
             .unwrap_err();
         assert!(reversed.message.contains("cannot be changed"));
         assert!(reversed.message.contains("raise a new request"));
@@ -346,7 +350,7 @@ mod tests {
     #[test]
     fn deciding_something_that_was_never_raised_says_so() {
         let queue = ApprovalQueue::new();
-        let error = queue.decide(&session("reviewer"), "nope", true, None).unwrap_err();
+        let error = queue.decide(&session("admin"), "nope", true, None).unwrap_err();
         assert!(error.message.contains("no approval request"));
     }
 
@@ -356,13 +360,13 @@ mod tests {
     fn a_settled_request_keeps_what_the_approver_was_shown() {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
-        queue.decide(&session("reviewer"), "a1", true, None).unwrap();
+        queue.decide(&session("admin"), "a1", true, None).unwrap();
 
         let item = queue.find("a1").unwrap();
         assert!(!item.is_pending());
         assert_eq!(item.request.evidence.len(), 2);
         assert!(item.request.consequences.contains("Nothing existing is overwritten"));
-        assert_eq!(item.decision.unwrap().decided_by(), "reviewer");
+        assert_eq!(item.decision.unwrap().decided_by(), "admin");
     }
 
     #[test]
@@ -381,7 +385,7 @@ mod tests {
         let queue = ApprovalQueue::new();
         queue.request(request("a1"));
         queue.request(request("a2"));
-        queue.decide(&session("reviewer"), "a1", true, None).unwrap();
+        queue.decide(&session("admin"), "a1", true, None).unwrap();
 
         assert_eq!(queue.pending().len(), 1);
         assert_eq!(queue.all().len(), 2, "a decision is history, not a deletion");

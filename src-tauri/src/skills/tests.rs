@@ -80,10 +80,13 @@ impl Fixture {
 }
 
 fn user() -> Session {
-    Session::open(User::new("priya", "Priya Sharma", vec![Role::User]))
+    Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]))
 }
 
 fn auditor() -> Session {
+    // The legacy `Auditor` role is kept on the enum for compatibility; it
+    // grants nothing in the active product. Tests use it to assert the
+    // "no clearance" property.
     Session::open(User::new("asha", "Asha Rao", vec![Role::Auditor]))
 }
 
@@ -772,9 +775,14 @@ fn every_shipped_skill_validates_and_is_trusted() {
     let expected = [
         "artifact-verification",
         "engineering-calculation",
+        "equipment-lookup",
+        "hazop-analyzer",
         "inspection-approval-note",
         "multimodal-inspection",
+        "pid-reader",
+        "safety-compliance",
         "sandbox-code-task",
+        "vendor-evaluator",
     ];
     assert_eq!(snapshot.count(), expected.len(), "unexpected skill count");
 

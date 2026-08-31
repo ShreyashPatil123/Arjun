@@ -32,6 +32,7 @@
 //! gets the default for its runtime.
 
 pub mod probe;
+pub mod transport;
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -45,8 +46,6 @@ use std::os::windows::process::CommandExt;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -267,13 +266,47 @@ impl ModelServers {
         // processes, and orphan the first one when the second insert
         // overwrites it. The lock is released before `wait_until_ready` so a
         // slow server load does not stall `stop()` / `stop_all()`.
+        //
+        // The critical section is split out into a sync helper so the lock
+        // guard never has to cross an `.await` — the future returned by this
+        // async function must be `Send` (Tauri's command runtime requires
+        // it), and a `std::sync::MutexGuard` is not `Send`.
+        let (endpoint, base_url) = self.spawn_managed(entry, models_dir, gpu)?;
+
+        match wait_until_ready(&base_url).await {
+            Ok(()) => Ok(endpoint),
+            Err(detail) => {
+                // Stopped rather than left running. A server that never became
+                // ready is holding VRAM for nothing, and the next attempt would
+                // find it in the table and hand back an endpoint that does not
+                // answer.
+                self.stop(&entry.id).await;
+                Err(ServingError::NeverReady {
+                    model: entry.name.clone(),
+                    base_url,
+                    detail,
+                })
+            }
+        }
+    }
+
+    /// Synchronous critical section: check-and-insert under the table lock.
+    /// Split out from `managed_endpoint` so the lock guard never has to cross
+    /// an `.await` — the calling async function needs a `Send` future, and
+    /// `std::sync::MutexGuard` is not `Send`.
+    fn spawn_managed(
+        &self,
+        entry: &ModelEntry,
+        models_dir: &Path,
+        gpu: &GpuOffloadPlan,
+    ) -> Result<(Endpoint, String), ServingError> {
         let mut table = self
             .managed
             .lock()
             .map_err(|_| ServingError::LaunchFailed("the server table is poisoned".into()))?;
 
         if let Some(existing) = table.get(&entry.id) {
-            return Ok(existing.endpoint.clone());
+            return Ok((existing.endpoint.clone(), existing.endpoint.base_url.clone()));
         }
 
         let weights = models_dir.join(&entry.path);
@@ -343,27 +376,9 @@ impl ModelServers {
             },
         );
 
-        // Drop the lock before the unbounded async health-check. Holding it
-        // across `.await` would block `stop()` from reclaiming the server if
-        // it never becomes ready, and block any other caller from observing
-        // the entry we just inserted.
-        drop(table);
-
-        match wait_until_ready(&plan.base_url).await {
-            Ok(()) => Ok(endpoint),
-            Err(detail) => {
-                // Stopped rather than left running. A server that never became
-                // ready is holding VRAM for nothing, and the next attempt would
-                // find it in the table and hand back an endpoint that does not
-                // answer.
-                self.stop(&entry.id).await;
-                Err(ServingError::NeverReady {
-                    model: entry.name.clone(),
-                    base_url: plan.base_url,
-                    detail,
-                })
-            }
-        }
+        // Lock guard goes out of scope at the end of this sync function —
+        // there is no `.await` to hold it across.
+        Ok((endpoint, plan.base_url))
     }
 
     /// Stops one server. Idempotent.

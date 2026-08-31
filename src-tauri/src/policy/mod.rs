@@ -107,24 +107,27 @@ impl Classification {
 
     /// Roles cleared to handle material of this kind.
     ///
-    /// The auditor is absent from every one of these on purpose: an auditor
-    /// reads the *record* of what happened, which is not the same as reading the
-    /// documents themselves, and conflating the two would quietly turn the
-    /// oversight role into the broadest read access in the building.
+    /// With the two-role product, classification access collapses to a binary:
+    /// Administrators are always cleared (they have to be able to triage the
+    /// system), Employees are cleared according to the sensitivity tier.
+    /// Everyday material is freely readable; commercially sensitive and
+    /// unreleased material is restricted to the work tier the Employee role
+    /// already implies.
     pub fn cleared_roles(self) -> &'static [Role] {
         match self {
-            // Everyday material: anyone doing the work, and whoever curates it.
+            // Everyday material: anyone doing the work.
             Classification::Internal | Classification::ProcessDiagram => {
-                &[Role::User, Role::KnowledgeAdministrator, Role::Reviewer]
+                &[Role::Administrator, Role::Employee]
             }
-            // Commercially sensitive: not the knowledge administrator, whose job
-            // is curating manuals and SOPs rather than reading deal terms.
+            // Commercially sensitive: Employees handling the work, Administrators.
             Classification::Financial
             | Classification::VendorNegotiation
-            | Classification::BusinessStrategy => &[Role::User, Role::Reviewer],
-            // Unreleased designs and internal correspondence: the narrowest set.
+            | Classification::BusinessStrategy => {
+                &[Role::Administrator, Role::Employee]
+            }
+            // Unreleased designs and internal correspondence: same set.
             Classification::UnreleasedDesign | Classification::InternalCorrespondence => {
-                &[Role::User, Role::Reviewer]
+                &[Role::Administrator, Role::Employee]
             }
         }
     }
@@ -372,7 +375,7 @@ mod tests {
 
     #[test]
     fn an_entitled_user_is_allowed() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let request = Request::new(Permission::UseModel);
         assert!(PolicyGateway::decide(&session, &request, true).is_allowed());
     }
@@ -381,7 +384,7 @@ mod tests {
     /// while the network is reachable.
     #[test]
     fn provisioning_mode_refuses_even_an_entitled_user() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let request = Request::new(Permission::UseModel);
         let decision = PolicyGateway::decide(&session, &request, false);
         assert!(decision.describe().contains("Provisioning mode"), "{decision:?}");
@@ -389,6 +392,8 @@ mod tests {
 
     #[test]
     fn a_user_without_the_permission_is_refused() {
+        // A legacy role grants nothing in the active product, so any active
+        // permission is refused for it.
         let session = session_with(vec![Role::Auditor]);
         let request = Request::new(Permission::UseModel);
         let decision = PolicyGateway::decide(&session, &request, true);
@@ -396,38 +401,45 @@ mod tests {
         assert!(decision.describe().contains("not permitted"), "{decision:?}");
     }
 
+    /// The classification clearance set is exactly the two active roles. The
+    /// legacy role variants — `ModelAdministrator`, `KnowledgeAdministrator`,
+    /// `User`, `Reviewer`, `Auditor` — grant nothing in the active product
+    /// and are absent from every classification's clearance list.
     #[test]
-    fn clearance_is_checked_against_the_classification() {
-        let kb = session_with(vec![Role::KnowledgeAdministrator]);
-
-        // Cleared for ordinary manuals and SOPs...
-        let sop = Request::new(Permission::SearchKnowledge)
-            .classified(Classification::ProcessDiagram);
-        assert!(PolicyGateway::decide(&kb, &sop, true).is_allowed());
-
-        // ...but not for vendor negotiations.
-        let deal = Request::new(Permission::SearchKnowledge)
-            .classified(Classification::VendorNegotiation);
-        let decision = PolicyGateway::decide(&kb, &deal, true);
-        assert!(!decision.is_allowed());
-        assert!(decision.describe().contains("not cleared"), "{decision:?}");
-    }
-
-    /// An auditor reads the record, not the documents behind it.
-    #[test]
-    fn the_auditor_is_cleared_for_nothing() {
+    fn clearance_only_includes_active_roles() {
+        let legacy = [
+            Role::ModelAdministrator,
+            Role::KnowledgeAdministrator,
+            Role::User,
+            Role::Reviewer,
+            Role::Auditor,
+        ];
         for classification in Classification::ALL {
+            let cleared = classification.cleared_roles();
             assert!(
-                !classification.cleared_roles().contains(&Role::Auditor),
-                "auditor should not be cleared for {}",
+                cleared.contains(&Role::Administrator),
+                "Administrator should be cleared for {}",
                 classification.label()
             );
+            assert!(
+                cleared.contains(&Role::Employee),
+                "Employee should be cleared for {}",
+                classification.label()
+            );
+            for role in &legacy {
+                assert!(
+                    !cleared.contains(role),
+                    "legacy role {:?} should not be cleared for {}",
+                    role,
+                    classification.label()
+                );
+            }
         }
     }
 
     #[test]
     fn a_write_inside_the_task_workspace_is_allowed() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/42")];
         let request = Request::new(Permission::GenerateArtifact)
             .writing_to("C:/arjun/tasks/42/approval-note.docx", &roots);
@@ -436,7 +448,7 @@ mod tests {
 
     #[test]
     fn a_write_outside_the_task_workspace_is_refused() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/42")];
         let request = Request::new(Permission::GenerateArtifact)
             .writing_to("C:/Windows/System32/drivers/etc/hosts", &roots);
@@ -446,7 +458,7 @@ mod tests {
     /// The traversal that a naive prefix check waves straight through.
     #[test]
     fn dot_dot_cannot_climb_out_of_the_workspace() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/42")];
         for escape in [
             "C:/arjun/tasks/42/../../../Windows/System32/config",
@@ -464,7 +476,7 @@ mod tests {
     /// inside the workspace — the classic prefix-matching bug.
     #[test]
     fn a_sibling_with_a_shared_prefix_is_not_inside_the_workspace() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let roots = vec![PathBuf::from("C:/arjun/tasks/4")];
         let request = Request::new(Permission::GenerateArtifact)
             .writing_to("C:/arjun/tasks/42/secret.docx", &roots);
@@ -473,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_write_with_no_permitted_roots_is_refused() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let request = Request::new(Permission::GenerateArtifact)
             .writing_to("C:/anywhere/at/all.docx", &[]);
         assert!(!PolicyGateway::decide(&session, &request, true).is_allowed());
@@ -481,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_risky_action_waits_for_a_human() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
         let request =
             Request::new(Permission::ExecuteCode).requiring_approval(ApprovalState::NotRequested);
         assert!(matches!(
@@ -492,7 +504,7 @@ mod tests {
 
     #[test]
     fn an_approved_action_proceeds_and_a_rejected_one_does_not() {
-        let session = session_with(vec![Role::User]);
+        let session = session_with(vec![Role::Employee]);
 
         let granted =
             Request::new(Permission::ExecuteCode).requiring_approval(ApprovalState::Granted);
@@ -503,10 +515,13 @@ mod tests {
         assert!(!PolicyGateway::decide(&session, &rejected, true).is_allowed());
     }
 
-    /// Holding the reviewer role is not enough to sign off your own work.
+    /// The "cannot approve your own work" rule is a property of the actor,
+    /// not of the role: an Employee (or Administrator) approving a task they
+    /// themselves own is refused. Tested with the Employee role because
+    /// Employee holds `ApproveOutput` in the new 2-role matrix.
     #[test]
-    fn a_reviewer_cannot_approve_their_own_task() {
-        let session = Session::open(User::new("kiran", "Kiran", vec![Role::Reviewer]));
+    fn an_employee_cannot_approve_their_own_task() {
+        let session = Session::open(User::new("kiran", "Kiran", vec![Role::Employee]));
         let request = Request::new(Permission::ApproveOutput).approving_task_owned_by("kiran");
         let decision = PolicyGateway::decide(&session, &request, true);
         assert!(!decision.is_allowed());
@@ -514,8 +529,8 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_can_approve_someone_elses_task() {
-        let session = Session::open(User::new("kiran", "Kiran", vec![Role::Reviewer]));
+    fn an_employee_can_approve_someone_elses_task() {
+        let session = Session::open(User::new("kiran", "Kiran", vec![Role::Employee]));
         let request = Request::new(Permission::ApproveOutput).approving_task_owned_by("anil");
         assert!(PolicyGateway::decide(&session, &request, true).is_allowed());
     }
@@ -525,7 +540,9 @@ mod tests {
     /// mode, because fixing their roles would not have helped.
     #[test]
     fn the_most_fundamental_refusal_wins() {
-        let session = session_with(vec![Role::Auditor]);
+        // A legacy role is unentitled, so the test exercises "no role grants
+        // this, and the machine is in a mode that compounds the refusal".
+        let session = session_with(vec![Role::Administrator]);
         let request = Request::new(Permission::UseModel);
         let decision = PolicyGateway::decide(&session, &request, false);
         assert!(decision.describe().contains("Provisioning mode"), "{decision:?}");

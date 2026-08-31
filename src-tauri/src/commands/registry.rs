@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use crate::commands::governance::{require_session, CurrentSession};
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 use crate::policy::Classification;
 use crate::ai_engine::activation::{ActivationOutcome, InferenceLoader, ModelActivator};
 use crate::audit::{AuditKind, AuditService};
@@ -27,7 +28,11 @@ pub struct PreparedModel {
 #[tauri::command]
 pub async fn list_registered_models(
     registry: State<'_, Arc<ModelRegistry>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Vec<ModelEntry>, String> {
+    // Read-only inspection. Any signed-in user may see the registry; the
+    // matrix does not gate read paths for the model list itself.
+    require_session(&session)?;
     Ok(registry.all().to_vec())
 }
 
@@ -39,7 +44,9 @@ pub async fn list_registered_models(
 #[tauri::command]
 pub async fn model_manifest_path(
     registry: State<'_, Arc<ModelRegistry>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<String, String> {
+    require_session(&session)?;
     Ok(registry.manifest_path().display().to_string())
 }
 
@@ -103,7 +110,7 @@ pub async fn prepare_model_for(
     prompt: String,
     classification: Option<Classification>,
 ) -> Result<PreparedModel, String> {
-    let signed_in = require_session(&session)?;
+    let signed_in = require_permission(&session, Permission::ImportModel)?;
 
     let vram = gpu_collector::detect_gpus()
         .iter()

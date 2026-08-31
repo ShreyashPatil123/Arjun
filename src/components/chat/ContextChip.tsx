@@ -1,36 +1,40 @@
-import React, { useState } from 'react';
-import { Database, X } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { ChevronDown, ChevronUp, Database, X } from 'lucide-react';
+import { useContextLedger } from '../run/runAdopt';
+import { useConversation } from '../run/useConversation';
 import {
   explainLedger,
   fitted,
   ledgerRows,
-  type LedgerSection,
 } from '../run/context-ledger';
-import type { CompactionRecord, ContextLedgerRecord } from '../../services/agent.service';
+import type { CompactionRecord } from '../../services/agent.service';
 import styles from './ChatSurface.module.css';
 
 /**
- * A compact summary of how full the model's context window is, and
- * which section is taking the most room. Clicking the chip expands a
- * card with the full breakdown.
+ * The compact context meter that lives in the right side of the
+ * composer.
  *
- * The narrative is the same one the existing `Tasks` page already
- * uses — `explainLedger()` returns a one-sentence diagnosis that names
- * the largest section and its share, which is the only number a person
- * reading the trace can act on. A full table is one click away.
+ * Re-uses the same shape as the legacy `ContextPanel` (a chip +
+ * popover with a per-section breakdown) so a person switching between
+ * workbench and chat sees the same numbers. Three states, distinguished
+ * by luminance rather than colour:
+ *  - **ok** (< 70% of window) — quiet grey
+ *  - **tight** (70-90%) — amber
+ *  - **critical** (≥ 90%) — red
  */
+export function ContextChip() {
+  const { conversation, activeRunId } = useConversation();
+  const latestRunId = useMemo(() => {
+    if (activeRunId) return activeRunId;
+    if (!conversation || conversation.runs.length === 0) return null;
+    return conversation.runs[conversation.runs.length - 1].runId;
+  }, [activeRunId, conversation]);
 
-export interface ContextPanelProps {
-  /** The most recent ledger entry, if any. */
-  ledger?: ContextLedgerRecord | null;
-  /** Times the run's older history was replaced by a summary. */
-  compactions?: number;
-  /** Last compaction, used to surface the before/after tokens. */
-  lastCompaction?: CompactionRecord | null;
-}
-
-export function ContextPanel({ ledger, compactions, lastCompaction }: ContextPanelProps) {
+  const { ledger, compactions } = useContextLedger(latestRunId);
   const [open, setOpen] = useState(false);
+
+  const lastCompaction: CompactionRecord | null =
+    compactions.length > 0 ? compactions[compactions.length - 1] : null;
 
   if (!ledger || ledger.committed === 0) {
     return (
@@ -47,13 +51,15 @@ export function ContextPanel({ ledger, compactions, lastCompaction }: ContextPan
     );
   }
 
-  const pct = Math.min(100, Math.round((ledger.occupied / Math.max(1, ledger.window)) * 100));
+  const pct = Math.min(
+    100,
+    Math.round((ledger.occupied / Math.max(1, ledger.window)) * 100),
+  );
   const diagnosis = explainLedger(ledger) ?? 'Context is within budget.';
   const willFit = fitted(ledger);
-  const compact = compactions ?? 0;
 
   return (
-    <>
+    <div className={styles.contextChipWrap}>
       <button
         type="button"
         className={styles.contextChip}
@@ -69,7 +75,10 @@ export function ContextPanel({ ledger, compactions, lastCompaction }: ContextPan
             ? `${(ledger.window / 1000).toFixed(0)}K`
             : `${(ledger.committed / 1000).toFixed(0)}K`}
         </span>
-        {compact > 0 && <span className={styles.contextCompactCount}>×{compact}</span>}
+        {compactions.length > 0 && (
+          <span className={styles.contextCompactCount}>×{compactions.length}</span>
+        )}
+        {open ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
       </button>
       {open && (
         <div className={styles.contextCard} role="dialog" aria-label="Context breakdown">
@@ -90,9 +99,10 @@ export function ContextPanel({ ledger, compactions, lastCompaction }: ContextPan
               The next turn would not fit in this model&rsquo;s window.
             </p>
           )}
-          {compact > 0 && (
+          {compactions.length > 0 && (
             <p className={styles.contextCompactionLine}>
-              {compact} compaction{compact === 1 ? '' : 's'} so far
+              {compactions.length} compaction
+              {compactions.length === 1 ? '' : 's'} so far
               {lastCompaction && (
                 <>
                   {' '}
@@ -127,6 +137,6 @@ export function ContextPanel({ ledger, compactions, lastCompaction }: ContextPan
           </ul>
         </div>
       )}
-    </>
+    </div>
   );
 }

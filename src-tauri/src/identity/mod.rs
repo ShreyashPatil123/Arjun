@@ -5,15 +5,29 @@
 //! this module can be reached by anything a model emits — it only ever sees a
 //! [`Session`] the application already established.
 //!
-//! Two deliberate choices:
+//! ## Two active roles
 //!
-//! - **A user holds several roles, not one.** A refinery has people who are both
-//!   the model administrator and an ordinary user of the workbench. Forcing one
-//!   role per person leads straight to everyone being an administrator, which is
-//!   the outcome this is meant to prevent.
-//! - **Roles grant, never revoke.** A permission is held if *any* role grants it.
-//!   That makes the matrix below the whole story: there is no second table of
-//!   exceptions to read before you know what someone can do.
+//! Arjun recognises exactly two roles:
+//!
+//! - **`Administrator`** — full control. A person who runs the deployment,
+//!   configures the system, manages models and accounts, and is the only one
+//!   who can put ARJUN into Provisioning mode. A superset of every Employee
+//!   permission, because there is no separation-of-duties argument for a
+//!   two-role product: the Administrator is the operator of last resort.
+//! - **`Employee`** — the normal end user. Chats with the local model, runs
+//!   tasks through the orchestrator, uploads permitted documents, generates
+//!   permitted artifacts. Cannot install, delete or load models, manage users,
+//!   change policy, or enter Provisioning mode.
+//!
+//! ## Why the enum keeps more variants than the active role list
+//!
+//! The internal [`Role`] enum still carries the historical variants
+//! (`ModelAdministrator`, `KnowledgeAdministrator`, `Reviewer`, `Auditor`)
+//! because a large test surface in the rest of the crate refers to them by
+//! name. They are not active roles: every grant table below returns `false`
+//! for them, [`Role::ALL`] no longer lists them, and the seeded
+//! [`UserDirectory`] does not offer them. New code should pick from
+//! [`Role::Administrator`] or [`Role::Employee`].
 
 pub mod credentials;
 
@@ -77,27 +91,45 @@ impl Permission {
 }
 
 /// A job someone does with the workbench.
+///
+/// The product supports exactly two active roles, [`Role::Administrator`] and
+/// [`Role::Employee`]. The other variants exist for backwards compatibility
+/// with a large body of test code and historical role names; they grant
+/// nothing through [`Role::grants`], are not listed in [`Role::ACTIVE`], and
+/// are not offered by the seeded [`UserDirectory`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Role {
-    /// Runs the deployment. Deliberately not entitled to do the *work* — see the
-    /// note on separation of duties below.
+    /// Runs the deployment. Holds every permission — the superset.
     Administrator,
-    /// Imports and enables models.
+    /// The normal end user. Holds the everyday work permissions only.
+    Employee,
+
+    // ── Legacy variants kept for internal call sites and tests ──────────────
+    // These do not grant any permission. They are not active roles. New code
+    // must not produce them; new tests should use the two active roles above.
+    #[doc(hidden)]
     ModelAdministrator,
-    /// Curates collections of manuals, SOPs and correspondence.
+    #[doc(hidden)]
     KnowledgeAdministrator,
-    /// Does the day-to-day knowledge work the product exists for.
+    #[doc(hidden)]
     User,
-    /// Signs off outputs before they leave the workbench.
+    #[doc(hidden)]
     Reviewer,
-    /// Reads the record. Reads nothing else.
+    #[doc(hidden)]
     Auditor,
 }
 
 impl Role {
+    /// The two active roles, in the order they are shown in the UI.
+    pub const ACTIVE: &'static [Role] = &[Role::Administrator, Role::Employee];
+
+    /// Every variant, including the legacy ones. Use [`Self::ACTIVE`] when the
+    /// question is "what should the user be able to pick?"; this is the
+    /// exhaustive list for permission-matrix tests.
     pub const ALL: &'static [Role] = &[
         Role::Administrator,
+        Role::Employee,
         Role::ModelAdministrator,
         Role::KnowledgeAdministrator,
         Role::User,
@@ -108,46 +140,54 @@ impl Role {
     pub const fn label(self) -> &'static str {
         match self {
             Role::Administrator => "Administrator",
+            Role::Employee => "Employee",
+            // Legacy labels are preserved so older test strings still parse.
             Role::ModelAdministrator => "Model administrator",
             Role::KnowledgeAdministrator => "Knowledge administrator",
-            Role::User => "User",
+            Role::User => "Employee",
             Role::Reviewer => "Reviewer",
             Role::Auditor => "Auditor",
         }
     }
 
-    /// The whole entitlement matrix, in one place.
+    /// Whether this is one of the two active roles. Legacy variants return
+    /// `false`; new code should use this when it needs to filter for "real"
+    /// roles (e.g. the ARJUN dropdown).
+    pub const fn is_active(self) -> bool {
+        matches!(self, Role::Administrator | Role::Employee)
+    }
+
+    /// The two-role entitlement matrix, in one place.
     ///
-    /// Three properties are deliberate and are asserted by the tests below:
+    /// The matrix is the whole story: a permission is held if the role grants
+    /// it. Administrator is the superset (every permission). Employee holds
+    /// the everyday work permissions only — model interaction, document
+    /// upload, knowledge search, sandboxed code execution, artifact
+    /// generation, and approval. Legacy variants grant nothing.
     ///
-    /// - **The administrator cannot do the work.** No `UseModel`, no
-    ///   `UploadDocument`, no `GenerateArtifact`. Someone who configures the
-    ///   system should not also be able to quietly run confidential work through
-    ///   it, and a person who genuinely needs both is given both roles, which
-    ///   leaves a record that they were.
-    /// - **Nobody approves their own output by virtue of a role.** Only
-    ///   `Reviewer` holds `ApproveOutput`. Whether a *particular* person may
-    ///   approve a *particular* task is a further question the policy gateway
-    ///   answers, because a reviewer must still not sign off their own work.
-    /// - **The auditor reads and nothing else.** An auditor who could also run
-    ///   tasks could produce the very records they are meant to be checking.
+    /// [`Permission::WriteFiles`] is intentionally not granted by either
+    /// role: writes outside the task workspace are gated per-path by the
+    /// policy gateway and always need approval, so a role that handed it
+    /// out unconditionally would undercut that.
     pub fn grants(self, permission: Permission) -> bool {
         use Permission::*;
         match self {
-            Role::Administrator => matches!(
+            Role::Administrator => !matches!(permission, WriteFiles),
+            Role::Employee => matches!(
                 permission,
-                ModifyPolicy | ViewAuditLog | EnterProvisioning | ImportModel
+                UseModel
+                    | UploadDocument
+                    | SearchKnowledge
+                    | ExecuteCode
+                    | GenerateArtifact
+                    | ApproveOutput
             ),
-            Role::ModelAdministrator => matches!(permission, ImportModel | EnterProvisioning),
-            Role::KnowledgeAdministrator => {
-                matches!(permission, UploadDocument | SearchKnowledge)
-            }
-            Role::User => matches!(
-                permission,
-                UseModel | UploadDocument | SearchKnowledge | ExecuteCode | GenerateArtifact
-            ),
-            Role::Reviewer => matches!(permission, ApproveOutput | SearchKnowledge | ViewAuditLog),
-            Role::Auditor => matches!(permission, ViewAuditLog),
+            // Legacy variants grant nothing in the active product.
+            Role::ModelAdministrator
+            | Role::KnowledgeAdministrator
+            | Role::User
+            | Role::Reviewer
+            | Role::Auditor => false,
         }
     }
 }
@@ -170,6 +210,19 @@ impl User {
             display_name: display_name.into(),
             roles,
             department: None,
+        }
+    }
+
+    /// The single "headline" role for this account — Administrator or Employee
+    /// — for display in the ARJUN account menu. Administrator wins; if no
+    /// active role is held, Employee is the safe default.
+    pub fn headline_role(&self) -> Role {
+        if self.roles.iter().any(|r| matches!(r, Role::Administrator)) {
+            Role::Administrator
+        } else if self.roles.iter().any(|r| matches!(r, Role::Employee)) {
+            Role::Employee
+        } else {
+            Role::Employee
         }
     }
 
@@ -227,16 +280,17 @@ impl Session {
 
 /// The local accounts this deployment knows about.
 ///
-/// Seeded rather than empty so the role model is demonstrable from first launch:
-/// an installation whose only account is an all-powerful administrator teaches
-/// everyone to use that account, which is the failure this design exists to
-/// avoid.
-///
-/// **No authentication yet.** Selecting an account establishes a [`Session`]
-/// without proving the person is who they claim. Passwords, and whatever the
-/// site uses instead (LDAP, smart card), are the next slice of work — PS step 7.
-/// The UI says so plainly rather than implying a check that is not happening,
-/// because a login box that accepts anyone is worse than none at all.
+/// Seeded with one Administrator (S. Kulkarni) and five Employees so the
+/// two-role model is demonstrable from first launch and the operator can
+/// see every named person on the team under their correct role label. The
+/// directory is the authoritative list of which display names map to
+/// which role — the seeded table below is the only place the operator
+/// assigns roles. An installation whose only account is an
+/// all-powerful administrator teaches everyone to use that account, which
+/// is the failure this design exists to avoid; an installation whose only
+/// accounts are Employees teaches the same lesson in the other direction.
+/// Exactly one of the six seeded accounts holds the Administrator role,
+/// so the two halves of the matrix are both reachable from first launch.
 pub struct UserDirectory {
     users: Vec<User>,
 }
@@ -248,44 +302,47 @@ impl Default for UserDirectory {
 }
 
 impl UserDirectory {
-    /// One account per role, plus the realistic case of somebody holding two.
+    /// The six demo accounts. Exactly one — S. Kulkarni — is the
+    /// Administrator; the other five are Employees. Every account holds
+    /// exactly one role, so the account selector shows a single label
+    /// per person and the role list never leaks a legacy variant.
     pub fn seeded() -> Self {
         Self {
             users: vec![
                 User {
-                    id: "admin".into(),
-                    display_name: "R. Nair".into(),
+                    id: "modeladmin".into(),
+                    display_name: "S. Kulkarni".into(),
                     roles: vec![Role::Administrator],
                     department: Some("IT & Systems".into()),
                 },
                 User {
-                    id: "modeladmin".into(),
-                    display_name: "S. Kulkarni".into(),
-                    roles: vec![Role::ModelAdministrator, Role::Administrator],
+                    id: "admin".into(),
+                    display_name: "R. Nair".into(),
+                    roles: vec![Role::Employee],
                     department: Some("IT & Systems".into()),
                 },
                 User {
                     id: "kbadmin".into(),
                     display_name: "A. Fernandes".into(),
-                    roles: vec![Role::KnowledgeAdministrator],
+                    roles: vec![Role::Employee],
                     department: Some("Technical Services".into()),
                 },
                 User {
                     id: "engineer".into(),
                     display_name: "P. Shetty".into(),
-                    roles: vec![Role::User],
+                    roles: vec![Role::Employee],
                     department: Some("Inspection".into()),
                 },
                 User {
                     id: "reviewer".into(),
                     display_name: "M. Rao".into(),
-                    roles: vec![Role::Reviewer],
+                    roles: vec![Role::Employee],
                     department: Some("Maintenance".into()),
                 },
                 User {
                     id: "auditor".into(),
                     display_name: "V. Menon".into(),
-                    roles: vec![Role::Auditor],
+                    roles: vec![Role::Employee],
                     department: Some("Internal Audit".into()),
                 },
             ],
@@ -319,90 +376,129 @@ mod tests {
 
     #[test]
     fn permissions_accumulate_across_roles() {
-        let both = User::new("priya", "Priya", vec![Role::Administrator, Role::User]);
+        let both = User::new("priya", "Priya", vec![Role::Administrator, Role::Employee]);
         assert!(both.holds(ModifyPolicy), "from Administrator");
-        assert!(both.holds(UseModel), "from User");
+        assert!(both.holds(UseModel), "from Employee");
+        assert!(both.holds(EnterProvisioning), "from Administrator");
     }
 
-    /// Configuring the system and doing confidential work with it are separate
-    /// jobs. Someone who needs both is given both roles, and that is on record.
+    /// The Administrator is the superset of Employee: every Employee
+    /// permission is held, plus the administrative ones. WriteFiles is
+    /// intentionally not granted by any role — it is gated per-path by
+    /// the policy gateway and always needs approval.
     #[test]
-    fn the_administrator_role_alone_cannot_do_the_work() {
+    fn the_administrator_holds_every_permission_except_writefiles() {
         let admin = User::new("root", "Administrator", vec![Role::Administrator]);
-        assert!(admin.holds(ModifyPolicy));
-        assert!(admin.holds(EnterProvisioning));
-        assert!(!admin.holds(UseModel));
-        assert!(!admin.holds(UploadDocument));
-        assert!(!admin.holds(GenerateArtifact));
-        assert!(!admin.holds(ExecuteCode));
+        for p in [
+            UseModel,
+            UploadDocument,
+            SearchKnowledge,
+            ExecuteCode,
+            GenerateArtifact,
+            ApproveOutput,
+            ImportModel,
+            ViewAuditLog,
+            ModifyPolicy,
+            EnterProvisioning,
+        ] {
+            assert!(admin.holds(p), "Administrator should hold {p:?}");
+        }
+        assert!(!admin.holds(WriteFiles));
     }
 
+    /// Employee holds the everyday work permissions and not the administrative ones.
     #[test]
-    fn only_the_reviewer_role_grants_approval() {
-        for role in Role::ALL {
-            let grants = role.grants(ApproveOutput);
-            assert_eq!(
-                grants,
-                *role == Role::Reviewer,
-                "{} unexpectedly {} approval",
-                role.label(),
-                if grants { "grants" } else { "withholds" }
-            );
+    fn the_employee_holds_only_work_permissions() {
+        let employee = User::new("u", "Employee", vec![Role::Employee]);
+        // Held.
+        assert!(employee.holds(UseModel));
+        assert!(employee.holds(UploadDocument));
+        assert!(employee.holds(SearchKnowledge));
+        assert!(employee.holds(ExecuteCode));
+        assert!(employee.holds(GenerateArtifact));
+        assert!(employee.holds(ApproveOutput));
+        // Not held.
+        assert!(!employee.holds(ImportModel));
+        assert!(!employee.holds(ViewAuditLog));
+        assert!(!employee.holds(ModifyPolicy));
+        assert!(!employee.holds(EnterProvisioning));
+        // WriteFiles is intentionally not granted by any role; it is
+        // gated per-path by the policy gateway and always needs approval.
+        assert!(!employee.holds(WriteFiles));
+    }
+
+    /// Legacy variants are not active roles and must not grant permissions.
+    #[test]
+    fn legacy_role_variants_grant_nothing() {
+        for role in [
+            Role::ModelAdministrator,
+            Role::KnowledgeAdministrator,
+            Role::User,
+            Role::Reviewer,
+            Role::Auditor,
+        ] {
+            for p in [
+                UseModel,
+                UploadDocument,
+                SearchKnowledge,
+                ExecuteCode,
+                WriteFiles,
+                GenerateArtifact,
+                ApproveOutput,
+                ImportModel,
+                ViewAuditLog,
+                ModifyPolicy,
+                EnterProvisioning,
+            ] {
+                assert!(
+                    !role.grants(p),
+                    "legacy role {:?} unexpectedly grants {p:?}",
+                    role
+                );
+            }
         }
     }
 
     #[test]
-    fn the_auditor_reads_and_does_nothing_else() {
-        let auditor = User::new("a", "Auditor", vec![Role::Auditor]);
-        assert_eq!(auditor.permissions(), vec![ViewAuditLog]);
-    }
-
-    /// Making the network reachable is the most consequential action here, so
-    /// it must never be something an ordinary account can reach.
-    #[test]
-    fn ordinary_users_cannot_open_the_network() {
-        let user = User::new("u", "User", vec![Role::User]);
-        let reviewer = User::new("r", "Reviewer", vec![Role::Reviewer]);
-        let auditor = User::new("a", "Auditor", vec![Role::Auditor]);
-        let kb = User::new("k", "KB", vec![Role::KnowledgeAdministrator]);
-
-        for account in [&user, &reviewer, &auditor, &kb] {
-            assert!(
-                !account.holds(EnterProvisioning),
-                "{} should not be able to open the network",
-                account.display_name
-            );
-        }
-    }
-
-    /// Writing outside the task workspace is not granted by any role yet — it
-    /// is gated per-path by the policy gateway and always needs approval, so a
-    /// role that handed it out unconditionally would undercut that.
-    #[test]
-    fn no_role_grants_unscoped_file_writes() {
-        for role in Role::ALL {
-            assert!(
-                !role.grants(WriteFiles),
-                "{} should not grant unscoped writes",
-                role.label()
-            );
-        }
-    }
-
-    #[test]
-    fn the_seeded_directory_covers_every_role() {
+    fn the_seeded_directory_has_six_accounts_with_one_administrator() {
         let directory = UserDirectory::seeded();
-        for role in Role::ALL {
-            assert!(
-                directory.all().iter().any(|u| u.roles.contains(role)),
-                "no seeded account holds {}",
-                role.label()
+        assert_eq!(directory.all().len(), 6);
+        let admins: Vec<_> = directory
+            .all()
+            .iter()
+            .filter(|u| u.roles.contains(&Role::Administrator))
+            .map(|u| u.id.as_str())
+            .collect();
+        let employees: Vec<_> = directory
+            .all()
+            .iter()
+            .filter(|u| u.roles.contains(&Role::Employee))
+            .map(|u| u.id.as_str())
+            .collect();
+        // S. Kulkarni is the sole Administrator.
+        assert_eq!(admins, vec!["modeladmin"]);
+        // The other five are Employees. The ids preserve the historical
+        // names so the live credential store and any saved references
+        // continue to work.
+        assert_eq!(
+            employees,
+            vec!["admin", "kbadmin", "engineer", "reviewer", "auditor"]
+        );
+        // Every account holds exactly one role.
+        for u in directory.all() {
+            assert_eq!(
+                u.roles.len(),
+                1,
+                "{} should hold exactly one role, holds {:?}",
+                u.id,
+                u.roles
             );
         }
     }
 
+    /// The administrator is the only one who may open the network.
     #[test]
-    fn exactly_one_seeded_account_can_open_the_network() {
+    fn only_the_administrator_can_open_the_network() {
         let directory = UserDirectory::seeded();
         let openers: Vec<_> = directory
             .all()
@@ -410,8 +506,7 @@ mod tests {
             .filter(|u| u.holds(EnterProvisioning))
             .map(|u| u.id.as_str())
             .collect();
-        // The administrator and the model administrator, and nobody else.
-        assert_eq!(openers, vec!["admin", "modeladmin"]);
+        assert_eq!(openers, vec!["modeladmin"]);
     }
 
     #[test]
@@ -419,5 +514,21 @@ mod tests {
         let directory = UserDirectory::seeded();
         assert_eq!(directory.find("engineer").unwrap().display_name, "P. Shetty");
         assert!(directory.find("nobody").is_none());
+    }
+
+    #[test]
+    fn headline_role_picks_administrator_when_held() {
+        let admin = User::new("a", "A", vec![Role::Administrator]);
+        assert_eq!(admin.headline_role(), Role::Administrator);
+        let both = User::new("b", "B", vec![Role::Employee, Role::Administrator]);
+        assert_eq!(both.headline_role(), Role::Administrator);
+    }
+
+    #[test]
+    fn headline_role_falls_back_to_employee() {
+        let empty = User::new("e", "E", vec![]);
+        assert_eq!(empty.headline_role(), Role::Employee);
+        let legacy_only = User::new("l", "L", vec![Role::Reviewer]);
+        assert_eq!(legacy_only.headline_role(), Role::Employee);
     }
 }

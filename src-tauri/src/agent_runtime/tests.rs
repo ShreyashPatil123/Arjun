@@ -18,7 +18,7 @@ fn signed_in_user() -> Arc<std::sync::RwLock<Option<Session>>> {
     Arc::new(std::sync::RwLock::new(Some(Session::open(User::new(
         "priya",
         "Priya Sharma",
-        vec![Role::User],
+        vec![Role::Employee],
     )))))
 }
 
@@ -241,7 +241,7 @@ async fn a_write_inside_the_runs_own_directory_is_put_to_a_person() {
 #[tokio::test]
 async fn a_side_effecting_call_made_twice_is_performed_once() {
     let (deps, dir) = deps_with(signed_in_user());
-    let reviewer = Session::open(User::new("ravi", "Ravi Menon", vec![Role::Reviewer]));
+    let reviewer = Session::open(User::new("ravi", "Ravi Menon", vec![Role::Administrator]));
 
     let write = |tool_call_id: &str| {
         json!({

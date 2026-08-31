@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(outcome.documents_read, 1);
         assert!(outcome.chunks_indexed > 0);
 
-        let session = Session::open(User::new("p", "P", vec![Role::User]));
+        let session = Session::open(User::new("p", "P", vec![Role::Employee]));
         let hits = f.index.search(&session, "wall thickness", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].classification, Classification::ProcessDiagram);
@@ -516,7 +516,7 @@ mod tests {
             &f.store, &f.index, None, "kbadmin",
         );
 
-        let session = Session::open(User::new("p", "P", vec![Role::User]));
+        let session = Session::open(User::new("p", "P", vec![Role::Employee]));
         let hits = f.index.search(&session, "minimum", 10).unwrap();
         assert_eq!(hits.len(), 1, "the old passage should be gone");
         assert!(hits[0].text.contains("9.0 mm"));

@@ -25,7 +25,7 @@ use crate::policy::Classification;
 
 /// A signed-in person, with the department the project boundary is drawn on.
 fn signed_in(department: Option<&str>) -> Arc<std::sync::RwLock<Option<Session>>> {
-    let mut user = User::new("priya", "Priya Sharma", vec![Role::User]);
+    let mut user = User::new("priya", "Priya Sharma", vec![Role::Employee]);
     user.department = department.map(str::to_string);
     Arc::new(std::sync::RwLock::new(Some(Session::open(user))))
 }
@@ -98,7 +98,7 @@ fn decided(deps: &Arc<RuntimeDeps>, id: &str, task_id: &str, target: &str, yes: 
     // Decided by a reviewer, because `ApproveOutput` is a reviewer's permission
     // and the queue checks it. A test that approved as the requester would be
     // asserting against a separation of duties the product does not have.
-    let reviewer = Session::open(User::new("asha", "Asha", vec![Role::Reviewer]));
+    let reviewer = Session::open(User::new("asha", "Asha", vec![Role::Administrator]));
     deps.approvals
         .decide(
             &reviewer,
@@ -240,7 +240,7 @@ fn one_persons_preferences_are_not_returned_to_another() {
         })
         .expect("stored");
 
-    let someone_else = Session::open(User::new("ravi", "Ravi", vec![Role::User]));
+    let someone_else = Session::open(User::new("ravi", "Ravi", vec![Role::Employee]));
     assert!(store
         .recall(
             &MemoryScope::User {
@@ -407,7 +407,7 @@ fn a_promoted_fact_is_still_bound_after_a_restart() {
         project_id: "Technical Services".to_string(),
     };
     let session = Session::open({
-        let mut user = User::new("priya", "Priya Sharma", vec![Role::User]);
+        let mut user = User::new("priya", "Priya Sharma", vec![Role::Employee]);
         user.department = Some("Technical Services".to_string());
         user
     });

@@ -269,8 +269,8 @@ mod tests {
 
     #[test]
     fn the_same_person_and_material_hash_the_same_way_twice() {
-        let one = session_of("priya", vec![Role::User, Role::Reviewer]);
-        let two = session_of("priya", vec![Role::Reviewer, Role::User]);
+        let one = session_of("priya", vec![Role::Employee, Role::Administrator]);
+        let two = session_of("priya", vec![Role::Administrator, Role::Employee]);
 
         // Role order is an accident of how the directory was written. Two
         // identical people must not produce two different hashes, or every
@@ -283,18 +283,18 @@ mod tests {
 
     #[test]
     fn changing_any_part_of_the_policy_changes_the_hash() {
-        let base = session_of("priya", vec![Role::User]);
+        let base = session_of("priya", vec![Role::Employee]);
         let reference = policy_hash(&base, Some(Classification::Internal), "sovereign");
 
         // A role added.
-        let widened = session_of("priya", vec![Role::User, Role::Reviewer]);
+        let widened = session_of("priya", vec![Role::Employee, Role::Administrator]);
         assert_ne!(
             policy_hash(&widened, Some(Classification::Internal), "sovereign"),
             reference
         );
 
         // A different person entirely.
-        let other = session_of("ravi", vec![Role::User]);
+        let other = session_of("ravi", vec![Role::Employee]);
         assert_ne!(
             policy_hash(&other, Some(Classification::Internal), "sovereign"),
             reference
@@ -317,7 +317,7 @@ mod tests {
     fn an_unclassified_run_is_not_hashed_as_though_it_were_internal() {
         // Otherwise classifying a run after the fact would leave the hash
         // unchanged, and the resumption would not notice.
-        let session = session_of("priya", vec![Role::User]);
+        let session = session_of("priya", vec![Role::Employee]);
         assert_ne!(
             policy_hash(&session, None, "sovereign"),
             policy_hash(&session, Some(Classification::Internal), "sovereign"),

@@ -14,6 +14,7 @@ import {
   ArrowDownWideNarrow,
 } from 'lucide-react';
 import { Button, Spinner } from '../components/ui';
+import { Can } from '../components/auth/Can';
 import {
   browseModelCards,
   findModelAdapters,
@@ -742,16 +743,25 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                     <td className={styles.qFit}>{q.fits ? 'fits' : 'too large'}</td>
                     <td className={styles.qAction}>
                       {card.kind !== 'lora-adapter' && (
-                        <button
-                          className={styles.rowBtn}
-                          disabled={
-                            starting !== null || isDownloading(card.repoId, q.label)
+                        <Can
+                          permission="importModel"
+                          fallback={
+                            <span className={styles.muted} title="You do not have permission to install models.">
+                              —
+                            </span>
                           }
-                          onClick={() => void download(q)}
-                          aria-label={`Download ${card.name} ${q.label}`}
                         >
-                          {isDownloading(card.repoId, q.label) ? '…' : <Download size={12} />}
-                        </button>
+                          <button
+                            className={styles.rowBtn}
+                            disabled={
+                              starting !== null || isDownloading(card.repoId, q.label)
+                            }
+                            onClick={() => void download(q)}
+                            aria-label={`Download ${card.name} ${q.label}`}
+                          >
+                            {isDownloading(card.repoId, q.label) ? '…' : <Download size={12} />}
+                          </button>
+                        </Can>
                       )}
                     </td>
                   </tr>
@@ -877,24 +887,37 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
             * converted in one step; if the conversion cannot be done the whole
             * install is rolled back, so the button never leaves a file behind
             * that llama.cpp would refuse. */}
-          <button
-            className={styles.getBtn}
-            disabled={installing || installed}
-            onClick={onInstall}
-            title={
-              a.ggufReady
-                ? 'Download this adapter'
-                : 'Download and convert this adapter to GGUF'
+          <Can
+            permission="importModel"
+            fallback={
+              <button
+                className={styles.getBtn}
+                disabled
+                title="You do not have permission to install adapters."
+              >
+                unavailable
+              </button>
             }
           >
-            {installed
-              ? 'installed'
-              : installing
-                ? a.ggufReady
-                  ? 'getting…'
-                  : 'converting…'
-                : 'Get'}
-          </button>
+            <button
+              className={styles.getBtn}
+              disabled={installing || installed}
+              onClick={onInstall}
+              title={
+                a.ggufReady
+                  ? 'Download this adapter'
+                  : 'Download and convert this adapter to GGUF'
+              }
+            >
+              {installed
+                ? 'installed'
+                : installing
+                  ? a.ggufReady
+                    ? 'getting…'
+                    : 'converting…'
+                  : 'Get'}
+            </button>
+          </Can>
         </td>
       </tr>
 

@@ -101,7 +101,11 @@ impl CredentialStore {
         Self::from_connection(conn)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    /// Builds a credential store against an arbitrary open connection.
+    /// `pub(crate)` because only the store itself and its tests should
+    /// initialise the schema; production code goes through [`Self::open`]
+    /// which picks a path under the app data directory.
+    pub(crate) fn from_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_credentials (
                 user_id    TEXT PRIMARY KEY,

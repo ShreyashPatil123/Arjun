@@ -292,7 +292,7 @@ mod tests {
     }
 
     fn session() -> Session {
-        Session::open(User::new("p", "P", vec![Role::User]))
+        Session::open(User::new("p", "P", vec![Role::Employee]))
     }
 
     #[test]

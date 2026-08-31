@@ -20,6 +20,17 @@
   --transition-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1);
 
+  /* Motion-specific tokens for the redesigned UI. */
+  --motion-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-slow: 320ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Chat-specific spacing — used for message rhythm. */
+  --chat-message-gap: 24px;
+  --chat-composer-pad: 16px 24px;
+  --chat-page-pad: 24px 24px 12px;
+  --chat-max-width: 44rem;
+
   --text-xs: 0.75rem;
   --text-sm: 0.875rem;
   --text-base: 1rem;
@@ -79,9 +90,10 @@
   --bg-secondary: #0B0B0B;
   --bg-tertiary: #141414;
   --bg-hover: #1F1F1F;
-  --text-primary: #FAFAFA;
-  --text-secondary: #A3A3A3;
-  --text-tertiary: #6E6E6E;
+  --bg-overlay: rgba(20, 20, 20, 0.92);
+  --text-primary: rgba(250, 250, 250, 0.92);
+  --text-secondary: rgba(212, 212, 216, 0.72);
+  --text-tertiary: rgba(161, 161, 170, 0.6);
   --accent-primary: #FAFAFA;
   --accent-secondary: #D4D4D4;
   --accent-hover: #FFFFFF;
@@ -190,7 +202,7 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
@@ -207,7 +219,22 @@ body {
   color: var(--text-primary);
 }
 
+/* Default focus ring is a calm 1px outline, not a 2px white halo. The
+ * composer and inputs override this with their own restrained states. */
 :focus-visible {
-  outline: 2px solid var(--border-focus);
-  outline-offset: 2px;
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────
+ * Honor the user's preference globally. Anything that animates a
+ * transform replaces it with an opacity-only change; the caret pulse
+ * and the spinner halts. This is wired through every component that
+ * uses the existing transition tokens. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

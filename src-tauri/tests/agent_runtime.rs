@@ -35,7 +35,7 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
     let session = Arc::new(RwLock::new(Some(Session::open(User::new(
         "priya",
         "Priya Sharma",
-        vec![Role::User],
+        vec![Role::Employee],
     )))));
     // One workspace, for the run these tests drive. A run without one has every
     // path-taking tool refused, which is correct but makes for a poor test of
@@ -70,6 +70,9 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             skills: Arc::new(sarathi_lib::skills::SkillRegistry::open(
                 dir.path().join("__no_skills__"),
             )),
+            // The test does not register any hooks; the empty default is
+            // exactly what a deployment with no custom checks would hold.
+            hooks: Arc::new(sarathi_lib::hooks::HookRegistry::default()),
             memory: Arc::new(sarathi_lib::agent_runtime::memory::MemoryStore::open(dir.path())),
             checkpoints: Arc::default(),
             emit: Arc::new(|_| {}),
@@ -151,6 +154,7 @@ async fn a_run_against_a_public_endpoint_is_refused_by_the_runtime_itself() {
                 "runId": "run-1",
                 "prompt": "hello",
                 "systemPrompt": "s",
+                "messageId": "msg-fixture",
                 "model": {
                     "id": "gpt-4",
                     "provider": "openai",
@@ -261,4 +265,435 @@ async fn runtime_logging_does_not_corrupt_the_channel() {
     }
 
     runtime.shutdown().await;
+}
+
+/// End-to-end proof that streaming is real and that the message-stream contract
+/// is correct.
+///
+/// Spawns the real runtime, points it at a real local model server, and
+/// captures every `run.event` notification as it arrives on the live channel.
+/// Asserts that the events a chat surface would consume are shaped the way
+/// the front-end expects: `message_start` carries the front-end's
+/// `messageId`, every visible `message_update` carries a non-empty `delta`,
+/// `thinking_delta` and `toolcall_delta` are not exposed as assistant text,
+/// and `message_end` carries the right `finishReason`.
+///
+/// Skips when the local model server is not reachable, because this is a
+/// proof against a real model — not a fixture. The skip is a fail-safe that
+/// prints the endpoint it tried, so a missing model is reported explicitly
+/// rather than as a generic test failure.
+#[tokio::test]
+async fn message_stream_events_carry_message_id_and_text_deltas() {
+    if !node_present() {
+        eprintln!("skipping: node is not on PATH");
+        return;
+    }
+
+    // A local OpenAI-compatible endpoint. The default of the live development
+    // deployment, and the one llama-server emits when the activator starts a
+    // managed model. If the machine has no model loaded, skip — the test is
+    // about the wire contract, not about whether a model exists.
+    let base_url = std::env::var("ARJUN_TEST_MODEL_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:61353/v1".to_string());
+    if !endpoint_reachable(&base_url).await {
+        eprintln!("skipping: local model at {base_url} is not reachable");
+        return;
+    }
+
+    let (deps, _dir) = deps();
+    // Collect every event the runtime emits. Held under a Mutex so the
+    // closures on the runtime side can append without `&mut` everywhere.
+    let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(move |value| {
+        sink_events
+            .lock()
+            .map(|mut v| v.push(value))
+            .unwrap_or_else(|e| e.into_inner().push(serde_json::Value::Null));
+    });
+    let runtime = AgentRuntime::spawn(deps, emit, bundle()).expect("runtime starts");
+
+    let run_id = "stream-e2e-run-1";
+    let message_id = "msg-e2e-1";
+
+    // The real run. Resolve on `run.start` returning; streaming events arrive
+    // on the live channel in parallel and are captured by the sink above.
+    let _outcome = runtime
+        .request(
+            "run.start",
+            serde_json::json!({
+                "runId": run_id,
+                "messageId": message_id,
+                "prompt": "hi",
+                "systemPrompt": "Answer in one short sentence.",
+                "model": {
+                    "id": "gemma-4-E4B-it",
+                    "provider": "sovereign-local",
+                    "baseUrl": base_url,
+                }
+            }),
+        )
+        .await
+        .expect("run.start resolves once the loop is done");
+
+    // Give the writer a moment to flush the last few notifications that were
+    // emitted between the loop returning and the `run.start` resolve.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let collected = events.lock().map(|v| v.clone()).unwrap_or_default();
+    runtime.shutdown().await;
+
+    // Every event the runtime emitted. The sink stores the params object the
+    // notification carried, which for `run.event` is `{ runId, event: ... }`.
+    let run_events: Vec<serde_json::Value> = collected
+        .into_iter()
+        .filter(|v| v.get("event").is_some())
+        .collect();
+
+    assert!(
+        !run_events.is_empty(),
+        "the runtime emitted no run.event notifications"
+    );
+
+    // 1. Every event is tagged with the runId we asked for.
+    for event in &run_events {
+        assert_eq!(
+            event["runId"].as_str(),
+            Some(run_id),
+            "event runId mismatch: {event}"
+        );
+    }
+
+    // 2. message_start is the first message-stream event and carries the
+    //    front-end's messageId.
+    let start = run_events
+        .iter()
+        .find(|e| e["event"]["type"] == "message_start")
+        .unwrap_or_else(|| {
+            panic!(
+                "no message_start in stream: {:#?}",
+                run_events
+                    .iter()
+                    .map(|e| e["event"]["type"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(start["event"]["messageId"].as_str(), Some(message_id));
+    assert_eq!(start["event"]["role"].as_str(), Some("assistant"));
+
+    // 3. At least one message_update arrives with a non-empty `delta`. The
+    //    proof that the model actually streamed text.
+    let updates: Vec<&serde_json::Value> = run_events
+        .iter()
+        .filter(|e| e["event"]["type"] == "message_update")
+        .collect();
+    assert!(
+        !updates.is_empty(),
+        "no message_update in stream: {:#?}",
+        run_events
+            .iter()
+            .map(|e| e["event"]["type"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+    for u in &updates {
+        assert_eq!(u["event"]["messageId"].as_str(), Some(message_id));
+        let delta = u["event"]["delta"].as_str().unwrap_or_default();
+        assert!(
+            !delta.is_empty(),
+            "message_update has empty delta: {u}"
+        );
+        // The contract: no internal state on the wire.
+        assert!(u["event"].get("message").is_none());
+        assert!(u["event"].get("assistantMessageEvent").is_none());
+    }
+
+    // 4. No message_update carries a `delta` that looks like private
+    //    chain-of-thought or a tool-call wire repair. The translator drops
+    //    these at the source so they cannot reach the chat.
+    for u in &updates {
+        let delta = u["event"]["delta"].as_str().unwrap_or_default();
+        assert!(
+            !delta.contains("Thinking Process"),
+            "thinking/reasoning content leaked into the visible stream: {delta:?}"
+        );
+        assert!(
+            !delta.contains("\"name\":"),
+            "tool-call JSON leaked into the visible stream: {delta:?}"
+        );
+    }
+
+    // 5. message_end is the last message-stream event and carries the
+    //    right messageId and a finishReason from the allowed union.
+    let end = run_events
+        .iter()
+        .rev()
+        .find(|e| e["event"]["type"] == "message_end")
+        .expect("no message_end in stream");
+    assert_eq!(end["event"]["messageId"].as_str(), Some(message_id));
+    let finish_reason = end["event"]["finishReason"].as_str().unwrap_or("");
+    assert!(
+        matches!(
+            finish_reason,
+            "stop" | "length" | "tool_calls" | "content_filter" | "error"
+        ),
+        "message_end has unknown finishReason: {finish_reason:?}"
+    );
+
+    // 6. The concatenation of all visible deltas is non-empty. This is the
+    //    end-to-end check: text was produced and translated.
+    let full_text: String = updates
+        .iter()
+        .filter_map(|e| e["event"]["delta"].as_str())
+        .collect();
+    assert!(
+        !full_text.trim().is_empty(),
+        "no visible text was streamed for the assistant message: {full_text:?}"
+    );
+
+    eprintln!(
+        "[e2e] streamed {} visible deltas totalling {} chars; finish={}",
+        updates.len(),
+        full_text.len(),
+        finish_reason
+    );
+}
+
+/// GET `/models` against the local endpoint. Cheap and tells us the
+/// runtime would also see the model.
+async fn endpoint_reachable(base_url: &str) -> bool {
+    let probe = format!("{}/models", base_url.trim_end_matches("/v1"));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(&probe).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// A longer prompt — proves the streaming contract holds for a request
+/// the model cannot answer in one short sentence. Skips if the model
+/// is not reachable, same as the `hi` test.
+///
+/// Distinct from the first E2E test so a regression on one prompt shape
+/// does not hide the other. Asserts the *minimum* contract — a
+/// `message_start`, at least one `message_update` with a non-empty
+/// `delta`, and a `message_end` — rather than a particular text
+/// content, because the local model is free to word its answer.
+#[tokio::test]
+async fn a_longer_prompt_streams_in_the_wire_contract() {
+    if !node_present() {
+        eprintln!("skipping: node is not on PATH");
+        return;
+    }
+    let base_url = std::env::var("ARJUN_TEST_MODEL_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:61353/v1".to_string());
+    if !endpoint_reachable(&base_url).await {
+        eprintln!("skipping: local model at {base_url} is not reachable");
+        return;
+    }
+
+    let (deps, _dir) = deps();
+    let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(move |value| {
+        sink_events
+            .lock()
+            .map(|mut v| v.push(value))
+            .unwrap_or_else(|e| e.into_inner().push(serde_json::Value::Null));
+    });
+    let runtime = AgentRuntime::spawn(deps, emit, bundle()).expect("runtime starts");
+
+    let run_id = "stream-e2e-run-long";
+    let message_id = "msg-e2e-long";
+
+    let _ = runtime
+        .request(
+            "run.start",
+            serde_json::json!({
+                "runId": run_id,
+                "messageId": message_id,
+                "prompt": "Explain in one paragraph why the sky is blue during the day and red at sunset.",
+                "systemPrompt": "Be concise.",
+                "model": {
+                    "id": "gemma-4-E4B-it",
+                    "provider": "sovereign-local",
+                    "baseUrl": base_url,
+                }
+            }),
+        )
+        .await
+        .expect("run.start resolves");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let collected = events.lock().map(|v| v.clone()).unwrap_or_default();
+    runtime.shutdown().await;
+
+    let run_events: Vec<serde_json::Value> = collected
+        .into_iter()
+        .filter(|v| v.get("event").is_some())
+        .collect();
+
+    assert!(
+        run_events.iter().any(|e| e["event"]["type"] == "message_start"
+            && e["event"]["messageId"].as_str() == Some(message_id)),
+        "no message_start with the right messageId"
+    );
+
+    let updates: Vec<serde_json::Value> = run_events
+        .iter()
+        .filter(|e| e["event"]["type"] == "message_update")
+        .cloned()
+        .collect();
+    assert!(
+        !updates.is_empty(),
+        "a longer prompt produced no message_update events"
+    );
+    for u in &updates {
+        assert_eq!(u["event"]["messageId"].as_str(), Some(message_id));
+        let delta = u["event"]["delta"].as_str().unwrap_or_default();
+        assert!(!delta.is_empty(), "empty delta: {u}");
+    }
+    let total: String = updates
+        .iter()
+        .filter_map(|e| e["event"]["delta"].as_str())
+        .collect();
+    assert!(
+        total.len() > 20,
+        "a paragraph answer should produce a non-trivial text length, got {total:?}"
+    );
+
+    assert!(
+        run_events.iter().any(|e| e["event"]["type"] == "message_end"
+            && e["event"]["messageId"].as_str() == Some(message_id)),
+        "no message_end with the right messageId"
+    );
+}
+
+/// A follow-up prompt in the same logical conversation: the second
+/// `run.start` call must use the *same* messageId isolation but a
+/// *different* `runId`, and both runs' message-stream events must
+/// carry the right per-cell messageId. Catches a regression where
+/// the runtime accidentally couples the wire contract to runId
+/// rather than per-message state.
+#[tokio::test]
+async fn two_runs_in_a_row_each_carry_their_own_messageId() {
+    if !node_present() {
+        eprintln!("skipping: node is not on PATH");
+        return;
+    }
+    let base_url = std::env::var("ARJUN_TEST_MODEL_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:61353/v1".to_string());
+    if !endpoint_reachable(&base_url).await {
+        eprintln!("skipping: local model at {base_url} is not reachable");
+        return;
+    }
+
+    let (deps, _dir) = deps();
+    let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(move |value| {
+        sink_events
+            .lock()
+            .map(|mut v| v.push(value))
+            .unwrap_or_else(|e| e.into_inner().push(serde_json::Value::Null));
+    });
+    let runtime = AgentRuntime::spawn(deps, emit, bundle()).expect("runtime starts");
+
+    // Run 1.
+    runtime
+        .request(
+            "run.start",
+            serde_json::json!({
+                "runId": "follow-up-1",
+                "messageId": "msg-follow-up-1",
+                "prompt": "hi",
+                "systemPrompt": "Be brief.",
+                "model": {
+                    "id": "gemma-4-E4B-it",
+                    "provider": "sovereign-local",
+                    "baseUrl": base_url,
+                }
+            }),
+        )
+        .await
+        .expect("first run.start resolves");
+
+    // Run 2 — fresh runId, fresh messageId. The chat surface reserves a
+    // new assistant cell for a follow-up turn, so the two must not
+    // share a messageId.
+    runtime
+        .request(
+            "run.start",
+            serde_json::json!({
+                "runId": "follow-up-2",
+                "messageId": "msg-follow-up-2",
+                "prompt": "What did I just say?",
+                "systemPrompt": "Be brief.",
+                "model": {
+                    "id": "gemma-4-E4B-it",
+                    "provider": "sovereign-local",
+                    "baseUrl": base_url,
+                }
+            }),
+        )
+        .await
+        .expect("second run.start resolves");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let collected = events.lock().map(|v| v.clone()).unwrap_or_default();
+    runtime.shutdown().await;
+
+    // Every message_start / message_update / message_end in the
+    // collected events is tagged with a messageId. The set of
+    // messageIds seen must include both follow-up-1 and follow-up-2.
+    let message_ids: std::collections::HashSet<String> = collected
+        .iter()
+        .filter_map(|e| {
+            let t = e["event"]["type"].as_str()?;
+            if t == "message_start" || t == "message_update" || t == "message_end" {
+                e["event"]["messageId"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        message_ids.contains("msg-follow-up-1"),
+        "no message-stream events for the first follow-up: {message_ids:?}"
+    );
+    assert!(
+        message_ids.contains("msg-follow-up-2"),
+        "no message-stream events for the second follow-up: {message_ids:?}"
+    );
+
+    // Each run's events carry exactly the right messageId — no
+    // cross-contamination between cells.
+    for run_id in ["follow-up-1", "follow-up-2"] {
+        let expected_mid = if run_id == "follow-up-1" {
+            "msg-follow-up-1"
+        } else {
+            "msg-follow-up-2"
+        };
+        let wrong = collected.iter().any(|e| {
+            e["runId"].as_str() == Some(run_id)
+                && matches!(
+                    e["event"]["type"].as_str(),
+                    Some("message_start" | "message_update" | "message_end")
+                )
+                && e["event"]["messageId"].as_str() != Some(expected_mid)
+        });
+        assert!(
+            !wrong,
+            "run {run_id} emitted a message-stream event with the wrong messageId"
+        );
+    }
 }

@@ -1,12 +1,38 @@
 import { getBackendService } from './api';
 
+/**
+ * The two active roles in Arjun. Legacy names are still accepted on the
+ * wire (the back-end enum keeps the variants for compatibility with the
+ * existing test surface), but new code should use only
+ * `'administrator'` or `'employee'`. The label map below carries the
+ * legacy spellings as fall-throughs so a stale role string still
+ * renders something rather than `undefined`.
+ */
 export type Role =
   | 'administrator'
+  | 'employee'
+  // Legacy spellings, kept so the back-end round-trips without loss.
   | 'modelAdministrator'
   | 'knowledgeAdministrator'
   | 'user'
   | 'reviewer'
   | 'auditor';
+
+/** True for the two active roles. Use this to filter UI. */
+export function isActiveRole(role: Role): boolean {
+  return role === 'administrator' || role === 'employee';
+}
+
+/**
+ * Collapse a (possibly legacy) role list down to the single headline
+ * role for display in the ARJUN account menu. Administrator wins; if
+ * no active role is held, Employee is the safe default.
+ */
+export function headlineRole(roles: readonly Role[]): 'administrator' | 'employee' {
+  if (roles.includes('administrator')) return 'administrator';
+  if (roles.includes('employee')) return 'employee';
+  return 'employee';
+}
 
 export type Permission =
   | 'useModel'
@@ -73,11 +99,13 @@ export type AuthenticationStatus = 'awaitingFirstAdministrator' | 'configured';
 
 export const ROLE_LABELS: Record<Role, string> = {
   administrator: 'Administrator',
-  modelAdministrator: 'Model administrator',
-  knowledgeAdministrator: 'Knowledge administrator',
-  user: 'User',
-  reviewer: 'Reviewer',
-  auditor: 'Auditor',
+  employee: 'Employee',
+  // Legacy labels, kept so stale data still renders.
+  modelAdministrator: 'Administrator',
+  knowledgeAdministrator: 'Administrator',
+  user: 'Employee',
+  reviewer: 'Employee',
+  auditor: 'Employee',
 };
 
 export const AUDIT_KIND_LABELS: Record<AuditKind, string> = {
@@ -119,6 +147,20 @@ export const governanceService = {
   },
 
   signOut(): Promise<void> {
+    // TODO 2: per-user data/history isolation. The session
+    // storage holds the *last* conversation/run id the user
+    // opened, scoped to nobody in particular. Without this
+    // clear, the next user to sign in on the same window would
+    // re-attach to the previous user's conversation. The
+    // back-end enforces ownership in any case, so this is
+    // belt-and-braces — but the belt is a useful belt.
+    try {
+      sessionStorage.removeItem('arjun.conversation.last');
+      sessionStorage.removeItem('arjun.run.last');
+    } catch {
+      // Browser with storage disabled: the back-end ownership
+      // check is the actual boundary.
+    }
     return getBackendService().invoke<void>('sign_out');
   },
 

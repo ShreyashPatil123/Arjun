@@ -15,6 +15,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tauri::State;
 
+use crate::commands::governance::{require_session, CurrentSession};
 use crate::commands::registry::SharedActivator;
 use crate::orchestrator::approvals::ApprovalQueue;
 use crate::health::{snapshot, HealthInputs, HealthSnapshot};
@@ -41,7 +42,12 @@ pub async fn health_snapshot(
     activator: State<'_, SharedActivator>,
     index: State<'_, Arc<KnowledgeIndex>>,
     approvals: State<'_, Arc<ApprovalQueue>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<HealthSnapshot, String> {
+    // Read-only system health. The matrix does not gate this beyond
+    // sign-in; the audit log it consults has its own `ViewAuditLog`
+    // gate inside the audit service.
+    require_session(&session)?;
     let gpu = read_gpu();
     let events = broker.recent_events();
     let observation = observe_own_connections();

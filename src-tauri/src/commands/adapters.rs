@@ -5,10 +5,12 @@
 
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
 use crate::adapter_manager::store::{self, InstalledAdapter};
 use crate::adapter_manager::AdapterRegistry;
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 
 /// Largest file accepted as a LoRA adapter.
 ///
@@ -113,9 +115,13 @@ fn package_dir_for(app: &AppHandle, provider_id: &str, model_id: &str) -> Result
 #[tauri::command]
 pub async fn list_installed_adapters(
     app: AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
 ) -> Result<InstalledAdapters, String> {
+    // The list of installed adapters is model-management metadata; any
+    // signed-in user can see it. Removing or installing is gated below.
+    require_session(&session)?;
     let package = package_dir_for(&app, &provider_id, &model_id)?;
     let adapters = store::list_installed(&package, &model_id);
     let total_bytes = adapters.iter().map(|a| a.size_bytes).sum();
@@ -130,10 +136,15 @@ pub async fn list_installed_adapters(
 #[tauri::command]
 pub async fn download_adapter(
     app: AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     adapter_repo_id: String,
 ) -> Result<InstalledAdapter, String> {
+    // An adapter is part of the model it attaches to. Installing one
+    // changes what the next prompt answers with, the same way installing
+    // a model does. The matrix puts it under `ImportModel`.
+    require_permission(&session, Permission::ImportModel)?;
     let package = package_dir_for(&app, &provider_id, &model_id)?;
     let token = crate::config::hf_token::get();
 
@@ -443,10 +454,12 @@ fn register_adapter(
 #[tauri::command]
 pub async fn remove_adapter(
     app: AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     adapter_id: String,
 ) -> Result<(), String> {
+    require_permission(&session, Permission::ImportModel)?;
     let package = package_dir_for(&app, &provider_id, &model_id)?;
     store::remove(&package, &adapter_id).map_err(|e| e.to_string())?;
 
@@ -519,11 +532,16 @@ fn clear_assignment(
 #[tauri::command]
 pub async fn set_adapter_capability(
     app: AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     adapter_id: String,
     capability: Option<String>,
 ) -> Result<(), String> {
+    // Capability assignment decides which adapter fills which slot at
+    // inference time. That is part of the model-configuration story,
+    // and the matrix puts it under `ImportModel`.
+    require_permission(&session, Permission::ImportModel)?;
     let package = package_dir_for(&app, &provider_id, &model_id)?;
 
     if let Some(key) = &capability {

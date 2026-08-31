@@ -92,10 +92,17 @@ function main(): void {
 
   peer.handle("run.start", async (params) => {
     const request = params as RunRequest;
-    if (!request?.runId || typeof request.prompt !== "string" || !request.model?.baseUrl) {
-      throw Object.assign(new Error("run.start needs runId, prompt and model.baseUrl"), {
-        code: ErrorCode.BadParams,
-      });
+    if (
+      !request?.runId ||
+      typeof request.messageId !== "string" ||
+      request.messageId.length === 0 ||
+      typeof request.prompt !== "string" ||
+      !request.model?.baseUrl
+    ) {
+      throw Object.assign(
+        new Error("run.start needs runId, messageId, prompt and model.baseUrl"),
+        { code: ErrorCode.BadParams },
+      );
     }
     try {
       return await startRun(peer, request, (run) => active.set(request.runId, run));

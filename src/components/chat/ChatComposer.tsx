@@ -1,50 +1,55 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Loader2, Plus, X } from 'lucide-react';
+import { ArrowUp, Plus, Square, X } from 'lucide-react';
 import { sovereigntyService } from '../../services/sovereignty.service';
+import { agentService } from '../../services/agent.service';
 import { RoutingPreview } from '../routing/RoutingPreview';
+import { ContextChip } from './ContextChip';
+import { useConversation } from '../run/useConversation';
 import styles from './ChatSurface.module.css';
 
 /**
  * The bottom-of-chat composer.
  *
- * The composer is always present in a chat surface — the user must be
- * able to send a follow-up after every completed response, including one
- * in a conversation that is still streaming. While a run is in flight,
- * the composer is disabled with a one-line reason.
+ * Two visible layers:
+ *  1. **Routing hint** — a single quiet line above the composer that
+ *     shows which model will take the next message. This was previously
+ *     below the composer; the redesign lifts it up so the user can see
+ *     the model before they press Enter.
+ *  2. **Composer** — the input row. Same Enter-to-send and auto-grow
+ *     behaviour as before; the right side now has a context chip and a
+ *     single send/stop button (the send button morphs into a stop
+ *     button while a run is streaming).
  *
- * Behaviour:
- *  - **Enter** sends; **Shift+Enter** inserts a newline. Matches the
- *    assistants this is meant to replace.
- *  - The textbox auto-grows up to a cap; beyond it, it scrolls.
- *  - The pre-send routing hint (which model will take this) sits
- *    underneath, below the controls. Reused from the existing
- *    `RoutingPreview` so the model choice is consistent with the
- *    workbench.
- *  - Attachments are accepted the same way the workbench accepts them:
- *    the sovereignty gateway is asked whether confidential material is
- *    allowed, and the names are held in state. The actual document is
- *    not sent up the wire here — that flows through the run.
+ * The composer is always present in a chat surface — the user must be
+ * able to send a follow-up after every completed response, including
+ * during a run that is still streaming. While a run is in flight, the
+ * input itself is *not* disabled (the user can type a follow-up that
+ * will queue once the run finishes); only the send button morphs into
+ * a stop.
  */
 const MAX_COMPOSER_HEIGHT = 220;
 
 export interface ChatComposerProps {
-  /** Disabled while a run is in flight, with a one-line reason. */
-  disabled?: boolean;
-  disabledReason?: string;
-  onSubmit: (prompt: string, attachmentNames: string[]) => Promise<void> | void;
+  /** True while a run is in flight; the send button becomes stop. */
+  streaming?: boolean;
+  /** When streaming, the active run's id (used to call abort). */
+  activeRunId?: string | null;
   /** Optional placeholder override. */
   placeholder?: string;
+  onSubmit: (prompt: string, attachmentNames: string[]) => Promise<void> | void;
 }
 
 export function ChatComposer({
-  disabled,
-  disabledReason,
-  onSubmit,
+  streaming,
+  activeRunId,
   placeholder,
+  onSubmit,
 }: ChatComposerProps) {
+  const { conversation } = useConversation();
   const [prompt, setPrompt] = useState('');
   const [attachments, setAttachments] = useState<string[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -59,8 +64,16 @@ export function ChatComposer({
     resize();
   }, [prompt, resize]);
 
-  const canSubmit =
-    !disabled && (prompt.trim().length > 0 || attachments.length > 0);
+  // Keep the textarea at a sensible height when the chat's content
+  // changes around it (e.g. a new assistant message that pushes the
+  // composer down).
+  useEffect(() => {
+    const t = window.setTimeout(resize, 0);
+    return () => window.clearTimeout(t);
+  }, [conversation?.messages.length, resize]);
+
+  const hasContent = prompt.trim().length > 0 || attachments.length > 0;
+  const canSubmit = !streaming && hasContent;
 
   const submit = useCallback(async () => {
     if (!canSubmit) return;
@@ -72,15 +85,26 @@ export function ChatComposer({
     try {
       await onSubmit(text, atts);
     } catch (error) {
-      // Surface the error in the composer, so the user can see the
-      // reason rather than losing what they typed.
       setRefusal(error instanceof Error ? error.message : String(error));
     }
   }, [canSubmit, prompt, attachments, onSubmit]);
 
+  const stop = useCallback(async () => {
+    if (!activeRunId || stopping) return;
+    setStopping(true);
+    try {
+      await agentService.abort(activeRunId);
+    } catch (err) {
+      setRefusal(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStopping(false);
+    }
+  }, [activeRunId, stopping]);
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      if (streaming) return; // never queue a second run while one is in flight
       void submit();
     }
   };
@@ -100,82 +124,101 @@ export function ChatComposer({
   };
 
   return (
-    <div className={styles.composer} data-disabled={disabled || undefined}>
-      {attachments.length > 0 && (
-        <ul className={styles.attachmentList}>
-          {attachments.map((name, i) => (
-            <li key={`${name}-${i}`} className={styles.attachmentChip}>
-              <span className={styles.attachmentName}>{name}</span>
-              <button
-                type="button"
-                className={styles.attachmentRemove}
-                aria-label={`Remove ${name}`}
-                onClick={() =>
-                  setAttachments(prev => prev.filter((_, j) => j !== i))
-                }
-              >
-                <X size={12} />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      <textarea
-        ref={textareaRef}
-        className={styles.composerInput}
-        placeholder={
-          placeholder ??
-          (disabled
-            ? disabledReason ?? 'Arjun is answering…'
-            : 'Ask Arjun — text, images, tables')
-        }
-        value={prompt}
-        rows={1}
-        onChange={e => setPrompt(e.target.value)}
-        onKeyDown={onKeyDown}
-        aria-label="Message"
-        disabled={disabled}
-      />
-
-      <div className={styles.composerControls}>
-        <button
-          type="button"
-          className={styles.iconBtn}
-          onClick={() => fileInputRef.current?.click()}
-          aria-label="Attach a document, drawing or photograph"
-          disabled={disabled}
-        >
-          <Plus size={18} />
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          hidden
-          onChange={onFilesPicked}
-        />
-        <div className={styles.composerRight}>
-          <button
-            type="button"
-            className={styles.sendBtn}
-            onClick={() => void submit()}
-            disabled={!canSubmit}
-            aria-label="Send"
-            title={disabled ? disabledReason : 'Send (Enter)'}
-          >
-            {disabled ? <Loader2 size={16} className={styles.spin} /> : <ArrowUp size={16} />}
-          </button>
-        </div>
+    <div className={styles.composerOuter}>
+      <div className={styles.composerHintRow}>
+        <RoutingPreview prompt={prompt} />
       </div>
 
-      {refusal && (
-        <p className={styles.refusalLine} role="alert">
-          <span>{refusal}</span>
-        </p>
-      )}
+      <div className={styles.composerWrap}>
+        <div className={styles.composer} data-streaming={streaming || undefined}>
+          {attachments.length > 0 && (
+            <ul className={styles.attachmentList}>
+              {attachments.map((name, i) => (
+                <li key={`${name}-${i}`} className={styles.attachmentChip}>
+                  <span className={styles.attachmentName}>{name}</span>
+                  <button
+                    type="button"
+                    className={styles.attachmentRemove}
+                    aria-label={`Remove ${name}`}
+                    onClick={() =>
+                      setAttachments(prev => prev.filter((_, j) => j !== i))
+                    }
+                  >
+                    <X size={12} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
 
-      <RoutingPreview prompt={prompt} />
+          <textarea
+            ref={textareaRef}
+            className={styles.composerInput}
+            placeholder={
+              placeholder ??
+              (streaming
+                ? 'Type your follow-up — it will send when the run finishes…'
+                : 'Ask Arjun — text, images, tables')
+            }
+            value={prompt}
+            rows={1}
+            onChange={e => setPrompt(e.target.value)}
+            onKeyDown={onKeyDown}
+            aria-label="Message"
+          />
+
+          <div className={styles.composerControls}>
+            <button
+              type="button"
+              className={styles.iconBtn}
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach a document, drawing or photograph"
+            >
+              <Plus size={18} />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              hidden
+              onChange={onFilesPicked}
+            />
+            <div className={styles.composerRight}>
+              <ContextChip />
+              {streaming ? (
+                <button
+                  type="button"
+                  className={styles.stopBtn}
+                  onClick={() => void stop()}
+                  disabled={stopping}
+                  aria-label="Stop generating"
+                  title="Stop generating"
+                >
+                  <Square size={12} />
+                  <span>Stop</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className={styles.sendBtn}
+                  onClick={() => void submit()}
+                  disabled={!canSubmit}
+                  aria-label="Send"
+                  title="Send (Enter)"
+                >
+                  <ArrowUp size={16} />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {refusal && (
+            <p className={styles.refusalLine} role="alert">
+              <span>{refusal}</span>
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

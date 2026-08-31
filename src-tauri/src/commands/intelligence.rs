@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
-use tauri::Manager;
+use tauri::{Manager, State};
 
 use crate::adapter_manager::AdapterRegistry;
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 use crate::model_intelligence::{
     telemetry::{ModelAggregate, TelemetrySink},
     AdapterRouteResult, AdapterRouter, ModelIntelligenceManager, ModelProfile, InferenceParameters,
@@ -17,16 +19,23 @@ use crate::model_intelligence::{
 #[tauri::command]
 pub async fn model_health_snapshot(
     state: tauri::State<'_, Arc<TelemetrySink>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Vec<ModelAggregate>, String> {
+    // Read-only model health summary. The matrix does not gate it
+    // beyond sign-in.
+    require_session(&session)?;
     Ok(state.snapshot())
 }
 
 #[tauri::command]
 pub async fn get_model_profile(
     app_handle: tauri::AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
 ) -> Result<ModelProfile, String> {
+    // Read-only profile inspection. Any signed-in user may see it.
+    require_session(&session)?;
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
@@ -42,10 +51,15 @@ pub async fn get_model_profile(
 #[tauri::command]
 pub async fn update_model_profile(
     app_handle: tauri::AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     params: InferenceParameters,
 ) -> Result<ModelProfile, String> {
+    // Writing a model profile changes how the model answers the next
+    // prompt. That is part of the model-configuration story, so the
+    // matrix puts it under `ImportModel`.
+    require_permission(&session, Permission::ImportModel)?;
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
@@ -69,9 +83,14 @@ pub async fn update_model_profile(
 #[tauri::command]
 pub async fn refresh_model_profile(
     app_handle: tauri::AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
 ) -> Result<ModelProfile, String> {
+    // Re-deriving a model profile re-reads the on-disk manifest and
+    // recomputes the model's capabilities. The matrix puts any write
+    // that changes model configuration under `ImportModel`.
+    require_permission(&session, Permission::ImportModel)?;
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
@@ -87,11 +106,15 @@ pub async fn refresh_model_profile(
 #[tauri::command]
 pub async fn route_prompt_capability(
     app_handle: tauri::AppHandle,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     prompt: String,
     user_override: Option<String>,
 ) -> Result<AdapterRouteResult, String> {
+    // Adapter routing is a model-management operation. A wrong answer
+    // chooses the wrong adapter for the next prompt.
+    require_permission(&session, Permission::ImportModel)?;
     let start_time = std::time::Instant::now();
     let app_data_dir = app_handle
         .path()

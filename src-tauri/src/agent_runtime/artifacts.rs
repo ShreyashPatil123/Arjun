@@ -403,7 +403,7 @@ mod tests {
     }
 
     fn author() -> Session {
-        Session::open(User::new("priya", "Priya Sharma", vec![Role::User]))
+        Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]))
     }
 
     #[test]

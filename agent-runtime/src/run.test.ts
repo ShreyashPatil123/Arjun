@@ -154,6 +154,7 @@ afterEach(async () => {
 function request(baseUrl: string, prompt = "What is the seal specification?"): RunRequest {
   return {
     runId: "run-1",
+    messageId: "msg-1",
     prompt,
     systemPrompt: "Search before answering.",
     model: { id: "test-model", provider: "sovereign-local", baseUrl, maxTokens: 256 },

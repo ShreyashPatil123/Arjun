@@ -62,6 +62,12 @@
 
 .item { margin: 0; }
 
+.item {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
 .itemBtn {
   display: flex;
   flex-direction: column;
@@ -108,3 +114,45 @@
 }
 
 .itemWhen { margin-left: auto; }
+
+/* The delete button is a sibling of the open-conversation button on
+ * each row. It is hidden until the row is hovered, then revealed as a
+ * small icon button on the right edge. Keeping it always visible
+ * would crowd the row with chrome; surfacing on hover is the
+ * conventional pattern in chat-history sidebars. */
+.itemDelete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 32px;
+  margin-left: 4px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  opacity: 0;
+  transition: background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    opacity var(--transition-fast);
+}
+.item:hover .itemDelete,
+.itemDelete:focus-visible {
+  opacity: 1;
+}
+.itemDelete:hover {
+  background: var(--error-bg, rgba(248, 81, 73, 0.12));
+  color: var(--error, #f85149);
+  border-color: var(--error, #f85149);
+}
+.itemDelete:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+.itemDelete:disabled {
+  cursor: progress;
+  opacity: 0.5;
+}

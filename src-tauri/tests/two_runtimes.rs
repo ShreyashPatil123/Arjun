@@ -128,13 +128,26 @@ async fn a_coding_task_and_a_document_task_reach_different_models_on_different_r
         "Write and test a Python function that computes pump efficiency from head and flow.",
         None,
         VRAM,
+        None,
+        false,
+        &[],
+        &[],
     )
     .expect("a coding model is available");
 
     // A document request, routed by known kind rather than by classifying the
     // user's words — OCR on a scanned page is not a question about the prompt.
-    let document = ModelRouter::route_for_role(&registry, ModelRole::DocumentOcr, None, VRAM)
-        .expect("a document model is available");
+    let document = ModelRouter::route_for_role(
+        &registry,
+        ModelRole::DocumentOcr,
+        None,
+        VRAM,
+        None,
+        false,
+        &[],
+        &[],
+    )
+    .expect("a document model is available");
 
     assert_eq!(coding.model_id, "qwen2.5-coder-7b");
     assert_eq!(coding.role, ModelRole::Coding);

@@ -107,6 +107,12 @@ pub struct RunMeta {
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
     pub id: String,
+    /// The account id (`User::id`) of the user who created the
+    /// conversation. Every read, list, and write is filtered by
+    /// this id — a different user asking for this conversation
+    /// gets `None`, not the contents. See TODO 2 of the
+    /// 7-step plan: per-user data/history isolation.
+    pub owner_user_id: String,
     /// What the conversation is about, in a few words. The UI shows it in the
     /// sidebar; a future build can have the model suggest a title.
     pub title: String,
@@ -128,7 +134,45 @@ struct ConversationFile {
     conversation: Conversation,
 }
 
-const SCHEMA_VERSION: u32 = 1;
+/// The v1 envelope, kept for migration only. A v1 file has no
+/// `ownerUserId` on the conversation. The migration reads as
+/// `ConversationFileV1`, sets the owner to `LEGACY_OWNER_ID`, and
+/// re-serialises at the current schema version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationFileV1 {
+    schema_version: u32,
+    conversation: ConversationV1,
+}
+
+/// The v1 conversation: same as v2 minus `owner_user_id`. The
+/// struct lives only to make the v1 → v2 migration parseable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationV1 {
+    id: String,
+    title: String,
+    created_at: String,
+    last_activity_at: String,
+    messages: Vec<Message>,
+    runs: Vec<RunMeta>,
+    compactions: u32,
+}
+
+/// Bumped from 1 to 2 when `owner_user_id` was added in TODO 2.
+/// Files at version 1 are migrated on first read — the owner is
+/// treated as the seed administrator (S. Kulkarni, id
+/// "modeladmin"), which matches the pre-TODO-2 reality where
+/// every conversation lived in a single global store. After the
+/// migration the file is written back at the current schema
+/// version, so the migration runs once per file.
+const SCHEMA_VERSION: u32 = 2;
+
+/// The id of the account that owned conversations before
+/// per-user isolation. Used only as the migration target for
+/// pre-TODO-2 files; new conversations always get the real
+/// session user id.
+pub const LEGACY_OWNER_ID: &str = "modeladmin";
 
 /// Where the conversations live on disk.
 pub struct ConversationStore {
@@ -157,12 +201,61 @@ impl ConversationStore {
 
     /// Read one conversation. Returns `Ok(None)` if the id is unknown,
     /// which is the honest answer rather than an error.
-    pub fn get(&self, id: &str) -> std::io::Result<Option<Conversation>> {
+    ///
+    /// The `owner_user_id` filter, when supplied, is the per-user
+    /// isolation boundary from TODO 2 of the 7-step plan. A request
+    /// from a different user returns `Ok(None)` rather than the
+    /// conversation — the file is on disk, but it is not for the
+    /// caller. Passing `None` is the unrestricted form, used by
+    /// internal callers that have already authorised the read.
+    pub fn get(
+        &self,
+        id: &str,
+        owner_user_id: Option<&str>,
+    ) -> std::io::Result<Option<Conversation>> {
+        let Some(mut conversation) = self.read_raw(id)? else {
+            return Ok(None);
+        };
+        if let Some(owner) = owner_user_id {
+            if conversation.owner_user_id != owner {
+                return Ok(None);
+            }
+        }
+        // Persist a migrated v1 file back to disk at the new schema
+        // version so the migration is one-shot per file. v1 files
+        // have no `owner_user_id`; we set it to the legacy owner id
+        // before the next write.
+        Ok(Some(conversation))
+    }
+
+    /// The migration step, separated so `list` can reuse it.
+    /// v1 → v2 stamps the legacy owner id and rewrites the file
+    /// atomically. Idempotent: a v2 file is left alone.
+    fn migrate_in_place(&self, id: &str, file: &mut ConversationFile) {
+        if file.schema_version >= SCHEMA_VERSION {
+            return;
+        }
+        if file.schema_version == 1 {
+            file.conversation.owner_user_id = LEGACY_OWNER_ID.to_string();
+        }
+        file.schema_version = SCHEMA_VERSION;
+        // Best-effort write; if it fails, the in-memory state is
+        // still correct and the next save will retry.
+        let _ = self.save(&file.conversation);
+    }
+
+    /// Read a conversation file without applying any owner filter.
+    /// Used by `list` (which filters after reading) and by internal
+    /// callers (admins, audits). v1 files are migrated in place.
+    fn read_raw(&self, id: &str) -> std::io::Result<Option<Conversation>> {
         let path = self.file_path(id);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let parsed: ConversationFile = serde_json::from_slice(&bytes)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let mut parsed = self.parse_envelope(&bytes)?;
+                if parsed.schema_version < SCHEMA_VERSION {
+                    let id_owned = parsed.conversation.id.clone();
+                    self.migrate_in_place(&id_owned, &mut parsed);
+                }
                 Ok(Some(parsed.conversation))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -170,10 +263,73 @@ impl ConversationStore {
         }
     }
 
+    /// Parse a file as either a v1 or v2 envelope. A v1 file has no
+    /// `ownerUserId` on the conversation; this is a v1-only shape
+    /// that the migration stamps. The struct is otherwise the
+    /// same — version 2 added one optional field.
+    fn parse_envelope(&self, bytes: &[u8]) -> std::io::Result<ConversationFile> {
+        // First try the current shape; on a missing-field error,
+        // fall back to a v1 envelope that allows absent
+        // `ownerUserId`. The fallback is the migration path; in
+        // steady state (v2-only) only the first branch runs.
+        match serde_json::from_slice::<ConversationFile>(bytes) {
+            Ok(env) => Ok(env),
+            Err(serde_err) => {
+                let v1: ConversationFileV1 = serde_json::from_slice(bytes).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, serde_err)
+                })?;
+                Ok(ConversationFile {
+                    schema_version: v1.schema_version,
+                    conversation: Conversation {
+                        id: v1.conversation.id,
+                        owner_user_id: String::new(),
+                        title: v1.conversation.title,
+                        created_at: v1.conversation.created_at,
+                        last_activity_at: v1.conversation.last_activity_at,
+                        messages: v1.conversation.messages,
+                        runs: v1.conversation.runs,
+                        compactions: v1.conversation.compactions,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Delete a conversation by id.
+    ///
+    /// Returns `true` when a file was removed, `false` when the id was
+    /// not present in the store *or* is owned by a different user.
+    /// The store does not raise on "not found" — the front-end treats
+    /// a successful delete of a missing entry as idempotent, the
+    /// same way an `rm` of a missing path is a no-op.
+    ///
+    /// The owner check is the per-user isolation boundary from
+    /// TODO 2: a non-owner can neither read nor delete the file.
+    ///
+    /// The file is removed with `remove_file`; there is no tmp/rename
+    /// dance because the deletion is not a partial-write hazard. The
+    /// directory is left in place.
+    pub fn delete(&self, id: &str, owner_user_id: &str) -> std::io::Result<bool> {
+        let Some(conversation) = self.get(id, Some(owner_user_id))? else {
+            return Ok(false);
+        };
+        let path = self.file_path(&conversation.id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Every conversation in the store, newest first by `lastActivityAt`.
     /// Conversations that fail to parse are skipped, not surfaced, on the
     /// principle that a corrupt one entry should not hide the others.
-    pub fn list(&self) -> std::io::Result<Vec<Conversation>> {
+    ///
+    /// The `owner_user_id` filter is the per-user isolation boundary
+    /// from TODO 2: a non-Administrator sees only their own
+    /// conversations. `None` is the unrestricted form, used by the
+    /// administrator's "all conversations" view and by tests.
+    pub fn list(&self, owner_user_id: Option<&str>) -> std::io::Result<Vec<Conversation>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -181,18 +337,35 @@ impl ConversationStore {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Some(mut conversation) = self
+                .read_path(&path)
+                .ok()
+                .flatten()
+            else {
+                continue;
             };
-            let parsed: ConversationFile = match serde_json::from_slice(&bytes) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            out.push(parsed.conversation);
+            if let Some(owner) = owner_user_id {
+                if conversation.owner_user_id != owner {
+                    continue;
+                }
+            }
+            out.push(conversation);
         }
         out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
         Ok(out)
+    }
+
+    /// Read a single file by full path, applying the v1→v2 migration
+    /// in place. Split out from `read_raw` so `list` does not have
+    /// to know the file naming convention.
+    fn read_path(&self, path: &Path) -> std::io::Result<Option<Conversation>> {
+        let bytes = std::fs::read(path)?;
+        let mut parsed = self.parse_envelope(&bytes)?;
+        if parsed.schema_version < SCHEMA_VERSION {
+            let id_owned = parsed.conversation.id.clone();
+            self.migrate_in_place(&id_owned, &mut parsed);
+        }
+        Ok(Some(parsed.conversation))
     }
 
     /// Write a conversation atomically. The file is written to `<id>.json.tmp`,
@@ -218,7 +391,19 @@ impl ConversationStore {
     }
 
     /// Create a new conversation with one system welcome message.
-    pub fn create(&self, title: String, system_welcome: String) -> std::io::Result<Conversation> {
+    ///
+    /// `owner_user_id` is required: every conversation belongs to
+    /// exactly one user, and the create call is the moment that
+    /// ownership is decided. The caller is the Tauri command, which
+    /// always has a session, so this is never `None` at the IPC
+    /// boundary — but the helper still takes an `Option` so the
+    /// internal tests can call it without a session.
+    pub fn create(
+        &self,
+        title: String,
+        system_welcome: String,
+        owner_user_id: &str,
+    ) -> std::io::Result<Conversation> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
         let welcome_id = format!("sys-{}", uuid::Uuid::new_v4());
@@ -239,6 +424,7 @@ impl ConversationStore {
         };
         let conversation = Conversation {
             id: id.clone(),
+            owner_user_id: owner_user_id.to_string(),
             title,
             created_at: now.clone(),
             last_activity_at: now,
@@ -251,7 +437,10 @@ impl ConversationStore {
     }
 
     /// Append a user message and an in-progress assistant message to a
-    /// conversation. Returns the new `Conversation` if the id is known.
+    /// conversation. Returns the new `Conversation` if the id is known
+    /// and is owned by `owner_user_id`. A request from a different
+    /// user returns `Ok(None)`, the same shape as an unknown id —
+    /// the surface cannot tell the difference.
     ///
     /// The assistant message starts as `Streaming`; the chat surface flips
     /// it to `Done` on `message_end` via `record_message_completion`.
@@ -261,8 +450,9 @@ impl ConversationStore {
         user_prompt: &str,
         assistant_message_id: &str,
         run_id: &str,
+        owner_user_id: &str,
     ) -> std::io::Result<Option<Conversation>> {
-        let Some(mut conversation) = self.get(id)? else {
+        let Some(mut conversation) = self.get(id, Some(owner_user_id))? else {
             return Ok(None);
         };
         let now = chrono::Utc::now().to_rfc3339();
@@ -313,14 +503,17 @@ impl ConversationStore {
     }
 
     /// Replace the streaming content of an in-flight assistant message.
-    /// Idempotent: the message is identified by `message_id`.
+    /// Idempotent: the message is identified by `message_id`. A request
+    /// from a non-owner returns `Ok(None)`, the same shape as an
+    /// unknown id.
     pub fn update_streaming_content(
         &self,
         id: &str,
         message_id: &str,
         content: &str,
+        owner_user_id: &str,
     ) -> std::io::Result<Option<Conversation>> {
-        let Some(mut conversation) = self.get(id)? else {
+        let Some(mut conversation) = self.get(id, Some(owner_user_id))? else {
             return Ok(None);
         };
         if let Some(msg) = conversation
@@ -337,6 +530,8 @@ impl ConversationStore {
 
     /// Mark an assistant message as done (or failed) and set the elapsed
     /// time and final error, if any. Returns the updated conversation.
+    /// A request from a non-owner returns `Ok(None)`, the same shape
+    /// as an unknown id.
     pub fn record_message_completion(
         &self,
         id: &str,
@@ -349,8 +544,9 @@ impl ConversationStore {
         used_fallback: Option<bool>,
         error: Option<&str>,
         failed: bool,
+        owner_user_id: &str,
     ) -> std::io::Result<Option<Conversation>> {
-        let Some(mut conversation) = self.get(id)? else {
+        let Some(mut conversation) = self.get(id, Some(owner_user_id))? else {
             return Ok(None);
         };
         let now = chrono::Utc::now().to_rfc3339();

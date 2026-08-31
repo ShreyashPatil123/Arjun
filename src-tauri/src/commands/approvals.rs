@@ -11,14 +11,20 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::audit::{AuditKind, AuditService};
-use crate::commands::governance::{require_session, CurrentSession};
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 use crate::orchestrator::approvals::{ApprovalItem, ApprovalQueue, Decision};
 
 /// Everything raised this session, newest first, settled ones included.
 #[tauri::command]
 pub async fn list_approvals(
     queue: State<'_, Arc<ApprovalQueue>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Vec<ApprovalItem>, String> {
+    // The approvals queue is reviewer's work. The matrix puts the
+    // ability to see it under `ApproveOutput`. A `User` or `Auditor`
+    // does not get to see what they are not allowed to decide.
+    require_permission(&session, Permission::ApproveOutput)?;
     Ok(queue.all())
 }
 

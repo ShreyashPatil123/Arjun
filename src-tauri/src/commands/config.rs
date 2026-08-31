@@ -3,10 +3,13 @@
 use std::collections::HashMap;
 use tauri::AppHandle;
 use tauri::Manager;
+use tauri::State;
 use std::path::PathBuf;
 
+use crate::commands::governance::{require_permission, CurrentSession};
 use crate::config::{ConfigManager, SarathiConfig};
 use crate::core::event_bus::{get_event_bus, SarathiEvent};
+use crate::identity::Permission;
 
 /// Gets the entire configuration as JSON string
 #[tauri::command]
@@ -16,20 +19,27 @@ pub async fn get_config(app: AppHandle) -> Result<String, String> {
     serde_json::to_string(&config).map_err(|e| e.to_string())
 }
 
-/// Sets the entire configuration from JSON string
+/// Sets the entire configuration from JSON string. Administrator only —
+/// a misconfigured ARJUN instance is broken for everyone, so this is
+/// gated on `ModifyPolicy`.
 #[tauri::command]
-pub async fn set_config(app: AppHandle, config: String) -> Result<(), String> {
+pub async fn set_config(
+    app: AppHandle,
+    config: String,
+    session: State<'_, CurrentSession>,
+) -> Result<(), String> {
+    require_permission(&session, Permission::ModifyPolicy)?;
     let new_config: SarathiConfig = serde_json::from_str(&config).map_err(|e| e.to_string())?;
     let path = ConfigManager::get_config_path(&app);
-    
+
     ConfigManager::save(&new_config, &path).map_err(|e| e.to_string())?;
-    
+
     // Publish config changed event
     let event_bus = get_event_bus();
     if let Ok(value) = serde_json::to_value(&new_config) {
         event_bus.publish(SarathiEvent::ConfigChanged, Some(value));
     }
-    
+
     Ok(())
 }
 
@@ -59,8 +69,17 @@ pub fn get_hf_token_status() -> HfTokenStatus {
 ///
 /// An empty string clears the saved token, after which any `HF_TOKEN` in the
 /// environment takes over again.
+///
+/// Administrator only — the token is a credential, and a leaked token
+/// lets the holder authenticate to HuggingFace as this account, so this
+/// is gated on `ModifyPolicy` like every other config write.
 #[tauri::command]
-pub async fn set_hf_token(app: AppHandle, token: String) -> Result<HfTokenStatus, String> {
+pub async fn set_hf_token(
+    app: AppHandle,
+    token: String,
+    session: State<'_, CurrentSession>,
+) -> Result<HfTokenStatus, String> {
+    require_permission(&session, Permission::ModifyPolicy)?;
     let path = ConfigManager::get_config_path(&app);
     let mut config = ConfigManager::load(&path).map_err(|e| e.to_string())?;
 
@@ -99,19 +118,24 @@ pub async fn get_config_value(app: AppHandle, key: String) -> Result<Option<Stri
 
 /// Sets a specific config value (simplified implementation)
 #[tauri::command]
-pub async fn set_config_value(app: AppHandle, key: String, value: String) -> Result<(), String> {
+pub async fn set_config_value(
+    app: AppHandle,
+    key: String,
+    value: String,
+    session: State<'_, CurrentSession>,
+) -> Result<(), String> {
     let config_json = get_config(app.clone()).await?;
     let mut config_val: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| e.to_string())?;
-    
+
     // Parse value if it's JSON, otherwise treat as string
     let parsed_val = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
-    
+
     if let Some(obj) = config_val.as_object_mut() {
         obj.insert(key, parsed_val);
     }
-    
+
     let updated_config_str = serde_json::to_string(&config_val).map_err(|e| e.to_string())?;
-    set_config(app, updated_config_str).await
+    set_config(app, updated_config_str, session).await
 }
 
 /// Returns the default config map
@@ -123,10 +147,13 @@ pub async fn get_default_config() -> Result<String, String> {
 
 /// Resets configuration to defaults
 #[tauri::command]
-pub async fn reset_config(app: AppHandle) -> Result<(), String> {
+pub async fn reset_config(
+    app: AppHandle,
+    session: State<'_, CurrentSession>,
+) -> Result<(), String> {
     let config = SarathiConfig::default();
     let config_str = serde_json::to_string(&config).map_err(|e| e.to_string())?;
-    set_config(app, config_str).await
+    set_config(app, config_str, session).await
 }
 
 /// Returns app paths

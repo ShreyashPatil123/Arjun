@@ -6,6 +6,7 @@ import { AssistantMessageCell } from './AssistantMessageCell';
 import { RunView } from '../run/RunView';
 import { useAdoptedRun, useContextLedger, useTaskRecord } from '../run/runAdopt';
 import { ChatHeader } from './ChatHeader';
+import { TaskPanel } from './TaskPanel';
 import {
   type ChatMessage,
   type Classification,
@@ -44,6 +45,7 @@ export function ChatSurface({
     conversation,
     isStreaming,
     activeMessageId,
+    activeRunId,
     streamingContent,
     send,
     replay,
@@ -131,6 +133,20 @@ export function ChatSurface({
     [send, classification],
   );
 
+  // The task panel shows up only when the latest run had actual
+  // orchestration (tools, multiple turns, plan). For a one-line
+  // answer it would be a banner that says "I said one thing", so
+  // we hide it.
+  const showTaskPanel = useMemo(() => {
+    if (!conversation) return false;
+    const last = conversation.runs[conversation.runs.length - 1];
+    if (!last) return false;
+    if (last.live) return true;
+    const totalMessages = conversation.messages.length;
+    if (totalMessages >= 4) return true;
+    return false;
+  }, [conversation, isStreaming]);
+
   return (
     <div className={styles.chatRoot}>
       <div className={styles.chatMain}>
@@ -213,8 +229,8 @@ export function ChatSurface({
 
         <div className={styles.composerWrap}>
           <ChatComposer
-            disabled={isStreaming}
-            disabledReason="Arjun is answering…"
+            streaming={isStreaming}
+            activeRunId={activeRunId}
             onSubmit={handleSubmit}
           />
         </div>
@@ -246,6 +262,17 @@ export function ChatSurface({
             </div>
           </div>
         </div>
+      )}
+
+      {showTaskPanel && !inspectorRunId && (
+        <TaskPanel
+          runId={
+            inspectorRunId ??
+            (conversation && conversation.runs.length > 0
+              ? conversation.runs[conversation.runs.length - 1].runId
+              : null)
+          }
+        />
       )}
     </div>
   );

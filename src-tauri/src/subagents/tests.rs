@@ -24,10 +24,16 @@ use crate::registry::ModelRole;
 const RUN: &str = "run-1";
 
 fn user() -> Session {
-    Session::open(User::new("priya", "Priya Sharma", vec![Role::User]))
+    Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]))
 }
 
 fn knowledge_admin() -> Session {
+    // The legacy `KnowledgeAdministrator` role is kept on the enum for
+    // compatibility. Tests use it as a fixture for "a person who is not
+    // a work-role user" — the active product's two roles are
+    // Administrator and Employee, both of which hold the work
+    // permissions, so a legacy variant is what stands in for "not
+    // cleared for this material".
     Session::open(User::new(
         "kiran",
         "Kiran Das",

@@ -126,12 +126,15 @@ mod tests {
     use super::*;
     use crate::identity::{Role, User};
 
-    fn reviewer() -> Session {
-        Session::open(User::new("ravi", "Ravi Menon", vec![Role::Reviewer]))
+    fn approver() -> Session {
+        // In the 2-role model, an Employee holds `ApproveOutput`. The
+        // approver and the author are deliberately different sessions,
+        // because an actor may not approve a task they themselves own.
+        Session::open(User::new("ravi", "Ravi Menon", vec![Role::Employee]))
     }
 
     fn author() -> Session {
-        Session::open(User::new("priya", "Priya Sharma", vec![Role::User]))
+        Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]))
     }
 
     #[tokio::test]
@@ -160,7 +163,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        queue.decide(&reviewer(), &id, true, None).expect("approved");
+        queue.decide(&approver(), &id, true, None).expect("approved");
 
         assert_eq!(
             waiting.await.expect("task finished"),
@@ -194,7 +197,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         queue
-            .decide(&reviewer(), &id, false, Some("the seal figure is unsourced"))
+            .decide(&approver(), &id, false, Some("the seal figure is unsourced"))
             .expect("rejected");
 
         let outcome = waiting.await.expect("task finished");

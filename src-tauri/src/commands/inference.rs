@@ -8,15 +8,23 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::ai_engine::traits::*;
 use crate::ai_engine::manager::InferenceManager;
+use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::identity::Permission;
 
 #[tauri::command]
 pub async fn load_installed_model(
     app_handle: AppHandle,
     inference_mgr: State<'_, Arc<InferenceManager>>,
+    session: State<'_, CurrentSession>,
     provider_id: String,
     model_id: String,
     quantization: String,
 ) -> Result<LoadedModelInfo, String> {
+    // Loading a model is a model-management operation: it changes what
+    // answers the next prompt. The matrix puts it under `ImportModel`,
+    // which `ModelAdministrator` and `Administrator` hold.
+    require_permission(&session, Permission::ImportModel)?;
+
     log::info!(
         "[STAGE 2 IPC] load_installed_model command entered: provider_id='{}', model_id='{}', quantization='{}'",
         provider_id, model_id, quantization
@@ -78,7 +86,9 @@ pub async fn load_installed_model(
 pub async fn unload_active_model(
     app_handle: AppHandle,
     inference_mgr: State<'_, Arc<InferenceManager>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<(), String> {
+    require_permission(&session, Permission::ImportModel)?;
     inference_mgr
         .unload_active_model(&app_handle)
         .map_err(|e| e.to_string())
@@ -87,7 +97,11 @@ pub async fn unload_active_model(
 #[tauri::command]
 pub fn get_inference_status(
     inference_mgr: State<'_, Arc<InferenceManager>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<InferenceStatusPayload, String> {
+    // Read-only; the matrix allows any signed-in user. The status reports
+    // which model is resident, which is not sensitive.
+    require_session(&session)?;
     let status = inference_mgr.get_status();
     let loaded_model = inference_mgr.get_loaded_model_info();
 
@@ -104,10 +118,16 @@ pub async fn send_chat_message(
     app_handle: AppHandle,
     inference_mgr: State<'_, Arc<InferenceManager>>,
     memory_mgr: State<'_, Arc<crate::memory_engine::MemoryManager>>,
+    session: State<'_, CurrentSession>,
     messages: Vec<ChatMessage>,
     params: Option<GenerationParams>,
     manual_capability: Option<String>,
 ) -> Result<(), String> {
+    // Sending a chat message uses a model. The matrix puts that under
+    // `UseModel`, which `User`, `ModelAdministrator`, and `Administrator`
+    // hold. An `Auditor` and a `Reviewer` cannot drive a model directly.
+    require_permission(&session, Permission::UseModel)?;
+
     let params = params.unwrap_or_default();
     let mgr = inference_mgr.inner().clone();
     let mem = memory_mgr.inner().clone();
@@ -154,7 +174,12 @@ pub async fn send_chat_message(
 #[tauri::command]
 pub fn stop_chat_generation(
     inference_mgr: State<'_, Arc<InferenceManager>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<(), String> {
+    // Stopping your own in-flight generation is `UseModel`: you started
+    // it, you may end it. The orchestrator's own cancellation goes
+    // through a different path (the agent runtime), not this command.
+    require_permission(&session, Permission::UseModel)?;
     inference_mgr.stop_generation();
     Ok(())
 }
@@ -163,7 +188,12 @@ pub fn stop_chat_generation(
 pub async fn restore_last_session(
     app_handle: AppHandle,
     inference_mgr: State<'_, Arc<InferenceManager>>,
+    session: State<'_, CurrentSession>,
 ) -> Result<Option<LoadedModelInfo>, String> {
+    // Restoring a session loads the saved model. That is a model-management
+    // operation, so it lives under `ImportModel` in the matrix.
+    require_permission(&session, Permission::ImportModel)?;
+
     let app_data_dir = app_handle
         .path()
         .app_data_dir()

@@ -518,7 +518,7 @@ mod tests {
 
         let hits = f
             .index
-            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .region(&session(vec![Role::Employee]), "manual", 11, 13, 50)
             .unwrap();
 
         assert_eq!(
@@ -534,7 +534,7 @@ mod tests {
 
         let hits = f
             .index
-            .region(&session(vec![Role::User]), "manual", 12, 12, 50)
+            .region(&session(vec![Role::Employee]), "manual", 12, 12, 50)
             .unwrap();
 
         assert_eq!(hits.len(), 1);
@@ -549,12 +549,13 @@ mod tests {
         let f = fixture();
         index_manual(&f, Classification::VendorNegotiation);
 
-        // A knowledge administrator curates manuals and is not cleared for deal
-        // terms — the same rule `search` applies.
+        // A legacy role is not cleared for any classification. The
+        // assertion that the region read returns nothing catches a
+        // regression that re-enables a legacy role.
         let refused = f
             .index
             .region(
-                &session(vec![Role::KnowledgeAdministrator]),
+                &session(vec![Role::Auditor]),
                 "manual",
                 11,
                 13,
@@ -565,7 +566,7 @@ mod tests {
 
         let permitted = f
             .index
-            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .region(&session(vec![Role::Employee]), "manual", 11, 13, 50)
             .unwrap();
         assert_eq!(permitted.len(), 3);
     }
@@ -580,7 +581,7 @@ mod tests {
 
         assert!(f
             .index
-            .region(&session(vec![Role::User]), "manual", 11, 13, 50)
+            .region(&session(vec![Role::Employee]), "manual", 11, 13, 50)
             .unwrap()
             .is_empty());
     }
@@ -592,7 +593,7 @@ mod tests {
 
         let hits = f
             .index
-            .region(&session(vec![Role::User]), "manual", 13, 11, 50)
+            .region(&session(vec![Role::Employee]), "manual", 13, 11, 50)
             .unwrap();
 
         assert_eq!(hits.len(), 3);
@@ -605,7 +606,7 @@ mod tests {
 
         let hits = f
             .index
-            .region(&session(vec![Role::User]), "manual", 10, 14, 2)
+            .region(&session(vec![Role::Employee]), "manual", 10, 14, 2)
             .unwrap();
 
         // Two, not five. The ceiling is what actually keeps a dense range from
@@ -623,7 +624,7 @@ mod tests {
 
         assert!(f
             .index
-            .region(&session(vec![Role::User]), "not-a-document", 1, 5, 50)
+            .region(&session(vec![Role::Employee]), "not-a-document", 1, 5, 50)
             .unwrap()
             .is_empty());
     }
@@ -635,7 +636,7 @@ mod tests {
 
         let hits = f
             .index
-            .region(&session(vec![Role::User]), "manual", 10, 14, 50)
+            .region(&session(vec![Role::Employee]), "manual", 10, 14, 50)
             .unwrap();
         let pages: Vec<u32> = hits.iter().map(|hit| hit.page).collect();
         let mut sorted = pages.clone();
@@ -649,7 +650,7 @@ mod tests {
         let f = fixture();
         index_sop(&f);
 
-        let hits = f.index.search(&session(vec![Role::User]), "wall thickness", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "wall thickness", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text.contains("9.0 mm"));
     }
@@ -667,7 +668,7 @@ mod tests {
             )
             .unwrap();
 
-        let hits = f.index.search(&session(vec![Role::User]), "thickness", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "thickness", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -684,15 +685,17 @@ mod tests {
             )
             .unwrap();
 
-        // The knowledge administrator is not cleared for commercial material.
+        // A legacy role is not cleared for any classification. The
+        // assertion that the search returns nothing catches a
+        // regression that re-enables a legacy role.
         let hits = f
             .index
-            .search(&session(vec![Role::KnowledgeAdministrator]), "valve", 10)
+            .search(&session(vec![Role::Auditor]), "valve", 10)
             .unwrap();
         assert!(hits.is_empty());
 
-        // An ordinary user is.
-        let hits = f.index.search(&session(vec![Role::User]), "valve", 10).unwrap();
+        // An Employee is cleared for the commercial tier.
+        let hits = f.index.search(&session(vec![Role::Employee]), "valve", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -701,6 +704,9 @@ mod tests {
     fn an_auditor_searching_finds_nothing_at_all() {
         let f = fixture();
         index_sop(&f);
+        // The legacy `Auditor` role is the test fixture for "no
+        // clearance" in the active product. Pinned here so a regression
+        // that re-enables a legacy role is caught at the search level.
         let hits = f.index.search(&session(vec![Role::Auditor]), "thickness", 10).unwrap();
         assert!(hits.is_empty());
     }
@@ -717,13 +723,16 @@ mod tests {
             )
             .unwrap();
 
+        // A legacy role that is not cleared for any classification: the
+        // vendor-term hit must look identical to a hit on a term that
+        // returns no results.
         let uncleared = f
             .index
-            .search(&session(vec![Role::KnowledgeAdministrator]), "valve", 10)
+            .search(&session(vec![Role::Auditor]), "valve", 10)
             .unwrap();
         let absent = f
             .index
-            .search(&session(vec![Role::KnowledgeAdministrator]), "sasquatch", 10)
+            .search(&session(vec![Role::Auditor]), "sasquatch", 10)
             .unwrap();
 
         assert_eq!(uncleared.len(), absent.len());
@@ -733,10 +742,10 @@ mod tests {
     fn a_superseded_document_stays_traceable_but_is_not_returned() {
         let f = fixture();
         index_sop(&f);
-        assert_eq!(f.index.search(&session(vec![Role::User]), "thickness", 10).unwrap().len(), 1);
+        assert_eq!(f.index.search(&session(vec![Role::Employee]), "thickness", 10).unwrap().len(), 1);
 
         f.index.supersede("sop").unwrap();
-        assert!(f.index.search(&session(vec![Role::User]), "thickness", 10).unwrap().is_empty());
+        assert!(f.index.search(&session(vec![Role::Employee]), "thickness", 10).unwrap().is_empty());
 
         // Still held, so a citation made before it was superseded still resolves.
         let conn = f.index.conn.lock().unwrap();
@@ -759,7 +768,7 @@ mod tests {
                 &[chunk("c2", "sop", 0, "New text about valves.", vec![])])
             .unwrap();
 
-        let hits = f.index.search(&session(vec![Role::User]), "valves", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "valves", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text.contains("New text"));
     }
@@ -768,7 +777,7 @@ mod tests {
     fn results_carry_everything_a_citation_needs() {
         let f = fixture();
         index_sop(&f);
-        let hit = &f.index.search(&session(vec![Role::User]), "thickness", 10).unwrap()[0];
+        let hit = &f.index.search(&session(vec![Role::Employee]), "thickness", 10).unwrap()[0];
 
         assert_eq!(
             hit.citation(),
@@ -786,7 +795,7 @@ mod tests {
             .collect();
         f.index.index_document("SOP", Classification::Internal, &chunks).unwrap();
 
-        let hits = f.index.search(&session(vec![Role::User]), "valve", 5).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "valve", 5).unwrap();
         assert_eq!(hits.len(), 5);
     }
 
@@ -805,7 +814,7 @@ mod tests {
             )
             .unwrap();
 
-        let hits = f.index.search(&session(vec![Role::User]), "PV-2201", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "PV-2201", 10).unwrap();
         assert_eq!(hits.len(), 1, "a hyphenated tag number must be findable");
     }
 
@@ -822,7 +831,7 @@ mod tests {
             .unwrap();
 
         // Reads as the literal words, not as a boolean operator.
-        let hits = f.index.search(&session(vec![Role::User]), "valve OR pump", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "valve OR pump", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -840,7 +849,7 @@ mod tests {
             "^thickness",
             "(unbalanced",
         ] {
-            let outcome = f.index.search(&session(vec![Role::User]), awkward, 10);
+            let outcome = f.index.search(&session(vec![Role::Employee]), awkward, 10);
             assert!(outcome.is_ok(), "{awkward:?} should not error: {outcome:?}");
         }
     }
@@ -851,7 +860,7 @@ mod tests {
         index_sop(&f);
 
         for empty in ["", "   ", "!!!", "--"] {
-            let hits = f.index.search(&session(vec![Role::User]), empty, 10).unwrap();
+            let hits = f.index.search(&session(vec![Role::Employee]), empty, 10).unwrap();
             assert!(hits.is_empty(), "{empty:?} should match nothing");
         }
     }
@@ -860,7 +869,7 @@ mod tests {
     fn a_measurement_with_a_decimal_point_is_found() {
         let f = fixture();
         index_sop(&f);
-        let hits = f.index.search(&session(vec![Role::User]), "9.0 mm", 10).unwrap();
+        let hits = f.index.search(&session(vec![Role::Employee]), "9.0 mm", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
 

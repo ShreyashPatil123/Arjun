@@ -936,7 +936,7 @@ mod tests {
             _dir: dir,
             root,
             index,
-            session: Session::open(User::new("kiran", "Kiran", vec![Role::User])),
+            session: Session::open(User::new("kiran", "Kiran", vec![Role::Employee])),
         }
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
             root,
             index,
             multimodal,
-            session: Session::open(User::new("kiran", "Kiran", vec![Role::User])),
+            session: Session::open(User::new("kiran", "Kiran", vec![Role::Employee])),
         }
     }
 

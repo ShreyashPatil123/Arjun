@@ -24,6 +24,8 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::ai_engine::manager::InferenceManager;
+use crate::ai_engine::request_context::RequestContext;
+use crate::ai_engine::request_context::RequestRegistry;
 use crate::ai_engine::traits::{ChatMessage, GenerationParams, StreamChunk};
 use crate::capability::CapabilityBackend;
 
@@ -52,6 +54,10 @@ pub struct GenerationJob {
     pub params: GenerationParams,
     pub capability: Option<CapabilityBackend>,
     pub origin: JobOrigin,
+    /// The per-request context (TODO 6). Optional for
+    /// back-compat with internal callers that pre-date the
+    /// TODO 6 work; the agent runtime always sets it.
+    pub context: Option<RequestContext>,
 }
 
 /// Caller's side of a submitted job.
@@ -129,6 +135,10 @@ struct Envelope {
     job: GenerationJob,
     out: tokio_mpsc::UnboundedSender<StreamChunk>,
     cancel: Arc<AtomicBool>,
+    /// The shared registry. The worker thread deregisters
+    /// the request when the job finishes. `None` for
+    /// internal callers that pre-date the registry.
+    registry: Option<Arc<RequestRegistry>>,
 }
 
 /// Serializes all model access behind a single worker thread.
@@ -170,6 +180,22 @@ impl GenerationScheduler {
     ///
     /// Returns immediately — it does not wait for the model to be free.
     pub fn submit(&self, job: GenerationJob) -> Result<GenerationHandle> {
+        self.submit_with_registry(job, None)
+    }
+
+    /// Queues a job and registers the request in `registry`
+    /// for the duration of generation. The worker thread
+    /// deregisters on completion (success, cancel, or
+    /// error).
+    ///
+    /// TODO 6: this is the multi-employee entry point. The
+    /// `request_id` on the job's `context` is what the
+    /// front-end uses to route tokens to the right cell.
+    pub fn submit_with_registry(
+        &self,
+        job: GenerationJob,
+        registry: Option<Arc<RequestRegistry>>,
+    ) -> Result<GenerationHandle> {
         let (out, chunks) = tokio_mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -177,11 +203,16 @@ impl GenerationScheduler {
         // predecessors but not itself.
         let position = self.depth.fetch_add(1, Ordering::SeqCst);
 
+        if let (Some(reg), Some(ctx)) = (registry.as_ref(), job.context.as_ref()) {
+            reg.register(ctx.clone(), cancel.clone());
+        }
+
         self.tx
             .send(Envelope {
                 job,
                 out,
                 cancel: cancel.clone(),
+                registry,
             })
             .map_err(|_| {
                 self.depth.fetch_sub(1, Ordering::SeqCst);
@@ -198,10 +229,13 @@ impl GenerationScheduler {
 
 /// Runs one job to completion on the worker thread.
 fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
-    let Envelope { job, out, cancel } = envelope;
+    let Envelope { job, out, cancel, registry } = envelope;
 
     if cancel.load(Ordering::Relaxed) {
         log::info!("[SCHEDULER] Job from '{}' cancelled before start", job.origin.label());
+        if let (Some(reg), Some(ctx)) = (registry.as_ref(), job.context.as_ref()) {
+            reg.deregister(&ctx.request_id);
+        }
         return;
     }
 
@@ -218,6 +252,12 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
                 tokens_generated: Some(0),
                 finish_reason: Some("no_model".to_string()),
             });
+            // TODO 6: still need to deregister on this path;
+            // the early `return` would otherwise leave the
+            // request in the registry forever.
+            if let (Some(reg), Some(ctx)) = (registry.as_ref(), job.context.as_ref()) {
+                reg.deregister(&ctx.request_id);
+            }
             return;
         }
     };
@@ -291,6 +331,17 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
             });
         }
     }
+
+    // TODO 6: deregister on completion. A request that
+    // finished (success, error, or cancel alike) is no
+    // longer live, and the agent status panel should stop
+    // showing it. Doing this *here* — at the very end of
+    // the worker — means a request that is still in the
+    // queue is still in the registry, which is what the
+    // front-end wants: it can see both running and queued.
+    if let (Some(reg), Some(ctx)) = (registry.as_ref(), job.context.as_ref()) {
+        reg.deregister(&ctx.request_id);
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +414,7 @@ mod tests {
                 params: GenerationParams::default(),
                 capability: None,
                 origin: JobOrigin::Gateway { client: "test".into() },
+                context: None,
             })
             .expect("submit should succeed");
 
@@ -390,6 +442,7 @@ mod tests {
             params: GenerationParams::default(),
             capability: None,
             origin: JobOrigin::Desktop,
+            context: None,
         };
 
         // Submitted back-to-back; the first is at or near the front.
