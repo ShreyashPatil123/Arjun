@@ -146,8 +146,8 @@ export function useConversation(): UseConversation {
   // this and the `correlationId` match is no longer needed.
   const subscribedActualRunId = useRef<string | null>(null);
   const isStreamingRef = useRef(false);
-  // Token counts from the message_end event, to be passed to completeMessage
-  const messageEndTokensRef = useRef<{ tokensIn?: number; tokensOut?: number }>({});
+  // BUG FIX: track start time for elapsed calculation
+  const startTimeRef = useRef<number>(Date.now());
 
   /** Refresh the conversation list. */
   const refresh = useCallback(async () => {
@@ -283,24 +283,42 @@ export function useConversation(): UseConversation {
             window.clearTimeout(persistDebounceRef.current);
             persistDebounceRef.current = null;
           }
-          // Store token counts from the message_end event for later use in completeMessage
-          messageEndTokensRef.current = {
-            tokensIn: event.tokensIn,
-            tokensOut: event.tokensOut,
-          };
-          if (
-            subscribedConversationId.current &&
-            subscribedMessageId.current
-          ) {
+
+          // ─── BUG FIX: mark message as done so composing stops ───
+          if (subscribedConversationId.current && subscribedMessageId.current) {
+            const convId = subscribedConversationId.current;
+            const msgId = subscribedMessageId.current;
+            const runId = subscribedActualRunId.current ?? subscribedRunId.current;
+            const finalContent = liveContentRef.current;
+            const elapsed = Date.now() - startTimeRef.current;
+
+            // 1. Persist final content
             void agentService
-              .updateStreamingContent(
-                subscribedConversationId.current,
-                subscribedMessageId.current,
-                liveContentRef.current,
-              )
-              .then(() => reloadActive(subscribedConversationId.current!))
+              .updateStreamingContent(convId, msgId, finalContent)
+              .then(() => reloadActive(convId))
               .catch(() => undefined);
+
+            // 2. MARK MESSAGE AS DONE — this was the missing call
+            if (runId) {
+              void agentService.completeMessage({
+                conversationId: convId,
+                messageId: msgId,
+                runId,
+                finalContent,
+                elapsedMs: elapsed,
+                failed: false,
+                tokensIn: event.tokensIn,
+                tokensOut: event.tokensOut,
+              }).then(() => reloadActive(convId))
+                .catch(() => undefined);
+            }
           }
+
+          // 3. Reset streaming flags immediately
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+          setActiveMessageId(null);
+          setActiveRunId(null);
           break;
       }
     },
@@ -342,9 +360,7 @@ export function useConversation(): UseConversation {
             .split('\n')
             .map(line => line.trim())
             .find(line => line.length > 0) ?? 'New conversation';
-        const created = await agentService.createConversation(
-          title.slice(0, 80),
-        );
+        const created = await agentService.createConversation(title.slice(0, 80));
         conv = created;
         rememberConversation(created.id);
       }
@@ -355,14 +371,12 @@ export function useConversation(): UseConversation {
       // Reserve the user message and the assistant cell on the
       // conversation, and bind the run id so the runtime can route
       // streaming events to the right cell.
-      const updated = await agentService.appendTurn(
-        conv.id,
-        runId,
-        messageId,
-        prompt,
-      );
+      const updated = await agentService.appendTurn(conv.id, runId, messageId, prompt);
       if (updated) setConversation(updated);
       await refresh();
+
+      // BUG FIX: reset start time
+      startTimeRef.current = Date.now();
 
       isStreamingRef.current = true;
       setIsStreaming(true);
@@ -397,18 +411,12 @@ export function useConversation(): UseConversation {
         // now updated to its final state by the server; if it did, this
         // is a no-op (the cell is already `done`).
         if (summary && summary.messageId) {
-          // Call complete with token counts from message_end event
-          await complete({
-            finalContent: liveContentRef.current,
-            elapsedMs: 0,
-            modelName: summary.routing.modelName,
-            modelRole: summary.routing.role,
-            usedFallback: summary.routing.usedFallback,
-            tokensIn: messageEndTokensRef.current.tokensIn,
-            tokensOut: messageEndTokensRef.current.tokensOut,
-          });
-          // Clear the token refs after use
-          messageEndTokensRef.current = {};
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+          setActiveMessageId(null);
+          setActiveRunId(null);
+          await reloadActive(conv.id);
+          await refresh();
         }
       } catch (error) {
         // Surface the failure to the conversation as a failed message.
@@ -448,8 +456,6 @@ export function useConversation(): UseConversation {
       usedFallback?: boolean;
       error?: string;
       failed?: boolean;
-      tokensIn?: number;
-      tokensOut?: number;
     }) => {
       if (!conversation || !activeMessageId || !activeRunId) return;
       await agentService.completeMessage({
@@ -463,8 +469,6 @@ export function useConversation(): UseConversation {
         usedFallback: args.usedFallback,
         error: args.error,
         failed: args.failed ?? false,
-        tokensIn: args.tokensIn,
-        tokensOut: args.tokensOut,
       });
       await reloadActive(conversation.id);
       await refresh();

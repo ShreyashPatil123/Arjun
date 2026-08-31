@@ -168,8 +168,9 @@
 
 .assistantRow {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
   padding: 0;
   background: transparent;
   border-radius: 0;
@@ -1179,4 +1180,399 @@
   display: block;
   border-radius: 50%;
   flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * ThinkingTree — expandable reasoning blocks with tree timeline
+ * ------------------------------------------------------------------ */
+.thinkingTree {
+  margin: 8px 0 12px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.thinkingHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.thinkingTitle {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.thinkingNodes {
+  position: relative;
+}
+
+.thinkingNode {
+  position: relative;
+  padding-left: 24px;
+}
+
+.thinkingNode::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  border-left: 1px dotted var(--border-default);
+}
+
+.thinkingNode:last-child::before {
+  display: none;
+}
+
+.thinkingNodeMain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  min-height: 24px;
+}
+
+.thinkingConnector {
+  width: 8px;
+  flex-shrink: 0;
+}
+
+.thinkingBullet {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+
+.thinkingStatusIcon {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.thinkingStatusIcon[data-status="running"] {
+  color: var(--text-primary);
+  animation: spin 1s linear infinite;
+}
+
+.thinkingStatusIcon[data-status="done"] {
+  color: var(--success, #22c55e);
+}
+
+.thinkingStatusIcon[data-status="failed"] {
+  color: var(--error, #fca5a5);
+}
+
+.thinkingIcon {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.thinkingLabel {
+  flex: 1;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: 1.4;
+  min-width: 0;
+}
+
+.thinkingMeta {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.thinkingExpand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.thinkingExpand:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.thinkingChildren {
+  padding-left: 8px;
+  border-left: 1px dotted var(--border-default);
+  margin-left: 4px;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Assistant message layout with orb avatar - replaced with proper styles below */
+
+
+/* Avatar + two-column layout (Kimi-style) */
+.assistantAvatar {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+}
+
+.chatOrb {
+  display: block;
+  border-radius: 50%;
+}
+
+.assistantCol {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Status pill with token metrics */
+.statusPillSub {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Thinking Tree - dotted timeline like Kimi */
+.thinkingTree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.thinkingTreeHeader {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.thinkingTreeTitle {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.thinkingTreeDoneIcon {
+  color: var(--success, #22c55e);
+}
+
+.thinkingTreeBody {
+  display: flex;
+  flex-direction: column;
+  padding-left: 4px;
+}
+
+/* Thinking Node - vertical dotted line + dot */
+.thinkingNode {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.thinkingNodeLineWrap {
+  flex: none;
+  width: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  min-height: 22px;
+}
+
+.thinkingNodeLine {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 0;
+  border-left: 1.5px dashed var(--border-default);
+  transform: translateX(-50%);
+}
+
+.thinkingNodeLineLast {
+  bottom: auto;
+  height: 8px;
+}
+
+.thinkingNodeDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  margin-top: 7px;
+  flex: none;
+  z-index: 1;
+}
+
+.thinkingNodeContent {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding-bottom: 6px;
+}
+
+.thinkingNodeHeader {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  text-align: left;
+}
+
+.thinkingNodeHeader:hover .thinkingNodeLabel {
+  color: var(--text-primary);
+}
+
+.thinkingNodeLabel {
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.thinkingNodeMeta {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  margin-left: 4px;
+}
+
+.thinkingNodeFail {
+  color: var(--error, #ef4444);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.thinkingNodeBullet {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+/* Thinking Node Children (nested rows) */
+.thinkingNodeChildren {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 2px;
+}
+
+.thinkingChildRow {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.thinkingChildLineWrap {
+  flex: none;
+  width: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  min-height: 18px;
+}
+
+.thinkingChildLine {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 0;
+  border-left: 1.5px dashed var(--border-default);
+  transform: translateX(-50%);
+}
+
+.thinkingChildDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--border-default);
+  margin-top: 5px;
+  flex: none;
+  z-index: 1;
+}
+
+.thinkingChildContent {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.thinkingChildLabel {
+  color: var(--text-secondary);
+}
+
+.thinkingChildMeta {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.thinkingChildLink {
+  color: var(--info, #3b82f6);
+  text-decoration: none;
+  margin-left: 2px;
+  font-size: 10px;
+}
+
+.thinkingChildLink:hover {
+  text-decoration: underline;
 }

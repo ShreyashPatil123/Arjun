@@ -23,39 +23,10 @@ import {
   type RunSummary,
 } from '../../services/agent.service';
 import { formatDuration } from './format';
+import { ChatOrb } from './ChatOrb';
+import { ThinkingTree, type ThinkingNode } from './ThinkingTree';
 import { useTokenMetrics } from './useTokenMetrics';
 import styles from './ChatSurface.module.css';
-
-/* ------------------------------------------------------------------ *
- * The compact assistant message cell.
- *
- * One cell per assistant turn. The redesign has three changes:
- *
- *  1. **Status pill** replaces the model badge. The model is now in a
- *     quieter meta footer (`model · role · elapsed`) so the eye goes
- *     to the content first and the metadata second.
- *  2. **Single-line tools**: the tool list is a single `verb + duration`
- *     line per tool, not a card. Tools stay in the cell only when they
- *     are short; long ones get a tiny expand chevron.
- *  3. **Inline artifacts**: the artifact card is rendered inline next
- *     to the cell, not as a sub-card. The `View details` link still
- *     opens the full inspector for the run.
- *
- * Status states:
- *  - Thinking…     before any tokens have arrived
- *  - Planning…     once the plan is in
- *  - Using tool…   while tools are running
- *  - Composing…    while text is streaming
- *  - Verifying…    during the verification pass
- *  - Verified      on success
- *  - failed        on error
- * ------------------------------------------------------------------ */
-
-const ARTIFACT_ICONS: Record<ArtifactReport['kind'], typeof FileText> = {
-  document: FileText,
-  workbook: FileSpreadsheet,
-  text: FileText,
-};
 
 function size(bytes: number): string {
   if (bytes < 1024) return `${bytes} bytes`;
@@ -63,223 +34,60 @@ function size(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-interface AssistantMessageCellProps {
-  message: ChatMessage;
-  /** Live streaming content for this cell, when applicable. Falls back to
-   *  the persisted `message.content` if absent (e.g. a remount). */
-  liveContent?: string;
-  /** True when this is the currently streaming cell. */
-  isLive?: boolean;
-  /** Activity for the run that produced this message. */
-  activity?: {
-    id: string;
-    tool: string;
-    status:
-      | 'running'
-      | 'done'
-      | 'failed'
-      | 'refused'
-      | 'replayed'
-      | 'unknown';
-    startedAt?: number;
-    endedAt?: number;
-    inputSummary?: string;
-    outputSummary?: string;
-    artifactPath?: string;
-    errorMessage?: string;
-  }[];
-  /** Run summary, for the per-run inspector. */
-  runSummary?: RunSummary | null;
-  /** Whether the inspector modal is currently open for this message. */
-  onOpenInspector?: (runId: string) => void;
-  /** Retry handler for failed messages. */
-  onRetry?: () => void;
-  /** True when the user is composing a follow-up; the retry button
-   *  is hidden in that case. */
-  composerDisabled?: boolean;
+/* ------------------------------------------------------------------ *
+ * Parse reasoning blocks from content.
+ * Supports:  <think>...</think>  or  <thinking>...</thinking>
+ * ------------------------------------------------------------------ */
+function parseThinking(content: string): { reasoning: string; answer: string; nodes: ThinkingNode[] } {
+  let reasoning = '';
+  let answer = content;
+
+  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+  if (thinkMatch) {
+    reasoning = thinkMatch[1].trim();
+    answer = content.replace(thinkMatch[0], '').trim();
+  }
+
+  // Convert raw reasoning text into a tree of nodes for the UI
+  const nodes: ThinkingNode[] = [];
+  if (reasoning) {
+    const lines = reasoning.split('\n').filter(l => l.trim());
+    lines.forEach((line, idx) => {
+      const trimmed = line.trim().replace(/^[-•]\s*/, '');
+      nodes.push({
+        id: `r-${idx}`,
+        label: trimmed,
+        status: 'done',
+        icon: 'none',
+      });
+    });
+  }
+
+  return { reasoning, answer, nodes };
 }
 
-export function AssistantMessageCell({
-  message,
-  liveContent,
-  isLive,
-  activity,
-  runSummary,
-  onOpenInspector,
-  onRetry,
-}: AssistantMessageCellProps) {
-  const content = isLive ? liveContent ?? message.content : message.content;
-  const isStreaming = isLive || message.status === 'streaming';
-  const isFailed = message.status === 'failed';
-
-  const elapsedMs = message.elapsedMs ?? null;
-  const elapsedText = elapsedMs !== null ? formatDuration(elapsedMs) : null;
-  const modelName =
-    message.modelName ?? runSummary?.routing.modelName ?? 'model';
-  const modelRole =
-    message.modelRole ?? runSummary?.routing.role ?? null;
-  const usedFallback =
-    message.usedFallback ?? runSummary?.routing.usedFallback ?? false;
-
-  // Token metrics (live during streaming, final on completion)
-  const tokenMetrics = useTokenMetrics(
-    isStreaming,
-    content.length,
-    message.tokensIn,
-    message.tokensOut
-  );
-
-  // Status derivation: which of the seven states are we in?
-  const runningTools = activity?.filter(a => a.status === 'running').length ?? 0;
-  const toolsTotal = activity?.length ?? 0;
-  const status = isFailed
-    ? 'failed'
-    : isStreaming
-      ? content.length > 0
-        ? 'composing'
-        : runningTools > 0
-          ? 'usingTool'
-          : 'thinking'
-      : 'verified';
-
-  return (
-    <div className={styles.assistantRow}>
-      {/* Meta footer — model identity, timing, and token metrics. */}
-      <div className={styles.assistantMeta}>
-        <StatusPill
-          state={status}
-          metrics={tokenMetrics}
-          runningTools={runningTools}
-        />
-        <span className={styles.assistantMetaSep}>·</span>
-        <span className={styles.assistantModel}>
-          {modelName}
-          {modelRole && (
-            <span className={styles.assistantModelRole}> · {modelRole}</span>
-          )}
-          {usedFallback && (
-            <span className={styles.assistantFallback}>fallback</span>
-          )}
-        </span>
-        {/* Token metrics display */}
-        <span className={styles.assistantMetaSep}>·</span>
-        <span className={styles.tokenMetrics}>
-          {tokenMetrics.tokensIn > 0 && (
-            <>
-              <span className={styles.tokenMetric}>
-                <span className={styles.tokenLabel}>in</span>
-                <span className={styles.tokenValue}>{tokenMetrics.tokensIn.toLocaleString()}</span>
-              </span>
-              <span className={styles.tokenSep}>·</span>
-            </>
-          )}
-          <span className={styles.tokenMetric}>
-            <span className={styles.tokenLabel}>out</span>
-            <span className={styles.tokenValue}>{tokenMetrics.tokensOut.toLocaleString()}</span>
-          </span>
-          <span className={styles.tokenSep}>·</span>
-          <span className={styles.tokenMetric}>
-            <span className={styles.tokenLabel}>tok/s</span>
-            <span className={styles.tokenValue}>{tokenMetrics.speed.toLocaleString()}</span>
-          </span>
-        </span>
-      </div>
-
-      <div className={styles.assistantBody}>
-        {isFailed ? (
-          <p className={styles.errorLine}>
-            <AlertTriangle size={13} />
-            <span>{message.error ?? 'The run did not finish cleanly.'}</span>
-          </p>
-        ) : (
-          <p className={styles.assistantText}>
-            {content || (isStreaming ? '…' : '')}
-            {isStreaming && content && <span className={styles.caret}>▍</span>}
-          </p>
-        )}
-
-        {isFailed && onRetry && (
-          <button
-            className={styles.retryBtn}
-            onClick={onRetry}
-            type="button"
-          >
-            <RotateCcw size={12} /> Retry
-          </button>
-        )}
-
-        {activity && activity.length > 0 && (
-          <ToolActivityList activity={activity} isLive={Boolean(isLive)} />
-        )}
-
-        {runSummary && runSummary.artifacts.length > 0 && (
-          <ArtifactList runId={runSummary.runId} artifacts={runSummary.artifacts} />
-        )}
-
-        {message.runId && onOpenInspector && (
-          <div className={styles.assistantFooter}>
-            <button
-              className={styles.detailsBtn}
-              onClick={() => onOpenInspector(message.runId!)}
-              type="button"
-            >
-              View details →
-            </button>
-            <span className={styles.assistantFooterMeta}>
-              {toolsTotal > 0 && (
-                <>
-                  {toolsTotal} tool{toolsTotal === 1 ? '' : 's'}
-                  {' · '}
-                </>
-              )}
-              {runSummary && (
-                <>
-                  {runSummary.plan.steps.length} step
-                  {runSummary.plan.steps.length === 1 ? '' : 's'}
-                  {' · '}
-                </>
-              )}
-              <ShieldCheck size={10} />
-              <span>verified</span>
-            </span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
+/* ------------------------------------------------------------------ *
+ * Status pill with live token metrics
+ * ------------------------------------------------------------------ */
 function StatusPill({
   state,
-  metrics,
+  elapsedText,
   runningTools,
+  metrics,
 }: {
-  state:
-    | 'thinking'
-    | 'usingTool'
-    | 'composing'
-    | 'verifying'
-    | 'verified'
-    | 'failed';
-  metrics: { tokensIn: number; tokensOut: number; speed: number; elapsedMs: number };
+  state: 'thinking' | 'usingTool' | 'composing' | 'verifying' | 'verified' | 'failed';
+  elapsedText: string | null;
   runningTools: number;
+  metrics: { tokensIn: number; tokensOut: number; speed: number; elapsedMs: number };
 }) {
   const labels: Record<typeof state, string> = {
     thinking: 'Thinking…',
-    usingTool:
-      runningTools > 1
-        ? `Using ${runningTools} tools…`
-        : 'Using a tool…',
+    usingTool: runningTools > 1 ? `Using ${runningTools} tools…` : 'Using a tool…',
     composing: 'Composing…',
     verifying: 'Verifying…',
     verified: 'Verified',
     failed: 'Failed',
   };
-
-  const elapsedText =
-    metrics.elapsedMs > 0
-      ? formatDuration(metrics.elapsedMs)
-      : null;
 
   return (
     <span className={styles.statusPill} data-state={state}>
@@ -304,13 +112,174 @@ function StatusPill({
 }
 
 /* ------------------------------------------------------------------ *
- * Tool activity list — single-line rows of tool calls the run made.
- *
- * Each tool reads as `verb · duration` on a single line. Failed tools
- * still show a single line plus a one-line reason. The expand chevron
- * only appears when there is something to expand (input/output/error).
+ * Main component
  * ------------------------------------------------------------------ */
+interface AssistantMessageCellProps {
+  message: ChatMessage;
+  liveContent?: string;
+  isLive?: boolean;
+  activity?: {
+    id: string;
+    tool: string;
+    status: 'running' | 'done' | 'failed' | 'refused' | 'replayed' | 'unknown';
+    startedAt?: number;
+    endedAt?: number;
+    inputSummary?: string;
+    outputSummary?: string;
+    artifactPath?: string;
+    errorMessage?: string;
+  }[];
+  runSummary?: RunSummary | null;
+  onOpenInspector?: (runId: string) => void;
+  onRetry?: () => void;
+  composerDisabled?: boolean;
+}
 
+export function AssistantMessageCell({
+  message,
+  liveContent,
+  isLive,
+  activity,
+  runSummary,
+  onOpenInspector,
+  onRetry,
+}: AssistantMessageCellProps) {
+  const content = isLive ? liveContent ?? message.content : message.content;
+  const isStreaming = isLive || message.status === 'streaming';
+  const isFailed = message.status === 'failed';
+
+  const elapsedMs = message.elapsedMs ?? null;
+  const elapsedText = elapsedMs !== null ? formatDuration(elapsedMs) : null;
+  const modelName = message.modelName ?? runSummary?.routing.modelName ?? 'model';
+  const modelRole = message.modelRole ?? runSummary?.routing.role ?? null;
+  const usedFallback = message.usedFallback ?? runSummary?.routing.usedFallback ?? false;
+
+  const runningTools = activity?.filter(a => a.status === 'running').length ?? 0;
+  const toolsTotal = activity?.length ?? 0;
+
+  const status = isFailed
+    ? 'failed'
+    : isStreaming
+      ? content.length > 0
+        ? 'composing'
+        : runningTools > 0
+          ? 'usingTool'
+          : 'thinking'
+      : 'verified';
+
+  // Token metrics
+  const metrics = useTokenMetrics(
+    Boolean(isLive),
+    content.length,
+    message.tokensIn,
+    message.tokensOut,
+  );
+
+  // Parse thinking / reasoning
+  const { reasoning, answer, nodes } = parseThinking(content);
+  const displayContent = reasoning ? answer : content;
+
+  // Build thinking nodes from activity when no explicit reasoning block exists
+  const thinkingNodes: ThinkingNode[] = nodes.length > 0
+    ? nodes
+    : (activity ?? []).map((a, i) => ({
+        id: a.id,
+        label: a.tool,
+        status: a.status === 'running' ? 'running' : a.status === 'done' ? 'done' : 'failed',
+        icon: a.tool.includes('search') ? 'search' : a.tool.includes('read') ? 'link' : 'tool',
+        meta: a.status === 'running'
+          ? 'in progress'
+          : a.endedAt && a.startedAt
+            ? formatDuration(Math.max(0, a.endedAt - a.startedAt))
+            : undefined,
+      }));
+
+  const showThinking = isStreaming || reasoning || (activity && activity.length > 0);
+
+  return (
+    <div className={styles.assistantRow}>
+      {/* LEFT: Orb Avatar (36px, same size as Kimi bot) */}
+      <div className={styles.assistantAvatar}>
+        <ChatOrb active={Boolean(isLive)} size={36} />
+      </div>
+
+      {/* RIGHT: Meta + Content */}
+      <div className={styles.assistantCol}>
+        {/* Meta line: status pill + model info */}
+        <div className={styles.assistantMeta}>
+          <StatusPill
+            state={status}
+            elapsedText={elapsedText}
+            runningTools={runningTools}
+            metrics={metrics}
+          />
+          <span className={styles.assistantMetaSep}>·</span>
+          <span className={styles.assistantModel}>
+            {modelName}
+            {modelRole && <span className={styles.assistantModelRole}> · {modelRole}</span>}
+            {usedFallback && <span className={styles.assistantFallback}>fallback</span>}
+          </span>
+        </div>
+
+        <div className={styles.assistantBody}>
+          {isFailed ? (
+            <p className={styles.errorLine}>
+              <AlertTriangle size={13} />
+              <span>{message.error ?? 'The run did not finish cleanly.'}</span>
+            </p>
+          ) : (
+            <>
+              {showThinking && (
+                <ThinkingTree nodes={thinkingNodes} isLive={Boolean(isLive)} />
+              )}
+
+              <p className={styles.assistantText}>
+                {displayContent || (isStreaming ? '…' : '')}
+                {isStreaming && displayContent && <span className={styles.caret}>▍</span>}
+              </p>
+            </>
+          )}
+
+          {isFailed && onRetry && (
+            <button className={styles.retryBtn} onClick={onRetry} type="button">
+              <RotateCcw size={12} /> Retry
+            </button>
+          )}
+
+          {activity && activity.length > 0 && (
+            <ToolActivityList activity={activity} isLive={Boolean(isLive)} />
+          )}
+
+          {runSummary && runSummary.artifacts.length > 0 && (
+            <ArtifactList runId={runSummary.runId} artifacts={runSummary.artifacts} />
+          )}
+
+          {message.runId && onOpenInspector && (
+            <div className={styles.assistantFooter}>
+              <button
+                className={styles.detailsBtn}
+                onClick={() => onOpenInspector(message.runId!)}
+                type="button"
+              >
+                View details →
+              </button>
+              <span className={styles.assistantFooterMeta}>
+                {toolsTotal > 0 && <>{toolsTotal} tool{toolsTotal === 1 ? '' : 's'} · </>}
+                {runSummary && <>{runSummary.plan.steps.length} step{runSummary.plan.steps.length === 1 ? '' : 's'} · </>}
+                <ShieldCheck size={10} />
+                <span>verified</span>
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Tool activity list — unchanged from original
+ * ------------------------------------------------------------------ */
 interface ActivityEntry {
   id: string;
   tool: string;
@@ -323,10 +292,7 @@ interface ActivityEntry {
   errorMessage?: string;
 }
 
-const STATUS_ICON: Record<
-  ActivityEntry['status'],
-  React.ComponentType<{ size?: number; className?: string }>
-> = {
+const STATUS_ICON: Record<ActivityEntry['status'], React.ComponentType<{ size?: number; className?: string }>> = {
   running: Loader2,
   done: CheckCircle2,
   failed: AlertTriangle,
@@ -359,15 +325,7 @@ function toolLabel(tool: string) {
   return TOOL_LABEL[tool] ?? tool;
 }
 
-function ToolActivityList({
-  activity,
-  isLive,
-}: {
-  activity: ActivityEntry[];
-  isLive: boolean;
-}) {
-  // Default to collapsed: a long list of tools is the one thing that
-  // makes a chat unreadable, and the user can expand the ones they want.
+function ToolActivityList({ activity, isLive }: { activity: ActivityEntry[]; isLive: boolean }) {
   const [open, setOpen] = useState(false);
   const runningCount = activity.filter(a => a.status === 'running').length;
   const doneCount = activity.filter(a => a.status === 'done').length;
@@ -375,12 +333,7 @@ function ToolActivityList({
 
   return (
     <div className={styles.toolBlock}>
-      <button
-        type="button"
-        className={styles.toolSummary}
-        onClick={() => setOpen(o => !o)}
-        aria-expanded={open}
-      >
+      <button type="button" className={styles.toolSummary} onClick={() => setOpen(o => !o)} aria-expanded={open}>
         <Wrench size={11} className={styles.toolSummaryIcon} />
         {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         <span className={styles.toolSummaryText}>
@@ -409,11 +362,7 @@ function ToolRow({ item }: { item: ActivityEntry }) {
       : item.status === 'running'
         ? 'in progress'
         : null;
-  const expandable =
-    Boolean(item.inputSummary) ||
-    Boolean(item.outputSummary) ||
-    Boolean(item.errorMessage) ||
-    Boolean(item.artifactPath);
+  const expandable = Boolean(item.inputSummary || item.outputSummary || item.errorMessage || item.artifactPath);
 
   return (
     <li className={styles.toolRow}>
@@ -451,17 +400,13 @@ function ToolRow({ item }: { item: ActivityEntry }) {
           {item.artifactPath && (
             <div className={styles.toolDetailRow}>
               <span className={styles.toolDetailLabel}>Produced</span>
-              <span className={`${styles.toolDetailValue} ${styles.toolPath}`}>
-                {item.artifactPath}
-              </span>
+              <span className={`${styles.toolDetailValue} ${styles.toolPath}`}>{item.artifactPath}</span>
             </div>
           )}
           {item.errorMessage && (
             <div className={styles.toolDetailRow}>
               <span className={styles.toolDetailLabel}>Failed because</span>
-              <span className={`${styles.toolDetailValue} ${styles.toolErrorLine}`}>
-                {item.errorMessage}
-              </span>
+              <span className={`${styles.toolDetailValue} ${styles.toolErrorLine}`}>{item.errorMessage}</span>
             </div>
           )}
         </div>
@@ -471,43 +416,27 @@ function ToolRow({ item }: { item: ActivityEntry }) {
 }
 
 /* ------------------------------------------------------------------ *
- * Artifact list — inline cards next to the cell. Each artifact has a
- * single line: icon · name · size · sound/unsound chip · actions.
- * Clicking the row opens an inline preview; the existing reveal button
- * is preserved for opening in the file manager.
+ * Artifact list — unchanged from original
  * ------------------------------------------------------------------ */
+const ARTIFACT_ICONS: Record<ArtifactReport['kind'], typeof FileText> = {
+  document: FileText,
+  workbook: FileSpreadsheet,
+  text: FileText,
+};
 
-function ArtifactList({
-  runId,
-  artifacts,
-}: {
-  runId: string;
-  artifacts: ArtifactReport[];
-}) {
+function ArtifactList({ runId, artifacts }: { runId: string; artifacts: ArtifactReport[] }) {
   return (
     <ul className={styles.artifactList}>
       {artifacts.map(artifact => (
-        <ArtifactRow
-          key={artifact.path}
-          runId={runId}
-          artifact={artifact}
-        />
+        <ArtifactRow key={artifact.path} runId={runId} artifact={artifact} />
       ))}
     </ul>
   );
 }
 
-function ArtifactRow({
-  runId,
-  artifact,
-}: {
-  runId: string;
-  artifact: ArtifactReport;
-}) {
+function ArtifactRow({ runId, artifact }: { runId: string; artifact: ArtifactReport }) {
   const [open, setOpen] = useState(false);
-  const [preview, setPreview] = useState<
-    ArtifactPreview | 'loading' | 'error' | undefined
-  >(undefined);
+  const [preview, setPreview] = useState<ArtifactPreview | 'loading' | 'error' | undefined>(undefined);
   const [problem, setProblem] = useState<string | null>(null);
   const Icon = ARTIFACT_ICONS[artifact.kind];
 
@@ -539,37 +468,18 @@ function ArtifactRow({
     <li className={styles.artifactRow}>
       <div className={styles.artifactRowMain}>
         <Icon size={13} className={styles.artifactIcon} />
-        <button
-          type="button"
-          className={styles.artifactNameBtn}
-          onClick={togglePreview}
-          title={open ? 'Hide preview' : 'Preview'}
-        >
+        <button type="button" className={styles.artifactNameBtn} onClick={togglePreview} title={open ? 'Hide preview' : 'Preview'}>
           <span className={styles.artifactName}>{artifact.name}</span>
         </button>
         <span className={styles.artifactSize}>{size(artifact.bytes)}</span>
-        <span
-          className={artifact.sound ? styles.tagSound : styles.tagUnsound}
-        >
+        <span className={artifact.sound ? styles.tagSound : styles.tagUnsound}>
           {artifact.sound ? 'opens and checks out' : 'did not pass its check'}
         </span>
         <div className={styles.artifactActions}>
-          <button
-            type="button"
-            className={styles.iconBtn}
-            onClick={togglePreview}
-            aria-label={open ? 'Hide preview' : 'Preview'}
-            title={open ? 'Hide preview' : 'Preview'}
-          >
+          <button type="button" className={styles.iconBtn} onClick={togglePreview} aria-label={open ? 'Hide preview' : 'Preview'} title={open ? 'Hide preview' : 'Preview'}>
             {open ? <ChevronDown size={12} /> : <Eye size={12} />}
           </button>
-          <button
-            type="button"
-            className={styles.iconBtn}
-            onClick={reveal}
-            aria-label="Show in file manager"
-            title="Show in file manager"
-          >
+          <button type="button" className={styles.iconBtn} onClick={reveal} aria-label="Show in file manager" title="Show in file manager">
             <FolderOpen size={12} />
           </button>
         </div>
@@ -585,13 +495,7 @@ function ArtifactRow({
   );
 }
 
-function ArtifactPreviewPane({
-  preview,
-  name,
-}: {
-  preview: ArtifactPreview | 'loading' | 'error' | undefined;
-  name: string;
-}) {
+function ArtifactPreviewPane({ preview, name }: { preview: ArtifactPreview | 'loading' | 'error' | undefined; name: string }) {
   if (preview === undefined || preview === 'loading') {
     return (
       <div className={styles.previewPane} aria-busy="true">
@@ -612,44 +516,25 @@ function ArtifactPreviewPane({
     return (
       <div className={styles.previewPane}>
         <CircleSlash size={12} />
-        <span>
-          Preview not available for this format ({preview.mime || 'unknown'}). Use
-          the folder button to open it in the file manager.
-        </span>
+        <span>Preview not available for this format ({preview.mime || 'unknown'}). Use the folder button to open it in the file manager.</span>
       </div>
     );
   }
   if (preview.kind === 'image') {
     return (
       <div className={styles.previewPane}>
-        <img
-          className={styles.previewImage}
-          src={preview.dataUrl}
-          alt={`Preview of ${name}`}
-        />
-        {preview.truncated && (
-          <p className={styles.previewNote}>Preview is truncated to fit.</p>
-        )}
+        <img className={styles.previewImage} src={preview.dataUrl} alt={`Preview of ${name}`} />
+        {preview.truncated && <p className={styles.previewNote}>Preview is truncated to fit.</p>}
       </div>
     );
   }
-  const mono =
-    preview.kind === 'docxBody' ||
-    preview.kind === 'xlsxFirstSheet' ||
-    preview.kind === 'text';
+  const mono = preview.kind === 'docxBody' || preview.kind === 'xlsxFirstSheet' || preview.kind === 'text';
   return (
     <div className={styles.previewPane}>
-      <pre
-        className={mono ? styles.previewPre : styles.previewMarkdown}
-        data-truncated={preview.truncated || undefined}
-      >
+      <pre className={mono ? styles.previewPre : styles.previewMarkdown} data-truncated={preview.truncated || undefined}>
         {preview.content}
       </pre>
-      {preview.truncated && (
-        <p className={styles.previewNote}>
-          Preview is truncated. Use the folder button for the full file.
-        </p>
-      )}
+      {preview.truncated && <p className={styles.previewNote}>Preview is truncated. Use the folder button for the full file.</p>}
     </div>
   );
 }

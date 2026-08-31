@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-interface TokenMetrics {
+export interface TokenMetrics {
   tokensIn: number;
   tokensOut: number;
   speed: number; // tokens per second
@@ -11,7 +11,7 @@ export function useTokenMetrics(
   isLive: boolean,
   contentLength: number,
   tokensIn?: number | null,
-  tokensOut?: number | null
+  tokensOut?: number | null,
 ) {
   const startRef = useRef<number>(Date.now());
   const [metrics, setMetrics] = useState<TokenMetrics>({
