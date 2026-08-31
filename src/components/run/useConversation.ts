@@ -250,6 +250,66 @@ export function useConversation(): UseConversation {
     [],
   );
 
+  /**
+   * Collapse runs of repeated content into a single instance.
+   *
+   * Small models tend to fall into loops and emit the same sentence
+   * two or three times in a row ("How may I assist you today?
+   * How may I assist you today? How may I assist you today?"). The
+   * raw stream faithfully reflects the model, but the duplication
+   * makes the answer look broken in the UI.
+   *
+   * Two passes:
+   *  1. Sentence-level: if the last N characters of the stream end
+   *     with the same sentence that already appears earlier in the
+   *     stream, strip the earlier copy.
+   *  2. Word-level: if the last 200 chars contain an immediate
+   *     repeat of a chunk (8..200 chars), strip one copy.
+   *
+   * Only exact matches are collapsed, so a genuine restatement of a
+   * key phrase is preserved.
+   */
+  const collapseRepeats = (s: string): string => {
+    if (s.length < 20) return s;
+
+    // Pass 1: sentence-level repeat. The most common pattern from
+    // small models is the same sentence appended two or three times
+    // with no whitespace between. We look for sentences that appear
+    // at the very end AND somewhere earlier, separated only by a
+    // space, period, or nothing.
+    const sentenceRe = /[.!?]\s+([^.!?]{8,200})[.!?]/g;
+    const tail1 = s.slice(-500);
+    const tailSentences: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = sentenceRe.exec(tail1)) !== null) {
+      tailSentences.push(m[1]);
+    }
+    if (tailSentences.length > 0) {
+      const last = tailSentences[tailSentences.length - 1];
+      // See if the same sentence appears earlier in the body.
+      const escaped = last.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const dupRe = new RegExp(`(?:^|[.!?]\\s+)${escaped}[.!?](?:\\s+${escaped}[.!?])+`, 'g');
+      if (dupRe.test(s)) {
+        return s.replace(dupRe, (match) => {
+          // Keep only the last occurrence (the trailing one).
+          const parts = match.split(new RegExp(`(?<=[.!?])\\s+(?=${escaped}[.!?])`));
+          return parts[parts.length - 1] ?? match;
+        });
+      }
+    }
+
+    // Pass 2: immediate word-level repeat.
+    const tail = s.slice(-400);
+    for (let len = Math.min(200, Math.floor(tail.length / 2)); len >= 8; len -= 1) {
+      const last = tail.slice(-len);
+      const before = tail.slice(-len * 2, -len);
+      if (last === before) {
+        return s.slice(0, s.length - len);
+      }
+    }
+    return s;
+  };
+
   /** Apply one message-event to the live content ref + state. */
   const applyMessageEvent = useCallback(
     (event: Extract<AgentEvent, { type: 'message_start' | 'message_update' | 'message_end' }>) => {
@@ -259,8 +319,13 @@ export function useConversation(): UseConversation {
           liveContentRef.current = '';
           setStreamingContent('');
           break;
-        case 'message_update':
-          liveContentRef.current += event.delta;
+        case 'message_update': {
+          // Append the new delta, then collapse any immediate repeats
+          // the model just produced. The collapse only ever trims the
+          // tail, so previously-rendered characters are not affected.
+          const next = liveContentRef.current + event.delta;
+          const collapsed = collapseRepeats(next);
+          liveContentRef.current = collapsed;
           // Debounce the React state mirror so a rapid token stream does
           // not queue a render per token. The ref is the truth for
           // subscribers that need the latest content.
@@ -272,6 +337,7 @@ export function useConversation(): UseConversation {
           }
           schedulePersist();
           break;
+        }
         case 'message_end':
           // Flush any pending state mirror and persist immediately.
           if (debounceRef.current !== null) {
