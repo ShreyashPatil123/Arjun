@@ -1013,6 +1013,8 @@ pub async fn agent_start_run(
         Some(routing.used_fallback),
         None,
         run_failed,
+        None,
+        None,
         &signed_in.user.id,
     );
     run_to_conversation.0.unbind(&run_id);

@@ -198,6 +198,8 @@ pub fn agent_complete_message(
     used_fallback: Option<bool>,
     error: Option<String>,
     failed: bool,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
     conversations: State<'_, ConversationsState>,
     run_to_conversation: State<'_, RunToConversationState>,
     session: State<'_, CurrentSession>,
@@ -216,6 +218,8 @@ pub fn agent_complete_message(
             used_fallback,
             error.as_deref(),
             failed,
+            tokens_in,
+            tokens_out,
             &session.user.id,
         )
         .map_err(|e| e.to_string())?;

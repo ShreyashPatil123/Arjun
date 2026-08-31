@@ -62,6 +62,11 @@ pub struct Message {
     /// True if the routed model was a fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_fallback: Option<bool>,
+    /// Token counts from the model (assistant messages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -421,6 +426,8 @@ impl ConversationStore {
             model_name: None,
             model_role: None,
             used_fallback: None,
+            tokens_in: None,
+            tokens_out: None,
         };
         let conversation = Conversation {
             id: id.clone(),
@@ -471,6 +478,8 @@ impl ConversationStore {
             model_name: None,
             model_role: None,
             used_fallback: None,
+            tokens_in: None,
+            tokens_out: None,
         };
         let assistant_msg = Message {
             id: assistant_message_id.to_string(),
@@ -486,6 +495,8 @@ impl ConversationStore {
             model_name: None,
             model_role: None,
             used_fallback: None,
+            tokens_in: None,
+            tokens_out: None,
         };
         conversation.messages.push(user_msg);
         conversation.messages.push(assistant_msg);
@@ -532,6 +543,7 @@ impl ConversationStore {
     /// time and final error, if any. Returns the updated conversation.
     /// A request from a non-owner returns `Ok(None)`, the same shape
     /// as an unknown id.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_message_completion(
         &self,
         id: &str,
@@ -544,6 +556,8 @@ impl ConversationStore {
         used_fallback: Option<bool>,
         error: Option<&str>,
         failed: bool,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
         owner_user_id: &str,
     ) -> std::io::Result<Option<Conversation>> {
         let Some(mut conversation) = self.get(id, Some(owner_user_id))? else {
@@ -569,6 +583,8 @@ impl ConversationStore {
             msg.model_role = model_role.map(str::to_string);
             msg.used_fallback = used_fallback;
             msg.error = error.map(str::to_string);
+            msg.tokens_in = tokens_in;
+            msg.tokens_out = tokens_out;
         }
         if let Some(run) = conversation.runs.iter_mut().find(|r| r.run_id == run_id) {
             run.finished_at = Some(now.clone());

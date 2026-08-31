@@ -132,6 +132,8 @@ fn record_message_completion_marks_done_with_model() {
             Some(false),
             None,
             false,
+            None,
+            None,
             OWNER,
         )
         .expect("complete")
@@ -173,6 +175,8 @@ fn record_message_completion_can_mark_failed() {
             None,
             Some("budget exhausted"),
             true,
+            None,
+            None,
             OWNER,
         )
         .expect("complete")
@@ -239,6 +243,8 @@ fn round_trip_preserves_all_fields() {
             Some(false),
             None,
             false,
+            None,
+            None,
             OWNER,
         )
         .expect("complete");
@@ -401,6 +407,8 @@ fn record_message_completion_for_a_non_owner_is_a_no_op() {
             Some(false),
             None,
             false,
+            None,
+            None,
             OTHER,
         )
         .expect("complete");
