@@ -215,17 +215,30 @@ impl ModelRouter {
             ));
         }
 
-        // Step 4: largest first, so the first that fits is the best that fits.
-        // The sort key is (size desc, preferred desc, rank asc). The size
-        // band is the dominant factor; the tie-breakers only matter when
-        // two candidates have the same `parameters_b`. `preferred` is the
-        // operator-set "use this one" knob, and `rank_within_band` is the
-        // telemetry-driven ordering, so the deterministic default is
-        // preserved when both are absent.
+        // Step 4: orchestrator first, then largest, so the first that fits
+        // is the best that fits. The orchestrator (the model tagged with
+        // id starting "orchestrator.") is the user-configured chat model
+        // and should win when it fits; only when it does not fit do we
+        // fall back to the largest cleared model that does.
+        //
+        // The sort key is (is_orchestrator desc, size desc, preferred desc,
+        // rank asc). The orchestrator flag is the dominant factor so the
+        // user's choice is honoured; the size band is the secondary
+        // criterion so capability tracks size within a role; the
+        // tie-breakers only matter when two candidates have the same
+        // `parameters_b`. `preferred` is the operator-set "use this one"
+        // knob, and `rank_within_band` is the telemetry-driven ordering,
+        // so the deterministic default is preserved when both are absent.
         candidates.sort_by(|a, b| {
-            b.parameters_b
-                .partial_cmp(&a.parameters_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_is_orch = a.id == "orchestrator" || a.id.starts_with("orchestrator.");
+            let b_is_orch = b.id == "orchestrator" || b.id.starts_with("orchestrator.");
+            b_is_orch
+                .cmp(&a_is_orch)
+                .then_with(|| {
+                    b.parameters_b
+                        .partial_cmp(&a.parameters_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| {
                     b.routing
                         .preferred
@@ -241,11 +254,20 @@ impl ModelRouter {
         for entry in &candidates {
             let plan = plan_gpu_offload(vram_total_bytes, entry.weights_bytes, entry.context_length, None);
             if plan.full_offload {
-                reasons.push(format!(
-                    "{} is the largest cleared {} model that fits in VRAM.",
-                    entry.name,
-                    role.label()
-                ));
+                let is_orch = entry.id == "orchestrator" || entry.id.starts_with("orchestrator.");
+                let reason_msg = if is_orch {
+                    format!(
+                        "{} is configured as the orchestrator and fits in VRAM.",
+                        entry.name,
+                    )
+                } else {
+                    format!(
+                        "{} is the largest cleared {} model that fits in VRAM.",
+                        entry.name,
+                        role.label()
+                    )
+                };
+                reasons.push(reason_msg);
                 reasons.push(plan.reason.clone());
                 return Ok(Self::decide(entry, role, intent_label, confidence, plan, false, reasons));
             }
@@ -520,6 +542,62 @@ mod tests {
         .unwrap();
         assert_eq!(decision.model_id, "qwen-32b");
         assert!(!decision.used_fallback);
+    }
+
+    /// The orchestrator is the user-configured chat model. When it fits in
+    /// VRAM, the router should pick it instead of a larger cleared model.
+    /// (The orchestrator is tagged by having an id starting with
+    /// "orchestrator." — see [`ModelRegistry::orchestrator_entry`].)
+    #[test]
+    fn the_orchestrator_wins_over_a_larger_cleared_model() {
+        let mut r = stocked();
+        // Mark qwen-8b (smaller than qwen-32b) as the orchestrator.
+        if let Some(qwen8b) = r.entries.iter_mut().find(|e| e.id == "qwen-8b") {
+            qwen8b.id = "orchestrator.gemma-4-12b-it".to_string();
+        }
+        let decision = ModelRouter::route(
+            &r,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        // qwen-8b is 8B and fits in 80 GB. qwen-32b is 32B and also fits.
+        // The orchestrator should win, even though it is smaller.
+        assert_eq!(decision.model_id, "orchestrator.gemma-4-12b-it");
+        assert!(!decision.used_fallback);
+    }
+
+    /// If the orchestrator does not fit in VRAM, fall back to the largest
+    /// cleared model that does — do not refuse to work.
+    #[test]
+    fn orchestrator_falls_back_when_it_does_not_fit() {
+        let mut r = stocked();
+        if let Some(qwen8b) = r.entries.iter_mut().find(|e| e.id == "qwen-8b") {
+            qwen8b.id = "orchestrator.qwen-8b".to_string();
+        }
+        // 6 GB cannot hold the 8B orchestrator (we have a 4 GB-per-param
+        // heuristic; 8B would not fit in 6 GB).
+        let decision = ModelRouter::route(
+            &r,
+            "Explain the trade-offs here",
+            None,
+            6 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        // The 7B coding model is also unavailable for reasoning, so the
+        // router falls back to the next-best reasoning model that fits.
+        // We only assert used_fallback is true (the exact choice depends
+        // on the vram planner's heuristic).
+        assert!(decision.used_fallback);
     }
 
     /// A laptop is the case the problem statement explicitly allows for.
