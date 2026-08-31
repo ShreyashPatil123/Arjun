@@ -1138,6 +1138,8 @@ export const agentService = {
     usedFallback?: boolean;
     error?: string;
     failed: boolean;
+    tokensIn?: number;
+    tokensOut?: number;
   }): Promise<Conversation | null> {
     return getBackendService().invoke<Conversation | null>('agent_complete_message', {
       conversationId: args.conversationId,
@@ -1150,6 +1152,8 @@ export const agentService = {
       usedFallback: args.usedFallback ?? null,
       error: args.error ?? null,
       failed: args.failed,
+      tokensIn: args.tokensIn ?? null,
+      tokensOut: args.tokensOut ?? null,
     });
   },
 
@@ -1206,6 +1210,9 @@ export interface ChatMessage {
   modelName?: string | null;
   modelRole?: string | null;
   usedFallback?: boolean | null;
+  /** Token counts from the model (assistant messages only). */
+  tokensIn?: number | null;
+  tokensOut?: number | null;
 }
 
 /** A run that produced an assistant message in a conversation. */

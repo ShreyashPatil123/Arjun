@@ -240,6 +240,39 @@
   margin-left: 4px;
 }
 
+/* Token metrics display */
+.tokenMetrics {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.tokenMetric {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tokenLabel {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.tokenValue {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.tokenSep {
+  color: var(--text-tertiary);
+  user-select: none;
+}
+
 .statusPill {
   display: inline-flex;
   align-items: center;

@@ -146,6 +146,8 @@ export function useConversation(): UseConversation {
   // this and the `correlationId` match is no longer needed.
   const subscribedActualRunId = useRef<string | null>(null);
   const isStreamingRef = useRef(false);
+  // Token counts from the message_end event, to be passed to completeMessage
+  const messageEndTokensRef = useRef<{ tokensIn?: number; tokensOut?: number }>({});
 
   /** Refresh the conversation list. */
   const refresh = useCallback(async () => {
@@ -281,6 +283,11 @@ export function useConversation(): UseConversation {
             window.clearTimeout(persistDebounceRef.current);
             persistDebounceRef.current = null;
           }
+          // Store token counts from the message_end event for later use in completeMessage
+          messageEndTokensRef.current = {
+            tokensIn: event.tokensIn,
+            tokensOut: event.tokensOut,
+          };
           if (
             subscribedConversationId.current &&
             subscribedMessageId.current
@@ -390,12 +397,18 @@ export function useConversation(): UseConversation {
         // now updated to its final state by the server; if it did, this
         // is a no-op (the cell is already `done`).
         if (summary && summary.messageId) {
-          isStreamingRef.current = false;
-          setIsStreaming(false);
-          setActiveMessageId(null);
-          setActiveRunId(null);
-          await reloadActive(conv.id);
-          await refresh();
+          // Call complete with token counts from message_end event
+          await complete({
+            finalContent: liveContentRef.current,
+            elapsedMs: 0,
+            modelName: summary.routing.modelName,
+            modelRole: summary.routing.role,
+            usedFallback: summary.routing.usedFallback,
+            tokensIn: messageEndTokensRef.current.tokensIn,
+            tokensOut: messageEndTokensRef.current.tokensOut,
+          });
+          // Clear the token refs after use
+          messageEndTokensRef.current = {};
         }
       } catch (error) {
         // Surface the failure to the conversation as a failed message.
@@ -435,6 +448,8 @@ export function useConversation(): UseConversation {
       usedFallback?: boolean;
       error?: string;
       failed?: boolean;
+      tokensIn?: number;
+      tokensOut?: number;
     }) => {
       if (!conversation || !activeMessageId || !activeRunId) return;
       await agentService.completeMessage({
@@ -448,6 +463,8 @@ export function useConversation(): UseConversation {
         usedFallback: args.usedFallback,
         error: args.error,
         failed: args.failed ?? false,
+        tokensIn: args.tokensIn,
+        tokensOut: args.tokensOut,
       });
       await reloadActive(conversation.id);
       await refresh();

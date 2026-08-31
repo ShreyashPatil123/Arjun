@@ -23,6 +23,7 @@ import {
   type RunSummary,
 } from '../../services/agent.service';
 import { formatDuration } from './format';
+import { useTokenMetrics } from './useTokenMetrics';
 import styles from './ChatSurface.module.css';
 
 /* ------------------------------------------------------------------ *
@@ -120,6 +121,14 @@ export function AssistantMessageCell({
   const usedFallback =
     message.usedFallback ?? runSummary?.routing.usedFallback ?? false;
 
+  // Token metrics (live during streaming, final on completion)
+  const tokenMetrics = useTokenMetrics(
+    isStreaming,
+    content.length,
+    message.tokensIn,
+    message.tokensOut
+  );
+
   // Status derivation: which of the seven states are we in?
   const runningTools = activity?.filter(a => a.status === 'running').length ?? 0;
   const toolsTotal = activity?.length ?? 0;
@@ -135,7 +144,7 @@ export function AssistantMessageCell({
 
   return (
     <div className={styles.assistantRow}>
-      {/* Meta footer — model identity and timing, quiet. */}
+      {/* Meta footer — model identity, timing, and token metrics. */}
       <div className={styles.assistantMeta}>
         <StatusPill state={status} elapsedText={elapsedText} runningTools={runningTools} />
         <span className={styles.assistantMetaSep}>·</span>
@@ -147,6 +156,28 @@ export function AssistantMessageCell({
           {usedFallback && (
             <span className={styles.assistantFallback}>fallback</span>
           )}
+        </span>
+        {/* Token metrics display */}
+        <span className={styles.assistantMetaSep}>·</span>
+        <span className={styles.tokenMetrics}>
+          {tokenMetrics.tokensIn > 0 && (
+            <>
+              <span className={styles.tokenMetric}>
+                <span className={styles.tokenLabel}>in</span>
+                <span className={styles.tokenValue}>{tokenMetrics.tokensIn.toLocaleString()}</span>
+              </span>
+              <span className={styles.tokenSep}>·</span>
+            </>
+          )}
+          <span className={styles.tokenMetric}>
+            <span className={styles.tokenLabel}>out</span>
+            <span className={styles.tokenValue}>{tokenMetrics.tokensOut.toLocaleString()}</span>
+          </span>
+          <span className={styles.tokenSep}>·</span>
+          <span className={styles.tokenMetric}>
+            <span className={styles.tokenLabel}>tok/s</span>
+            <span className={styles.tokenValue}>{tokenMetrics.speed.toLocaleString()}</span>
+          </span>
         </span>
       </div>
 
