@@ -7,7 +7,6 @@ import * as systemService from '../services/system.service';
 import * as modelService from '../services/model.service';
 import * as providerService from '../services/provider.service';
 import * as aiService from '../services/ai.service';
-import * as loraService from '../services/lora.service';
 import { AppConfig } from '../types/config';
 import { Theme } from '../types/theme';
 
@@ -71,10 +70,4 @@ export class SarathiTauriClient implements ISarathiClient {
     chat: async (msgs?: unknown[]) => aiService.chat(msgs as any),
   };
 
-  // Phase 6: Dynamic LoRA Orchestration
-  readonly lora = {
-    loadAdapter: async (id: string) => loraService.loadAdapter(id),
-    switchAdapter: async (id: string) => loraService.switchAdapter(id),
-    composeAdapters: async (adapters: unknown[]) => loraService.composeAdapters(adapters),
-  };
 }

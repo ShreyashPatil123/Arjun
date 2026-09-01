@@ -12,7 +12,6 @@ pub enum AppStatus {
     Downloading,
     Installing,
     LoadingModel,
-    LoadingLoRA,
     Chatting,
     Error,
 }

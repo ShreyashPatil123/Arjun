@@ -1,7 +1,7 @@
 //! Decoupled Intent Detection Engine
 //!
 //! Classifies user prompts into high-level intent categories:
-//! User Prompt -> Intent Classifier -> Target Capability -> Compatible Adapter Selection.
+//! User Prompt -> Intent Classifier -> Target Capability -> Prompt Profile Selection.
 
 use serde::{Deserialize, Serialize};
 

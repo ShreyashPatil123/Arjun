@@ -6,10 +6,8 @@ import {
   Power,
   Play,
   AlertTriangle,
-  Layers,
   Download,
-  ChevronDown,
-  ChevronRight,
+  Star,
 } from 'lucide-react';
 import { Button, Spinner, DownloadBar } from '../components/ui';
 import { Can } from '../components/auth/Can';
@@ -21,17 +19,11 @@ import {
   getStorageSummary,
 } from '../services/download.service';
 import { getInferenceStatus, loadInstalledModel, unloadActiveModel } from '../services/ai.service';
-import {
-  listInstalledAdapters,
-  removeAdapter,
-  setAdapterCapability,
-  ASSIGNMENT_SOURCE,
-  CAPABILITIES,
-  CAPABILITY_LABELS,
-  type Capability,
-  type InstalledAdapter,
-} from '../services/adapters.service';
 import { formatSize } from '../services/catalog.service';
+import {
+  registryService,
+  type OrchestratorModelSelection,
+} from '../services/registry.service';
 import styles from './Storage.module.css';
 
 /**
@@ -46,24 +38,24 @@ export const Storage: React.FC = () => {
   const [models, setModels] = useState<any[]>([]);
   const [summary, setSummary] = useState<any>(null);
   const [loadedModelId, setLoadedModelId] = useState<string | null>(null);
+  const [orchestrator, setOrchestrator] = useState<OrchestratorModelSelection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  /** Adapters per model id, loaded when a model is expanded. */
-  const [adapters, setAdapters] = useState<Record<string, InstalledAdapter[]>>({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [installed, sum, status] = await Promise.all([
+      const [installed, sum, status, configuredOrchestrator] = await Promise.all([
         getInstalledModels(),
         getStorageSummary().catch(() => null),
         getInferenceStatus().catch(() => null),
+        registryService.getOrchestratorModel().catch(() => null),
       ]);
       setModels(installed ?? []);
       setSummary(sum);
       setLoadedModelId(status?.model?.modelId ?? null);
+      setOrchestrator(configuredOrchestrator);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -88,32 +80,12 @@ export const Storage: React.FC = () => {
     refresh();
   }, [refresh]);
 
-  const toggleAdapters = async (m: any) => {
-    const next = new Set(expanded);
-    if (next.has(m.modelId)) {
-      next.delete(m.modelId);
-      setExpanded(next);
-      return;
-    }
-    next.add(m.modelId);
-    setExpanded(next);
-
-    if (!adapters[m.modelId]) {
-      try {
-        const found = await listInstalledAdapters(m.providerId, m.modelId);
-        setAdapters((prev) => ({ ...prev, [m.modelId]: found.adapters }));
-      } catch {
-        setAdapters((prev) => ({ ...prev, [m.modelId]: [] }));
-      }
-    }
-  };
-
   const handleDeleteModel = async (m: any) => {
     // Deleting frees gigabytes and cannot be undone, so it is confirmed and the
     // size is named — "are you sure?" alone does not convey what is at stake.
     const ok = window.confirm(
-      `Delete ${m.modelName}?\n\nThis frees ${formatSize(m.sizeBytes)} and removes any adapters ` +
-        `installed for it. You would need to download it again to use it.`
+      `Delete ${m.modelName}?\n\nThis frees ${formatSize(m.sizeBytes)}. ` +
+        `You would need to download it again to use it.`
     );
     if (!ok) return;
 
@@ -122,49 +94,6 @@ export const Storage: React.FC = () => {
       await deleteInstalledModel(m.providerId, m.modelId, m.quantization);
       addToast('success', `${m.modelName} deleted`);
       await refresh();
-    } catch (err) {
-      addToast('error', String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  /**
-   * Points a capability at an adapter, or unassigns it.
-   *
-   * The whole list for this model is refetched rather than patched locally: only
-   * one adapter can hold a capability, so assigning one displaces another, and
-   * guessing which from here would eventually disagree with the manifest.
-   */
-  const handleCapabilityChange = async (m: any, a: InstalledAdapter, next: string) => {
-    const capability = next === '' ? null : (next as Capability);
-    setBusy(a.id);
-    try {
-      await setAdapterCapability(m.providerId, m.modelId, a.id, capability);
-      const found = await listInstalledAdapters(m.providerId, m.modelId);
-      setAdapters((prev) => ({ ...prev, [m.modelId]: found.adapters }));
-      addToast(
-        'success',
-        capability
-          ? `${a.name} will be used for ${CAPABILITY_LABELS[capability]}`
-          : `${a.name} is no longer used`
-      );
-    } catch (err) {
-      addToast('error', String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const handleRemoveAdapter = async (m: any, a: InstalledAdapter) => {
-    setBusy(a.id);
-    try {
-      await removeAdapter(m.providerId, m.modelId, a.id);
-      setAdapters((prev) => ({
-        ...prev,
-        [m.modelId]: (prev[m.modelId] ?? []).filter((x) => x.id !== a.id),
-      }));
-      addToast('success', 'Adapter removed');
     } catch (err) {
       addToast('error', String(err));
     } finally {
@@ -198,6 +127,27 @@ export const Storage: React.FC = () => {
     }
   };
 
+  const handleSetOrchestrator = async (m: any) => {
+    const busyKey = `orchestrator:${m.id}`;
+    setBusy(busyKey);
+    try {
+      const selected = await registryService.setOrchestratorModel({
+        providerId: m.providerId,
+        modelId: m.modelId,
+        quantization: m.quantization,
+      });
+      setOrchestrator(selected);
+      addToast(
+        'success',
+        `${m.modelName} is the orchestrator and will auto-load on the GPU at startup`
+      );
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (loading) {
     return (
       <div className={styles.centered}>
@@ -213,7 +163,7 @@ export const Storage: React.FC = () => {
         <div>
           <h1 className={styles.title}>Storage</h1>
           <p className={styles.subtitle}>
-            Models and adapters on this computer. To find new ones, use Discover.
+            Models on this computer. To find new ones, use Discover.
           </p>
         </div>
         <Button variant="ghost" size="sm" onClick={refresh}>
@@ -279,15 +229,19 @@ export const Storage: React.FC = () => {
 
         {models.map((m: any) => {
           const isLoaded = loadedModelId === m.modelId;
-          const isOpen = expanded.has(m.modelId);
-          const mine = adapters[m.modelId];
-
+          const isOrchestrator =
+            orchestrator?.providerId === m.providerId &&
+            orchestrator?.modelId === m.modelId &&
+            orchestrator?.quantization === m.quantization;
           return (
             <article key={`${m.modelId}-${m.quantization}`} className={styles.model}>
               <div className={styles.modelHead}>
                 <div className={styles.modelInfo}>
                   <h3 className={styles.modelName}>
                     {m.modelName} <span className={styles.quant}>{m.quantization}</span>
+                    {isOrchestrator && (
+                      <span className={styles.orchestrator}>★ Orchestrator</span>
+                    )}
                   </h3>
                   <p className={styles.modelMeta}>
                     {formatSize(m.sizeBytes)} · {m.providerId}
@@ -295,6 +249,20 @@ export const Storage: React.FC = () => {
                 </div>
 
                 <div className={styles.modelActions}>
+                  {!isOrchestrator && (
+                    <Can permission="modifyPolicy">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleSetOrchestrator(m)}
+                        disabled={busy !== null || !m.isReady}
+                        title="Use this exact model variant as the startup orchestrator"
+                      >
+                        <Star size={13} />
+                        {busy === `orchestrator:${m.id}` ? 'Saving…' : 'Set as orchestrator'}
+                      </Button>
+                    </Can>
+                  )}
                   {isLoaded ? (
                     <>
                       <span className={styles.serving}>● Serving the gateway</span>
@@ -323,7 +291,7 @@ export const Storage: React.FC = () => {
                       size="sm"
                       onClick={() => handleDeleteModel(m)}
                       disabled={busy === m.modelId}
-                      title="Delete this model and its adapters"
+                      title="Delete this model"
                     >
                       <Trash2 size={13} />
                     </Button>
@@ -331,89 +299,6 @@ export const Storage: React.FC = () => {
                 </div>
               </div>
 
-              <button className={styles.adapterToggle} onClick={() => toggleAdapters(m)}>
-                {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                <Layers size={13} /> LoRA adapters
-                {mine !== undefined && <span className={styles.count}>{mine.length}</span>}
-              </button>
-
-              {isOpen && (
-                <div className={styles.adapterList}>
-                  {mine === undefined && <span className={styles.muted}>Checking…</span>}
-
-                  {mine?.length === 0 && (
-                    <span className={styles.muted}>
-                      None installed. Find adapters for this model in Discover.
-                    </span>
-                  )}
-
-                  {mine?.map((a) => (
-                    <div key={a.id} className={styles.adapterRow}>
-                      <span className={styles.adapterName}>{a.name}</span>
-
-                      {/*
-                        An adapter only ever runs through the capability it is
-                        assigned to. Where that assignment came from is spelled
-                        out beneath, because most of them are inferred from the
-                        adapter's name and a guess shown as a fact is worse than
-                        no guess at all.
-                      */}
-                      <label className={styles.adapterUse}>
-                        <span className={styles.srOnly}>Use {a.name} for</span>
-                        <Can
-                          permission="importModel"
-                          fallback={
-                            <select
-                              className={styles.capabilitySelect}
-                              value={a.capability ?? ''}
-                              disabled
-                              title="You do not have permission to change capability assignments."
-                            >
-                              <option value={a.capability ?? ''}>
-                                {a.capability
-                                  ? CAPABILITY_LABELS[a.capability as Capability]
-                                  : 'Not used'}
-                              </option>
-                            </select>
-                          }
-                        >
-                          <select
-                            className={styles.capabilitySelect}
-                            value={a.capability ?? ''}
-                            disabled={busy === a.id}
-                            onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
-                          >
-                            <option value="">Not used</option>
-                            {CAPABILITIES.map((c) => (
-                              <option key={c} value={c}>
-                                {CAPABILITY_LABELS[c]}
-                              </option>
-                            ))}
-                          </select>
-                        </Can>
-                        {a.capability && a.assignmentConfidence && (
-                          <span className={styles.muted}>
-                            {ASSIGNMENT_SOURCE[a.assignmentConfidence]}
-                          </span>
-                        )}
-                      </label>
-
-                      <span className={styles.muted}>{formatSize(a.sizeBytes)}</span>
-                      <Can permission="importModel">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleRemoveAdapter(m, a)}
-                          disabled={busy === a.id}
-                          title="Delete this adapter"
-                        >
-                          <Trash2 size={12} />
-                        </Button>
-                      </Can>
-                    </div>
-                  ))}
-                </div>
-              )}
             </article>
           );
         })}

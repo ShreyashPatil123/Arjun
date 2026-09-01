@@ -52,18 +52,3 @@ pub struct DownloadRecord {
     pub created_at: String,
     pub updated_at: String,
 }
-
-/// Represents an installed LoRA adapter
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstalledLoRA {
-    pub id: String,
-    pub name: String,
-    pub base_model_id: String,
-    pub file_path: String,
-    pub size_bytes: i64,
-    pub adapter_type: String,
-    pub metadata: Option<String>,
-    pub is_active: i32, // bool as i32 for SQLite
-    pub created_at: String,
-    pub updated_at: String,
-}

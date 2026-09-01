@@ -1,10 +1,10 @@
-# Saarthi Certification Report: Qwen/Qwen2.5-7B-Instruct-GGUF::Q4_K_M::llama.cpp
+# Arjun Certification Report: Qwen/Qwen2.5-7B-Instruct-GGUF::Q4_K_M::llama.cpp
 
 - **Tier**: Certified
-- **Confidence Score**: 92.9/100
-- **Generated At**: 2026-08-02T05:02:30.921495Z
+- **Confidence Score**: 93.0/100
+- **Generated At**: 2026-09-01T01:41:21.525674+00:00
 
-## 17-Point Benchmark Scores
+## 16-Point Benchmark Scores
 
 | Benchmark Module | Score | Status |
 |:---|:---:|:---:|
@@ -16,7 +16,6 @@
 | `json_reliability` | 92.5/100 | PASS |
 | `tool_calling_accuracy` | 92.5/100 | PASS |
 | `memory_engine_compatibility` | 92.5/100 | PASS |
-| `lora_adapter_switching` | 92.5/100 | PASS |
 | `context_window_retention` | 92.5/100 | PASS |
 | `response_stability` | 92.5/100 | PASS |
 | `chat_template_correctness` | 95.0/100 | PASS |

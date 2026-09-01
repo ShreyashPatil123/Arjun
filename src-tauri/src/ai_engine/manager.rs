@@ -3,14 +3,13 @@
 //! Manages model loading/unloading with hardware-aware configuration,
 //! provides streaming generation via Tauri events, and tracks the last used model.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 use anyhow::{anyhow, Result};
 use tauri::Emitter;
 
-use crate::adapter_manager::{AdapterRegistry, ModelPackageManifest};
+use crate::model_package::{ModelPackageManifest, ModelPackageRegistry};
 use crate::ai_engine::runtime::LlamaCppRuntime;
 use crate::ai_engine::traits::*;
 use crate::ai_engine::residency::{Residency, SwapDecision};
@@ -26,16 +25,6 @@ use crate::system_analyzer;
 /// it per model in Settings.
 const DEFAULT_WORKING_CONTEXT: u32 = 8192;
 
-/// The installed package backing the currently loaded model.
-///
-/// Captured at load time so each turn can resolve capabilities without
-/// re-reading and re-parsing `manifest.json` from disk.
-#[derive(Clone)]
-pub struct ActivePackage {
-    pub package_dir: PathBuf,
-    pub manifest: ModelPackageManifest,
-}
-
 /// Thread-safe inference state manager.
 ///
 /// Wraps `LlamaCppRuntime` in `Arc<Mutex<>>` for safe concurrent access
@@ -43,8 +32,6 @@ pub struct ActivePackage {
 pub struct InferenceManager {
     runtime: Arc<Mutex<LlamaCppRuntime>>,
     last_used_model_id: Arc<Mutex<Option<String>>>,
-    /// Package context for the loaded model, used to resolve LoRA adapters.
-    active_package: Arc<Mutex<Option<ActivePackage>>>,
     /// Intent classification, switch hysteresis, and capability resolution.
     capability: Arc<CapabilityLayer>,
     /// Which model is in VRAM, and how long it has been idle. Kept here rather
@@ -59,7 +46,6 @@ impl InferenceManager {
         Self {
             runtime: Arc::new(Mutex::new(LlamaCppRuntime::new())),
             last_used_model_id: Arc::new(Mutex::new(None)),
-            active_package: Arc::new(Mutex::new(None)),
             residency: Arc::new(Mutex::new(Residency::new())),
             capability: Arc::new(CapabilityLayer::default()),
         }
@@ -68,14 +54,6 @@ impl InferenceManager {
     /// The capability layer, for status queries and manual overrides.
     pub fn capability_layer(&self) -> Arc<CapabilityLayer> {
         self.capability.clone()
-    }
-
-    /// The package backing the loaded model, if any.
-    pub fn active_package(&self) -> Option<ActivePackage> {
-        self.active_package
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
     }
 
     /// Returns the current runtime status
@@ -176,10 +154,12 @@ impl InferenceManager {
         }
 
         // Resolve package directory and read manifest
-        let package_dir = AdapterRegistry::resolve_package_dir(app_data_dir, provider_id, model_id);
+        let package_dir =
+            ModelPackageRegistry::resolve_package_dir(app_data_dir, provider_id, model_id);
         log::info!("[STAGE 3 MANAGER] Resolved package_dir: {:?} (exists: {})", package_dir, package_dir.exists());
 
-        let manifest = AdapterRegistry::ensure_valid_manifest(&package_dir, provider_id, model_id)
+        let manifest =
+            ModelPackageRegistry::ensure_valid_manifest(&package_dir, provider_id, model_id)
             .map_err(|e| {
                 let err = anyhow!("[STAGE 3 MANAGER ERROR] Failed to read or repair manifest for model '{}' in {:?}: {:#}", model_id, package_dir, e);
                 log::error!("{}", err);
@@ -299,14 +279,7 @@ impl InferenceManager {
 
         log::info!("[STAGE 3 MANAGER SUCCESS] Model loaded cleanly: {:?}", info);
 
-        // Record package context for per-turn capability resolution, and clear
-        // any capability stickiness carried over from the previous model.
-        if let Ok(mut guard) = self.active_package.lock() {
-            *guard = Some(ActivePackage {
-                package_dir: package_dir.clone(),
-                manifest: manifest.clone(),
-            });
-        }
+        // A new model starts with no capability stickiness from the previous one.
         self.capability.reset();
 
         self.set_last_used_model_id(Some(model_id.to_string()));
@@ -328,7 +301,7 @@ impl InferenceManager {
 
     /// Direct unload without requiring Tauri AppHandle
     pub fn unload_active_model_direct(&self) -> Result<()> {
-        self.clear_package_context();
+        self.capability.reset();
         if let Ok(mut residency) = self.residency.lock() {
             residency.mark_unloaded();
         }
@@ -396,24 +369,13 @@ impl InferenceManager {
         }
     }
 
-    /// Drops package context and capability stickiness.
-    ///
-    /// Called on every unload path so a newly loaded model never inherits the
-    /// previous model's active capability or adapter bindings.
-    fn clear_package_context(&self) {
-        if let Ok(mut guard) = self.active_package.lock() {
-            *guard = None;
-        }
-        self.capability.reset();
-    }
-
     /// Unloads the currently active model
     pub fn unload_active_model(&self, app_handle: &tauri::AppHandle) -> Result<()> {
         if let Ok(app_dir) = app_handle.path().app_data_dir() {
             let _ = super::session::SessionManager::clear_session(&app_dir);
         }
 
-        self.clear_package_context();
+        self.capability.reset();
 
         let _ = app_handle.emit("inference:status", InferenceStatusPayload {
             status: "Unloading".to_string(),
@@ -472,7 +434,7 @@ impl InferenceManager {
         // Resolve the capability for this turn and apply it to the prompt and
         // sampler. Previously the routing result was computed in the UI purely
         // to render a badge, and generation ran on the unmodified base model.
-        let (final_messages, final_params, capability_backend) =
+        let (final_messages, final_params) =
             self.prepare_capability_turn(app_handle, &messages, &params, manual_capability.as_deref());
 
         // Model Health: capture the loaded model id and an honest word-count
@@ -494,14 +456,9 @@ impl InferenceManager {
         let app_handle_clone = app_handle.clone();
         let result = {
             let mut runtime = self.runtime.lock().unwrap();
-            runtime.generate_with_capability(
-                &final_messages,
-                &final_params,
-                capability_backend.as_ref(),
-                |chunk| {
+            runtime.generate(&final_messages, &final_params, |chunk| {
                     let _ = app_handle_clone.emit("inference:token", &chunk);
-                },
-            )
+                })
         };
 
         // Model Health: record the call to the in-memory telemetry sink so
@@ -578,25 +535,16 @@ impl InferenceManager {
     /// Classifies the turn, resolves a capability backend, and layers it onto
     /// the prompt and sampling parameters.
     ///
-    /// Returns the messages and params to generate with, plus the backend to
-    /// bind. Falls back to the untouched inputs whenever no package context is
-    /// available or the turn resolves to general conversation.
+    /// Returns the messages and params to generate with. General conversation
+    /// falls back to the untouched inputs.
     fn prepare_capability_turn(
         &self,
         app_handle: &tauri::AppHandle,
         messages: &[ChatMessage],
         params: &GenerationParams,
         manual_capability: Option<&str>,
-    ) -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
-        // Explicitly typed: a bare `None` here would be ambiguous to infer.
-        let untouched = || -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
-            (messages.to_vec(), params.clone(), None)
-        };
-
-        let Some(package) = self.active_package() else {
-            log::debug!("[CAPABILITY] No active package context — generating on base model");
-            return untouched();
-        };
+    ) -> (Vec<ChatMessage>, GenerationParams) {
+        let untouched = || (messages.to_vec(), params.clone());
 
         // Classify on the latest user turn only; earlier turns describe past
         // intent, not the request being answered now.
@@ -609,12 +557,7 @@ impl InferenceManager {
             return untouched();
         };
 
-        let turn = self.capability.resolve_turn(
-            prompt,
-            &package.package_dir,
-            &package.manifest,
-            manual_capability,
-        );
+        let turn = self.capability.resolve_turn(prompt, manual_capability);
 
         let is_base = matches!(turn.resolution.backend, capability::CapabilityBackend::Base);
 
@@ -639,7 +582,7 @@ impl InferenceManager {
             final_params.temperature
         );
 
-        (final_messages, final_params, Some(turn.resolution.backend))
+        (final_messages, final_params)
     }
 
     /// Direct generation without requiring a Tauri AppHandle (for test scripts & backend execution)

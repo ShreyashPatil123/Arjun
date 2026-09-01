@@ -17,9 +17,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use crate::ai_engine::lora_binding::LoraAdapterCache;
 use crate::ai_engine::traits::*;
-use crate::capability::CapabilityBackend;
 
 /// Buffer-type override patterns keeping the routed experts of the first
 /// `n_layers` layers in system RAM.
@@ -62,9 +60,6 @@ pub struct LlamaCppRuntime {
     /// an error — so they are only a fallback for GGUFs that carry no template.
     native_template: Option<NativeChatTemplate>,
     is_generating: Arc<AtomicBool>,
-    /// LoRA adapters initialised against the currently loaded model.
-    /// Cleared on unload — entries are only valid for the model they were built from.
-    adapter_cache: LoraAdapterCache,
 }
 
 impl LlamaCppRuntime {
@@ -76,7 +71,6 @@ impl LlamaCppRuntime {
             loaded_info: None,
             native_template: None,
             is_generating: Arc::new(AtomicBool::new(false)),
-            adapter_cache: LoraAdapterCache::new(),
         }
     }
 
@@ -297,7 +291,7 @@ impl LlamaCppRuntime {
 
         let model_result = LlamaModel::load_from_file(&backend, &clean_path, &model_params);
 
-        let (model, actual_backend) = match model_result {
+        let (model, actual_backend, applied_gpu_layers, applied_cpu_moe) = match model_result {
             Ok(m) => {
                 let desc = if effective_gpu_layers > 0 && effective_cpu_moe > 0 {
                     // Names the split explicitly: a user whose experts went to
@@ -314,7 +308,7 @@ impl LlamaCppRuntime {
                     "llama.cpp (CPU)".to_string()
                 };
                 log::info!("[STAGE 4 RUNTIME] LlamaModel::load_from_file succeeded with backend: {}", desc);
-                (m, desc)
+                (m, desc, effective_gpu_layers, effective_cpu_moe)
             }
             Err(e) => {
                 log::warn!(
@@ -325,7 +319,7 @@ impl LlamaCppRuntime {
                 match LlamaModel::load_from_file(&backend, &clean_path, &cpu_params) {
                     Ok(cpu_model) => {
                         log::info!("[STAGE 4 RUNTIME] CPU fallback LlamaModel::load_from_file succeeded!");
-                        (cpu_model, "llama.cpp (CPU Fallback)".to_string())
+                        (cpu_model, "llama.cpp (CPU Fallback)".to_string(), 0, 0)
                     }
                     Err(e2) => {
                         let err = anyhow!(
@@ -402,8 +396,8 @@ impl LlamaCppRuntime {
             file_path: config.model_path.clone(),
             context_length: config.context_length,
             // Report what was actually applied, not what was requested.
-            gpu_layers: effective_gpu_layers,
-            cpu_moe_layers: effective_cpu_moe,
+            gpu_layers: applied_gpu_layers,
+            cpu_moe_layers: applied_cpu_moe,
             threads: config.threads,
             backend_used: backend_desc,
             loaded_at: chrono::Utc::now().to_rfc3339(),
@@ -411,7 +405,6 @@ impl LlamaCppRuntime {
             template_source,
             stop_tokens: effective_stop_tokens,
             model_family: fam_str,
-            active_adapter: None,
         };
 
         self.model = Some(model);
@@ -503,11 +496,6 @@ impl LlamaCppRuntime {
             log::info!("[RUNTIME] Unloading model: {} ({})", info.model_name, info.quantization);
         }
 
-        // Release adapter handles BEFORE dropping the model. Each adapter was
-        // initialised against this model; using one after the model is freed
-        // would dereference a dangling pointer.
-        self.adapter_cache.clear();
-
         // Drop model to free RAM/VRAM tensors
         self.model = None;
         self.native_template = None;
@@ -531,37 +519,13 @@ impl LlamaCppRuntime {
     where
         F: FnMut(StreamChunk),
     {
-        self.generate_with_capability(messages, params, None, token_cb)
-    }
-
-    /// Generates tokens with an optional capability backend applied.
-    ///
-    /// When `capability_backend` is [`CapabilityBackend::LoraAdapter`], the
-    /// adapter is bound to the freshly created context *before* the prompt is
-    /// decoded, so prefill and generation both run against adapted weights.
-    ///
-    /// A LoRA binding failure is never fatal: it is logged and generation
-    /// proceeds on the base model, matching the graceful-degradation contract
-    /// in [`crate::capability`].
-    pub fn generate_with_capability<F>(
-        &mut self,
-        messages: &[ChatMessage],
-        params: &GenerationParams,
-        capability_backend: Option<&CapabilityBackend>,
-        mut token_cb: F,
-    ) -> Result<String>
-    where
-        F: FnMut(StreamChunk),
-    {
-        // Destructured so `adapter_cache` can be borrowed mutably while `model`
-        // is borrowed immutably — these are disjoint fields.
+        let mut token_cb = token_cb;
         let Self {
             backend,
             model,
             loaded_info,
             native_template,
             is_generating,
-            adapter_cache,
         } = self;
 
         let model = model
@@ -687,35 +651,6 @@ impl LlamaCppRuntime {
         let mut ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow!("Failed to create inference context: {:?}", e))?;
-
-        // Bind the capability's LoRA adapter, if one was resolved.
-        //
-        // This must happen before the prefill decode below so the prompt is
-        // processed against the adapted weights. Because the context is created
-        // fresh for every generation, there is no stale binding to clear first.
-        let mut active_adapter_label: Option<String> = None;
-        if let Some(CapabilityBackend::LoraAdapter { path, scale }) = capability_backend {
-            match adapter_cache.get_or_init(model, path) {
-                Ok(adapter) => match crate::ai_engine::lora_binding::bind_adapter(&mut ctx, adapter, *scale) {
-                    Ok(()) => {
-                        let label = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "adapter".to_string());
-                        log::info!("[RUNTIME] Generating with LoRA adapter '{}' at scale {:.2}", label, scale);
-                        active_adapter_label = Some(label);
-                    }
-                    Err(e) => log::warn!(
-                        "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
-                        e
-                    ),
-                },
-                Err(e) => log::warn!(
-                    "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
-                    e
-                ),
-            }
-        }
 
         // Prefill in chunks the size of this context's own batch.
         //
@@ -970,10 +905,9 @@ impl LlamaCppRuntime {
 
         is_generating.store(false, Ordering::Relaxed);
         log::info!(
-            "[RUNTIME] Generation complete: {} tokens, {} chars, adapter={}",
+            "[RUNTIME] Generation complete: {} tokens, {} chars",
             n_generated,
-            generated_text.len(),
-            active_adapter_label.as_deref().unwrap_or("none")
+            generated_text.len()
         );
 
         Ok(generated_text)
@@ -1567,7 +1501,7 @@ mod tests {
     #[test]
     fn test_simulate_gui_load_model_flow() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        use crate::adapter_manager::AdapterRegistry;
+        use crate::model_package::ModelPackageRegistry;
         use crate::ai_engine::manager::InferenceManager;
 
         let app_data_dir = std::path::PathBuf::from(r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app");
@@ -1577,13 +1511,13 @@ mod tests {
 
         println!("Simulating exact GUI load flow for provider='{}', model='{}'", provider_id, model_id);
 
-        let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, provider_id, model_id);
+        let package_dir = ModelPackageRegistry::resolve_package_dir(&app_data_dir, provider_id, model_id);
         if !package_dir.exists() || !package_dir.join("manifest.json").exists() {
             println!("Skipping Llama test: package dir or manifest does not exist at {:?}", package_dir);
             return;
         }
 
-        let manifest = AdapterRegistry::read_manifest(&package_dir).expect("Failed to read manifest");
+        let manifest = ModelPackageRegistry::read_manifest(&package_dir).expect("Failed to read manifest");
         println!("Manifest: model_name='{}', file_path='{}'", manifest.base_model.model_name, manifest.base_model.file_path);
 
         let gguf_path = match InferenceManager::resolve_gguf_path(&package_dir, &manifest) {
@@ -1608,7 +1542,7 @@ mod tests {
     #[test]
     fn test_simulate_gui_load_qwen_coder_7b() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        use crate::adapter_manager::AdapterRegistry;
+        use crate::model_package::ModelPackageRegistry;
         use crate::ai_engine::manager::InferenceManager;
 
         let app_data_dir = std::path::PathBuf::from(r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app");
@@ -1618,13 +1552,13 @@ mod tests {
 
         println!("Simulating exact GUI load flow for provider='{}', model='{}'", provider_id, model_id);
 
-        let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, provider_id, model_id);
+        let package_dir = ModelPackageRegistry::resolve_package_dir(&app_data_dir, provider_id, model_id);
         if !package_dir.exists() || !package_dir.join("manifest.json").exists() {
             println!("Skipping Qwen test: package dir or manifest does not exist at {:?}", package_dir);
             return;
         }
 
-        let manifest = AdapterRegistry::read_manifest(&package_dir).expect("Failed to read manifest");
+        let manifest = ModelPackageRegistry::read_manifest(&package_dir).expect("Failed to read manifest");
         let gguf_path = match InferenceManager::resolve_gguf_path(&package_dir, &manifest) {
             Ok(p) => p,
             Err(e) => {
@@ -1646,7 +1580,7 @@ mod tests {
     #[test]
     fn test_generic_multi_model_sequential_session_load() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        use crate::adapter_manager::AdapterRegistry;
+        use crate::model_package::ModelPackageRegistry;
         use crate::ai_engine::manager::InferenceManager;
         use crate::model_intelligence::{MetadataExtractor, ModelFamily};
 
@@ -1660,9 +1594,9 @@ mod tests {
         let mut runtime = LlamaCppRuntime::new();
 
         // 2. Load Model 1 (Llama-3.2-1B) in runtime session
-        let pkg1 = AdapterRegistry::resolve_package_dir(&app_data_dir, "huggingface", "meta-llama/Llama-3.2-1B");
+        let pkg1 = ModelPackageRegistry::resolve_package_dir(&app_data_dir, "huggingface", "meta-llama/Llama-3.2-1B");
         if pkg1.exists() && pkg1.join("manifest.json").exists() {
-            let manifest1 = AdapterRegistry::read_manifest(&pkg1).unwrap();
+            let manifest1 = ModelPackageRegistry::read_manifest(&pkg1).unwrap();
             if let Ok(path1) = InferenceManager::resolve_gguf_path(&pkg1, &manifest1) {
             let profile1 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg1, &manifest1).unwrap();
             let cfg1 = InferenceManager::build_load_config(&app_data_dir, &path1, "meta-llama/Llama-3.2-1B", &manifest1, "Q8_0", &profile1).unwrap();
@@ -1678,9 +1612,9 @@ mod tests {
         }
 
         // 3. Load Model 2 (Qwen2.5-Coder-7B) into SAME runtime session without process restart
-        let pkg2 = AdapterRegistry::resolve_package_dir(&app_data_dir, "huggingface", "Qwen/Qwen2.5-Coder-7B");
+        let pkg2 = ModelPackageRegistry::resolve_package_dir(&app_data_dir, "huggingface", "Qwen/Qwen2.5-Coder-7B");
         if pkg2.exists() && pkg2.join("manifest.json").exists() {
-            let manifest2 = AdapterRegistry::read_manifest(&pkg2).unwrap();
+            let manifest2 = ModelPackageRegistry::read_manifest(&pkg2).unwrap();
             if let Ok(path2) = InferenceManager::resolve_gguf_path(&pkg2, &manifest2) {
             let profile2 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg2, &manifest2).unwrap();
             let cfg2 = InferenceManager::build_load_config(&app_data_dir, &path2, "Qwen/Qwen2.5-Coder-7B", &manifest2, "Q4_0", &profile2).unwrap();
@@ -1701,14 +1635,14 @@ mod tests {
     #[test]
     fn test_phase5_2_automatic_runtime_configuration_verification() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        use crate::adapter_manager::AdapterRegistry;
+        use crate::model_package::ModelPackageRegistry;
 
         let app_data_dir = std::path::PathBuf::from(r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app");
 
         // Model 1: Llama 3.2 1B
-        let pkg1 = AdapterRegistry::resolve_package_dir(&app_data_dir, "huggingface", "meta-llama/Llama-3.2-1B");
+        let pkg1 = ModelPackageRegistry::resolve_package_dir(&app_data_dir, "huggingface", "meta-llama/Llama-3.2-1B");
         if pkg1.exists() && pkg1.join("manifest.json").exists() {
-            let manifest1 = AdapterRegistry::read_manifest(&pkg1).unwrap();
+            let manifest1 = ModelPackageRegistry::read_manifest(&pkg1).unwrap();
             let profile1 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg1, &manifest1).unwrap();
             println!("\n[PHASE 5.2 VERIFICATION] Llama 3.2 1B Profile Extracted:");
             println!("  Family: {:?}", profile1.model_family);
@@ -1726,9 +1660,9 @@ mod tests {
         }
 
         // Model 2: Qwen 2.5 Coder 7B
-        let pkg2 = AdapterRegistry::resolve_package_dir(&app_data_dir, "huggingface", "Qwen/Qwen2.5-Coder-7B");
+        let pkg2 = ModelPackageRegistry::resolve_package_dir(&app_data_dir, "huggingface", "Qwen/Qwen2.5-Coder-7B");
         if pkg2.exists() && pkg2.join("manifest.json").exists() {
-            let manifest2 = AdapterRegistry::read_manifest(&pkg2).unwrap();
+            let manifest2 = ModelPackageRegistry::read_manifest(&pkg2).unwrap();
             let profile2 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg2, &manifest2).unwrap();
             println!("\n[PHASE 5.2 VERIFICATION] Qwen 2.5 Coder 7B Profile Extracted:");
             println!("  Family: {:?}", profile2.model_family);

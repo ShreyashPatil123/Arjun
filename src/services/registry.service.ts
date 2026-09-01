@@ -90,6 +90,12 @@ export interface PreparedModel {
   activation: ActivationOutcome;
 }
 
+export interface OrchestratorModelSelection {
+  providerId: string;
+  modelId: string;
+  quantization: string;
+}
+
 export const registryService = {
   listModels(): Promise<ModelEntry[]> {
     return getBackendService().invoke<ModelEntry[]>('list_registered_models');
@@ -98,6 +104,22 @@ export const registryService = {
   /** The file an administrator edits to register a model. */
   manifestPath(): Promise<string> {
     return getBackendService().invoke<string>('model_manifest_path');
+  },
+
+  /** Exact model variant that will be loaded as the orchestrator on startup. */
+  getOrchestratorModel(): Promise<OrchestratorModelSelection> {
+    return getBackendService().invoke<OrchestratorModelSelection>('get_orchestrator_model');
+  },
+
+  /** Administrator-only: persist any ready installed model as the orchestrator. */
+  setOrchestratorModel(
+    selection: OrchestratorModelSelection
+  ): Promise<OrchestratorModelSelection> {
+    return getBackendService().invoke<OrchestratorModelSelection>('set_orchestrator_model', {
+      providerId: selection.providerId,
+      modelId: selection.modelId,
+      quantization: selection.quantization,
+    });
   },
 
   /**

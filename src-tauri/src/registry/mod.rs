@@ -249,6 +249,29 @@ fn default_true() -> bool {
     true
 }
 
+fn is_default_orchestrator(entry: &ModelEntry) -> bool {
+    let configured = crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID;
+    if entry
+        .load
+        .as_ref()
+        .map(|load| normalized_identity(&load.model_id) == normalized_identity(configured))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let identity = normalized_identity(&format!("{} {}", entry.id, entry.name));
+    identity.contains("gemma4") && identity.contains("12b")
+}
+
+fn normalized_identity(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl ModelEntry {
     /// Whether the inference runtime can load this on its own.
     pub fn is_loadable(&self) -> bool {
@@ -500,10 +523,10 @@ impl ModelRegistry {
             .collect()
     }
 
-    /// The model entry tagged as the orchestrator — the model
-    /// that runs the chat. The product assumes there is exactly
-    /// one such model; this is the lookup the orchestrator
-    /// resolver uses to find its `sha256` for verification.
+    /// The model entry used by the orchestrator — the model that runs the chat.
+    /// An explicit `orchestrator.*` entry always wins. Without one, the product
+    /// default (Gemma 4 12B) is selected from its installed load coordinates or
+    /// recognizable identity.
     ///
     /// The marker is the first model whose `id` starts with
     /// `"orchestrator"` (i.e. `"orchestrator"` itself, or
@@ -513,26 +536,30 @@ impl ModelRegistry {
     pub fn orchestrator_entry(&self) -> Option<&ModelEntry> {
         self.entries.iter().find(|e| {
             e.id == "orchestrator" || e.id.starts_with("orchestrator.")
-        })
+        }).or_else(|| self.entries.iter().find(|e| is_default_orchestrator(e)))
     }
 
     /// The (family, quantisation) tuple the orchestrator
     /// resolver should look for in the library scan. Falls
-    /// back to the standard Qwen3-4B / Q6_K if no orchestrator
+    /// back to the standard Gemma 4 12B / Q4_0 if no orchestrator
     /// is registered — the resolver then reports NotFound
     /// rather than guessing.
     pub fn orchestrator_identity(&self) -> Option<(String, String)> {
         let entry = self.orchestrator_entry()?;
-        let family = entry
-            .id
-            .strip_prefix("orchestrator")
-            .map(|s| s.trim_start_matches('.').to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| entry.name.clone());
+        let family = if is_default_orchestrator(entry) {
+            "gemma-4-12b".to_string()
+        } else {
+            entry
+                .id
+                .strip_prefix("orchestrator")
+                .map(|s| s.trim_start_matches('.').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| entry.name.clone())
+        };
         let quant = entry
             .quantization
             .clone()
-            .unwrap_or_else(|| "Q6_K".to_string());
+            .unwrap_or_else(|| crate::config::DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string());
         Some((family, quant))
     }
 
@@ -1043,5 +1070,50 @@ pub(crate) mod tests {
         let reloaded = ModelRegistry::load(&dir).expect("reload");
         assert_eq!(reloaded.all().len(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemma_4_12b_is_the_implicit_orchestrator_when_no_entry_is_tagged() {
+        let mut gemma = entry(
+            "lmstudio-community_gemma-4-12B-it-QAT-GGUF_Q4_0",
+            12.0,
+            vec![ModelRole::Reasoning, ModelRole::Coding],
+        );
+        gemma.name = "Gemma 4 12B IT QAT".to_string();
+        gemma.quantization = Some("Q4_0".to_string());
+        gemma.load = Some(LoadSpec {
+            provider_id: "huggingface".to_string(),
+            model_id: crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID.to_string(),
+            quantization: "Q4_0".to_string(),
+        });
+        let registry = registry(vec![gemma]);
+
+        let selected = registry
+            .orchestrator_entry()
+            .expect("the default Gemma package should run the orchestrator");
+        assert_eq!(
+            selected.load.as_ref().map(|load| load.model_id.as_str()),
+            Some(crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID)
+        );
+        assert_eq!(
+            registry.orchestrator_identity(),
+            Some(("gemma-4-12b".to_string(), "Q4_0".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_explicit_orchestrator_still_overrides_the_gemma_default() {
+        let gemma = entry("gemma-4-12b", 12.0, vec![ModelRole::Reasoning]);
+        let explicit = entry(
+            "orchestrator.custom-model",
+            14.0,
+            vec![ModelRole::Reasoning],
+        );
+        let registry = registry(vec![gemma, explicit]);
+
+        assert_eq!(
+            registry.orchestrator_entry().map(|model| model.id.as_str()),
+            Some("orchestrator.custom-model")
+        );
     }
 }

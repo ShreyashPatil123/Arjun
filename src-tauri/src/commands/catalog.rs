@@ -215,15 +215,8 @@ pub async fn browse_model_cards(
     let budget = weight_budget();
     let now = chrono::Utc::now();
 
-    // Adapters are not models and must not be browsed as though they were.
-    //
-    // A LoRA is a patch that cannot load on its own; listing it beside runnable
-    // models offered a Download button for something that would never start.
-    // They stay discoverable in the place they make sense — the adapter list on
-    // the base model they were trained against.
     let cards: Vec<ModelCard> = repos
         .iter()
-        .filter(|r| !r.is_lora_adapter)
         .map(|r| build_card(r, budget, now))
         .collect();
 
@@ -239,52 +232,6 @@ pub async fn browse_model_cards(
         weight_budget_bytes: budget,
         notice,
     })
-}
-
-/// Adapters published for a model, plus how usable they are here.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdapterPage {
-    pub adapters: Vec<live_catalog::AdapterListing>,
-    /// How many can be loaded as they are. The rest are PEFT safetensors, which
-    /// Sarathi converts to GGUF during installation.
-    pub ready_count: usize,
-    /// Shown when none are directly usable, explaining what that means.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<String>,
-}
-
-/// Lists LoRA adapters published for a base model.
-///
-/// Looks up HuggingFace's `base_model:adapter:` tag, which adapter authors set
-/// to declare their parent — a real relationship, not a name-similarity guess.
-#[tauri::command]
-pub async fn find_model_adapters(
-    base_model_id: String,
-    session: State<'_, CurrentSession>,
-) -> Result<AdapterPage, String> {
-    require_session(&session)?;
-    let token = crate::config::hf_token::get();
-
-    let adapters = live_catalog::find_adapters(&base_model_id, 20, token.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let ready_count = adapters.iter().filter(|a| a.gguf_ready).count();
-
-    let notice = if adapters.is_empty() {
-        Some("No LoRA adapters published for this model yet.".to_string())
-    } else if ready_count == 0 {
-        Some(format!(
-            "{} adapter(s) found. None ship GGUF, so Sarathi converts them during install — \
-             which needs this base model installed and its family supported.",
-            adapters.len()
-        ))
-    } else {
-        None
-    };
-
-    Ok(AdapterPage { adapters, ready_count, notice })
 }
 
 /// Every category the app knows about, for a sidebar that stays stable while

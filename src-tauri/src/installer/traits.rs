@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-pub enum InstallTarget { Ollama, LlamaCpp, CudaToolkit, Model, LoRA, Runtime(String) }
+pub enum InstallTarget { Ollama, LlamaCpp, CudaToolkit, Model, Runtime(String) }
 pub enum InstallStatus { Checking, Downloading, Installing, Configuring, Completed, Failed }
 
 pub struct InstallResult { pub target: String, pub success: bool, pub version: Option<String>, pub path: Option<String>, pub error: Option<String> }

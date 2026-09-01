@@ -1,8 +1,8 @@
 [package]
 name = "sarathi"
 version = "0.1.0"
-description = "Sarathi: A Local-First LoRA Orchestration System"
-authors = ["Sarathi Team"]
+description = "Arjun: a sovereign local agentic workbench for SIH 2026 PS 26117"
+authors = ["Arjun Team"]
 edition = "2021"
 
 [lib]
@@ -97,10 +97,6 @@ rand_core = { version = "0.6", features = ["std"] }
 # document sidecar child process, removing the setuid/setgid escalation
 # path for the untrusted-input parser stack.
 libc = "0.2"
-# Reads PEFT adapter weights so they can be converted to GGUF locally. Pure
-# Rust with no C toolchain, which is what makes conversion possible without
-# shipping Python and torch for llama.cpp's `convert_lora_to_gguf.py`.
-safetensors = "0.4"
 # Renders the Jinja chat template embedded in a GGUF. llama.cpp's built-in
 # `llama_chat_apply_template` only recognises a fixed set of well-known formats
 # and returns -1 for anything else, which leaves newer or custom-format models

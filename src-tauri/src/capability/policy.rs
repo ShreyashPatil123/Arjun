@@ -1,4 +1,4 @@
-//! Capability Switch Policy — hysteresis against adapter thrashing.
+//! Capability Switch Policy — hysteresis against profile thrashing.
 //!
 //! Neither the original build plan nor the legacy routing code addressed what
 //! happens across a *conversation*. Real sessions alternate intent constantly:
@@ -9,7 +9,7 @@
 //! "ok now add error handling" -> coding
 //! ```
 //!
-//! Switching on every turn would rebind the LoRA adapter three times in three
+//! Switching on every turn would change the active prompt profile three times in three
 //! turns, and — more damagingly — make model behaviour feel unstable to the
 //! user for no benefit.
 //!
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn borderline_turns_do_not_thrash_the_adapter() {
+    fn borderline_turns_do_not_thrash_the_profile() {
         let mut t = tracker();
         turn(&mut t, "refactor this python class to fix the compile error");
         assert_eq!(t.active_capability(), "coding");

@@ -12,7 +12,6 @@ export interface NumericScores {
   jsonReliability: number;
   toolCallingAccuracy: number;
   memoryEngineCompatibility: number;
-  loraAdapterSwitching: number;
   contextWindowRetention: number;
   responseStability: number;
   chatTemplateCorrectness: number;
@@ -43,7 +42,6 @@ export interface PackageCertification {
   confidenceScore: number;
   runtimeProfileId: string;
   numericScores: NumericScores;
-  loraCapabilityMatrix: Record<string, CertificationTier>;
   provenance: Provenance;
   quirksAndNotes: string;
 }

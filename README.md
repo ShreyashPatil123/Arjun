@@ -76,6 +76,17 @@ npm run tauri:build:gpu   # CUDA
 npm run tauri:build:vulkan
 ```
 
+On a fresh configuration, ARJUN uses
+`lmstudio-community/gemma-4-12B-it-QAT-GGUF` (`Q4_0`) as the default
+orchestrator and loads it automatically at startup. The automatic load requires
+a CUDA- or Vulkan-enabled build and at least one layer must be resident on the
+GPU; a CPU fallback is rejected rather than reported as GPU execution. Install
+the model from Discover before restarting ARJUN. An administrator can choose
+any ready installed model variant from **Models → Set as orchestrator**; ARJUN
+persists its provider, model ID, and quantization and uses that exact variant on
+future startups. Startup loading can be disabled with
+`ai_settings.auto_load_on_startup`.
+
 ---
 
 ## Verifying a build
@@ -122,7 +133,7 @@ src-tauri/              Rust core (crate: sarathi)
   serving/              model serving lifecycle and probing
   model_manager/        download, sizing, and installation
   model_intelligence/   hardware-aware recommendation
-  lora/  adapter_manager/
+  model_package/        base-model package manifests and repair
   sovereignty/          the single egress broker
   policy/  capability/  audit/  identity/
   memory_engine/  knowledge/  documents/

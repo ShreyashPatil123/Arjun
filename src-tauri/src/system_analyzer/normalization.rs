@@ -99,7 +99,6 @@ pub fn compute_ai_capabilities(
     };
 
     let multi_model_capable = memory.total_bytes >= 24 * 1024 * 1024 * 1024 || max_vram >= 12 * 1024 * 1024 * 1024;
-    let lora_ready = max_vram >= 6 * 1024 * 1024 * 1024 || memory.total_bytes >= 16 * 1024 * 1024 * 1024;
     let vision_ready = max_vram >= 8 * 1024 * 1024 * 1024 || memory.total_bytes >= 16 * 1024 * 1024 * 1024;
     let embedding_ready = true;
 
@@ -119,7 +118,6 @@ pub fn compute_ai_capabilities(
         recommended_context_length,
         preferred_inference_backend,
         multi_model_capable,
-        lora_ready,
         vision_ready,
         embedding_ready,
         extra_capabilities,

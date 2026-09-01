@@ -21,10 +21,6 @@ use crate::model_providers::huggingface::discovery::{GgufRepo, Quantization};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelCategory {
-    /// A LoRA adapter — a patch applied on top of a base model, not something
-    /// that runs on its own. Listed first because it changes what the entry
-    /// *is*, not merely what it is good at.
-    LoraAdapter,
     Coding,
     Reasoning,
     Math,
@@ -42,7 +38,6 @@ pub enum ModelCategory {
 impl ModelCategory {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::LoraAdapter => "LoRA adapter",
             Self::Coding => "Coding",
             Self::Reasoning => "Reasoning",
             Self::Math => "Math",
@@ -59,7 +54,6 @@ impl ModelCategory {
     /// Every category, in the order a sidebar should list them.
     pub fn all() -> &'static [ModelCategory] {
         &[
-            Self::LoraAdapter,
             Self::Coding,
             Self::Reasoning,
             Self::Math,
@@ -104,13 +98,6 @@ pub fn categorize(
 
     let mut out = Vec::new();
 
-    // Checked against the tags directly rather than the flattened haystack: a
-    // model merely *named* "lora-tuned" is not an adapter, and mislabelling a
-    // runnable model as one would hide it from the model list.
-    if crate::model_providers::huggingface::discovery::is_lora_adapter(tags) {
-        out.push(ModelCategory::LoraAdapter);
-    }
-
     if has(&["coder", "code", "codegen", "starcoder", "codestral", "codellama", "sql"]) {
         out.push(ModelCategory::Coding);
     }
@@ -141,8 +128,7 @@ pub fn categorize(
     }
 
     // "General" means no specialisation, so size and context alone do not
-    // disqualify it — a small general chat model is still general. An adapter,
-    // however, is never a general assistant: it cannot run by itself.
+    // disqualify it — a small general chat model is still general.
     let specialised = out.iter().any(|c| {
         !matches!(
             c,
@@ -158,10 +144,8 @@ pub fn categorize(
 
 /// What kind of thing an entry is, in terms a non-specialist can act on.
 ///
-/// The distinction that matters is whether you can download it and run it. A
-/// base model and a fine-tune both can; an adapter cannot — it needs a base
-/// model underneath. Burying that in tags leaves people downloading files that
-/// will not load.
+/// The distinction records whether the repository is original, retrained, or
+/// compressed. Non-runnable model extensions are filtered during discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelKind {
@@ -171,8 +155,6 @@ pub enum ModelKind {
     FineTuned,
     /// The same model, compressed to run on smaller hardware.
     Quantized,
-    /// A patch applied on top of a base model. Cannot run alone.
-    LoraAdapter,
 }
 
 impl ModelKind {
@@ -181,7 +163,6 @@ impl ModelKind {
             Self::BaseModel => "Base model",
             Self::FineTuned => "Fine-tuned",
             Self::Quantized => "Quantized",
-            Self::LoraAdapter => "LoRA adapter",
         }
     }
 
@@ -191,23 +172,16 @@ impl ModelKind {
             Self::BaseModel => "The original model. Download and run it.",
             Self::FineTuned => "A base model retrained for a specific job. Download and run it.",
             Self::Quantized => "A compressed version of another model. Download and run it.",
-            Self::LoraAdapter => {
-                "An add-on for a base model. It cannot run on its own — you need the base model too."
-            }
         }
     }
 }
 
 /// Determines the kind from HuggingFace's `base_model:` tags.
 ///
-/// Order matters: a repo can carry both `base_model:X` and
-/// `base_model:adapter:X`, and the more specific one is the truth.
 pub fn model_kind(tags: &[String]) -> ModelKind {
     let has = |prefix: &str| tags.iter().any(|t| t.starts_with(prefix));
 
-    if crate::model_providers::huggingface::discovery::is_lora_adapter(tags) {
-        ModelKind::LoraAdapter
-    } else if has("base_model:finetune:") || has("base_model:merge:") {
+    if has("base_model:finetune:") || has("base_model:merge:") {
         ModelKind::FineTuned
     } else if has("base_model:quantized:") {
         ModelKind::Quantized
@@ -297,7 +271,7 @@ pub struct ModelCard {
     /// Factual one-liner built from real metadata — never marketing copy.
     pub summary: String,
     pub categories: Vec<ModelCategory>,
-    /// What this is — base model, fine-tune, quantization, or adapter.
+    /// What this is — base model, fine-tune, or quantization.
     pub kind: ModelKind,
     /// Plain-language note on what that means for the user.
     pub kind_explanation: String,
@@ -514,67 +488,6 @@ mod tests {
     }
 
     #[test]
-    fn lora_adapters_are_labelled_as_adapters() {
-        // An adapter is a patch for a base model, not something you can load
-        // and talk to. Labelling it plainly stops someone downloading one
-        // expecting a chat model.
-        let c = categorize(
-            "someone/Llama-3-Coding-LoRA",
-            &tags(&["base_model:adapter:meta-llama/Llama-3.1-8B", "lora"]),
-            0,
-            0,
-            "",
-        );
-
-        assert!(c.contains(&ModelCategory::LoraAdapter));
-        assert!(
-            !c.contains(&ModelCategory::General),
-            "an adapter cannot run on its own, so it is never a general assistant"
-        );
-    }
-
-    #[test]
-    fn a_peft_tag_alone_marks_an_adapter() {
-        let c = categorize("x/y", &tags(&["peft"]), 0, 0, "");
-        assert!(c.contains(&ModelCategory::LoraAdapter));
-    }
-
-    #[test]
-    fn a_model_merely_named_lora_is_not_treated_as_an_adapter() {
-        // Detection reads tags, not the name — mislabelling a runnable model as
-        // an adapter would hide it from the model list.
-        let c = categorize("someone/lora-tuned-chat-7B", &tags(&["en"]), 7_000_000_000, 8192, "llama");
-
-        assert!(!c.contains(&ModelCategory::LoraAdapter));
-        assert!(c.contains(&ModelCategory::General));
-    }
-
-    #[test]
-    fn an_adapter_can_still_carry_what_it_is_for() {
-        // "A coding LoRA" is exactly the useful description, so both apply.
-        let c = categorize(
-            "someone/Coder-LoRA",
-            &tags(&["base_model:adapter:Qwen/Qwen2.5-7B", "code"]),
-            0,
-            0,
-            "",
-        );
-
-        assert!(c.contains(&ModelCategory::LoraAdapter));
-        assert!(c.contains(&ModelCategory::Coding));
-    }
-
-    #[test]
-    fn quantizations_and_finetunes_are_not_adapters() {
-        // These are runnable models; only `base_model:adapter:` is a patch.
-        let quantized = categorize("x/y", &tags(&["base_model:quantized:Qwen/Qwen2.5-7B"]), 7_000_000_000, 8192, "");
-        assert!(!quantized.contains(&ModelCategory::LoraAdapter));
-
-        let finetuned = categorize("x/y", &tags(&["base_model:finetune:meta-llama/Llama-3.1-8B"]), 8_000_000_000, 8192, "");
-        assert!(!finetuned.contains(&ModelCategory::LoraAdapter));
-    }
-
-    #[test]
     fn a_plain_chat_model_falls_back_to_general() {
         let c = categorize("x/Llama-3.1-8B-Instruct-GGUF", &tags(&["en"]), 8_000_000_000, 8192, "llama");
         assert_eq!(c, vec![ModelCategory::General]);
@@ -608,27 +521,10 @@ mod tests {
             model_kind(&tags(&["base_model:finetune:meta-llama/Llama-3.1-8B"])),
             ModelKind::FineTuned
         );
-        assert_eq!(
-            model_kind(&tags(&["base_model:adapter:meta-llama/Llama-3.1-8B"])),
-            ModelKind::LoraAdapter
-        );
     }
 
     #[test]
-    fn the_more_specific_tag_wins() {
-        // Adapters commonly carry both `base_model:X` and `base_model:adapter:X`.
-        // Reading the plain one first would call an adapter a base model.
-        let both = tags(&[
-            "base_model:meta-llama/Llama-3.1-8B",
-            "base_model:adapter:meta-llama/Llama-3.1-8B",
-        ]);
-        assert_eq!(model_kind(&both), ModelKind::LoraAdapter);
-    }
-
-    #[test]
-    fn every_kind_explains_whether_it_can_run_alone() {
-        // The distinction a non-specialist needs is exactly this one.
-        assert!(ModelKind::LoraAdapter.explanation().contains("cannot run on its own"));
+    fn every_kind_explains_that_it_can_run() {
         for k in [ModelKind::BaseModel, ModelKind::FineTuned, ModelKind::Quantized] {
             assert!(k.explanation().contains("Download and run"), "{:?}", k);
         }
@@ -720,7 +616,6 @@ mod tests {
             }),
             base_model: Some("Qwen/Qwen2.5-Coder-7B-Instruct".into()),
             is_finetune: false,
-            is_lora_adapter: false,
             tags: tags(&["license:apache-2.0", "code", "gguf"]),
         }
     }

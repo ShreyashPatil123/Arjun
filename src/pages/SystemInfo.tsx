@@ -211,7 +211,7 @@ export const SystemInfo: React.FC = () => {
   const rawRuntimes = unwrapOverride(profile.aiRuntimes, []);
   const aiRuntimes: AIRuntimeInfo[] = Array.isArray(rawRuntimes) ? rawRuntimes : [];
 
-  const aiCapabilities = profile.aiCapabilities || { recommendedQuantizations: [], multiModelCapable: false, loraReady: false, visionReady: false, embeddingReady: false };
+  const aiCapabilities = profile.aiCapabilities || { recommendedQuantizations: [], multiModelCapable: false, visionReady: false, embeddingReady: false };
   const validation = profile.validation || { isReadyForAi: false, score: 0, warnings: [], errors: [], recommendations: [] };
   const overrides = profile.overrides || {};
 
@@ -641,9 +641,6 @@ export const SystemInfo: React.FC = () => {
             <div style={{ marginTop: '8px' }}>
               <span className={styles.specLabel} style={{ marginBottom: '8px' }}>Module & Feature Readiness:</span>
               <div className={styles.pillsGroup}>
-                <Badge variant={aiCapabilities.loraReady ? 'success' : 'warning'}>
-                  {aiCapabilities.loraReady ? '✓ Dynamic LoRA Ready' : 'LoRA Restricted'}
-                </Badge>
                 <Badge variant={aiCapabilities.visionReady ? 'success' : 'default'}>
                   {aiCapabilities.visionReady ? '✓ Multimodal Vision Ready' : 'Vision Limited'}
                 </Badge>

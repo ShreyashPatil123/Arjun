@@ -53,8 +53,6 @@ pub struct DownloadProgressPayload {
     pub status: DownloadStatus,
     pub error: Option<String>,
     pub package_id: Option<String>,
-    pub capability: Option<String>,
-    pub item_type: Option<String>, // "base_model" | "adapter"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +71,6 @@ pub struct InstalledModel {
     pub installed_at: String,
     pub is_ready: bool,
     pub checksum: Option<String>,
-    pub adapters: Option<std::collections::HashMap<String, crate::adapter_manager::AdapterManifestInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

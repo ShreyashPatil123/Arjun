@@ -7,8 +7,6 @@ import {
   Heart,
   Clock,
   Layers,
-  ChevronDown,
-  ChevronRight,
   X,
   Sparkles,
   ArrowDownWideNarrow,
@@ -17,16 +15,9 @@ import { Button, Spinner } from '../components/ui';
 import { Can } from '../components/auth/Can';
 import {
   browseModelCards,
-  findModelAdapters,
   formatSize,
-  type AdapterPage,
   type CatalogPage,
 } from '../services/catalog.service';
-import {
-  downloadAdapter,
-  getAdapterDetails,
-  type AdapterDetails,
-} from '../services/adapters.service';
 import { startModelDownload } from '../services/download.service';
 import { useDownloads } from '../hooks/useDownloads';
 import { useToast } from '../hooks/useToast';
@@ -143,8 +134,8 @@ function inSelection(card: ModelCard, selection: Selection): boolean {
  *
  * Details open in a drawer rather than inline. Cards sit in a grid, and grid
  * rows share a height, so expanding one card stretched its neighbours into tall
- * empty boxes; the drawer also gives the size and adapter tables room to be
- * read, which a third of a card's width did not.
+ * empty boxes; the drawer also gives the size table room to be read, which a
+ * third of a card's width did not.
  */
 export const Browse: React.FC = () => {
   const [page, setPage] = useState<CatalogPage | null>(null);
@@ -519,10 +510,7 @@ function Card({ card, open, onOpen }: CardProps) {
         <div className={styles.badges}>
           {/* What this *is* comes first: whether it can run on its own is the
             * thing a non-specialist most needs to know before downloading. */}
-          <span
-            className={card.kind === 'lora-adapter' ? styles.badgeStrong : styles.badgeKind}
-            title={card.kindExplanation}
-          >
+          <span className={styles.badgeKind} title={card.kindExplanation}>
             {KIND_LABELS[card.kind]}
           </span>
           {card.license && <span className={styles.badge}>{card.license}</span>}
@@ -532,8 +520,6 @@ function Card({ card, open, onOpen }: CardProps) {
       <h2 className={styles.cardName}>{card.name}</h2>
       <p className={styles.summary}>{card.summary}</p>
 
-      {/* Spelled out, because "LoRA adapter" alone does not tell someone that
-        * downloading it on its own will not give them a working model. */}
       <p className={styles.kindNote}>{card.kindExplanation}</p>
 
       {card.datasets && card.datasets.length > 0 && (
@@ -573,12 +559,10 @@ function Card({ card, open, onOpen }: CardProps) {
 
       <div className={styles.cardFoot}>
         <button className={styles.expand} onClick={onOpen} aria-expanded={open}>
-          {`Sizes & LoRA — ${fitting.length} of ${card.quantizations.length} fit`}
+          {`Sizes — ${fitting.length} of ${card.quantizations.length} fit`}
         </button>
 
-        {/* An adapter is not a runnable model, so it gets no download button —
-          * it is installed from the base model's card instead. */}
-        {card.kind !== 'lora-adapter' && offer && (
+        {offer && (
           <button
             className={fitsHere ? styles.downloadBtn : styles.downloadBtnWarn}
             disabled={starting || isDownloading(card.repoId)}
@@ -620,11 +604,6 @@ interface DrawerProps {
  * any other card.
  */
 function DetailDrawer({ card, onClose }: DrawerProps) {
-  const [adapters, setAdapters] = useState<AdapterPage | null>(null);
-  const [loadingAdapters, setLoadingAdapters] = useState(true);
-  const [installing, setInstalling] = useState<string | null>(null);
-  const [installed, setInstalled] = useState<Set<string>>(new Set());
-  const [installError, setInstallError] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
   const { addToast } = useToast();
   const { isDownloading } = useDownloads();
@@ -637,45 +616,6 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
-
-  // Looked up per model, not with the listing: one request per card would mean
-  // a hundred extra calls per sweep and would hit the rate limit immediately.
-  useEffect(() => {
-    let cancelled = false;
-    setAdapters(null);
-    setLoadingAdapters(true);
-
-    findModelAdapters(card.baseModel || card.repoId)
-      .then((found) => {
-        if (!cancelled) setAdapters(found);
-      })
-      .catch((err) => {
-        if (!cancelled) setAdapters({ adapters: [], readyCount: 0, notice: String(err) });
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingAdapters(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [card.repoId, card.baseModel]);
-
-  const install = async (adapterRepoId: string) => {
-    setInstalling(adapterRepoId);
-    setInstallError(null);
-    try {
-      // Adapters install beside the base model, so the base model's id is what
-      // identifies where they belong.
-      await downloadAdapter('huggingface', card.baseModel || card.repoId, adapterRepoId);
-      setInstalled((prev) => new Set(prev).add(adapterRepoId));
-    } catch (err) {
-      // The backend explains refusals in plain language — pass it through.
-      setInstallError(String(err));
-    } finally {
-      setInstalling(null);
-    }
-  };
 
   const download = async (q: Quant) => {
     setStarting(q.label);
@@ -742,27 +682,23 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                     </td>
                     <td className={styles.qFit}>{q.fits ? 'fits' : 'too large'}</td>
                     <td className={styles.qAction}>
-                      {card.kind !== 'lora-adapter' && (
-                        <Can
-                          permission="importModel"
-                          fallback={
-                            <span className={styles.muted} title="You do not have permission to install models.">
-                              —
-                            </span>
-                          }
+                      <Can
+                        permission="importModel"
+                        fallback={
+                          <span className={styles.muted} title="You do not have permission to install models.">
+                            —
+                          </span>
+                        }
+                      >
+                        <button
+                          className={styles.rowBtn}
+                          disabled={starting !== null || isDownloading(card.repoId, q.label)}
+                          onClick={() => void download(q)}
+                          aria-label={`Download ${card.name} ${q.label}`}
                         >
-                          <button
-                            className={styles.rowBtn}
-                            disabled={
-                              starting !== null || isDownloading(card.repoId, q.label)
-                            }
-                            onClick={() => void download(q)}
-                            aria-label={`Download ${card.name} ${q.label}`}
-                          >
-                            {isDownloading(card.repoId, q.label) ? '…' : <Download size={12} />}
-                          </button>
-                        </Can>
-                      )}
+                          {isDownloading(card.repoId, q.label) ? '…' : <Download size={12} />}
+                        </button>
+                      </Can>
                     </td>
                   </tr>
                 ))}
@@ -776,212 +712,8 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
             </p>
           </section>
 
-          <section>
-            <h3 className={styles.drawerSection}>LoRA adapters</h3>
-
-            {loadingAdapters && <p className={styles.adapterNotice}>Looking for adapters…</p>}
-            {adapters?.notice && <p className={styles.adapterNotice}>{adapters.notice}</p>}
-            {installError && <p className={styles.adapterError}>{installError}</p>}
-
-            {adapters && adapters.adapters.length > 0 && (
-              <>
-                <table className={styles.adapterTable}>
-                  <thead>
-                    <tr className={styles.quantHead}>
-                      <th scope="col">Adapter</th>
-                      <th scope="col">By</th>
-                      <th scope="col" className={styles.qFit}>
-                        Usable
-                      </th>
-                      <th scope="col" aria-label="Get" />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {adapters.adapters.map((a) => (
-                      <AdapterRow
-                        key={a.repoId}
-                        adapter={a}
-                        installing={installing === a.repoId}
-                        installed={installed.has(a.repoId)}
-                        onInstall={() => void install(a.repoId)}
-                      />
-                    ))}
-                  </tbody>
-                </table>
-                <p className={styles.sizeNote}>
-                  Select an adapter's name to see what it changes about the model.
-                </p>
-              </>
-            )}
-          </section>
         </div>
       </aside>
-    </>
-  );
-}
-
-interface AdapterRowProps {
-  adapter: { repoId: string; name: string; author: string; focus: string; ggufReady: boolean };
-  installing: boolean;
-  installed: boolean;
-  onInstall: () => void;
-}
-
-/**
- * One adapter, with its name acting as a disclosure for what it changes.
- *
- * The detail is fetched on selection rather than with the list: one lookup per
- * adapter would hit HuggingFace's rate limit immediately.
- */
-function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRowProps) {
-  const [open, setOpen] = useState(false);
-  const [details, setDetails] = useState<AdapterDetails | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState<string | null>(null);
-
-  const toggle = async () => {
-    const next = !open;
-    setOpen(next);
-    if (!next || details || loading) return;
-
-    setLoading(true);
-    setFailed(null);
-    try {
-      setDetails(await getAdapterDetails(a.repoId));
-    } catch (err) {
-      setFailed(String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <>
-      <tr className={a.ggufReady ? styles.fits : styles.tooBig}>
-        <td>
-          <button
-            className={styles.adapterNameBtn}
-            onClick={() => void toggle()}
-            aria-expanded={open}
-            title="What does this change?"
-          >
-            {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-            <span className={styles.adapterFocus}>{a.focus}</span>
-          </button>
-        </td>
-        <td className={styles.adapterAuthor}>{a.author}</td>
-        <td className={styles.qFit}>
-          {a.ggufReady ? (
-            'ready'
-          ) : (
-            <span
-              className={styles.needsConversion}
-              title="PEFT safetensors. Sarathi converts it to GGUF after downloading, which needs the base model installed and a supported model family."
-            >
-              converts on install
-            </span>
-          )}
-        </td>
-        <td className={styles.qAction}>
-          {/* Both kinds are installable now. A PEFT adapter is downloaded and
-            * converted in one step; if the conversion cannot be done the whole
-            * install is rolled back, so the button never leaves a file behind
-            * that llama.cpp would refuse. */}
-          <Can
-            permission="importModel"
-            fallback={
-              <button
-                className={styles.getBtn}
-                disabled
-                title="You do not have permission to install adapters."
-              >
-                unavailable
-              </button>
-            }
-          >
-            <button
-              className={styles.getBtn}
-              disabled={installing || installed}
-              onClick={onInstall}
-              title={
-                a.ggufReady
-                  ? 'Download this adapter'
-                  : 'Download and convert this adapter to GGUF'
-              }
-            >
-              {installed
-                ? 'installed'
-                : installing
-                  ? a.ggufReady
-                    ? 'getting…'
-                    : 'converting…'
-                  : 'Get'}
-            </button>
-          </Can>
-        </td>
-      </tr>
-
-      {open && (
-        <tr>
-          <td colSpan={4} className={styles.adapterDetailCell}>
-            {loading && <p className={styles.adapterNotice}>Reading its page…</p>}
-            {failed && <p className={styles.adapterError}>{failed}</p>}
-
-            {details && (
-              <div className={styles.adapterDetail}>
-                {details.effects.length > 0 && (
-                  <ul className={styles.effects}>
-                    {details.effects.map((e) => (
-                      <li key={e.skill} className={styles.effect}>
-                        <span className={styles.effectSkill}>{e.skill}</span>
-                        {/* A guess read off the repository name must never be
-                          * presented with the same weight as the author's own
-                          * tags, so each line says which it is.
-                          *
-                          * The label says "author tagged", not "author says":
-                          * the author supplied a tag, and the sentence beside it
-                          * is Sarathi explaining what that tag means. Wording it
-                          * as speech put our words in their mouth, which also
-                          * made every adapter in a category look identical. */}
-                        <span
-                          className={
-                            e.confidence === 'stated' ? styles.stated : styles.suggested
-                          }
-                          title={
-                            e.confidence === 'stated'
-                              ? 'The author tagged this adapter with this skill. The description is Sarathi explaining what that tag means.'
-                              : 'Guessed from the repository name — the author did not tag it'
-                          }
-                        >
-                          {e.confidence === 'stated' ? 'author tagged' : 'from its name'}
-                        </span>
-                        <span className={styles.effectText}>{e.description}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {details.datasets.length > 0 && (
-                  <p className={styles.detailLine}>
-                    <strong>Trained on:</strong> {details.datasets.join(', ')}
-                  </p>
-                )}
-
-                <p className={styles.detailLine}>
-                  {details.sizeBytes > 0 && <>{formatSize(details.sizeBytes)} · </>}
-                  {details.downloads.toLocaleString()} downloads
-                  {details.license && <> · {details.license}</>}
-                </p>
-
-                {details.notice && <p className={styles.adapterNotice}>{details.notice}</p>}
-                {details.blockedReason && (
-                  <p className={styles.adapterNotice}>{details.blockedReason}</p>
-                )}
-              </div>
-            )}
-          </td>
-        </tr>
-      )}
     </>
   );
 }

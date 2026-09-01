@@ -43,8 +43,6 @@ export interface DownloadProgressPayload {
   status: DownloadStatus;
   error: string | null;
   packageId?: string;
-  capability?: string;
-  itemType?: string;
 }
 
 export interface InstalledModel {
@@ -61,7 +59,6 @@ export interface InstalledModel {
   installedAt: string;
   isReady: boolean;
   checksum: string | null;
-  adapters?: Record<string, AdapterManifestInfo>;
 }
 
 export interface StorageSummary {
@@ -70,59 +67,4 @@ export interface StorageSummary {
   totalModelsBytes: number;
   availableDiskSpaceBytes: number;
   totalDiskSpaceBytes: number;
-}
-
-export interface AdapterCandidate {
-  repoId: string;
-  capability: string;
-  baseModelMatch: string;
-  peftType: string;
-  targetModules: string[];
-  adapterFileName: string;
-  downloadUrl: string;
-  sizeBytes: number;
-  downloads: number;
-  likes: number;
-  confidenceScore: number;
-}
-
-export interface AdapterSearchResult {
-  capability: string;
-  status: 'Found' | 'Unavailable' | 'Searching';
-  candidate: AdapterCandidate | null;
-  reason: string | null;
-}
-
-export interface BaseManifestInfo {
-  modelId: string;
-  modelName: string;
-  quantization: string;
-  filePath: string;
-  sizeBytes: number;
-  checksum: string | null;
-}
-
-export interface AdapterManifestInfo {
-  capability: string;
-  status: 'Installed' | 'READY' | 'Unavailable' | 'Failed' | string;
-  adapterRuntimeStatus?: 'compatible' | 'requires_conversion' | 'incompatible' | 'not_present' | null;
-  repoId: string | null;
-  localPath: string | null;
-  adapterFile: string | null;
-  configFile: string | null;
-  sizeBytes: number | null;
-  baseModelMatch: string | null;
-  targetModules: string[];
-  peftType: string | null;
-  checksum: string | null;
-  reason: string | null;
-}
-
-export interface ModelPackageManifest {
-  packageId: string;
-  providerId: string;
-  baseModel: BaseManifestInfo;
-  adapters: Record<string, AdapterManifestInfo>;
-  createdAt: string;
-  updatedAt: string;
 }

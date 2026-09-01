@@ -543,7 +543,7 @@ connections plus the `tauri-plugin-sql` migration runner.
 | `settings`, `activity_log`, `schema_version` | `database/mod.rs` migrations | inherited |
 | `audit_log` | `audit/mod.rs` | append-only by trigger; SHA-256 hash-chained |
 | `documents`, `chunks`, `chunk_text` (FTS5) | `knowledge/index.rs`, `documents/store.rs` | classification column drives the ACL filter |
-| `models`, `downloads`, `installed_loras` | registry / download / adapter managers | inherited |
+| `models`, `downloads` | registry / download managers | inherited |
 | `account_credentials` | `identity/credentials.rs` | Argon2id |
 | `memory_nodes`, `working_memory`, `conversation_summaries`, `user_profile`, `projects` | `memory_engine/persistence.rs` | inherited; standing unclear |
 | `task_events` | `agent_runtime/events/store.rs` *(uncommitted)* | append-only by trigger; `UNIQUE(run_id, seq)` |
@@ -774,12 +774,12 @@ commands/**}`; `sidecars/document_sidecar/{router,escalation,injection}.py` and
 `acceptance-baseline.json`; `src-tauri/tests/*.rs`; `THIRD_PARTY_NOTICES.md`.
 
 **Not inspected in depth:** `ai_engine/` (7 files, ~5 700 lines),
-`download_manager/`, `model_providers/`, `adapter_manager/`, `lora/`,
+`download_manager/`, `model_providers/`, `model_package/`,
 `model_recommendation/`, `system_analyzer/`, `capability/`, `installer/`,
 `plugins/`, `memory_engine/` beyond its module root, and the vendored OpenClaw
 tree file by file. These are inherited Sarathi subsystems largely orthogonal to
 the nine SIH capabilities; they should be inspected before any phase that touches
-model loading, VRAM planning or adapter binding.
+model loading or VRAM planning.
 
 **No product code was edited in this phase.** No dependency was installed, no
 model downloaded, and no external service contacted.

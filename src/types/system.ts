@@ -117,7 +117,6 @@ export interface AICapabilityProfile {
   recommendedContextLength?: number | null;
   preferredInferenceBackend?: string | null;
   multiModelCapable: boolean;
-  loraReady: boolean;
   visionReady: boolean;
   embeddingReady: boolean;
   extraCapabilities?: Record<string, boolean | string | number>;

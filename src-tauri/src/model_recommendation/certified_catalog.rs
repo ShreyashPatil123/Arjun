@@ -1,8 +1,6 @@
 //! Saarthi Data-Driven Certified Model Catalog & Decoupled Metadata Specs
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CertificationTier {
     Certified,
@@ -39,8 +37,6 @@ pub struct NumericScores {
     pub tool_calling_accuracy: f64,
     #[serde(alias = "memory_engine_compatibility")]
     pub memory_engine_compatibility: f64,
-    #[serde(alias = "lora_adapter_switching")]
-    pub lora_adapter_switching: f64,
     #[serde(alias = "context_window_retention")]
     pub context_window_retention: f64,
     #[serde(alias = "response_stability")]
@@ -96,8 +92,6 @@ pub struct PackageCertification {
     pub runtime_profile_id: String,
     #[serde(alias = "numeric_scores")]
     pub numeric_scores: NumericScores,
-    #[serde(alias = "lora_capability_matrix")]
-    pub lora_capability_matrix: HashMap<String, CertificationTier>,
     pub provenance: Provenance,
     #[serde(alias = "quirks_and_notes")]
     pub quirks_and_notes: String,

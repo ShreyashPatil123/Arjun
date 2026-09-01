@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::governance::{require_permission, require_session, CurrentSession};
+use crate::config::ConfigManager;
+use crate::core::event_bus::{get_event_bus, SarathiEvent};
 use crate::identity::Permission;
 use crate::policy::Classification;
 use crate::ai_engine::activation::{ActivationOutcome, InferenceLoader, ModelActivator};
@@ -12,6 +14,8 @@ use crate::audit::{AuditKind, AuditService};
 use crate::registry::router::{ModelRouter, RoutingDecision};
 use crate::registry::{ModelEntry, ModelRegistry};
 use crate::system_analyzer::gpu_collector;
+use crate::ai_engine::startup::StartupModelTarget;
+use crate::download_manager::traits::InstalledModel;
 
 /// The activator, shared across commands.
 pub type SharedActivator = Arc<ModelActivator<InferenceLoader>>;
@@ -22,6 +26,99 @@ pub type SharedActivator = Arc<ModelActivator<InferenceLoader>>;
 pub struct PreparedModel {
     pub routing: RoutingDecision,
     pub activation: ActivationOutcome,
+}
+
+/// The exact installed model variant selected to run the orchestrator.
+#[tauri::command]
+pub async fn get_orchestrator_model(
+    app: AppHandle,
+    session: State<'_, CurrentSession>,
+) -> Result<StartupModelTarget, String> {
+    require_session(&session)?;
+    let config = ConfigManager::load(&ConfigManager::get_config_path(&app))
+        .map_err(|e| e.to_string())?;
+    Ok(StartupModelTarget {
+        provider_id: config.ai_settings.orchestrator_provider_id,
+        model_id: config.ai_settings.orchestrator_model_id,
+        quantization: config.ai_settings.orchestrator_quantization,
+    })
+}
+
+/// Selects any ready installed model as the orchestrator. Administrator only.
+/// The exact provider/model/quantization coordinates are persisted so startup
+/// never guesses between two variants of the same model.
+#[tauri::command]
+pub async fn set_orchestrator_model(
+    app: AppHandle,
+    session: State<'_, CurrentSession>,
+    audit: State<'_, Arc<AuditService>>,
+    provider_id: String,
+    model_id: String,
+    quantization: String,
+) -> Result<StartupModelTarget, String> {
+    let signed_in = require_permission(&session, Permission::ModifyPolicy)?;
+    let requested = StartupModelTarget {
+        provider_id: provider_id.trim().to_string(),
+        model_id: model_id.trim().to_string(),
+        quantization: quantization.trim().to_string(),
+    };
+    if requested.provider_id.is_empty()
+        || requested.model_id.is_empty()
+        || requested.quantization.is_empty()
+    {
+        return Err("Provider, model and quantization are all required.".to_string());
+    }
+
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let installed = crate::model_manager::ModelManager::list_installed_models(&app_data);
+    let selected = resolve_installed_orchestrator(&installed, &requested)?;
+
+    let config_path = ConfigManager::get_config_path(&app);
+    let mut config = ConfigManager::load(&config_path).map_err(|e| e.to_string())?;
+    config.ai_settings.orchestrator_provider_id = selected.provider_id.clone();
+    config.ai_settings.orchestrator_model_id = selected.model_id.clone();
+    config.ai_settings.orchestrator_quantization = selected.quantization.clone();
+    config.ai_settings.auto_load_on_startup = true;
+    config.ai_settings.use_gpu = true;
+    ConfigManager::save(&config, &config_path).map_err(|e| e.to_string())?;
+
+    get_event_bus().publish(
+        SarathiEvent::ConfigChanged,
+        Some(serde_json::json!({ "orchestrator": &selected })),
+    );
+    let _ = audit.record(
+        &signed_in.user.id,
+        AuditKind::ModelRegistry,
+        format!(
+            "Set orchestrator to {} ({})",
+            selected.model_id, selected.quantization
+        ),
+        Some(serde_json::json!({
+            "providerId": &selected.provider_id,
+            "modelId": &selected.model_id,
+            "quantization": &selected.quantization,
+        })),
+    );
+
+    Ok(selected)
+}
+
+fn resolve_installed_orchestrator(
+    installed: &[InstalledModel],
+    requested: &StartupModelTarget,
+) -> Result<StartupModelTarget, String> {
+    installed
+        .iter()
+        .find(|model| {
+            requested.matches_installed(model) && model.is_ready && model.size_bytes > 0
+        })
+        .map(StartupModelTarget::from_installed)
+        .ok_or_else(|| {
+            format!(
+                "{} ({}) is not a ready installed model.",
+                requested.model_id, requested.quantization
+            )
+        })
 }
 
 /// Every registered model, including disabled ones.
@@ -174,4 +271,46 @@ pub async fn model_residency(
     Ok(serde_json::json!({
         "heldBy": activator.current_holder(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn installed(quantization: &str, is_ready: bool) -> InstalledModel {
+        InstalledModel {
+            id: format!("custom-{quantization}"),
+            model_id: "org/custom-orchestrator".to_string(),
+            model_name: "Custom Orchestrator".to_string(),
+            provider_id: "huggingface".to_string(),
+            quantization: quantization.to_string(),
+            format: "GGUF".to_string(),
+            backend: "llama.cpp (GGUF)".to_string(),
+            file_name: "model.gguf".to_string(),
+            file_path: "/models/model.gguf".to_string(),
+            size_bytes: 1_000,
+            installed_at: String::new(),
+            is_ready,
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn administrator_selection_resolves_the_exact_ready_variant() {
+        let requested = StartupModelTarget::from_installed(&installed("Q6_K", true));
+        let selected = resolve_installed_orchestrator(
+            &[installed("Q4_K_M", true), installed("Q6_K", true)],
+            &requested,
+        )
+        .expect("the exact requested variant should be selectable");
+
+        assert_eq!(selected, requested);
+    }
+
+    #[test]
+    fn incomplete_models_cannot_become_the_orchestrator() {
+        let model = installed("Q6_K", false);
+        let requested = StartupModelTarget::from_installed(&model);
+        assert!(resolve_installed_orchestrator(&[model], &requested).is_err());
+    }
 }

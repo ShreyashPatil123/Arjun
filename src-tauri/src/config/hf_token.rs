@@ -1,7 +1,7 @@
 //! The HuggingFace token, resolved once for the whole process.
 //!
 //! Reaching the Hub happens from several places — browsing the catalog,
-//! discovering adapters, resolving artifacts, downloading weights — and most of
+//! resolving artifacts, downloading weights — and most of
 //! them are plain commands with no access to the Tauri app handle needed to
 //! read `config.json`. Rather than thread a handle through all of them, the
 //! saved token is loaded into memory at startup and read from here.

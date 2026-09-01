@@ -1,46 +1,34 @@
 //! Capability Layer — intent-driven specialization of the active model.
 //!
-//! This module is the working replacement for what the build plan called the
-//! "Dynamic LoRA Switching Engine". It resolves, per turn, *how* the model
-//! should be specialized, and applies that specialization to the actual
-//! inference call.
+//! It resolves, per turn, how the model should be specialized and applies that
+//! specialization to the actual inference call.
 //!
 //! The pipeline is:
 //!
 //! ```text
 //! prompt -> classify (confidence) -> switch policy (hysteresis) -> resolve backend
-//!        -> apply (system directive + sampling, and/or LoRA adapter binding)
+//!        -> apply (system directive + sampling)
 //! ```
 //!
 //! Two properties are deliberate:
 //!
-//! - **It always applies.** The legacy path classified intent, displayed a
-//!   badge, and then generated with the unmodified base model — the routing was
-//!   never wired to inference. Everything here terminates in a real change to
-//!   the prompt, the sampler, or the context's bound adapter.
-//! - **It always degrades.** A capability with no loadable adapter is delivered
-//!   through its prompt profile rather than being dropped, so behaviour is
-//!   consistent whether or not adapters are installed.
+//! Every non-general capability terminates in a real prompt or sampler change.
 
-pub mod assign;
 pub mod classifier;
 pub mod eval;
 pub mod policy;
 pub mod profile;
 pub mod resolver;
 
-use std::path::Path;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::adapter_manager::ModelPackageManifest;
 use crate::ai_engine::traits::{ChatMessage, GenerationParams};
 
-pub use assign::{AssignmentConfidence, CapabilityAssignment};
 pub use classifier::{ClassificationResult, IntentClassifier};
 pub use policy::{CapabilityTracker, SwitchDecision, SwitchPolicy, GENERAL};
-pub use profile::{CapabilityBackend, CapabilitySpec, SamplingOverrides, DEFAULT_LORA_SCALE};
+pub use profile::{CapabilityBackend, CapabilitySpec, SamplingOverrides};
 pub use resolver::{CapabilityResolution, CapabilityResolver};
 
 /// Everything decided for a single turn.
@@ -66,10 +54,6 @@ impl CapabilityTurn {
             switched: self.decision.is_switch(),
             reason: self.decision.reason().to_string(),
             backend_reason: self.resolution.backend_reason.clone(),
-            adapter_path: self
-                .resolution
-                .adapter_path()
-                .map(|p| p.to_string_lossy().to_string()),
             effective_temperature: effective.temperature,
             effective_top_p: effective.top_p,
             effective_repeat_penalty: effective.repeat_penalty,
@@ -86,16 +70,14 @@ impl CapabilityTurn {
 pub struct CapabilityPayload {
     pub capability: String,
     pub display_name: String,
-    /// Pre-formatted UI label, e.g. `Code · lora`.
+    /// Pre-formatted UI label, e.g. `Code · prompt-profile`.
     pub badge: String,
-    /// `base` | `prompt-profile` | `lora`.
+    /// `base` | `prompt-profile`.
     pub backend: String,
     pub confidence: f32,
     pub switched: bool,
     pub reason: String,
     pub backend_reason: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adapter_path: Option<String>,
     /// Sampling values generation will actually use, post-override.
     pub effective_temperature: f32,
     pub effective_top_p: f32,
@@ -136,8 +118,6 @@ impl CapabilityLayer {
     pub fn resolve_turn(
         &self,
         prompt: &str,
-        package_dir: &Path,
-        manifest: &ModelPackageManifest,
         manual_override: Option<&str>,
     ) -> CapabilityTurn {
         let classification = IntentClassifier::classify(prompt);
@@ -151,8 +131,7 @@ impl CapabilityLayer {
             tracker.decide(&classification, manual_override)
         };
 
-        let resolution =
-            CapabilityResolver::resolve(decision.resulting_capability(), package_dir, manifest);
+        let resolution = CapabilityResolver::resolve(decision.resulting_capability());
 
         log::info!(
             "[CAPABILITY] intent={:?} confidence={:.2} -> capability='{}' backend={} ({})",

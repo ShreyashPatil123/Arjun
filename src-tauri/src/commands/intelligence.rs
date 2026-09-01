@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tauri::{Manager, State};
 
-use crate::adapter_manager::AdapterRegistry;
+use crate::model_package::ModelPackageRegistry;
 use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::identity::Permission;
 use crate::model_intelligence::{
     telemetry::{ModelAggregate, TelemetrySink},
-    AdapterRouteResult, AdapterRouter, ModelIntelligenceManager, ModelProfile, InferenceParameters,
+    InferenceParameters, ModelIntelligenceManager, ModelProfile,
 };
 
 /// Reads the in-memory aggregate for the Model Health page. Bounded:
@@ -41,8 +41,10 @@ pub async fn get_model_profile(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app_data_dir: {}", e))?;
 
-    let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
-    let manifest = AdapterRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
+    let package_dir =
+        ModelPackageRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
+    let manifest =
+        ModelPackageRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
 
     ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest)
         .map_err(|e| format!("Failed to load model profile: {}", e))
@@ -65,8 +67,10 @@ pub async fn update_model_profile(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app_data_dir: {}", e))?;
 
-    let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
-    let manifest = AdapterRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
+    let package_dir =
+        ModelPackageRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
+    let manifest =
+        ModelPackageRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
 
     let mut profile = ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest)
         .map_err(|e| e.to_string())?;
@@ -96,45 +100,11 @@ pub async fn refresh_model_profile(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app_data_dir: {}", e))?;
 
-    let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
-    let manifest = AdapterRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
+    let package_dir =
+        ModelPackageRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
+    let manifest =
+        ModelPackageRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
 
     ModelIntelligenceManager::refresh_profile(&package_dir, &manifest)
         .map_err(|e| format!("Failed to refresh model profile: {}", e))
-}
-
-#[tauri::command]
-pub async fn route_prompt_capability(
-    app_handle: tauri::AppHandle,
-    session: State<'_, CurrentSession>,
-    provider_id: String,
-    model_id: String,
-    prompt: String,
-    user_override: Option<String>,
-) -> Result<AdapterRouteResult, String> {
-    // Adapter routing is a model-management operation. A wrong answer
-    // chooses the wrong adapter for the next prompt.
-    require_permission(&session, Permission::ImportModel)?;
-    let start_time = std::time::Instant::now();
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app_data_dir: {}", e))?;
-
-    let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
-    let manifest = AdapterRegistry::read_manifest(&package_dir).map_err(|e| e.to_string())?;
-
-    let route = AdapterRouter::select_adapter_for_prompt(
-        &package_dir,
-        &manifest,
-        &prompt,
-        user_override.as_deref(),
-    );
-
-    log::info!(
-        "[INTENT_ROUTER] Prompt Intent Analysis complete in {}ms | Intent: {:?} | Target Capability: '{}' | Selected Adapter: {:?}",
-        start_time.elapsed().as_millis(), route.intent, route.target_capability, route.selected_adapter_name
-    );
-
-    Ok(route)
 }

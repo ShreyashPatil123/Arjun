@@ -36,7 +36,7 @@ impl ModelManager {
                                 let folder_name = pkg_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                 let inferred_model_id = folder_name.replace('_', "/");
 
-                                if let Ok(manifest) = crate::adapter_manager::AdapterRegistry::ensure_valid_manifest(
+                                if let Ok(manifest) = crate::model_package::ModelPackageRegistry::ensure_valid_manifest(
                                     &pkg_path,
                                     &provider_id,
                                     &inferred_model_id,
@@ -63,7 +63,6 @@ impl ModelManager {
                                             installed_at: chrono::Utc::now().to_rfc3339(),
                                             is_ready: size_bytes > 0,
                                             checksum: None,
-                                            adapters: Some(manifest.adapters),
                                         });
                                     }
                                 }

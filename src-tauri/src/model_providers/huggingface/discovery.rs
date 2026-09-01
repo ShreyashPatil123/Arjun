@@ -64,10 +64,6 @@ pub struct GgufRepo {
     pub base_model: Option<String>,
     /// True when the repo is a fine-tune rather than a plain re-quantization.
     pub is_finetune: bool,
-    /// True when the repo is a LoRA adapter — a patch for a base model, not
-    /// something that can be loaded and run on its own.
-    #[serde(default)]
-    pub is_lora_adapter: bool,
     /// Free-form tags, kept for search and display.
     pub tags: Vec<String>,
 }
@@ -164,7 +160,9 @@ pub fn is_servable_pipeline(tag: Option<&str>) -> bool {
 impl RawModelInfo {
     /// Builds a [`GgufRepo`], or `None` when the repo cannot serve chat requests.
     pub fn into_repo(self) -> Option<GgufRepo> {
-        if !is_servable_pipeline(self.pipeline_tag.as_deref()) {
+        if !is_servable_pipeline(self.pipeline_tag.as_deref())
+            || is_model_extension(&self.tags)
+        {
             return None;
         }
 
@@ -189,7 +187,6 @@ impl RawModelInfo {
 
         let base_model = base_model_from_tags(&self.tags);
         let is_finetune = is_finetune(&self.tags);
-        let is_lora_adapter = is_lora_adapter(&self.tags);
 
         Some(GgufRepo {
             repo_id: self.id,
@@ -201,7 +198,6 @@ impl RawModelInfo {
             gguf,
             base_model,
             is_finetune,
-            is_lora_adapter,
             tags: self.tags,
         })
     }
@@ -342,23 +338,13 @@ pub fn base_model_from_tags(tags: &[String]) -> Option<String> {
     None
 }
 
-/// True when the repo is a LoRA adapter rather than a runnable model.
-///
-/// This matters more here than in a general model browser: an adapter is a
-/// small patch applied *on top of* a base model, not something you can load and
-/// talk to. Downloading one expecting a chat model gets you a file that will not
-/// run, so adapters are labelled distinctly rather than folded in with
-/// fine-tunes.
-pub fn is_lora_adapter(tags: &[String]) -> bool {
-    tags.iter().any(|t| {
-        t.starts_with("base_model:adapter:")
-            || t.eq_ignore_ascii_case("lora")
-            || t.eq_ignore_ascii_case("peft")
-    })
+/// Extensions that require another model are not runnable catalog entries.
+pub fn is_model_extension(tags: &[String]) -> bool {
+    tags.iter().any(|tag| tag.starts_with("base_model:adapter:"))
 }
 
 /// True when the repo is a fine-tune — a fully retrained model — rather than a
-/// plain re-quantization or an adapter.
+/// plain re-quantization.
 pub fn is_finetune(tags: &[String]) -> bool {
     tags.iter()
         .any(|t| t.starts_with("base_model:finetune:") || t.starts_with("base_model:merge:"))
@@ -575,7 +561,6 @@ mod tests {
             gguf: None,
             base_model: None,
             is_finetune: false,
-            is_lora_adapter: false,
             tags: vec![],
         }
     }

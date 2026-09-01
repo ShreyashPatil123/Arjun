@@ -117,16 +117,13 @@
   /* ── Semantic accents ──────────────────────────────────────────────────
    * The interface stays greyscale; these are reserved for badges where a
    * distinction has to be readable at a glance and brightness alone proved
-   * too weak — chiefly "will this fit in my VRAM" and "is this an adapter
-   * rather than a model".
+   * too weak — chiefly "will this fit in my VRAM?".
    *
    * Kept desaturated so they read as accents on a black surface rather than
    * turning the page colourful. Each is always paired with a word, never
    * standing in for one, so nothing depends on distinguishing hues. */
   --tag-fit: #4ADE80;
   --tag-fit-bg: rgba(74, 222, 128, 0.12);
-  --tag-lora: #C084FC;
-  --tag-lora-bg: rgba(192, 132, 252, 0.14);
   --tag-type: #60A5FA;
   --tag-type-bg: rgba(96, 165, 250, 0.12);
   --tag-license: #FBBF24;
@@ -167,8 +164,6 @@
   /* Semantic accents, darkened for contrast on a light surface. */
   --tag-fit: #15803D;
   --tag-fit-bg: rgba(21, 128, 61, 0.10);
-  --tag-lora: #7E22CE;
-  --tag-lora-bg: rgba(126, 34, 206, 0.10);
   --tag-type: #1D4ED8;
   --tag-type-bg: rgba(29, 78, 216, 0.10);
   --tag-license: #A16207;

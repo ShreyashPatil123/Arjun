@@ -18,7 +18,6 @@ export interface LoadedModelInfo {
   chatTemplate?: string;
   stopTokens?: string[];
   modelFamily?: string;
-  activeAdapter?: string | null;
 }
 
 export interface InferenceStatusPayload {
@@ -54,7 +53,6 @@ export interface GenerationParams {
  * `coding` and `small-and-fast`, so either filter surfaces it.
  */
 export type ModelCategory =
-  | 'lora-adapter'
   | 'coding'
   | 'reasoning'
   | 'math'
@@ -69,12 +67,9 @@ export type ModelCategory =
 /**
  * Display order for the category sidebar.
  *
- * `lora-adapter` leads because it changes what an entry *is* — a patch applied
- * on top of a base model, not something that runs on its own — rather than what
- * it is good at.
+ * Categories describe what a runnable model is good at.
  */
 export const MODEL_CATEGORIES: readonly ModelCategory[] = [
-  'lora-adapter',
   'coding',
   'reasoning',
   'math',
@@ -88,7 +83,6 @@ export const MODEL_CATEGORIES: readonly ModelCategory[] = [
 ] as const;
 
 export const CATEGORY_LABELS: Record<ModelCategory, string> = {
-  'lora-adapter': 'LoRA adapter',
   coding: 'Coding',
   reasoning: 'Reasoning',
   math: 'Math',
@@ -104,16 +98,14 @@ export const CATEGORY_LABELS: Record<ModelCategory, string> = {
 /**
  * What an entry is, in terms someone can act on.
  *
- * The distinction that matters: a base model, fine-tune, or quantization can be
- * downloaded and run. A LoRA adapter cannot — it needs a base model underneath.
+ * Every listed kind is a runnable model.
  */
-export type ModelKind = 'base-model' | 'fine-tuned' | 'quantized' | 'lora-adapter';
+export type ModelKind = 'base-model' | 'fine-tuned' | 'quantized';
 
 export const KIND_LABELS: Record<ModelKind, string> = {
   'base-model': 'Base model',
   'fine-tuned': 'Fine-tuned',
   quantized: 'Quantized',
-  'lora-adapter': 'LoRA adapter',
 };
 
 /** One quantization choice, for the size/quality comparison. */
@@ -142,7 +134,7 @@ export interface ModelCard {
   /** Factual one-liner assembled from metadata, not marketing copy. */
   summary: string;
   categories: ModelCategory[];
-  /** Base model, fine-tune, quantization, or adapter. */
+  /** Base model, fine-tune, or quantization. */
   kind: ModelKind;
   /** Plain-language note on whether this can run on its own. */
   kindExplanation: string;
@@ -156,12 +148,7 @@ export interface ModelCard {
   /** Compact relative age, e.g. "2mo". Absent when the date is unknown. */
   ageLabel?: string | null;
   isFinetune: boolean;
-  /**
-   * True when this is a LoRA adapter — a patch for a base model, not something
-   * that can be loaded and run on its own.
-   */
-  isLoraAdapter: boolean;
-  /** Parent model, when this is a fine-tune, adapter, or re-quantization. */
+  /** Parent model, when this is a fine-tune or re-quantization. */
   baseModel?: string | null;
   totalParameters?: number | null;
   contextLength?: number | null;
@@ -182,28 +169,27 @@ export interface ModelCard {
 }
 
 /** How a capability is actually being applied to the model. */
-export type CapabilityBackend = 'base' | 'prompt-profile' | 'lora';
+export type CapabilityBackend = 'base' | 'prompt-profile';
 
 /**
  * Emitted by the backend on `capability:changed` *after* the capability has
- * been applied to the prompt, sampler, and adapter binding.
+ * been applied to the prompt and sampler.
  *
- * This replaces the previous client-side `routePromptCapability` badge, which
- * displayed a routing decision that never reached inference.
+ * This keeps the displayed state aligned with the route actually used for
+ * generation.
  */
 export interface CapabilityPayload {
   capability: string;
   displayName: string;
-  /** Pre-formatted label, e.g. `Code · lora`. */
+  /** Pre-formatted label, e.g. `Code · prompt-profile`. */
   badge: string;
   backend: CapabilityBackend;
   confidence: number;
   switched: boolean;
   /** Why this capability is active (classification / hysteresis / override). */
   reason: string;
-  /** Why this backend was chosen, including any degradation from LoRA. */
+  /** Why this backend was chosen. */
   backendReason: string;
-  adapterPath?: string | null;
   /** Sampling values generation actually used, after capability overrides. */
   effectiveTemperature: number;
   effectiveTopP: number;

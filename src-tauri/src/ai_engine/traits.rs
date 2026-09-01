@@ -199,7 +199,6 @@ pub struct LoadedModelInfo {
     pub stop_tokens: Vec<String>,
     #[serde(default = "default_model_family")]
     pub model_family: String,
-    pub active_adapter: Option<String>,
 }
 
 fn default_model_family() -> String {

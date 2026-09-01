@@ -61,23 +61,6 @@ for pkg in packages:
             "sizeBytes": os.path.getsize(gguf_path),
             "checksum": None
         },
-        "adapters": {
-            "coding": {
-                "capability": "coding",
-                "status": "READY",
-                "adapterRuntimeStatus": "compatible",
-                "repo_id": None,
-                "local_path": None,
-                "adapter_file": None,
-                "config_file": None,
-                "size_bytes": 0,
-                "base_model_match": None,
-                "target_modules": ["q_proj", "v_proj"],
-                "peft_type": "LORA",
-                "checksum": None,
-                "reason": None
-            }
-        },
         "createdAt": now_str,
         "updatedAt": now_str
     }

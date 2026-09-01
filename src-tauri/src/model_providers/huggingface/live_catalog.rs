@@ -214,106 +214,6 @@ pub async fn fetch_repos(repo_ids: &[String], token: Option<&str>) -> Vec<GgufRe
     out
 }
 
-/// A LoRA adapter published for some base model.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdapterListing {
-    pub repo_id: String,
-    pub name: String,
-    pub author: String,
-    pub downloads: u64,
-    pub likes: u64,
-    /// True when the repo ships `.gguf` files, which llama.cpp can load directly.
-    ///
-    /// Most published adapters are PEFT safetensors and are **not** loadable as
-    /// they stand — they need converting to GGUF first. Saying so on the card is
-    /// the difference between "download this and it works" and a file that
-    /// silently fails to load.
-    pub gguf_ready: bool,
-    /// Short description derived from the repo name, e.g. `text to sql`.
-    pub focus: String,
-}
-
-/// Finds LoRA adapters published for a given base model.
-///
-/// Uses HuggingFace's `base_model:adapter:` tag, which adapter authors set to
-/// declare their parent — so this is a real lookup, not a name-similarity guess.
-pub async fn find_adapters(
-    base_model_id: &str,
-    limit: u32,
-    token: Option<&str>,
-) -> Result<Vec<AdapterListing>> {
-    let base = base_model_id.trim();
-    if base.is_empty() || !base.contains('/') {
-        // Without an org/name id there is nothing to match against.
-        return Ok(Vec::new());
-    }
-
-    let url = format!(
-        "https://huggingface.co/api/models?filter=base_model:adapter:{}&sort=downloads&direction=-1&limit={}&full=true",
-        base,
-        limit.clamp(1, 50)
-    );
-
-    let resp = authorized_get(&url, token)?.send().await?;
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(RateLimited { had_token: token.is_some() }.into());
-    }
-    if !resp.status().is_success() {
-        return Err(anyhow!("HuggingFace returned {} searching adapters", resp.status()));
-    }
-
-    let raw: Vec<RawModelInfo> = resp.json().await?;
-    Ok(raw.into_iter().map(to_adapter_listing).collect())
-}
-
-fn to_adapter_listing(raw: RawModelInfo) -> AdapterListing {
-    let author = raw
-        .author
-        .clone()
-        .unwrap_or_else(|| raw.id.split('/').next().unwrap_or("").to_string());
-
-    // Asking "does it contain a .gguf?" is not enough. Some repositories carry
-    // the `base_model:adapter:` tag while shipping fully merged weights, and a
-    // model GGUF passes that test — the Get button would then start a
-    // multi-gigabyte download that can never be bound as an adapter.
-    //
-    // The installability rule lives in one place so the button and the download
-    // cannot disagree about what is loadable.
-    let filenames: Vec<String> = raw.siblings.iter().map(|s| s.rfilename.clone()).collect();
-    let gguf_ready = crate::adapter_manager::store::check_installable(&filenames).is_ok();
-
-    let short = raw.id.split('/').next_back().unwrap_or(&raw.id);
-    let name = short.replace(['-', '_'], " ");
-
-    // Trim only the boilerplate suffixes, keeping the rest of the name intact.
-    //
-    // An earlier version filtered out family names, digits, and anything ending
-    // in "b", trying to distil a "focus". It mangled real names into single
-    // meaningless words — "Persim", "Iraqi", "Merged" — because it stripped
-    // everything that looked like model metadata and kept whatever was left.
-    // The author's own name is more informative than a guess at its meaning.
-    let focus = {
-        let lowered = name.to_lowercase();
-        let mut trimmed = lowered.as_str();
-        for suffix in [" lora", " peft", " adapter", " finetune", " ft"] {
-            trimmed = trimmed.strip_suffix(suffix).unwrap_or(trimmed);
-        }
-        let cleaned = trimmed.trim();
-        if cleaned.is_empty() { name.clone() } else { cleaned.to_string() }
-    };
-
-    AdapterListing {
-        repo_id: raw.id,
-        name,
-        author,
-        downloads: raw.downloads,
-        likes: raw.likes,
-        gguf_ready,
-        focus: if focus.trim().is_empty() { "general".to_string() } else { focus },
-    }
-}
-
 /// Converts a discovered repository into the engine's model record.
 ///
 /// Returns `None` when the repo lacks the GGUF metadata needed to reason about
@@ -398,13 +298,11 @@ pub async fn discover(
     let models: Vec<ModelMetadata> = repos.iter().filter_map(to_model_metadata).collect();
 
     let finetunes = repos.iter().filter(|r| r.is_finetune).count();
-    let adapters = repos.iter().filter(|r| r.is_lora_adapter).count();
     log::info!(
-        "[HF_CATALOG] Resolved {} models from {} repositories ({} fine-tunes, {} LoRA adapters)",
+        "[HF_CATALOG] Resolved {} models from {} repositories ({} fine-tunes)",
         models.len(),
         repos.len(),
-        finetunes,
-        adapters
+        finetunes
     );
 
     Ok(models)
@@ -468,7 +366,6 @@ mod tests {
             }),
             base_model: None,
             is_finetune: false,
-            is_lora_adapter: false,
             tags: vec![],
         }
     }

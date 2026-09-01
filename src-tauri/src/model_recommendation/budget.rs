@@ -201,7 +201,6 @@ mod tests {
                 recommended_context_length: None,
                 preferred_inference_backend: None,
                 multi_model_capable: false,
-                lora_ready: false,
                 vision_ready: false,
                 embedding_ready: false,
                 extra_capabilities: std::collections::HashMap::new(),

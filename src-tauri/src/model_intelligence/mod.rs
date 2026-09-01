@@ -1,9 +1,8 @@
 //! Model Intelligence Layer Module
 //!
 //! Provides source-driven metadata extraction, profile versioning,
-//! dynamic capability management, intent detection, and dynamic adapter routing.
+//! dynamic capability management and intent detection.
 
-pub mod adapter_router;
 pub mod complexity;
 pub mod extractor;
 pub mod intent;
@@ -19,8 +18,7 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-use crate::adapter_manager::ModelPackageManifest;
-pub use adapter_router::{AdapterRouteResult, AdapterRouter};
+use crate::model_package::ModelPackageManifest;
 pub use extractor::MetadataExtractor;
 pub use intent::{IntentDetector, PromptIntent};
 pub use profile::{CapabilityRegistry, ModelFamily, ModelProfile, InferenceParameters, TokenConfig, CURRENT_PROFILE_VERSION};
@@ -65,7 +63,7 @@ impl ModelIntelligenceManager {
         Ok(profile)
     }
 
-    /// Forces a metadata refresh from package sources without re-downloading GGUF or adapters
+    /// Forces a metadata refresh from package sources without re-downloading GGUF weights.
     pub fn refresh_profile(
         package_dir: &Path,
         manifest: &ModelPackageManifest,

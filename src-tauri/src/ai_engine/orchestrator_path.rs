@@ -35,7 +35,7 @@ use crate::registry::ModelRegistry;
 /// orchestrator is here. The resolver tries this first and only
 /// scans the library when the file is missing.
 pub const ORCHESTRATOR_CONTRACT_PATH: &str =
-    r"D:\models\Qwen\Qwen3-4B-Instruct-2507\Qwen3-4B-Instruct-2507-Q6_K.gguf";
+    r"D:\models\Gemma\gemma-4-12B-it-QAT-GGUF\gemma-4-12B-it-QAT-Q4_0.gguf";
 
 /// What the resolver found. The `path` is the file to load.
 /// `resolved_via_contract` is true when the contract path was
@@ -149,7 +149,10 @@ pub fn resolve_orchestrator_path(
     //    sha256-verify the first hit.
     let (wanted_family, wanted_quant) = registry
         .orchestrator_identity()
-        .unwrap_or_else(|| ("qwen".to_string(), "Q6_K".to_string()));
+        .unwrap_or_else(|| (
+            "gemma-4-12b".to_string(),
+            crate::config::DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string(),
+        ));
 
     let library_root = registry.library_root(app_data_dir);
     if let Some(hit) = scan_library_for(&library_root, &wanted_family, &wanted_quant) {
@@ -317,11 +320,11 @@ mod tests {
             "arjun-orchestrator-path-library-{}",
             std::process::id()
         ));
-        let nested = dir.join("General").join("Qwen3-4B-Instruct-2507");
+        let nested = dir.join("General").join("Gemma-4-12B-Instruct");
         std::fs::create_dir_all(&nested).unwrap();
-        let target = nested.join("Qwen3-4B-Instruct-2507-Q6_K.gguf");
+        let target = nested.join("gemma-4-12b-it-Q4_0.gguf");
         std::fs::write(&target, b"not a real GGUF").unwrap();
-        let hit = scan_library_for(&dir, "qwen", "Q6_K");
+        let hit = scan_library_for(&dir, "gemma-4-12b", "Q4_0");
         assert_eq!(hit, Some(target));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -334,10 +337,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         // A file with the right extension but wrong family.
-        std::fs::write(dir.join("Gemma-3-12B-Q4.gguf"), b"").unwrap();
+        std::fs::write(dir.join("Qwen3-4B-Q4_0.gguf"), b"").unwrap();
         // And a file with the right family but wrong quant.
-        std::fs::write(dir.join("Qwen3-4B-Q4_K.gguf"), b"").unwrap();
-        let hit = scan_library_for(&dir, "qwen", "Q6_K");
+        std::fs::write(dir.join("Gemma-4-12B-Q6_K.gguf"), b"").unwrap();
+        let hit = scan_library_for(&dir, "gemma-4-12b", "Q4_0");
         assert!(hit.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -345,7 +348,14 @@ mod tests {
     #[test]
     fn the_library_scan_handles_a_missing_root() {
         let dir = std::env::temp_dir().join("definitely-does-not-exist-xyz");
-        let hit = scan_library_for(&dir, "qwen", "Q6_K");
+        let hit = scan_library_for(&dir, "gemma-4-12b", "Q4_0");
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn the_contract_names_gemma_4_12b_q4() {
+        let normalized = ORCHESTRATOR_CONTRACT_PATH.to_ascii_lowercase();
+        assert!(normalized.contains("gemma-4-12b"));
+        assert!(normalized.contains("q4_0"));
     }
 }

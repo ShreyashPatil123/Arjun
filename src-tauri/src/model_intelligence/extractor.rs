@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-use crate::adapter_manager::ModelPackageManifest;
+use crate::model_package::ModelPackageManifest;
 use crate::model_intelligence::profile::*;
 
 pub struct MetadataExtractor;

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, Eye, Layers, Search } from 'lucide-react';
+import { Boxes, Eye, Search } from 'lucide-react';
 import type { AICapabilityProfile } from '../../types/system';
 import styles from './CapabilityReadout.module.css';
 
@@ -114,12 +114,6 @@ export const CapabilityReadout = ({ capabilities, detected }: CapabilityReadoutP
           detail={
             capabilities.embeddingReady ? 'Embeddings can run here' : 'Keyword search only'
           }
-        />
-        <CapabilityFlag
-          icon={<Layers size={15} />}
-          label="Capability adapters"
-          supported={capabilities.loraReady}
-          detail={capabilities.loraReady ? 'LoRA adapters can be bound' : 'Prompt profiles instead'}
         />
       </div>
     </div>

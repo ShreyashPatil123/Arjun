@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_ORCHESTRATOR_MODEL_ID: &str =
+    "lmstudio-community/gemma-4-12B-it-QAT-GGUF";
+pub const DEFAULT_ORCHESTRATOR_PROVIDER_ID: &str = "huggingface";
+pub const DEFAULT_ORCHESTRATOR_QUANTIZATION: &str = "Q4_0";
+
 /// Main configuration for Sarathi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SarathiConfig {
@@ -32,19 +37,37 @@ pub struct AiSettings {
     pub use_gpu: bool,
     pub gpu_layers: u32,
 
+    /// Exact installed package coordinates selected by an administrator for
+    /// the agent orchestrator at startup.
+    #[serde(default = "default_orchestrator_provider_id")]
+    pub orchestrator_provider_id: String,
+    #[serde(default = "default_orchestrator_model_id")]
+    pub orchestrator_model_id: String,
+    #[serde(default = "default_orchestrator_quantization")]
+    pub orchestrator_quantization: String,
+
     /// Whether startup may load a model without being asked.
     ///
-    /// Off by default. Loading a model is not a free convenience: it commits
-    /// several gigabytes of VRAM and takes seconds to tens of seconds, and doing
-    /// it before the user has said which model they want makes the app feel like
-    /// it is deciding for them. The gateway reports "no model loaded" until one
-    /// is chosen, which is honest and recoverable.
-    ///
-    /// `serde(default)` so configuration files written before this field existed
-    /// keep parsing — and they inherit the off default rather than the old
-    /// implicit on behaviour.
-    #[serde(default)]
+    /// Enabled by default so the orchestrator is ready without a manual load.
+    /// Existing configurations that explicitly set this to false stay disabled.
+    #[serde(default = "default_true")]
     pub auto_load_on_startup: bool,
+}
+
+fn default_orchestrator_model_id() -> String {
+    DEFAULT_ORCHESTRATOR_MODEL_ID.to_string()
+}
+
+fn default_orchestrator_provider_id() -> String {
+    DEFAULT_ORCHESTRATOR_PROVIDER_ID.to_string()
+}
+
+fn default_orchestrator_quantization() -> String {
+    DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AiSettings {
@@ -54,8 +77,45 @@ impl Default for AiSettings {
             default_temperature: 0.7,
             use_gpu: true,
             gpu_layers: 35,
-            auto_load_on_startup: false,
+            orchestrator_provider_id: default_orchestrator_provider_id(),
+            orchestrator_model_id: default_orchestrator_model_id(),
+            orchestrator_quantization: default_orchestrator_quantization(),
+            auto_load_on_startup: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma_orchestrator_auto_loads_on_gpu_by_default() {
+        let settings = AiSettings::default();
+        assert_eq!(settings.orchestrator_provider_id, DEFAULT_ORCHESTRATOR_PROVIDER_ID);
+        assert_eq!(settings.orchestrator_model_id, DEFAULT_ORCHESTRATOR_MODEL_ID);
+        assert_eq!(settings.orchestrator_quantization, DEFAULT_ORCHESTRATOR_QUANTIZATION);
+        assert!(settings.auto_load_on_startup);
+        assert!(settings.use_gpu);
+        assert!(settings.gpu_layers > 0);
+    }
+
+    #[test]
+    fn older_config_without_startup_fields_inherits_the_new_defaults() {
+        let settings: AiSettings = serde_json::from_str(
+            r#"{
+                "max_context_length": 4096,
+                "default_temperature": 0.7,
+                "use_gpu": true,
+                "gpu_layers": 35
+            }"#,
+        )
+        .expect("legacy AI settings should still deserialize");
+
+        assert_eq!(settings.orchestrator_model_id, DEFAULT_ORCHESTRATOR_MODEL_ID);
+        assert_eq!(settings.orchestrator_provider_id, DEFAULT_ORCHESTRATOR_PROVIDER_ID);
+        assert_eq!(settings.orchestrator_quantization, DEFAULT_ORCHESTRATOR_QUANTIZATION);
+        assert!(settings.auto_load_on_startup);
     }
 }
 

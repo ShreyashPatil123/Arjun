@@ -29,12 +29,11 @@ pub mod model_recommendation;
 pub mod model_manager;
 pub mod model_providers;
 pub mod download_manager;
-pub mod adapter_manager;
 pub mod ai_engine;
 pub mod capability;
 pub mod gateway;
 pub mod model_intelligence;
-pub mod lora;
+pub mod model_package;
 pub mod installer;
 pub mod plugins;
 pub mod memory_engine;
@@ -401,8 +400,8 @@ pub fn run() {
             app.manage(memory_manager);
 
             // Load the saved HuggingFace token into the process before anything
-            // reaches the Hub. Catalog browsing and adapter discovery run from
-            // plain commands with no app handle, so they read it from there
+            // reaches the Hub. Catalog browsing and artifact resolution run
+            // from plain commands with no app handle, so they read it from there
             // rather than opening config.json themselves.
             {
                 let config_path = crate::config::ConfigManager::get_config_path(app.handle());
@@ -464,84 +463,104 @@ pub fn run() {
                 }
             });
 
-            // Optionally bring a model up on launch so the gateway can answer
-            // immediately.
-            //
-            // Sarathi serves other tools rather than hosting its own chat, so
-            // nothing in the UI would otherwise trigger a load — a user could
-            // install a model, point Claude Code at the gateway, and get
-            // "no model loaded" with no obvious way to fix it. That is the case
-            // this exists for.
-            //
-            // It is off by default all the same: a load commits gigabytes of
-            // VRAM and takes real time, and doing that before the user has named
-            // a model takes a decision away from them. "No model loaded" is a
-            // recoverable state; a surprise load is not. Enable it with
-            // `ai_settings.auto_load_on_startup` when the gateway-first workflow
-            // is what you want.
-            //
-            // When enabled it prefers the last model used, then falls back to the
-            // only installed one. With several installed and no previous session
-            // it loads nothing, because guessing which model someone wants
-            // resident in VRAM is worse than letting them choose.
-            let auto_load_on_startup = config::ConfigManager::load(
+            // Bring the configured orchestrator onto the GPU during startup so
+            // the agent loop and local gateway are ready without a manual model
+            // selection. Gemma 4 12B is the product default; a saved session is
+            // only a fallback when that package is not installed.
+            let ai_settings = config::ConfigManager::load(
                 &config::ConfigManager::get_config_path(app.handle()),
             )
-            .map(|c| c.ai_settings.auto_load_on_startup)
-            .unwrap_or(false);
+            .map(|config| config.ai_settings)
+            .unwrap_or_default();
 
-            if !auto_load_on_startup {
+            if !ai_settings.auto_load_on_startup {
                 info!(
                     "Startup auto-load is off — no model will be loaded until one is \
                      chosen in the app. Set ai_settings.auto_load_on_startup to change this."
                 );
             }
 
-            if auto_load_on_startup {
+            if ai_settings.auto_load_on_startup {
                 let inference = app.state::<Arc<InferenceManager>>().inner().clone();
                 let app_data = app.path().app_data_dir().ok();
+                let preferred = ai_engine::startup::StartupModelTarget {
+                    provider_id: ai_settings.orchestrator_provider_id,
+                    model_id: ai_settings.orchestrator_model_id,
+                    quantization: ai_settings.orchestrator_quantization,
+                };
+                let require_gpu = ai_settings.use_gpu;
 
                 tauri::async_runtime::spawn(async move {
                     let Some(dir) = app_data else { return };
+
+                    if require_gpu && !ai_engine::startup::gpu_backend_compiled() {
+                        log::error!(
+                            "Cannot auto-load the orchestrator on the GPU: this ARJUN binary was \
+                             built without CUDA or Vulkan. Start it with `npm run dev:auto`, or \
+                             build it with `npm run build:auto`."
+                        );
+                        return;
+                    }
 
                     let restore = ai_engine::session::SessionManager::load_session(&dir)
                         .ok()
                         .flatten()
                         .filter(|s| s.auto_restore_enabled)
-                        .map(|s| (s.provider_id, s.model_id, s.quantization));
+                        .map(|session| ai_engine::startup::StartupModelTarget {
+                            provider_id: session.provider_id,
+                            model_id: session.model_id,
+                            quantization: session.quantization,
+                        });
 
-                    let target = restore.or_else(|| {
-                        let packages = adapter_manager::AdapterRegistry::list_installed_packages(&dir);
-                        match packages.len() {
-                            1 => {
-                                let p = &packages[0];
-                                Some((
-                                    p.provider_id.clone(),
-                                    p.base_model.model_id.clone(),
-                                    p.base_model.quantization.clone(),
-                                ))
-                            }
-                            0 => None,
-                            n => {
-                                info!("{n} models installed — select one to load; not guessing.");
-                                None
-                            }
-                        }
-                    });
+                    let installed = model_manager::ModelManager::list_installed_models(&dir);
+                    let target = ai_engine::startup::select_startup_model(
+                        &installed,
+                        &preferred,
+                        restore.as_ref(),
+                    );
 
-                    let Some((provider, model, quant)) = target else { return };
-                    info!("Auto-loading '{model}' ({quant}) so the gateway can serve requests");
+                    let Some(target) = target else {
+                        log::error!(
+                            "The configured orchestrator '{}' ({}) is not installed and \
+                             no unambiguous fallback is available. Install Gemma 4 12B Q4_0 from \
+                             Discover, or choose another installed orchestrator in Models.",
+                            preferred.model_id,
+                            preferred.quantization
+                        );
+                        return;
+                    };
+                    let provider = target.provider_id;
+                    let model = target.model_id;
+                    let quant = target.quantization;
+                    info!(
+                        "Auto-loading orchestrator '{model}' ({quant}){}",
+                        if require_gpu { " with GPU residency required" } else { "" }
+                    );
 
+                    let inference_for_load = inference.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        inference.load_installed_model_direct(&dir, &provider, &model, &quant)
+                        inference_for_load.load_installed_model_direct(
+                            &dir, &provider, &model, &quant,
+                        )
                     })
                     .await;
 
                     match res {
-                        Ok(Ok(info)) => info!(
-                            "Model ready: {} via {} — gateway can now serve requests",
-                            info.model_name, info.backend_used
-                        ),
+                        Ok(Ok(info)) => {
+                            if require_gpu {
+                                if let Err(reason) =
+                                    ai_engine::startup::validate_gpu_residency(info.gpu_layers)
+                                {
+                                    let _ = inference.unload_active_model_direct();
+                                    log::error!("Orchestrator auto-load rejected: {reason}");
+                                    return;
+                                }
+                            }
+                            info!(
+                                "Orchestrator ready: {} via {} with {} GPU layer(s) — gateway can now serve requests",
+                                info.model_name, info.backend_used, info.gpu_layers
+                            );
+                        }
                         // A load failure must not take the app down; the UI still
                         // needs to open so the user can pick a different model.
                         Ok(Err(e)) => log::error!("Auto-load failed: {e:#}"),
@@ -553,13 +572,6 @@ pub fn run() {
             // Initial event publication
             let event_bus = core::event_bus::get_event_bus();
             event_bus.publish(core::event_bus::SarathiEvent::ApplicationStarted, None);
-
-            // Startup scan for local model packages and LoRA adapters
-            if let Ok(app_data_dir) = app.path().app_data_dir() {
-                std::thread::spawn(move || {
-                    adapter_manager::AdapterRegistry::perform_startup_scan(&app_data_dir);
-                });
-            }
 
             // Run initial system analysis task on a blocking thread (not a tokio async worker)
             // so it doesn't occupy the async runtime while running PowerShell/DXGI detection
@@ -614,11 +626,6 @@ pub fn run() {
             commands::download::delete_installed_model,
             commands::download::get_storage_summary,
 
-            // LoRA Capability Adapter commands
-            commands::adapter::discover_model_adapters,
-            commands::adapter::get_model_package_manifest,
-            commands::adapter::list_installed_model_packages,
-
             // Phase 5 Inference Commands
             commands::inference::load_installed_model,
             commands::inference::unload_active_model,
@@ -631,7 +638,6 @@ pub fn run() {
             commands::intelligence::get_model_profile,
             commands::intelligence::update_model_profile,
             commands::intelligence::refresh_model_profile,
-            commands::intelligence::route_prompt_capability,
             commands::intelligence::model_health_snapshot,
 
             // Launch section — start coding tools already connected
@@ -715,6 +721,8 @@ pub fn run() {
             commands::governance::set_account_password,
             commands::registry::list_registered_models,
             commands::registry::model_manifest_path,
+            commands::registry::get_orchestrator_model,
+            commands::registry::set_orchestrator_model,
             commands::registry::preview_routing,
             commands::registry::prepare_model_for,
             commands::registry::model_residency,
@@ -723,14 +731,6 @@ pub fn run() {
             commands::approvals::decide_approval,
             commands::catalog::browse_model_cards,
             commands::catalog::list_model_categories,
-            commands::catalog::find_model_adapters,
-
-            // Adapter downloads and management
-            commands::adapters::list_installed_adapters,
-            commands::adapters::download_adapter,
-            commands::adapters::remove_adapter,
-            commands::adapters::set_adapter_capability,
-            commands::adapter_details::get_adapter_details,
 
             // Phase 6 Memory Engine Commands
             memory_engine::api::get_memory_health_status,

@@ -90,7 +90,6 @@ const emptyHardwareProfile: HardwareProfile = {
     recommendedContextLength: undefined,
     preferredInferenceBackend: undefined,
     multiModelCapable: false,
-    loraReady: false,
     visionReady: false,
     embeddingReady: false
   },

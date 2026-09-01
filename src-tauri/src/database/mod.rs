@@ -60,18 +60,6 @@ pub fn get_migrations() -> Vec<Migration> {
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS installed_loras (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    base_model_id TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    adapter_type TEXT DEFAULT 'lora',
-                    metadata TEXT,
-                    is_active INTEGER DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
             ",
             kind: MigrationKind::Up,
         },

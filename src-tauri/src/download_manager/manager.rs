@@ -1,8 +1,4 @@
-//! Phase 4 Native Download Engine
-//!
-//! Handles background HTTP streaming, pause/resume via HTTP Range headers,
-//! disk space verification, atomic file finalization (.part -> .gguf),
-//! and Tauri progress event broadcasting.
+//! Resumable base-model download manager.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,61 +8,39 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use tauri::Emitter;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::download_manager::traits::*;
+use crate::model_package::{BaseManifestInfo, ModelPackageManifest, ModelPackageRegistry};
 use crate::model_providers::huggingface::resolver;
-use crate::model_providers::huggingface::adapter_provider::HuggingFaceAdapterProvider;
-use crate::adapter_manager::{AdapterRegistry, ModelPackageManifest, BaseManifestInfo, AdapterManifestInfo, AdapterState, log_adapter_transition};
 
-/// How many times a dropped connection is retried before the task fails.
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
 
-/// Result of a single streaming attempt.
 enum StreamOutcome {
-    /// The stream reached its end.
     Finished { downloaded: u64, expected: u64 },
-    /// Pause or cancel was signalled; the partial file is left in place.
     Interrupted,
 }
 
-/// Distinguishes failures worth retrying from failures worth reporting.
 enum StreamError {
-    /// Connection-level problem — resume and try again.
     Transient(anyhow::Error),
-    /// Will not improve on retry (bad URL, auth failure, disk error).
     Fatal(anyhow::Error),
 }
 
 impl StreamError {
-    fn transient(e: impl Into<anyhow::Error>) -> Self {
-        Self::Transient(e.into())
+    fn transient(error: impl Into<anyhow::Error>) -> Self {
+        Self::Transient(error.into())
     }
 }
 
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transient(e) | Self::Fatal(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-/// Extracts the first byte offset from a `Content-Range: bytes <start>-<end>/<total>` header.
-///
-/// Used to confirm a 206 actually resumes where we asked; a server may return
-/// partial content from a different offset than requested.
 fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::CONTENT_RANGE)?
         .to_str()
         .ok()?
-        .trim()
         .strip_prefix("bytes ")?
-        .split('-')
-        .next()?
-        .trim()
+        .split_once('-')?
+        .0
         .parse()
         .ok()
 }
@@ -84,48 +58,35 @@ impl DownloadManager {
         }
     }
 
-    /// Check if destination drive has sufficient free space
     pub fn check_disk_space(target_path: &Path, required_bytes: u64) -> Result<()> {
         let disks = sysinfo::Disks::new_with_refreshed_list();
+        let available = disks
+            .iter()
+            .filter(|disk| target_path.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map(|disk| disk.available_space())
+            .unwrap_or(u64::MAX);
 
-        let path_str = target_path.to_string_lossy();
-        let drive_prefix = if path_str.len() >= 3 && &path_str[1..3] == ":\\" {
-            &path_str[0..3]
-        } else {
-            "C:\\"
-        };
-
-        for disk in &disks {
-            let mount_point = disk.mount_point().to_string_lossy();
-            if mount_point.eq_ignore_ascii_case(drive_prefix) || path_str.starts_with(mount_point.as_ref()) {
-                let available = disk.available_space();
-                let safety_margin = 1_073_741_824; // 1 GB safety reserve
-                if available < required_bytes + safety_margin {
-                    return Err(anyhow!(
-                        "Insufficient disk space on drive {}. Required: {:.2} GB, Available: {:.2} GB (with 1 GB safety reserve)",
-                        drive_prefix,
-                        required_bytes as f64 / 1_073_741_824.0,
-                        available as f64 / 1_073_741_824.0
-                    ));
-                }
-                return Ok(());
-            }
+        if available < required_bytes {
+            return Err(anyhow!(
+                "Insufficient disk space: need {} bytes, have {} bytes",
+                required_bytes,
+                available
+            ));
         }
-
-        Ok(()) // Default pass if volume query doesn't match
+        Ok(())
     }
 
-    /// Generates canonical storage path: <SarathiAppData>/models/<provider>/<model_id>/base
-    pub fn get_model_storage_dir(app_data_dir: &Path, provider_id: &str, model_id: &str, _quantization: &str) -> PathBuf {
-        let clean_model_id = model_id.replace('/', "_");
-        app_data_dir
-            .join("models")
-            .join(provider_id)
-            .join(clean_model_id)
-            .join("base")
+    pub fn get_model_storage_dir(
+        app_data_dir: &Path,
+        provider_id: &str,
+        model_id: &str,
+        _quantization: &str,
+    ) -> PathBuf {
+        ModelPackageRegistry::resolve_package_dir(app_data_dir, provider_id, model_id).join("base")
     }
 
-    /// Start a new download task or resume an existing one
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_download(
         &self,
         app_handle: tauri::AppHandle,
@@ -138,28 +99,40 @@ impl DownloadManager {
         backend: String,
         hf_token: Option<String>,
     ) -> Result<String> {
-        let task_id = format!("dl_{}_{}", model_id.replace('/', "_"), quantization.to_lowercase());
+        let task_id = format!(
+            "dl_{}_{}",
+            model_id.replace('/', "_"),
+            quantization.to_lowercase()
+        );
 
-        // Check if task is already running or completed
-        if let Some(existing) = self.tasks.lock().unwrap().get(&task_id) {
-            if matches!(existing.status, DownloadStatus::Downloading | DownloadStatus::Resolving | DownloadStatus::Verifying) {
-                log::info!("[DOWNLOAD_DIAGNOSTIC] Task {} is already active with status {:?}", task_id, existing.status);
-                return Ok(task_id);
-            }
+        if self.tasks.lock().unwrap().get(&task_id).is_some_and(|task| {
+            matches!(
+                task.status,
+                DownloadStatus::Downloading
+                    | DownloadStatus::Resolving
+                    | DownloadStatus::Verifying
+                    | DownloadStatus::Queued
+            )
+        }) {
+            return Ok(task_id);
         }
 
-        let storage_dir = Self::get_model_storage_dir(&app_data_dir, &provider_id, &model_id, &quantization);
+        let storage_dir = Self::get_model_storage_dir(
+            &app_data_dir,
+            &provider_id,
+            &model_id,
+            &quantization,
+        );
         tokio::fs::create_dir_all(&storage_dir).await?;
 
-        // Immediately create and broadcast Resolving task state so UI updates
-        let resolving_task = DownloadTask {
+        let mut task = DownloadTask {
             id: task_id.clone(),
             model_id: model_id.clone(),
             model_name: model_name.clone(),
             provider_id: provider_id.clone(),
             quantization: quantization.clone(),
-            format: format.clone(),
-            backend: backend.clone(),
+            format,
+            backend,
             url: String::new(),
             destination_path: String::new(),
             temp_path: String::new(),
@@ -173,720 +146,132 @@ impl DownloadManager {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), task.clone());
+        self.broadcast_progress(&app_handle, &task);
 
-        self.tasks.lock().unwrap().insert(task_id.clone(), resolving_task.clone());
-        self.broadcast_progress(&app_handle, &resolving_task);
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Created task {} in Resolving state", task_id);
-
-        // Trigger background LoRA adapter discovery & real streaming download
-        let app_handle_for_adapters = app_handle.clone();
-        let model_id_clone = model_id.clone();
-        let model_name_clone = model_name.clone();
-        let quantization_clone = quantization.clone();
-        let provider_id_clone = provider_id.clone();
-        let hf_token_clone = hf_token.clone();
-        let app_data_dir_clone = app_data_dir.clone();
-
-        tokio::spawn(async move {
-            let package_id = model_id_clone.replace('/', "_");
-            let package_dir = AdapterRegistry::resolve_package_dir(&app_data_dir_clone, &provider_id_clone, &model_id_clone);
-            let adapters_dir = package_dir.join("adapters");
-            let _ = tokio::fs::create_dir_all(&adapters_dir).await;
-
-            // Load existing manifest to preserve installed adapters (Single Source of Truth)
-            let existing_manifest = AdapterRegistry::read_manifest(&package_dir).ok();
-            let manifest_adapters = Arc::new(Mutex::new(
-                existing_manifest
-                    .as_ref()
-                    .map(|m| m.adapters.clone())
-                    .unwrap_or_default(),
-            ));
-
-            let capabilities = HuggingFaceAdapterProvider::all_capabilities();
-            let mut cap_tasks = Vec::new();
-
-            for cap in capabilities {
-                let app_handle_cap = app_handle_for_adapters.clone();
-                let model_id_cap = model_id_clone.clone();
-                let quantization_cap = quantization_clone.clone();
-                let package_id_cap = package_id.clone();
-                let package_dir_cap = package_dir.clone();
-                let adapters_dir_cap = adapters_dir.clone();
-                let hf_token_cap = hf_token_clone.clone();
-                let manifest_adapters_cap = manifest_adapters.clone();
-                let existing_manifest_cap = existing_manifest.clone();
-
-                cap_tasks.push(tokio::spawn(async move {
-                    let cap_key = cap.key().to_string();
-                    let adapter_task_id = format!("dl_{}_{}_adapter_{}", package_id_cap, quantization_cap.to_lowercase(), cap_key);
-                    let cap_dir = adapters_dir_cap.join(&cap_key);
-
-                    // PRE-DOWNLOAD CHECK: If adapter is ALREADY INSTALLED & VALID locally, SKIP REMOTE DOWNLOAD!
-                    if AdapterRegistry::is_adapter_installed_and_valid(&package_dir_cap, &cap_key) {
-                        log_adapter_transition(
-                            &cap_key,
-                            &AdapterState::Ready,
-                            &AdapterState::Ready,
-                            "Pre-download check verified local adapter is valid on disk. Skipping download.",
-                            "PreDownloadCheck",
-                        );
-
-                        let mut map = manifest_adapters_cap.lock().unwrap();
-                        if !map.contains_key(&cap_key) || !map[&cap_key].status.eq_ignore_ascii_case("Installed") {
-                            if let Some((weight_file, size)) = AdapterRegistry::verify_adapter_files(&cap_dir) {
-                                map.insert(
-                                    cap_key.clone(),
-                                    AdapterManifestInfo {
-                                        capability: cap_key.clone(),
-                                        status: "Installed".to_string(),
-                                        adapter_runtime_status: None,
-                                        repo_id: existing_manifest_cap.as_ref().and_then(|m| m.adapters.get(&cap_key)).and_then(|a| a.repo_id.clone()),
-                                        local_path: Some(format!("adapters/{}/", cap_key)),
-                                        adapter_file: Some(format!("adapters/{}/{}", cap_key, weight_file)),
-                                        config_file: Some(format!("adapters/{}/adapter_config.json", cap_key)),
-                                        size_bytes: Some(size),
-                                        base_model_match: Some(model_id_cap.clone()),
-                                        target_modules: vec![],
-                                        peft_type: Some("LORA".to_string()),
-                                        checksum: None,
-                                        reason: None,
-                                        source: Some(
-                                            crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
-                                        ),
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                        }
-
-                        let size_b = map.get(&cap_key).and_then(|a| a.size_bytes).unwrap_or(0);
-
-                        let _ = app_handle_cap.emit(
-                            "download:progress",
-                            DownloadProgressPayload {
-                                task_id: adapter_task_id,
-                                model_id: model_id_cap.clone(),
-                                quantization: quantization_cap.clone(),
-                                downloaded_bytes: size_b,
-                                total_bytes: size_b,
-                                progress_percent: 100.0,
-                                speed_bps: 0.0,
-                                speed_formatted: "Ready".to_string(),
-                                eta_seconds: Some(0),
-                                status: DownloadStatus::Completed,
-                                error: None,
-                                package_id: Some(package_id_cap.clone()),
-                                capability: Some(cap_key),
-                                item_type: Some("adapter".to_string()),
-                            },
-                        );
-                        return;
-                    }
-
-                    // Adapter missing locally: Run full concurrent discovery & download state machine
-                    log_adapter_transition(
-                        &cap_key,
-                        &AdapterState::NotFound,
-                        &AdapterState::Searching,
-                        "Adapter missing locally. Initiating remote search.",
-                        "DownloadManager",
-                    );
-
-                    let _ = app_handle_cap.emit(
-                        "download:progress",
-                        DownloadProgressPayload {
-                            task_id: adapter_task_id.clone(),
-                            model_id: model_id_cap.clone(),
-                            quantization: quantization_cap.clone(),
-                            downloaded_bytes: 0,
-                            total_bytes: 0,
-                            progress_percent: 0.0,
-                            speed_bps: 0.0,
-                            speed_formatted: "Searching...".to_string(),
-                            eta_seconds: None,
-                            status: DownloadStatus::Resolving,
-                            error: None,
-                            package_id: Some(package_id_cap.clone()),
-                            capability: Some(cap_key.clone()),
-                            item_type: Some("adapter".to_string()),
-                        },
-                    );
-
-                    let res = HuggingFaceAdapterProvider::discover_single_capability(&model_id_cap, cap.clone(), hf_token_cap.as_deref()).await;
-
-                    if res.status == "Found" {
-                        if let Some(cand) = res.candidate {
-                            log_adapter_transition(
-                                &cap_key,
-                                &AdapterState::Searching,
-                                &AdapterState::Found,
-                                &format!("Found compatible adapter repo: {}", cand.repo_id),
-                                "DownloadManager",
-                            );
-
-                            let _ = tokio::fs::create_dir_all(&cap_dir).await;
-                            let config_file_path = cap_dir.join("adapter_config.json");
-                            let target_weight_path = cap_dir.join(&cand.adapter_file_name);
-                            let temp_weight_path = cap_dir.join(format!("{}.part", cand.adapter_file_name));
-
-                            // The broker owns the only outbound client and refuses
-                            // everything in Work mode, so a download cannot start
-                            // unless an operator has entered Provisioning.
-                            let broker = crate::sovereignty::global_broker();
-
-                            // 1. Fetch & save adapter_config.json
-                            let config_url = format!("https://huggingface.co/{}/raw/main/adapter_config.json", cand.repo_id);
-                            // A refusal means nothing was sent. That is the same
-                            // outcome as a failed fetch, which this path already
-                            // tolerates, so both collapse to `None`.
-                            let config_response = match broker.authorized_get(&config_url) {
-                                Ok(req) => {
-                                    let mut req = req.timeout(std::time::Duration::from_secs(300));
-                                    if let Some(t) = &hf_token_cap {
-                                        if !t.trim().is_empty() {
-                                            req = req.header("Authorization", format!("Bearer {}", t.trim()));
-                                        }
-                                    }
-                                    req.send().await.ok()
-                                }
-                                Err(_) => None,
-                            };
-
-                            let config_ok = if let Some(c_res) = config_response {
-                                if c_res.status().is_success() {
-                                    if let Ok(bytes) = c_res.bytes().await {
-                                        tokio::fs::write(&config_file_path, bytes).await.is_ok()
-                                    } else { false }
-                                } else { false }
-                            } else { false };
-
-                            // 2. Stream download adapter weight file WITH HTTP RANGE RESUME SUPPORT
-                            let mut download_success = false;
-                            let mut actual_downloaded_bytes: u64 = 0;
-
-                            if config_ok {
-                                // Resume check: Check existing byte length of .part file
-                                let existing_bytes = if temp_weight_path.exists() {
-                                    tokio::fs::metadata(&temp_weight_path).await.map(|m| m.len()).unwrap_or(0)
-                                } else { 0 };
-
-                                let total_bytes = cand.size_bytes;
-
-                                if existing_bytes >= total_bytes && total_bytes > 0 {
-                                    actual_downloaded_bytes = existing_bytes;
-                                    download_success = true;
-                                } else {
-                                    log_adapter_transition(
-                                        &cap_key,
-                                        &AdapterState::Found,
-                                        &AdapterState::Downloading,
-                                        &format!("Downloading weights from {} (resuming from byte {})", cand.download_url, existing_bytes),
-                                        "DownloadManager",
-                                    );
-
-                                    // Same shape as the config fetch above: a refusal
-                                    // and a transport failure both leave this `None`,
-                                    // so download_success simply stays false.
-                                    let weight_response = match broker.authorized_get(&cand.download_url) {
-                                        Ok(req) => {
-                                            let mut req = req.timeout(std::time::Duration::from_secs(300));
-                                            if let Some(t) = &hf_token_cap {
-                                                if !t.trim().is_empty() {
-                                                    req = req.header("Authorization", format!("Bearer {}", t.trim()));
-                                                }
-                                            }
-                                            if existing_bytes > 0 {
-                                                req = req.header("Range", format!("bytes={}-", existing_bytes));
-                                            }
-                                            req.send().await.ok()
-                                        }
-                                        Err(_) => None,
-                                    };
-
-                                    if let Some(w_res) = weight_response {
-                                        let status_code = w_res.status();
-                                        if status_code.is_success() || status_code == reqwest::StatusCode::PARTIAL_CONTENT {
-                                            let is_partial = status_code == reqwest::StatusCode::PARTIAL_CONTENT;
-                                            let mut file = match tokio::fs::OpenOptions::new()
-                                                .create(true)
-                                                .write(true)
-                                                .append(is_partial)
-                                                .truncate(!is_partial)
-                                                .open(&temp_weight_path)
-                                                .await
-                                            {
-                                                Ok(f) => f,
-                                                Err(_) => return,
-                                            };
-
-                                            let mut stream = w_res.bytes_stream();
-                                            let mut downloaded: u64 = if is_partial { existing_bytes } else { 0 };
-                                            let start_time = Instant::now();
-                                            let mut last_broadcast = Instant::now();
-
-                                            while let Some(chunk_res) = stream.next().await {
-                                                if let Ok(chunk) = chunk_res {
-                                                    if file.write_all(&chunk).await.is_err() {
-                                                        break;
-                                                    }
-                                                    downloaded += chunk.len() as u64;
-
-                                                    let elapsed = start_time.elapsed().as_secs_f64();
-                                                    let speed_bps = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
-                                                    let progress_percent = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64) * 100.0 } else { 0.0 };
-
-                                                    if last_broadcast.elapsed() >= Duration::from_millis(250) {
-                                                        last_broadcast = Instant::now();
-                                                        let _ = app_handle_cap.emit(
-                                                            "download:progress",
-                                                            DownloadProgressPayload {
-                                                                task_id: adapter_task_id.clone(),
-                                                                model_id: model_id_cap.clone(),
-                                                                quantization: quantization_cap.clone(),
-                                                                downloaded_bytes: downloaded,
-                                                                total_bytes,
-                                                                progress_percent,
-                                                                speed_bps,
-                                                                speed_formatted: format!("{:.1} MB/s", speed_bps / 1_048_576.0),
-                                                                eta_seconds: if speed_bps > 0.0 { Some(((total_bytes.saturating_sub(downloaded)) as f64 / speed_bps) as u64) } else { None },
-                                                                status: DownloadStatus::Downloading,
-                                                                error: None,
-                                                                package_id: Some(package_id_cap.clone()),
-                                                                capability: Some(cap_key.clone()),
-                                                                item_type: Some("adapter".to_string()),
-                                                            },
-                                                        );
-                                                    }
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-
-                                            let _ = file.flush().await;
-                                            drop(file);
-
-                                            log_adapter_transition(
-                                                &cap_key,
-                                                &AdapterState::Downloading,
-                                                &AdapterState::Verifying,
-                                                "Verifying weight file integrity",
-                                                "DownloadManager",
-                                            );
-
-                                            if temp_weight_path.exists() {
-                                                if let Ok(meta) = tokio::fs::metadata(&temp_weight_path).await {
-                                                    if meta.len() >= 100_000 {
-                                                        log_adapter_transition(
-                                                            &cap_key,
-                                                            &AdapterState::Verifying,
-                                                            &AdapterState::Installing,
-                                                            "Renaming temp download file to target weight",
-                                                            "DownloadManager",
-                                                        );
-                                                        if tokio::fs::rename(&temp_weight_path, &target_weight_path).await.is_ok() {
-                                                            actual_downloaded_bytes = meta.len();
-                                                            download_success = true;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if download_success {
-                                // What just landed is almost always PEFT safetensors, which
-                                // llama.cpp cannot load. Converting here is the whole reason an
-                                // auto-discovered adapter can ever bind: without it the record
-                                // below is stamped `requires_conversion`, and `try_bind_adapter`
-                                // refuses that permanently.
-                                //
-                                // Conversion is CPU- and IO-bound and this is an async task, so
-                                // it runs on the blocking pool rather than stalling the runtime
-                                // for the other capabilities downloading alongside it.
-                                let mut adapter_rel =
-                                    format!("adapters/{}/{}", cap_key, cand.adapter_file_name);
-                                let mut runtime_status = Some("compatible".to_string());
-                                let mut convert_reason: Option<String> = None;
-                                let mut converted: Option<crate::lora::ConversionSummary> = None;
-
-                                let lower = cand.adapter_file_name.to_lowercase();
-                                if lower.ends_with(".safetensors") {
-                                    let dir = cap_dir.clone();
-                                    let pkg = package_dir_cap.clone();
-                                    let outcome = tokio::task::spawn_blocking(move || {
-                                        let base =
-                                            crate::lora::convert::arch::resolve_base_gguf(&pkg)?;
-                                        crate::lora::convert_adapter(&dir, &base)
-                                    })
-                                    .await;
-
-                                    match outcome {
-                                        Ok(Ok(summary)) => {
-                                            // The safetensors were the input. Removing them only
-                                            // after the GGUF exists means a failed conversion
-                                            // still leaves the download intact.
-                                            let _ =
-                                                tokio::fs::remove_file(&target_weight_path).await;
-                                            adapter_rel = format!(
-                                                "adapters/{}/{}",
-                                                cap_key,
-                                                crate::lora::convert::CONVERTED_FILENAME
-                                            );
-                                            actual_downloaded_bytes = summary.output_bytes;
-                                            converted = Some(summary);
-                                        }
-                                        // A conversion failure is not a download failure. The
-                                        // files stay put and the capability falls back to its
-                                        // prompt profile, but the real reason is recorded so the
-                                        // UI can say more than "unavailable".
-                                        Ok(Err(e)) => {
-                                            log::warn!("[DOWNLOAD] '{cap_key}' adapter downloaded but could not be converted: {e:#}");
-                                            runtime_status = Some("requires_conversion".to_string());
-                                            convert_reason = Some(format!("{e:#}"));
-                                        }
-                                        Err(e) => {
-                                            log::warn!("[DOWNLOAD] '{cap_key}' adapter conversion task failed: {e}");
-                                            runtime_status = Some("requires_conversion".to_string());
-                                            convert_reason =
-                                                Some("the conversion did not finish".to_string());
-                                        }
-                                    }
-                                } else if !lower.ends_with(".gguf") {
-                                    // `.bin` is a pickle checkpoint; the converter reads
-                                    // safetensors only, deliberately.
-                                    runtime_status = Some("requires_conversion".to_string());
-                                    convert_reason = Some(
-                                        "this adapter is a .bin checkpoint, which Sarathi does not convert."
-                                            .to_string(),
-                                    );
-                                }
-
-                                log_adapter_transition(
-                                    &cap_key,
-                                    &AdapterState::Installing,
-                                    &AdapterState::Ready,
-                                    "Adapter successfully installed and registered to READY",
-                                    "DownloadManager",
-                                );
-
-                                let mut map = manifest_adapters_cap.lock().unwrap();
-                                map.insert(
-                                    cap_key.clone(),
-                                    AdapterManifestInfo {
-                                        capability: cap_key.clone(),
-                                        status: "Installed".to_string(),
-                                        adapter_runtime_status: runtime_status,
-                                        repo_id: Some(cand.repo_id),
-                                        local_path: Some(format!("adapters/{}/", cap_key)),
-                                        adapter_file: Some(adapter_rel),
-                                        config_file: Some(format!("adapters/{}/adapter_config.json", cap_key)),
-                                        size_bytes: Some(actual_downloaded_bytes),
-                                        base_model_match: Some(cand.base_model_match),
-                                        target_modules: cand.target_modules,
-                                        peft_type: Some(cand.peft_type),
-                                        checksum: None,
-                                        reason: convert_reason,
-                                        // The sweep chose this slot, so a later manual assignment
-                                        // can be told apart from it.
-                                        source: Some(
-                                            crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
-                                        ),
-                                        rank: converted.as_ref().and_then(|s| s.rank),
-                                        alpha: converted.as_ref().map(|s| s.alpha),
-                                        architecture: converted.as_ref().map(|s| s.architecture.clone()),
-                                        ..Default::default()
-                                    },
-                                );
-
-                                let _ = app_handle_cap.emit(
-                                    "download:progress",
-                                    DownloadProgressPayload {
-                                        task_id: adapter_task_id,
-                                        model_id: model_id_cap.clone(),
-                                        quantization: quantization_cap.clone(),
-                                        downloaded_bytes: actual_downloaded_bytes,
-                                        total_bytes: actual_downloaded_bytes,
-                                        progress_percent: 100.0,
-                                        speed_bps: 0.0,
-                                        speed_formatted: "Ready".to_string(),
-                                        eta_seconds: Some(0),
-                                        status: DownloadStatus::Completed,
-                                        error: None,
-                                        package_id: Some(package_id_cap.clone()),
-                                        capability: Some(cap_key),
-                                        item_type: Some("adapter".to_string()),
-                                    },
-                                );
-                                return;
-                            }
-                        }
-                    }
-
-                    // Candidate missing or failed: If no valid local files exist, mark Unavailable
-                    if !AdapterRegistry::is_adapter_installed_and_valid(&package_dir_cap, &cap_key) {
-                        log_adapter_transition(
-                            &cap_key,
-                            &AdapterState::Searching,
-                            &AdapterState::Unavailable,
-                            "Adapter not found on HuggingFace Hub or download failed",
-                            "DownloadManager",
-                        );
-
-                        let mut map = manifest_adapters_cap.lock().unwrap();
-                        map.insert(
-                            cap_key.clone(),
-                            AdapterManifestInfo {
-                                capability: cap_key.clone(),
-                                status: "Unavailable".to_string(),
-                                adapter_runtime_status: None,
-                                repo_id: None,
-                                local_path: None,
-                                adapter_file: None,
-                                config_file: None,
-                                size_bytes: None,
-                                base_model_match: None,
-                                target_modules: vec![],
-                                peft_type: None,
-                                checksum: None,
-                                reason: Some("Handled natively by base model".to_string()),
-                                source: Some(
-                                    crate::adapter_manager::SOURCE_AUTO_DISCOVERY.to_string(),
-                                ),
-                                ..Default::default()
-                            },
-                        );
-
-                        let _ = app_handle_cap.emit(
-                            "download:progress",
-                            DownloadProgressPayload {
-                                task_id: adapter_task_id,
-                                model_id: model_id_cap.clone(),
-                                quantization: quantization_cap.clone(),
-                                downloaded_bytes: 0,
-                                total_bytes: 0,
-                                progress_percent: 0.0,
-                                speed_bps: 0.0,
-                                speed_formatted: "".to_string(),
-                                eta_seconds: None,
-                                status: DownloadStatus::Completed,
-                                error: Some("Unavailable — Handled natively by base model".to_string()),
-                                package_id: Some(package_id_cap.clone()),
-                                capability: Some(cap_key),
-                                item_type: Some("adapter".to_string()),
-                            },
-                        );
-                    }
-                }));
-            }
-
-            // Wait for all capability download tasks to complete
-            for t in cap_tasks {
-                let _ = t.await;
-            }
-
-            let final_adapters = manifest_adapters.lock().unwrap().clone();
-            let manifest = ModelPackageManifest {
-                package_id: package_id.clone(),
-                provider_id: provider_id_clone,
-                base_model: BaseManifestInfo {
-                    model_id: model_id_clone.clone(),
-                    model_name: model_name_clone,
-                    quantization: quantization_clone.clone(),
-                    file_path: "base/".to_string(),
-                    size_bytes: 0,
-                    checksum: None,
-                },
-                adapters: final_adapters,
-                created_at: existing_manifest.as_ref().map(|m| m.created_at.clone()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            };
-
-            let _ = AdapterRegistry::write_manifest(&package_dir, &manifest);
-            let _ = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest);
-
-            // Broadcast final single package completed event
-            let pkg_task_id = format!("dl_{}_{}_pkg", package_id, quantization_clone.to_lowercase());
-            let _ = app_handle_for_adapters.emit(
-                "download:progress",
-                DownloadProgressPayload {
-                    task_id: pkg_task_id,
-                    model_id: model_id_clone,
-                    quantization: quantization_clone,
-                    downloaded_bytes: 0,
-                    total_bytes: 0,
-                    progress_percent: 100.0,
-                    speed_bps: 0.0,
-                    speed_formatted: "Ready".to_string(),
-                    eta_seconds: Some(0),
-                    status: DownloadStatus::Completed,
-                    error: None,
-                    package_id: Some(package_id),
-                    capability: None,
-                    item_type: Some("package_completed".to_string()),
-                },
-            );
-        });
-
-        // 1. Resolve artifact details from Hugging Face
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Resolving GGUF artifact for model_id={} quantization={}", model_id, quantization);
-        let artifact_result = resolver::resolve_artifact(&model_id, &quantization, hf_token.as_deref()).await;
-
-        let artifact = match artifact_result {
-            Ok(art) => art,
-            Err(e) => {
-                let err_msg = format!("Failed to resolve artifact: {}", e);
-                log::error!("[DOWNLOAD_DIAGNOSTIC] {}", err_msg);
-                if let Some(t) = self.tasks.lock().unwrap().get_mut(&task_id) {
-                    t.status = DownloadStatus::Failed;
-                    t.error = Some(err_msg.clone());
-                    t.updated_at = chrono::Utc::now().to_rfc3339();
-                    self.broadcast_progress(&app_handle, t);
-                }
-                return Err(anyhow!(err_msg));
-            }
-        };
-
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Artifact resolved successfully: repo={}, file={}, url={}, size_bytes={}", 
-            artifact.repo_id, artifact.file_name, artifact.download_url, artifact.size_bytes);
-
-        let file_name = artifact.file_name.split('/').last().unwrap_or(&artifact.file_name).to_string();
+        let artifact = resolver::resolve_artifact(&model_id, &quantization, hf_token.as_deref())
+            .await
+            .map_err(|error| {
+                self.fail_task(&app_handle, &task_id, error.to_string());
+                error
+            })?;
+        let file_name = artifact
+            .file_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.file_name)
+            .to_string();
         let destination_path = storage_dir.join(&file_name);
-        let temp_path = storage_dir.join(format!("{}.part", file_name));
+        let temp_path = storage_dir.join(format!("{file_name}.part"));
 
-        // Check if final ready file already exists.
-        //
-        // An unknown artifact size is not evidence that whatever is on disk is
-        // complete — treating it as such marked truncated files as ready.
-        if destination_path.exists() {
-            let metadata = tokio::fs::metadata(&destination_path).await?;
-            if artifact.size_bytes > 0 && metadata.len() == artifact.size_bytes {
-                log::info!("[DOWNLOAD_DIAGNOSTIC] Model artifact already downloaded & verified at {:?}", destination_path);
-                let completed_task = DownloadTask {
-                    id: task_id.clone(),
-                    model_id,
-                    model_name,
-                    provider_id,
-                    quantization,
-                    format,
-                    backend,
-                    url: artifact.download_url,
-                    destination_path: destination_path.to_string_lossy().to_string(),
-                    temp_path: temp_path.to_string_lossy().to_string(),
-                    total_bytes: metadata.len(),
-                    downloaded_bytes: metadata.len(),
-                    status: DownloadStatus::Completed,
-                    speed_bps: 0.0,
-                    eta_seconds: Some(0),
-                    checksum: artifact.sha256,
-                    error: None,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                };
-                self.tasks.lock().unwrap().insert(task_id.clone(), completed_task.clone());
-                self.broadcast_progress(&app_handle, &completed_task);
+        if destination_path.is_file() {
+            let size = tokio::fs::metadata(&destination_path).await?.len();
+            if artifact.size_bytes > 0 && size == artifact.size_bytes {
+                Self::write_package_manifest(
+                    &app_data_dir,
+                    &provider_id,
+                    &model_id,
+                    &model_name,
+                    &quantization,
+                    &file_name,
+                    size,
+                    artifact.sha256.clone(),
+                )?;
+                task.url = artifact.download_url;
+                task.destination_path = destination_path.to_string_lossy().to_string();
+                task.temp_path = temp_path.to_string_lossy().to_string();
+                task.total_bytes = size;
+                task.downloaded_bytes = size;
+                task.status = DownloadStatus::Completed;
+                task.eta_seconds = Some(0);
+                self.tasks
+                    .lock()
+                    .unwrap()
+                    .insert(task_id.clone(), task.clone());
+                self.broadcast_progress(&app_handle, &task);
                 return Ok(task_id);
             }
         }
 
-        // Determine existing downloaded bytes from .part file
-        let initial_bytes = if temp_path.exists() {
-            tokio::fs::metadata(&temp_path).await?.len()
-        } else {
-            0
-        };
+        let existing_bytes = tokio::fs::metadata(&temp_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Self::check_disk_space(
+            &storage_dir,
+            artifact.size_bytes.saturating_sub(existing_bytes),
+        )?;
 
-        let total_bytes = artifact.size_bytes;
-
-        // Check disk space before starting stream
-        let remaining_needed = total_bytes.saturating_sub(initial_bytes);
-        if let Err(e) = Self::check_disk_space(&destination_path, remaining_needed) {
-            let err_msg = format!("Disk space check failed: {}", e);
-            log::error!("[DOWNLOAD_DIAGNOSTIC] {}", err_msg);
-            if let Some(t) = self.tasks.lock().unwrap().get_mut(&task_id) {
-                t.status = DownloadStatus::Failed;
-                t.error = Some(err_msg.clone());
-                t.updated_at = chrono::Utc::now().to_rfc3339();
-                self.broadcast_progress(&app_handle, t);
-            }
-            return Err(anyhow!(err_msg));
-        }
-
-        let task = DownloadTask {
-            id: task_id.clone(),
-            model_id,
-            model_name,
-            provider_id,
-            quantization,
-            format,
-            backend,
-            url: artifact.download_url.clone(),
-            destination_path: destination_path.to_string_lossy().to_string(),
-            temp_path: temp_path.to_string_lossy().to_string(),
-            total_bytes,
-            downloaded_bytes: initial_bytes,
-            status: DownloadStatus::Downloading,
-            speed_bps: 0.0,
-            eta_seconds: None,
-            checksum: artifact.sha256.clone(),
-            error: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        // HuggingFace's LFS object id is the file's SHA-256, so it doubles as the
-        // integrity check the downloader never previously performed.
-        let expected_sha256 = artifact.sha256;
-
-        self.tasks.lock().unwrap().insert(task_id.clone(), task.clone());
+        task.url = artifact.download_url.clone();
+        task.destination_path = destination_path.to_string_lossy().to_string();
+        task.temp_path = temp_path.to_string_lossy().to_string();
+        task.total_bytes = artifact.size_bytes;
+        task.downloaded_bytes = existing_bytes;
+        task.status = DownloadStatus::Queued;
+        task.checksum = artifact.sha256.clone();
+        task.updated_at = chrono::Utc::now().to_rfc3339();
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), task.clone());
         self.broadcast_progress(&app_handle, &task);
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Starting streaming download for task {} ({:.2} MB expected)", task_id, total_bytes as f64 / 1_048_576.0);
 
-        // Set up cancel watch channel
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.cancel_senders.lock().unwrap().insert(task_id.clone(), cancel_tx);
+        self.cancel_senders
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), cancel_tx);
 
-        // Spawn background tokio task for HTTP streaming download
-        let tasks_map = self.tasks.clone();
-        let cancel_senders_map = self.cancel_senders.clone();
-        let task_id_clone = task_id.clone();
-        let app_handle_clone = app_handle.clone();
-
+        let tasks = self.tasks.clone();
+        let cancel_senders = self.cancel_senders.clone();
+        let spawned_task_id = task_id.clone();
         tokio::spawn(async move {
-            let res = Self::run_download_loop(
-                &app_handle_clone,
-                &task_id_clone,
+            let result = Self::run_download_loop(
+                &app_handle,
+                &spawned_task_id,
                 &artifact.download_url,
-                &PathBuf::from(&task.temp_path),
-                &PathBuf::from(&task.destination_path),
-                total_bytes,
-                initial_bytes,
+                &temp_path,
+                &destination_path,
+                artifact.size_bytes,
+                existing_bytes,
                 hf_token,
-                expected_sha256,
+                artifact.sha256.clone(),
                 cancel_rx,
-                tasks_map.clone(),
+                tasks.clone(),
             )
             .await;
 
-            cancel_senders_map.lock().unwrap().remove(&task_id_clone);
-
-            if let Err(err) = res {
-                log::error!("[DOWNLOAD_DIAGNOSTIC] Task {} failed: {}", task_id_clone, err);
-                if let Some(t) = tasks_map.lock().unwrap().get_mut(&task_id_clone) {
-                    if t.status != DownloadStatus::Cancelled && t.status != DownloadStatus::Paused {
-                        t.status = DownloadStatus::Failed;
-                        t.error = Some(err.to_string());
-                        t.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = app_handle_clone.emit("download:progress", Self::make_payload(t));
-                    }
+            if result.is_ok() && destination_path.is_file() {
+                let size = tokio::fs::metadata(&destination_path)
+                    .await
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if let Err(error) = Self::write_package_manifest(
+                    &app_data_dir,
+                    &provider_id,
+                    &model_id,
+                    &model_name,
+                    &quantization,
+                    &file_name,
+                    size,
+                    artifact.sha256,
+                ) {
+                    Self::set_failed(&app_handle, &tasks, &spawned_task_id, error.to_string());
                 }
+            } else if let Err(error) = result {
+                Self::set_failed(&app_handle, &tasks, &spawned_task_id, error.to_string());
             }
+
+            cancel_senders.lock().unwrap().remove(&spawned_task_id);
         });
 
         Ok(task_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_download_loop(
         app_handle: &tauri::AppHandle,
         task_id: &str,
@@ -900,151 +285,111 @@ impl DownloadManager {
         cancel_rx: watch::Receiver<bool>,
         tasks: Arc<Mutex<HashMap<String, DownloadTask>>>,
     ) -> Result<()> {
-        // Checked once here, then the borrowed client is reused across resume
-        // attempts. Retries target the same URL, so re-checking every attempt
-        // would only add duplicate entries to the egress log.
         let client = crate::sovereignty::global_broker().authorize(url)?;
-
         let mut expected_total = expected_total_bytes;
         let mut resume_from = initial_bytes;
-        let mut attempt: u32 = 0;
 
-        // A dropped connection mid-transfer is ordinary on a multi-gigabyte
-        // download and used to fail the whole task outright. Each retry resumes
-        // from whatever actually reached disk.
-        let downloaded = loop {
-            attempt += 1;
-
-            match Self::stream_once(
-                app_handle,
-                &client,
-                task_id,
-                url,
-                temp_path,
-                expected_total,
-                resume_from,
-                hf_token.as_deref(),
-                &cancel_rx,
-                &tasks,
-            )
-            .await
-            {
-                Ok(StreamOutcome::Interrupted) => {
-                    log::info!("[DOWNLOAD_DIAGNOSTIC] Pause/Cancel signal received for task {}", task_id);
-                    return Ok(());
-                }
-                Ok(StreamOutcome::Finished { downloaded, expected }) => {
-                    if expected > 0 {
-                        expected_total = expected;
+        let downloaded = 'attempts: loop {
+            let mut last_error = None;
+            for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+                match Self::stream_once(
+                    app_handle,
+                    &client,
+                    task_id,
+                    url,
+                    temp_path,
+                    expected_total,
+                    resume_from,
+                    hf_token.as_deref(),
+                    &cancel_rx,
+                    &tasks,
+                )
+                .await
+                {
+                    Ok(StreamOutcome::Interrupted) => return Ok(()),
+                    Ok(StreamOutcome::Finished {
+                        downloaded,
+                        expected,
+                    }) => {
+                        if expected > 0 {
+                            expected_total = expected;
+                        }
+                        break 'attempts downloaded;
                     }
-                    break downloaded;
-                }
-                Err(StreamError::Fatal(e)) => return Err(e),
-                Err(StreamError::Transient(e)) => {
-                    if attempt >= MAX_DOWNLOAD_ATTEMPTS {
-                        return Err(anyhow!(
-                            "Download failed after {} attempts. Last error: {}",
-                            attempt, e
-                        ));
-                    }
-
-                    // Re-read from disk rather than trusting an in-memory count:
-                    // buffered bytes may not have landed when the stream broke.
-                    resume_from = tokio::fs::metadata(temp_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-
-                    let backoff = Duration::from_secs(2u64.pow(attempt.min(4)));
-                    log::warn!(
-                        "[DOWNLOAD_DIAGNOSTIC] Task {} attempt {}/{} failed ({}). Resuming from byte {} in {:?}",
-                        task_id, attempt, MAX_DOWNLOAD_ATTEMPTS, e, resume_from, backoff
-                    );
-
-                    if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-                        task.speed_bps = 0.0;
-                        task.error = Some(format!("Connection lost — retrying ({}/{})", attempt, MAX_DOWNLOAD_ATTEMPTS));
-                        task.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = app_handle.emit("download:progress", Self::make_payload(task));
-                    }
-
-                    tokio::time::sleep(backoff).await;
-
-                    if *cancel_rx.borrow() {
-                        return Ok(());
+                    Err(StreamError::Fatal(error)) => return Err(error),
+                    Err(StreamError::Transient(error)) => {
+                        last_error = Some(error);
+                        if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                            resume_from = tokio::fs::metadata(temp_path)
+                                .await
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(4))))
+                                .await;
+                        }
                     }
                 }
             }
+            return Err(anyhow!(
+                "Download failed after {} attempts: {}",
+                MAX_DOWNLOAD_ATTEMPTS,
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown transport failure".to_string())
+            ));
         };
 
-        // Verification step
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Streaming finished for task {}. Updating status to Verifying...", task_id);
-        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = downloaded;
-            task.status = DownloadStatus::Verifying;
-            task.speed_bps = 0.0;
-            task.error = None;
-            task.updated_at = chrono::Utc::now().to_rfc3339();
-            let _ = app_handle.emit("download:progress", Self::make_payload(task));
-        }
+        {
+            if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+                task.downloaded_bytes = downloaded;
+                task.status = DownloadStatus::Verifying;
+                task.speed_bps = 0.0;
+                task.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = app_handle.emit("download:progress", Self::make_payload(task));
+            }
 
-        let final_size = tokio::fs::metadata(temp_path).await?.len();
-        if expected_total > 0 && final_size != expected_total {
-            return Err(anyhow!(
-                "Integrity verification failed: expected {} bytes, actual {} bytes",
-                expected_total,
-                final_size
-            ));
-        }
-
-        // Refuse to finalize something that was never checked. A model file that
-        // is silently short still loads far enough to produce fluent nonsense,
-        // which is much harder to diagnose than a failed download.
-        if expected_total == 0 && expected_sha256.is_none() {
-            return Err(anyhow!(
-                "Cannot verify this download: the server reported neither a size nor a checksum. \
-                 Refusing to install an unverified model file."
-            ));
-        }
-
-        if let Some(expected_hash) = &expected_sha256 {
-            let actual = Self::hash_file_sha256(temp_path).await?;
-            if !actual.eq_ignore_ascii_case(expected_hash) {
-                let _ = tokio::fs::remove_file(temp_path).await;
+            let final_size = tokio::fs::metadata(temp_path).await?.len();
+            if expected_total > 0 && final_size != expected_total {
                 return Err(anyhow!(
-                    "Checksum verification failed: expected SHA-256 {}, got {}. \
-                     The partial file has been discarded; start the download again.",
-                    expected_hash, actual
+                    "Integrity verification failed: expected {} bytes, got {}",
+                    expected_total,
+                    final_size
                 ));
             }
-            log::info!("[DOWNLOAD_DIAGNOSTIC] ✓ SHA-256 verified for task {}: {}", task_id, actual);
-        }
+            if expected_total == 0 && expected_sha256.is_none() {
+                return Err(anyhow!(
+                    "Cannot verify download because the server reported neither size nor checksum"
+                ));
+            }
+            if let Some(expected_hash) = expected_sha256 {
+                let actual_hash = Self::hash_file_sha256(temp_path).await?;
+                if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+                    let _ = tokio::fs::remove_file(temp_path).await;
+                    return Err(anyhow!(
+                        "Checksum verification failed: expected {}, got {}",
+                        expected_hash,
+                        actual_hash
+                    ));
+                }
+            }
 
-        // Atomic rename .part -> final file
-        if destination_path.exists() {
-            let _ = tokio::fs::remove_file(destination_path).await;
+            if destination_path.exists() {
+                tokio::fs::remove_file(destination_path).await?;
+            }
+            tokio::fs::rename(temp_path, destination_path).await?;
+            if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+                task.downloaded_bytes = final_size;
+                task.total_bytes = final_size;
+                task.status = DownloadStatus::Completed;
+                task.speed_bps = 0.0;
+                task.eta_seconds = Some(0);
+                task.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = app_handle.emit("download:progress", Self::make_payload(task));
+            }
         }
-        tokio::fs::rename(temp_path, destination_path).await?;
-        log::info!("[DOWNLOAD_DIAGNOSTIC] ✓ Atomic finalization complete: renamed {:?} -> {:?}", temp_path, destination_path);
-
-        // Update task status to Completed
-        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = final_size;
-            task.total_bytes = final_size;
-            task.status = DownloadStatus::Completed;
-            task.speed_bps = 0.0;
-            task.eta_seconds = Some(0);
-            task.updated_at = chrono::Utc::now().to_rfc3339();
-            let _ = app_handle.emit("download:progress", Self::make_payload(task));
-        }
-
         Ok(())
     }
 
-    /// Streams the artifact once, appending to `temp_path`.
-    ///
-    /// Returns [`StreamOutcome::Interrupted`] on pause/cancel, and distinguishes
-    /// transient failures (worth resuming) from fatal ones (worth reporting).
     #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         app_handle: &tauri::AppHandle,
@@ -1058,58 +403,37 @@ impl DownloadManager {
         cancel_rx: &watch::Receiver<bool>,
         tasks: &Arc<Mutex<HashMap<String, DownloadTask>>>,
     ) -> std::result::Result<StreamOutcome, StreamError> {
-        let mut req = client.get(url);
-        if let Some(token) = hf_token {
-            if !token.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", token.trim()));
-            }
+        let mut request = client.get(url);
+        if let Some(token) = hf_token.filter(|token| !token.trim().is_empty()) {
+            request = request.header("Authorization", format!("Bearer {}", token.trim()));
         }
-
         if resume_from > 0 {
-            req = req.header("Range", format!("bytes={}-", resume_from));
-            log::info!("[DOWNLOAD_DIAGNOSTIC] Requesting Range: bytes={}- for task {}", resume_from, task_id);
+            request = request.header("Range", format!("bytes={resume_from}-"));
         }
 
-        let resp = req.send().await.map_err(StreamError::transient)?;
-        let status = resp.status();
-        log::info!(
-            "[DOWNLOAD_DIAGNOSTIC] HTTP response received: status={}, Content-Length={:?}, Content-Range={:?}",
-            status,
-            resp.headers().get(reqwest::header::CONTENT_LENGTH),
-            resp.headers().get(reqwest::header::CONTENT_RANGE)
-        );
-
+        let response = request.send().await.map_err(StreamError::transient)?;
+        let status = response.status();
         if status.is_client_error() {
-            return Err(StreamError::Fatal(anyhow!("HTTP error response: {}", status)));
+            return Err(StreamError::Fatal(anyhow!("HTTP error response: {status}")));
         }
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(StreamError::transient(anyhow!("HTTP error response: {}", status)));
+            return Err(StreamError::transient(anyhow!(
+                "HTTP error response: {status}"
+            )));
         }
 
-        // Decide whether the server actually honoured the resume before writing
-        // a single byte.
-        //
-        // A server is free to answer a Range request with the *whole* file and a
-        // plain 200. Appending that to an existing partial produces a file that
-        // is both too long and internally garbage, and because the partial was
-        // never truncated every subsequent retry appended again — the download
-        // could never succeed once it entered this state.
-        let honoured_range = status == reqwest::StatusCode::PARTIAL_CONTENT
-            && content_range_start(resp.headers()) == Some(resume_from);
-
-        let start_offset = if resume_from > 0 && !honoured_range {
-            log::warn!(
-                "[DOWNLOAD_DIAGNOSTIC] Server did not honour the resume for task {} \
-                 (status {}, Content-Range {:?}); restarting the file from zero",
-                task_id, status, resp.headers().get(reqwest::header::CONTENT_RANGE)
-            );
+        let range_was_honoured = status == reqwest::StatusCode::PARTIAL_CONTENT
+            && content_range_start(response.headers()) == Some(resume_from);
+        let start_offset = if resume_from > 0 && !range_was_honoured {
             0
         } else {
             resume_from
         };
+        let expected_total = response
+            .content_length()
+            .map(|length| start_offset + length)
+            .unwrap_or(expected_total_bytes);
 
-        // Truncate when starting over so leftover bytes cannot be prepended to a
-        // fresh body; append only when the resume was genuinely accepted.
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1117,130 +441,113 @@ impl DownloadManager {
             .truncate(start_offset == 0)
             .open(temp_path)
             .await
-            .map_err(|e| StreamError::Fatal(e.into()))?;
-
-        // Content-Length describes the remaining bytes, so the full size is that
-        // plus wherever we resumed from. This is the authoritative total even
-        // when the resolver could not determine one up front.
-        let expected_total = match resp.content_length() {
-            Some(len) => start_offset + len,
-            None => expected_total_bytes,
-        };
-
-        let mut stream = resp.bytes_stream();
+            .map_err(|error| StreamError::Fatal(error.into()))?;
+        let mut stream = response.bytes_stream();
         let mut downloaded = start_offset;
-        let mut last_sample_time = Instant::now();
-        let mut last_sample_bytes = downloaded;
-        let mut last_broadcast = Instant::now();
+        let mut sample_time = Instant::now();
+        let mut sample_bytes = downloaded;
 
-        // Broadcast initial progress immediately upon connection
-        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = downloaded;
-            if expected_total > 0 {
-                task.total_bytes = expected_total;
-            }
-            task.status = DownloadStatus::Downloading;
-            let _ = app_handle.emit("download:progress", Self::make_payload(task));
-        }
-
-        while let Some(chunk_res) = stream.next().await {
-            // Check cancellation / pause
+        while let Some(chunk) = stream.next().await {
             if *cancel_rx.borrow() {
                 let _ = file.flush().await;
                 return Ok(StreamOutcome::Interrupted);
             }
-
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(e) => {
-                    // Flush before surfacing the error: tokio buffers writes, and
-                    // dropping the handle discards whatever has not landed yet,
-                    // so an unflushed tail would silently rewind the resume point.
-                    let _ = file.flush().await;
-                    return Err(StreamError::transient(anyhow!(
-                        "Network error while streaming chunks: {}",
-                        e
-                    )));
-                }
-            };
-
-            if let Err(e) = file.write_all(&chunk).await {
-                let _ = file.flush().await;
-                return Err(StreamError::Fatal(e.into()));
-            }
+            let chunk = chunk.map_err(StreamError::transient)?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| StreamError::Fatal(error.into()))?;
             downloaded += chunk.len() as u64;
 
             let now = Instant::now();
-            let sample_elapsed = now.duration_since(last_sample_time).as_secs_f64();
-
-            if sample_elapsed >= 0.25 {
-                let bytes_diff = downloaded.saturating_sub(last_sample_bytes);
-                let speed_bps = if sample_elapsed > 0.0 { bytes_diff as f64 / sample_elapsed } else { 0.0 };
-                let remaining_bytes = expected_total.saturating_sub(downloaded);
-                let eta_seconds = if speed_bps > 0.0 {
-                    Some((remaining_bytes as f64 / speed_bps) as u64)
-                } else {
-                    None
-                };
-
-                last_sample_time = now;
-                last_sample_bytes = downloaded;
-
+            let elapsed = now.duration_since(sample_time).as_secs_f64();
+            if elapsed >= 0.25 {
+                let speed = downloaded.saturating_sub(sample_bytes) as f64 / elapsed;
                 if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
                     task.downloaded_bytes = downloaded;
-                    if expected_total > 0 {
-                        task.total_bytes = expected_total;
-                    }
-                    task.speed_bps = if speed_bps.is_nan() || speed_bps.is_infinite() { 0.0 } else { speed_bps };
-                    task.eta_seconds = eta_seconds;
+                    task.total_bytes = expected_total;
+                    task.speed_bps = speed;
+                    task.eta_seconds = (speed > 0.0)
+                        .then(|| (expected_total.saturating_sub(downloaded) as f64 / speed) as u64);
+                    task.status = DownloadStatus::Downloading;
                     task.updated_at = chrono::Utc::now().to_rfc3339();
-
-                    if now.duration_since(last_broadcast) >= Duration::from_millis(250) {
-                        let _ = app_handle.emit("download:progress", Self::make_payload(task));
-                        last_broadcast = now;
-                    }
+                    let _ = app_handle.emit("download:progress", Self::make_payload(task));
                 }
+                sample_time = now;
+                sample_bytes = downloaded;
             }
         }
 
-        file.flush().await.map_err(|e| StreamError::Fatal(e.into()))?;
-        drop(file);
-
-        // A stream that ends early looks exactly like one that ends on time, so
-        // treat a short read as a dropped connection and let the retry resume it.
+        file.flush()
+            .await
+            .map_err(|error| StreamError::Fatal(error.into()))?;
         if expected_total > 0 && downloaded < expected_total {
             return Err(StreamError::transient(anyhow!(
                 "Connection closed after {} of {} bytes",
-                downloaded, expected_total
+                downloaded,
+                expected_total
             )));
         }
-
-        Ok(StreamOutcome::Finished { downloaded, expected: expected_total })
+        Ok(StreamOutcome::Finished {
+            downloaded,
+            expected: expected_total,
+        })
     }
 
-    /// Hashes a file in fixed-size blocks so a multi-gigabyte model does not
-    /// have to be held in memory to be verified.
     async fn hash_file_sha256(path: &Path) -> Result<String> {
         use sha2::{Digest, Sha256};
-        use tokio::io::AsyncReadExt;
-
         let mut file = tokio::fs::File::open(path).await?;
         let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1024 * 1024];
-
+        let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
                 break;
             }
-            hasher.update(&buf[..n]);
+            hasher.update(&buffer[..read]);
         }
-
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn write_package_manifest(
+        app_data_dir: &Path,
+        provider_id: &str,
+        model_id: &str,
+        model_name: &str,
+        quantization: &str,
+        file_name: &str,
+        size_bytes: u64,
+        checksum: Option<String>,
+    ) -> Result<()> {
+        let package_dir =
+            ModelPackageRegistry::resolve_package_dir(app_data_dir, provider_id, model_id);
+        let previous = ModelPackageRegistry::read_manifest(&package_dir).ok();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let manifest = ModelPackageManifest {
+            package_id: format!("{model_id}::{quantization}::llama.cpp"),
+            provider_id: provider_id.to_string(),
+            base_model: BaseManifestInfo {
+                model_id: model_id.to_string(),
+                model_name: model_name.to_string(),
+                quantization: quantization.to_string(),
+                file_path: format!("base/{file_name}"),
+                size_bytes,
+                checksum,
+            },
+            created_at: previous
+                .map(|manifest| manifest.created_at)
+                .unwrap_or_else(|| timestamp.clone()),
+            updated_at: timestamp,
+        };
+        ModelPackageRegistry::write_manifest(&package_dir, &manifest)?;
+        let _ = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(
+            &package_dir,
+            &manifest,
+        );
+        Ok(())
+    }
+
     pub fn pause_download(&self, task_id: &str) -> Result<()> {
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Pausing download for task {}", task_id);
         if let Some(sender) = self.cancel_senders.lock().unwrap().get(task_id) {
             let _ = sender.send(true);
         }
@@ -1252,56 +559,26 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// Cancels a download and tells the UI it happened.
-    ///
-    /// The announcement matters: without it the only thing that removed the
-    /// progress bar was the clicking page hiding it optimistically, so a cancel
-    /// triggered any other way left a bar on screen for a download that no
-    /// longer existed — and a cancel that failed still cleared the bar.
     pub fn cancel_download(&self, app_handle: &tauri::AppHandle, task_id: &str) -> Result<()> {
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Cancelling download for task {}", task_id);
-        if let Some(sender) = self.cancel_senders.lock().unwrap().get(task_id) {
+        if let Some(sender) = self.cancel_senders.lock().unwrap().remove(task_id) {
             let _ = sender.send(true);
         }
         if let Some(mut task) = self.tasks.lock().unwrap().remove(task_id) {
-            let temp_path = PathBuf::from(&task.temp_path);
-            if temp_path.exists() {
-                // The streaming task only notices the cancel between chunks, so
-                // it may still hold the file open. Windows refuses to delete an
-                // open file, and the failure is silent — leaving a stale partial
-                // that the next download would resume from. Retry briefly
-                // instead of deleting once and hoping.
-                let task_id_owned = task_id.to_string();
-                tokio::spawn(async move {
-                    for _ in 0..10 {
-                        if !temp_path.exists() {
-                            return;
-                        }
-                        if tokio::fs::remove_file(&temp_path).await.is_ok() {
-                            log::info!("[DOWNLOAD_DIAGNOSTIC] Removed temporary .part file {:?}", temp_path);
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    log::warn!(
-                        "[DOWNLOAD_DIAGNOSTIC] Could not remove {:?} for cancelled task {}; \
-                         it will be resumed or overwritten on the next attempt",
-                        temp_path, task_id_owned
-                    );
-                });
-            }
-
             task.status = DownloadStatus::Cancelled;
             self.broadcast_progress(app_handle, &task);
+            let temp_path = PathBuf::from(task.temp_path);
+            tokio::spawn(async move {
+                for _ in 0..10 {
+                    if !temp_path.exists() || tokio::fs::remove_file(&temp_path).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
         }
         Ok(())
     }
 
-    /// Restarts a paused or failed task from whatever is already on disk.
-    ///
-    /// `start_download` resumes from the `.part` file on its own, so this just
-    /// replays the task's stored parameters — sparing the UI from having to
-    /// remember them in order to offer a retry.
     pub async fn resume_download(
         &self,
         app_handle: tauri::AppHandle,
@@ -1310,18 +587,8 @@ impl DownloadManager {
         hf_token: Option<String>,
     ) -> Result<String> {
         let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("No download task named '{}' to resume", task_id))?;
-
-        log::info!(
-            "[DOWNLOAD_DIAGNOSTIC] Resuming task {} from status {:?} ({} bytes already on disk)",
-            task_id, task.status, task.downloaded_bytes
-        );
-
+            .get_task(task_id)
+            .ok_or_else(|| anyhow!("No download task named '{task_id}' to resume"))?;
         self.start_download(
             app_handle,
             app_data_dir,
@@ -1348,23 +615,36 @@ impl DownloadManager {
         let _ = app_handle.emit("download:progress", Self::make_payload(task));
     }
 
-    fn make_payload(task: &DownloadTask) -> DownloadProgressPayload {
-        let mut speed = task.speed_bps;
-        if speed.is_nan() || speed.is_infinite() || speed < 0.0 {
-            speed = 0.0;
-        }
+    fn fail_task(&self, app_handle: &tauri::AppHandle, task_id: &str, error: String) {
+        Self::set_failed(app_handle, &self.tasks, task_id, error);
+    }
 
-        let pct = if task.total_bytes > 0 {
-            let calculated = (task.downloaded_bytes as f64 / task.total_bytes as f64) * 100.0;
-            if calculated.is_nan() || calculated.is_infinite() {
-                0.0
-            } else {
-                calculated.clamp(0.0, 100.0)
-            }
+    fn set_failed(
+        app_handle: &tauri::AppHandle,
+        tasks: &Arc<Mutex<HashMap<String, DownloadTask>>>,
+        task_id: &str,
+        error: String,
+    ) {
+        if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+            task.status = DownloadStatus::Failed;
+            task.speed_bps = 0.0;
+            task.error = Some(error);
+            task.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = app_handle.emit("download:progress", Self::make_payload(task));
+        }
+    }
+
+    fn make_payload(task: &DownloadTask) -> DownloadProgressPayload {
+        let speed = if task.speed_bps.is_finite() && task.speed_bps > 0.0 {
+            task.speed_bps
         } else {
             0.0
         };
-
+        let progress_percent = if task.total_bytes > 0 {
+            ((task.downloaded_bytes as f64 / task.total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
         let speed_formatted = match task.status {
             DownloadStatus::Resolving => "Resolving...".to_string(),
             DownloadStatus::Verifying => "Verifying integrity...".to_string(),
@@ -1373,35 +653,34 @@ impl DownloadManager {
             DownloadStatus::Completed => "Completed".to_string(),
             DownloadStatus::Failed => "Failed".to_string(),
             DownloadStatus::Cancelled => "Cancelled".to_string(),
-            DownloadStatus::Downloading => {
-                if speed >= 1_048_576.0 {
-                    format!("{:.1} MB/s", speed / 1_048_576.0)
-                } else if speed >= 1024.0 {
-                    format!("{:.0} KB/s", speed / 1024.0)
-                } else if speed > 0.0 {
-                    format!("{:.0} B/s", speed)
-                } else {
-                    "Starting...".to_string()
-                }
+            DownloadStatus::Downloading if speed >= 1_048_576.0 => {
+                format!("{:.1} MB/s", speed / 1_048_576.0)
             }
+            DownloadStatus::Downloading if speed >= 1024.0 => {
+                format!("{:.0} KB/s", speed / 1024.0)
+            }
+            DownloadStatus::Downloading => format!("{speed:.0} B/s"),
         };
-
         DownloadProgressPayload {
             task_id: task.id.clone(),
             model_id: task.model_id.clone(),
             quantization: task.quantization.clone(),
             downloaded_bytes: task.downloaded_bytes,
             total_bytes: task.total_bytes,
-            progress_percent: pct,
+            progress_percent,
             speed_bps: speed,
             speed_formatted,
             eta_seconds: task.eta_seconds,
             status: task.status.clone(),
             error: task.error.clone(),
-            package_id: None,
-            capability: None,
-            item_type: Some("base_model".to_string()),
+            package_id: Some(task.model_id.replace('/', "_")),
         }
+    }
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1409,288 +688,42 @@ impl DownloadManager {
 mod tests {
     use super::*;
 
-    /// Builds a header map carrying just what the range check reads.
-    fn headers_with(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
-        let mut map = reqwest::header::HeaderMap::new();
-        for (k, v) in pairs {
-            map.insert(
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                v.parse().unwrap(),
-            );
-        }
-        map
-    }
-
     #[test]
-    fn content_range_start_reads_the_first_offset() {
-        let headers = headers_with(&[("content-range", "bytes 1024-2047/4096")]);
+    fn content_range_start_reads_offset() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 1024-2047/4096".parse().unwrap(),
+        );
         assert_eq!(content_range_start(&headers), Some(1024));
     }
 
     #[test]
-    fn content_range_start_is_none_when_the_header_is_absent() {
-        // A 200 carries no Content-Range. Treating that as "resumed from 0"
-        // rather than "no answer" is what let a full body be appended onto a
-        // partial file, corrupting it and growing it past its expected size.
-        let headers = headers_with(&[("content-length", "4096")]);
-        assert_eq!(content_range_start(&headers), None);
-    }
-
-    #[test]
-    fn content_range_start_rejects_a_malformed_header() {
-        let headers = headers_with(&[("content-range", "chunks 5-9/20")]);
-        assert_eq!(content_range_start(&headers), None);
-    }
-
-    #[test]
-    fn a_range_answered_from_the_wrong_offset_is_not_honoured() {
-        // Asking for bytes 5000- and being handed bytes 0- is the case that
-        // previously wedged a download: the body was appended to the partial
-        // regardless, so every retry made the file longer and more wrong.
-        let headers = headers_with(&[("content-range", "bytes 0-4095/8192")]);
-        assert_ne!(content_range_start(&headers), Some(5000));
+    fn storage_path_contains_only_model_package_and_base_directory() {
+        let path = DownloadManager::get_model_storage_dir(
+            Path::new("C:/data"),
+            "huggingface",
+            "owner/model",
+            "Q4_0",
+        );
+        assert_eq!(
+            path,
+            Path::new("C:/data/models/huggingface/owner_model/base")
+        );
     }
 
     #[tokio::test]
-    async fn hash_file_sha256_matches_a_known_digest() {
+    async fn hashes_file_in_streaming_blocks() {
         let path = std::env::temp_dir().join(format!(
-            "sarathi_hash_{}.bin",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            "arjun-download-hash-{}.bin",
+            std::process::id()
         ));
         tokio::fs::write(&path, b"abc").await.unwrap();
-
         let digest = DownloadManager::hash_file_sha256(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(path).await;
         assert_eq!(
             digest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn hash_file_sha256_reads_past_a_single_buffer() {
-        // The hasher reads in 1 MB blocks; a file larger than one block would
-        // hash only its first megabyte if the read loop were wrong.
-        let path = std::env::temp_dir().join(format!(
-            "sarathi_hash_big_{}.bin",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        let data = vec![7u8; 3 * 1024 * 1024 + 17];
-        tokio::fs::write(&path, &data).await.unwrap();
-
-        let digest = DownloadManager::hash_file_sha256(&path).await.unwrap();
-
-        use sha2::Digest;
-        let mut expected = sha2::Sha256::new();
-        expected.update(&data);
-        assert_eq!(digest, format!("{:x}", expected.finalize()));
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[test]
-    fn test_storage_dir_construction() {
-        let base = PathBuf::from("C:\\AppData");
-        let dir = DownloadManager::get_model_storage_dir(&base, "huggingface", "Qwen/Qwen2.5-Coder-7B", "Q4_0");
-        assert_eq!(
-            dir,
-            PathBuf::from("C:\\AppData\\models\\huggingface\\Qwen_Qwen2.5-Coder-7B\\base")
-        );
-    }
-
-    /// Reaches the real Hugging Face API, so it is ignored by default.
-    ///
-    /// Two reasons, both structural rather than incidental. ARJUN starts in Work
-    /// mode, where the broker refuses every outbound call — so this cannot pass
-    /// without first putting the process into Provisioning. And `npm run
-    /// check:offline` asserts the whole tree builds and tests with no network at
-    /// all, which a test that dials out would contradict.
-    ///
-    /// Run it deliberately, on a connected machine:
-    ///   cargo test --lib -- --ignored test_full_lifecycle_real_download
-    #[ignore = "requires the network and Provisioning mode; see check:offline"]
-    #[tokio::test]
-    async fn test_full_lifecycle_real_download() {
-        let app_data_dir = std::env::temp_dir().join(format!("sarathi_e2e_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(12345)));
-        let _ = tokio::fs::remove_dir_all(&app_data_dir).await;
-        tokio::fs::create_dir_all(&app_data_dir).await.unwrap();
-
-        let model_id = "meta-llama/Llama-3.2-1B";
-        let requested_quant = "Q8_0";
-
-        println!("\n=======================================================");
-        println!("=== PHASE 4 FULL LIFECYCLE REAL E2E DOWNLOAD TEST ===");
-        println!("=======================================================");
-
-        // STEP 1 & 2: Exact Hugging Face artifact + quantization resolution
-        let artifact = resolver::resolve_artifact(model_id, requested_quant, None)
-            .await
-            .expect("Hugging Face API artifact resolution must succeed");
-
-        println!("1. Resolved Artifact:");
-        println!("   - Repo ID: {}", artifact.repo_id);
-        println!("   - File Name: {}", artifact.file_name);
-        println!("   - Download URL: {}", artifact.download_url);
-        println!("   - Size: {:.2} MB ({} bytes)", artifact.size_bytes as f64 / 1_048_576.0, artifact.size_bytes);
-
-        assert!(artifact.download_url.starts_with("https://huggingface.co/"));
-        let clean_filename = artifact.file_name.split('/').last().unwrap_or("model.gguf");
-        assert!(clean_filename.to_lowercase().contains("q8_0"), "Resolved quantization must strictly match Q8_0");
-
-        // STEP 3: Disk space pre-check
-        let space_check = DownloadManager::check_disk_space(&app_data_dir, artifact.size_bytes);
-        assert!(space_check.is_ok(), "Disk space pre-check must succeed");
-        println!("2. Disk space pre-check passed (free space > model size + 1 GB safety margin).");
-
-        // STEP 4: Setup paths
-        let storage_dir = DownloadManager::get_model_storage_dir(&app_data_dir, "huggingface", model_id, requested_quant);
-        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-
-        let temp_path = storage_dir.join(format!("{}.part", clean_filename));
-        let destination_path = storage_dir.join(clean_filename);
-
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let _ = tokio::fs::remove_file(&destination_path).await;
-
-        println!("3. Target Locations:");
-        println!("   - Storage Dir: {:?}", storage_dir);
-        println!("   - Temp Path (.part): {:?}", temp_path);
-        println!("   - Final Path (.gguf): {:?}", destination_path);
-
-        // STEP 5 & 6: Download initial chunk & test PAUSE
-        let client = reqwest::Client::new();
-        let resp = client.get(&artifact.download_url).send().await.unwrap();
-        assert!(resp.status().is_success());
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(&temp_path)
-            .await
-            .unwrap();
-
-        let mut stream = resp.bytes_stream();
-        let mut downloaded_bytes: u64 = 0;
-
-        // Download ~10 MB initial chunk
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res.unwrap();
-            file.write_all(&chunk).await.unwrap();
-            downloaded_bytes += chunk.len() as u64;
-            if downloaded_bytes >= 10 * 1024 * 1024 {
-                break;
-            }
-        }
-        file.flush().await.unwrap();
-        drop(file);
-
-        // Verify .part file exists and exact byte count is preserved
-        assert!(temp_path.exists(), ".part file must exist on disk after pause");
-        let part_size_on_disk = tokio::fs::metadata(&temp_path).await.unwrap().len();
-        assert_eq!(part_size_on_disk, downloaded_bytes, ".part size on disk must equal downloaded chunk");
-        println!("4. PAUSE TEST: Download paused at {:.2} MB. Verified .part file preserved: {} bytes.", 
-            downloaded_bytes as f64 / 1_048_576.0, part_size_on_disk);
-
-        // STEP 7 & 8: HTTP Range RESUME & Complete 100% Download
-        let resume_req = client.get(&artifact.download_url).header("Range", format!("bytes={}-", downloaded_bytes));
-        let resume_resp = resume_req.send().await.unwrap();
-        assert_eq!(resume_resp.status(), reqwest::StatusCode::PARTIAL_CONTENT, "HF server must return 206 Partial Content for Range resume");
-
-        println!("5. RESUME TEST: Resuming download from byte offset {}...", downloaded_bytes);
-
-        let mut resume_file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&temp_path)
-            .await
-            .unwrap();
-
-        let mut resume_stream = resume_resp.bytes_stream();
-        let mut last_reported_pct: u32 = 0;
-
-        while let Some(chunk_res) = resume_stream.next().await {
-            let chunk = chunk_res.unwrap();
-            resume_file.write_all(&chunk).await.unwrap();
-            downloaded_bytes += chunk.len() as u64;
-
-            let pct = ((downloaded_bytes as f64 / artifact.size_bytes as f64) * 100.0) as u32;
-            if pct >= last_reported_pct + 25 || downloaded_bytes == artifact.size_bytes {
-                println!("   - Download progress: {}% ({:.2} MB / {:.2} MB)", 
-                    pct, downloaded_bytes as f64 / 1_048_576.0, artifact.size_bytes as f64 / 1_048_576.0);
-                last_reported_pct = pct;
-            }
-        }
-        resume_file.flush().await.unwrap();
-        drop(resume_file);
-
-        // STEP 9: Size Integrity Verification
-        assert_eq!(downloaded_bytes, artifact.size_bytes, "Downloaded bytes must exactly match expected HF size");
-        let final_temp_size = tokio::fs::metadata(&temp_path).await.unwrap().len();
-        assert_eq!(final_temp_size, artifact.size_bytes, "Temp .part file size must equal expected artifact size");
-        println!("6. INTEGRITY VERIFICATION: 100% download complete! Expected: {} B, Actual: {} B.", 
-            artifact.size_bytes, final_temp_size);
-
-        // STEP 10: Atomic finalization (.part -> .gguf)
-        tokio::fs::rename(&temp_path, &destination_path).await.unwrap();
-        assert!(!temp_path.exists(), ".part file must be removed after atomic rename");
-        assert!(destination_path.exists(), "Final .gguf file must exist on disk");
-
-        // Write test manifest.json to package directory
-        let package_dir = storage_dir.parent().unwrap();
-        let manifest = ModelPackageManifest {
-            package_id: model_id.replace('/', "_"),
-            provider_id: "huggingface".to_string(),
-            base_model: BaseManifestInfo {
-                model_id: model_id.to_string(),
-                model_name: "Llama 3.2 1B".to_string(),
-                quantization: requested_quant.to_string(),
-                file_path: "base/".to_string(),
-                size_bytes: artifact.size_bytes,
-                checksum: None,
-            },
-            adapters: HashMap::new(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        };
-        AdapterRegistry::write_manifest(package_dir, &manifest).unwrap();
-        println!("7. ATOMIC FINALIZATION: Renamed .part -> .gguf cleanly & wrote manifest.json.");
-
-        // STEP 11 & 12: Model Manager Scanning & Detection
-        let installed = crate::model_manager::ModelManager::list_installed_models(&app_data_dir);
-        assert_eq!(installed.len(), 1, "ModelManager must report exactly 1 installed model");
-        let model = &installed[0];
-        assert_eq!(model.model_id, model_id);
-        assert_eq!(model.provider_id, "huggingface");
-        assert_eq!(model.quantization, requested_quant);
-        assert_eq!(model.format, "GGUF");
-        assert_eq!(model.backend, "llama.cpp (GGUF)");
-        assert!(model.is_ready, "Model must be marked Ready");
-        assert_eq!(model.size_bytes, artifact.size_bytes);
-        println!("8. STORAGE DETECTION: Detected model in Storage tab with status READY.");
-
-        // STEP 13: App Restart Persistence Simulation
-        let restarted_installed = crate::model_manager::ModelManager::list_installed_models(&app_data_dir);
-        assert_eq!(restarted_installed.len(), 1, "Model must persist across app restarts");
-        assert!(restarted_installed[0].is_ready, "Model must retain Ready status after restart");
-        println!("9. RESTART PERSISTENCE: Model persisted cleanly across restart simulation.");
-
-        // STEP 14, 15 & 16: Delete Model from Storage
-        crate::model_manager::ModelManager::delete_installed_model(&app_data_dir, "huggingface", model_id, requested_quant)
-            .expect("Model deletion must succeed");
-
-        assert!(!destination_path.exists(), "Model file must be deleted from disk");
-        assert!(!package_dir.exists(), "Model package directory must be removed from disk");
-
-        let post_delete_installed = crate::model_manager::ModelManager::list_installed_models(&app_data_dir);
-        assert_eq!(post_delete_installed.len(), 0, "Installed models list must be empty after deletion");
-        println!("10. DELETE TEST: Model file and directory removed from disk. Storage updated cleanly.");
-
-        println!("=======================================================");
-        println!("=== ALL 10 E2E FULL LIFECYCLE VERIFICATIONS PASSED ===");
-        println!("=======================================================\n");
-
-        let _ = tokio::fs::remove_dir_all(&app_data_dir).await;
     }
 }

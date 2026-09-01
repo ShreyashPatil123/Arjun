@@ -1,7 +1,7 @@
 //! Which models Sarathi puts its name to.
 //!
 //! The Hub's popular sweep is not a shortlist. It mixes finished releases with
-//! week-old merges, 1-bit experiments, and adapters, all sorted by download
+//! week-old merges, 1-bit experiments, and non-runnable extensions, all sorted by download
 //! count — which favours whatever went viral, not what will work on the user's
 //! machine tonight. "Sarathi Recommended" is the answer to a narrower question:
 //! *which of these would we hand to someone who just wants a working model?*
@@ -146,7 +146,6 @@ const MIN_DOWNLOADS: u64 = 10_000;
 pub fn is_recommended(repo: &GgufRepo, fits_here: bool) -> bool {
     fits_here
         && is_trusted_publisher(&repo.repo_id)
-        && !repo.is_lora_adapter
         && !looks_experimental(&repo.repo_id)
         && !emits_reasoning_tokens(repo)
         && repo.downloads >= MIN_DOWNLOADS
@@ -184,7 +183,6 @@ mod tests {
             }),
             base_model: None,
             is_finetune: false,
-            is_lora_adapter: false,
             tags: vec![],
         }
     }
@@ -254,11 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn adapters_and_barely_used_conversions_are_refused() {
-        let mut adapter = repo("bartowski/Thing-GGUF", 900_000, Some("{{ messages }}"));
-        adapter.is_lora_adapter = true;
-        assert!(!is_recommended(&adapter, true));
-
+    fn barely_used_conversions_are_refused() {
         let obscure = repo("bartowski/Thing-GGUF", 12, Some("{{ messages }}"));
         assert!(!is_recommended(&obscure, true));
     }

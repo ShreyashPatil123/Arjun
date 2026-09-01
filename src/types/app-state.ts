@@ -4,7 +4,6 @@ export type AppStatus =
   | 'downloading'
   | 'installing'
   | 'loading-model'
-  | 'loading-lora'
   | 'chatting'
   | 'error';
 

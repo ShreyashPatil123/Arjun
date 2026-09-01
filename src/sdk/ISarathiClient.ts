@@ -70,12 +70,6 @@ export interface ISarathiAIEngineService {
   chat(messages?: unknown[]): Promise<unknown>;
 }
 
-export interface ISarathiLoRAService {
-  loadAdapter(adapterId: string): Promise<void>;
-  switchAdapter(adapterId: string): Promise<void>;
-  composeAdapters(adapters: unknown[]): Promise<void>;
-}
-
 /**
  * Master Sarathi Client Interface
  */
@@ -90,5 +84,4 @@ export interface ISarathiClient {
   readonly modelManager: ISarathiModelManagerService;
   readonly modelProviders: ISarathiModelProviderService;
   readonly aiEngine: ISarathiAIEngineService;
-  readonly lora: ISarathiLoRAService;
 }

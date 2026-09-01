@@ -37,41 +37,6 @@ export function listModelCategories(): Promise<CategoryCount[]> {
   return invoke<CategoryCount[]>('list_model_categories');
 }
 
-/** A LoRA adapter published for some base model. */
-export interface AdapterListing {
-  repoId: string;
-  name: string;
-  author: string;
-  downloads: number;
-  likes: number;
-  /**
-   * True when the repo ships `.gguf` files. Most published adapters are PEFT
-   * safetensors and cannot be loaded until converted — the card says so rather
-   * than offering a download that will not work.
-   */
-  ggufReady: boolean;
-  /** What the adapter is for, e.g. `text to sql`. */
-  focus: string;
-}
-
-export interface AdapterPage {
-  adapters: AdapterListing[];
-  /** How many are loadable as-is. */
-  readyCount: number;
-  /** Explains an empty or unusable result. */
-  notice?: string | null;
-}
-
-/**
- * LoRA adapters published for a base model.
- *
- * Uses HuggingFace's `base_model:adapter:` tag, which adapter authors set to
- * declare their parent — a real relationship, not a name-similarity guess.
- */
-export function findModelAdapters(baseModelId: string): Promise<AdapterPage> {
-  return invoke<AdapterPage>('find_model_adapters', { baseModelId });
-}
-
 /** Bytes as GB with one decimal, e.g. `4.7 GB`. */
 export function formatSize(bytes: number): string {
   const gb = bytes / 1024 ** 3;

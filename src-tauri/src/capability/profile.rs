@@ -1,18 +1,13 @@
 //! Capability Specifications — what it means to "be good at" a domain.
 //!
-//! A capability is realised through one of two interchangeable backends:
+//! A capability is realised through a built-in prompt profile:
 //!
 //! - [`CapabilityBackend::PromptProfile`] — a system directive plus sampling
 //!   overrides. Works on every model, requires zero downloads, applies instantly.
-//! - [`CapabilityBackend::LoraAdapter`] — a GGUF LoRA adapter bound to the live
-//!   llama.cpp context. Higher fidelity, but only available when a
-//!   shape-compatible adapter has been installed for the active base model.
-//!
-//! The inference path treats both identically, so a capability transparently
-//! upgrades from prompt-profile to LoRA the moment a valid adapter appears.
+//! Profiles combine a system directive with sampling overrides and work with
+//! every runnable model without additional weights.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 use crate::ai_engine::traits::GenerationParams;
 
@@ -67,8 +62,6 @@ pub enum CapabilityBackend {
     Base,
     /// System directive + sampling overrides. Always available.
     PromptProfile,
-    /// A GGUF LoRA adapter bound to the live context at the given scale.
-    LoraAdapter { path: PathBuf, scale: f32 },
 }
 
 impl CapabilityBackend {
@@ -77,27 +70,16 @@ impl CapabilityBackend {
         match self {
             Self::Base => "base",
             Self::PromptProfile => "prompt-profile",
-            Self::LoraAdapter { .. } => "lora",
         }
-    }
-
-    pub fn is_lora(&self) -> bool {
-        matches!(self, Self::LoraAdapter { .. })
     }
 }
 
-/// Default LoRA scale when a manifest does not specify one.
-///
-/// 1.0 applies the adapter at its trained strength; llama.cpp multiplies the
-/// low-rank delta by this factor before adding it to the base weights.
-pub const DEFAULT_LORA_SCALE: f32 = 1.0;
-
 /// A capability definition: the directive, the sampling shape, and an optional
-/// adapter binding discovered from the active model's package manifest.
+/// specialization applied to the active model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilitySpec {
-    /// Canonical capability key — matches manifest adapter keys
+    /// Canonical capability key used by the prompt-profile registry
     /// (`coding`, `reasoning`, `mathematics`, `tool-calling`, `research`, `general`).
     pub capability: String,
     /// Human-readable name for the UI badge.

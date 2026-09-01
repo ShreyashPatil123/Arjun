@@ -189,7 +189,6 @@ pub struct AICapabilityProfile {
     pub recommended_context_length: Option<u32>,
     pub preferred_inference_backend: Option<String>,
     pub multi_model_capable: bool,
-    pub lora_ready: bool,
     pub vision_ready: bool,
     pub embedding_ready: bool,
     pub extra_capabilities: HashMap<String, serde_json::Value>,
