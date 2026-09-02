@@ -19,6 +19,7 @@ use crate::ai_engine::ocr_profile::{
 };
 use crate::ai_engine::ocr_spans::{OcrEvent, RawBox};
 use crate::ai_engine::ocr_stream::stream_ocr;
+use crate::agent_runtime::stages::StageTag;
 use crate::registry::ModelRegistry;
 use crate::serving::ModelServers;
 
@@ -376,10 +377,21 @@ pub struct AttachmentProgress {
     pub pages: Option<u32>,
     /// Which local path handled it, so the chip can say how it was read.
     pub kind: Option<String>,
+    /// The turn this read belongs to.
+    ///
+    /// This channel used to carry only a filename, which was enough while one
+    /// window read one file at a time and wrong the moment it did not: a
+    /// progress line has to land on the turn that asked for the read, and a
+    /// name cannot say which turn that is. Carried as the caller's own ids
+    /// because the read happens before the run has one of its own.
+    pub correlation_id: Option<String>,
+    pub message_id: Option<String>,
+    pub conversation_id: Option<String>,
 }
 
 fn progress(
     app: &AppHandle,
+    tag: &StageTag,
     name: &str,
     phase: &'static str,
     page: Option<u32>,
@@ -394,6 +406,9 @@ fn progress(
             page,
             pages,
             kind,
+            correlation_id: tag.correlation_id.clone(),
+            message_id: tag.message_id.clone(),
+            conversation_id: tag.conversation_id.clone(),
         },
     );
 }
@@ -612,6 +627,7 @@ pub async fn read_attachment(
     servers: &ModelServers,
     attachment: &ChatAttachment,
     detent: OcrDetent,
+    tag: &StageTag,
 ) -> Result<AttachmentRead, String> {
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -637,7 +653,7 @@ pub async fn read_attachment(
     std::fs::create_dir_all(&base)
         .map_err(|e| format!("could not store {}: {e}", attachment.name))?;
 
-    progress(app, &attachment.name, "reading", None, None, None);
+    progress(app, tag, &attachment.name, "reading", None, None, None);
 
     // What the answer will say about how this file was read. Filled in by
     // whichever branch actually runs, so it reports the path taken rather
@@ -655,6 +671,7 @@ pub async fn read_attachment(
             }
             progress(
                 app,
+                tag,
                 &attachment.name,
                 "understanding",
                 Some(1),
@@ -681,7 +698,7 @@ pub async fn read_attachment(
                 std::fs::write(&stored, &bytes)
                     .map_err(|e| format!("could not store {}: {e}", attachment.name))?;
             }
-            progress(app, &attachment.name, "preparing", None, None, None);
+            progress(app, tag, &attachment.name, "preparing", None, None, None);
             let extracted = run_extractor(&stored, &base)?;
             let pages = extracted.pages.max(1);
 
@@ -693,6 +710,7 @@ pub async fn read_attachment(
                 // No model was needed to read it, and none was used.
                 progress(
                     app,
+                    tag,
                     &attachment.name,
                     "extracting",
                     None,
@@ -710,6 +728,7 @@ pub async fn read_attachment(
                 for (index, image) in extracted.page_images.iter().enumerate() {
                     progress(
                         app,
+                        tag,
                         &attachment.name,
                         "understanding",
                         Some(index as u32 + 1),
@@ -743,7 +762,7 @@ pub async fn read_attachment(
         }
     };
 
-    progress(app, &attachment.name, "done", None, None, None);
+    progress(app, tag, &attachment.name, "done", None, None, None);
     Ok(AttachmentRead {
         name: attachment.name.clone(),
         sha256,

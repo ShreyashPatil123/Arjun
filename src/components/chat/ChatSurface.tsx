@@ -17,6 +17,7 @@ import {
 import { OcrReadout } from './OcrReadout';
 import { useOcrPreference } from './useOcrPreference';
 import { AssistantMessageCell } from './AssistantMessageCell';
+import type { ProgressStep } from './runProgress';
 import { RunView } from '../run/RunView';
 import {
   useAdoptedRun,
@@ -75,6 +76,7 @@ export function ChatSurface({
     activeMessageId,
     activeRunId,
     streamingContents,
+    progressByMessage,
     send,
     replay,
   } = useConversation();
@@ -100,13 +102,19 @@ export function ChatSurface({
   const ocrPreference = useOcrPreference();
 
   useEffect(() => {
-    const sub = listenAttachmentProgress(p =>
-      setReading(p.phase === 'done' ? null : p),
-    );
+    const sub = listenAttachmentProgress(p => {
+      // Scoped to the turn that asked for the read. The channel is
+      // application-wide, and a second window reading a document would
+      // otherwise put its page counter under this window's composer.
+      if (p.messageId && activeMessageId && p.messageId !== activeMessageId) {
+        return;
+      }
+      setReading(p.phase === 'done' ? null : p);
+    });
     return () => {
       void sub.then(un => un());
     };
-  }, []);
+  }, [activeMessageId]);
 
   useEffect(() => {
     const sub = listenAttachmentOcr(event =>
@@ -305,6 +313,7 @@ export function ChatSurface({
               }
               runId={runsByMessageId.get(m.id) ?? null}
               activity={activityByRun.get(runsByMessageId.get(m.id) ?? '')}
+              progress={progressByMessage.get(m.id)}
               showAvatar={m.id === orbMessageId}
               runSummary={
                 inspectorRunId && runsByMessageId.get(m.id) === inspectorRunId
@@ -422,6 +431,8 @@ interface MessageRowProps {
   message: ChatMessage;
   isLive?: boolean;
   liveContent?: string;
+  /** This turn's own step list, found by message id and never by position. */
+  progress?: ProgressStep[];
   runId: string | null;
   activity?: Activity[];
   runSummary?: RunSummary | null;
@@ -436,6 +447,7 @@ function MessageRow({
   message,
   isLive,
   liveContent,
+  progress,
   runId,
   activity,
   runSummary,
@@ -465,6 +477,7 @@ function MessageRow({
       message={message}
       isLive={isLive}
       liveContent={liveContent}
+      progress={progress}
       activity={runId ? activity : undefined}
       runSummary={runSummary ?? null}
       showAvatar={showAvatar}

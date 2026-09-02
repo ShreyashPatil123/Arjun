@@ -41,6 +41,7 @@ pub mod protocol;
 pub mod recording;
 pub mod resume;
 pub mod retrieval;
+pub mod stages;
 pub mod tasks;
 pub mod workspace;
 
@@ -473,8 +474,18 @@ async fn dispatch(
                     .and_then(|v| v.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if matches!(event_type, "message_start" | "message_update" | "message_end") {
+                if matches!(
+                    event_type,
+                    "message_start" | "message_update" | "message_end" | "model_thinking"
+                ) {
                     // Live channel only. Drop on slow consumer.
+                    //
+                    // `model_thinking` is here for a second reason as well as
+                    // the first: it says the model is reasoning and how much
+                    // of it there has been, and that is a progress line, not a
+                    // fact about the run worth keeping. Recording it would put
+                    // a row on disk every second of every reasoning pass to
+                    // preserve a number nobody reads afterwards.
                     emit(params);
                 } else {
                     remember_loop_event(deps, &params);

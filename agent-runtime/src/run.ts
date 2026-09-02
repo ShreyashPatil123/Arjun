@@ -22,6 +22,7 @@ import { ContextLedger } from "./context-ledger.js";
 import { WorkingNotes, type WorkingNotesState } from "./working-notes.js";
 import { payloadPolicy } from "./providers.js";
 import { withToolCallRepair } from "./repair.js";
+import { withCallTiming } from "./timing.js";
 import { GrantLedger, authorizeToolCall, buildTools, fetchCatalogue } from "./tools.js";
 import { observeToolResult } from "./note-taking.js";
 
@@ -249,9 +250,16 @@ export async function startRun(
   });
 
   const agent = new Agent({
-    streamFn: withToolCallRepair(
-      runtime.streamSimple,
-      tools.map((tool) => tool.name),
+    // Timed on the outside of the repair wrapper, so a call the repair layer
+    // re-issues is counted as the second call it is. Counting them together
+    // would report one very slow model instead of two ordinary ones, which is
+    // the distinction the measurement exists to make.
+    streamFn: withCallTiming(
+      withToolCallRepair(
+        runtime.streamSimple,
+        tools.map((tool) => tool.name),
+      ),
+      runId,
     ),
     /**
      * The harness converter, not the default.
@@ -470,6 +478,27 @@ type WireEvent =
   | { type: "message_start"; messageId: string; role: "assistant" }
   | { type: "message_update"; messageId: string; delta: string }
   | {
+      /**
+       * The model is reasoning privately, or has stopped.
+       *
+       * Carries no reasoning. `characters` is the *size* of what the model
+       * produced, which is a progress signal in the same way a byte count is,
+       * and `elapsedMs` is how long it has been at it. Neither can be turned
+       * back into a single token of the thought.
+       *
+       * This exists because dropping the thinking stream entirely — which is
+       * the right thing to do with its *content* — also dropped the only
+       * evidence that anything was happening. A reasoning model that thinks
+       * for ninety seconds before its first word left the chat surface with
+       * nothing to show for a minute and a half.
+       */
+      type: "model_thinking";
+      messageId: string;
+      state: "start" | "active" | "end";
+      characters: number;
+      elapsedMs: number;
+    }
+  | {
       type: "message_end";
       messageId: string;
       finishReason: "stop" | "length" | "tool_calls" | "content_filter" | "error";
@@ -506,8 +535,90 @@ export class MessageTranslator {
   private sawTextDelta = new Set<number>();
   private seenStart = false;
   private seenEnd = false;
+  /** When the current run of private reasoning began, or null if none is open. */
+  private thinkingSince: number | null = null;
+  /** How many characters of reasoning this block has produced. Never the text. */
+  private thinkingChars = 0;
+  /** When the last `active` tick went out, so the channel is not flooded. */
+  private thinkingTickedAt = 0;
+  /**
+   * How many of each inner event type the loop delivered.
+   *
+   * The chat surface can only stream as finely as the events it is given, so
+   * when an answer arrives in one lump the question is always the same: did
+   * the model not stream, or did something between the model and here glue
+   * the pieces back together? A shape count answers it in one log line, and
+   * counts are all it holds — never a fragment of what the events carried.
+   */
+  private readonly shape = new Map<string, number>();
 
-  constructor(private readonly messageId: string) {}
+  constructor(
+    private readonly messageId: string,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /**
+   * Opens or advances the private-reasoning signal.
+   *
+   * `size` is the length of the delta, and it is the only thing taken from
+   * it. The delta itself is not read, not stored, and not passed on.
+   */
+  private thinking(size: number): WireEvent[] {
+    const at = this.now();
+    this.thinkingChars += size;
+    if (this.thinkingSince === null) {
+      this.thinkingSince = at;
+      this.thinkingTickedAt = at;
+      return [
+        {
+          type: "model_thinking",
+          messageId: this.messageId,
+          state: "start",
+          characters: this.thinkingChars,
+          elapsedMs: 0,
+        },
+      ];
+    }
+    // A reasoning model emits deltas as fast as it can decode. Forwarding one
+    // event per delta would put thousands of frames through the stdio channel
+    // to move a number the person reads once a second. Ticked instead.
+    if (at - this.thinkingTickedAt < THINKING_TICK_MS) return [];
+    this.thinkingTickedAt = at;
+    return [
+      {
+        type: "model_thinking",
+        messageId: this.messageId,
+        state: "active",
+        characters: this.thinkingChars,
+        elapsedMs: at - this.thinkingSince,
+      },
+    ];
+  }
+
+  /**
+   * Closes the private-reasoning signal, if one is open.
+   *
+   * Called on `thinking_end`, but also on the first visible text and on
+   * `message_end`: a model that stops reasoning by simply starting to answer
+   * never sends `thinking_end`, and without this the surface would show
+   * "Thinking" underneath an answer that was already being written.
+   */
+  private endThinking(): WireEvent[] {
+    if (this.thinkingSince === null) return [];
+    const elapsed = this.now() - this.thinkingSince;
+    const characters = this.thinkingChars;
+    this.thinkingSince = null;
+    this.thinkingChars = 0;
+    return [
+      {
+        type: "model_thinking",
+        messageId: this.messageId,
+        state: "end",
+        characters,
+        elapsedMs: elapsed,
+      },
+    ];
+  }
 
   translate(event: AgentEvent): WireEvent[] {
     if (event.type === "message_start") {
@@ -517,23 +628,29 @@ export class MessageTranslator {
       this.sentTextStart.clear();
       this.sentTextEnd.clear();
       this.sawTextDelta.clear();
+      this.thinkingSince = null;
+      this.thinkingChars = 0;
       return [{ type: "message_start", messageId: this.messageId, role: "assistant" }];
     }
 
     if (event.type === "message_update") {
       const inner = event.assistantMessageEvent;
+      this.shape.set(inner.type, (this.shape.get(inner.type) ?? 0) + 1);
 
       if (inner.type === "text_delta") {
         const delta = (inner as { delta?: unknown }).delta;
         if (typeof delta !== "string" || delta.length === 0) return [];
         const contentIndex = (inner as { contentIndex?: number }).contentIndex ?? 0;
         this.sawTextDelta.add(contentIndex);
+        // Visible text means the reasoning pass is over, whether or not the
+        // model bothered to say so.
+        const closed = this.endThinking();
         // Once we've sent the full block via text_start or text_end, ignore
         // further deltas for that block — the wire contract is "delta = new
         // text", and the deltas are echoes of the text_start/text_end payload.
-        if (this.sentTextStart.has(contentIndex)) return [];
-        if (this.sentTextEnd.has(contentIndex)) return [];
-        return [{ type: "message_update", messageId: this.messageId, delta }];
+        if (this.sentTextStart.has(contentIndex)) return closed;
+        if (this.sentTextEnd.has(contentIndex)) return closed;
+        return [...closed, { type: "message_update", messageId: this.messageId, delta }];
       }
 
       if (inner.type === "text_start" || inner.type === "text_end") {
@@ -569,21 +686,47 @@ export class MessageTranslator {
         return [{ type: "message_update", messageId: this.messageId, delta: block.text }];
       }
 
-      // thinking_delta / thinking_start / thinking_end / toolcall_* are
-      // either internal model state or wire-format repairs. None of it is
-      // the user's answer, so none of it becomes a `message_update` on the
-      // wire. The audit record holds the model-side view under access
-      // control; the chat surface only ever sees the assistant's text.
+      // Private reasoning. The *content* never leaves this function: no
+      // branch below reads `delta`, `content`, or `partial` for anything but
+      // its length, and none of them produces a `message_update`. What does
+      // go out is that the model is reasoning, how long for, and how much it
+      // has produced — the same class of fact as a byte counter, and the only
+      // thing that keeps the surface honest during a long reasoning pass.
+      if (inner.type === "thinking_start") {
+        return this.thinking(0);
+      }
+      if (inner.type === "thinking_delta") {
+        const delta = (inner as { delta?: unknown }).delta;
+        return this.thinking(typeof delta === "string" ? delta.length : 0);
+      }
+      if (inner.type === "thinking_end") {
+        return this.endThinking();
+      }
+
+      // toolcall_* is a wire-format repair artefact, not visible prose, so it
+      // is not forwarded either. The audit record holds the model-side view
+      // under access control; the chat surface only ever sees the text.
       return [];
     }
 
     if (event.type === "message_end") {
       if (this.seenEnd) return [];
       this.seenEnd = true;
+      const shape = [...this.shape.entries()]
+        .map(([type, count]) => `${type}=${count}`)
+        .sort()
+        .join(" ");
+      process.stderr.write(`[agent-runtime:log] [stream] messageId=${this.messageId} ${shape}
+`);
+      // A model that reasoned and then stopped without answering still has an
+      // open thinking block. Closing it here is what stops the surface
+      // spinning on a run that is already over.
+      const closed = this.endThinking();
       const message = event.message;
       const stopReason = message.role === "assistant" ? message.stopReason : undefined;
       const usage = message.role === "assistant" ? message.usage : undefined;
       return [
+        ...closed,
         {
           type: "message_end",
           messageId: this.messageId,
@@ -597,6 +740,15 @@ export class MessageTranslator {
     return [];
   }
 }
+
+/**
+ * How often an in-progress reasoning pass reports its size.
+ *
+ * A second is slower than the model produces and faster than a person reads,
+ * which is the whole requirement. Lower would spend frames on a number nobody
+ * looked at; higher would make a long pause look like a stall again.
+ */
+const THINKING_TICK_MS = 1000;
 
 /**
  * Backwards-compatible stateless wrapper. Used by the unit tests; the

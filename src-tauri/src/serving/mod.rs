@@ -512,6 +512,30 @@ impl ModelServers {
             .map(|table| table.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Whether this model's server is already up and has answered a probe.
+    ///
+    /// Asked *before* [`Self::endpoint_for`] so a caller can tell the person
+    /// "Loading model…" only when that is what is about to happen. A warm
+    /// server returns in microseconds and should never produce a loading line;
+    /// a cold one takes seconds to minutes, and showing nothing for that is
+    /// what made the application look frozen.
+    ///
+    /// Reads the same `ready` flag `managed_endpoint` sets, so the answer here
+    /// and the branch taken there cannot disagree. An external endpoint is not
+    /// in this table and reports `false`, which is honest: it is about to be
+    /// probed.
+    pub fn is_warm(&self, model_id: &str) -> bool {
+        self.managed
+            .lock()
+            .ok()
+            .and_then(|table| {
+                table
+                    .get(model_id)
+                    .map(|server| server.ready.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// How long a model server gets to load its weights and answer.

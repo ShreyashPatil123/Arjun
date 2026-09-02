@@ -25,6 +25,7 @@ import React, {
 } from 'react';
 import {
   agentService,
+  listenAttachmentProgress,
   type AgentEvent,
   type AgentEventEnvelope,
   type ChatMessage,
@@ -34,6 +35,11 @@ import {
   type ComposerAttachment,
 } from '../services/agent.service';
 import type { OcrDetent } from '../services/ocr.service';
+import {
+  applyProgress,
+  type ProgressInput,
+  type ProgressStep,
+} from '../components/chat/runProgress';
 
 const LAST_CONVERSATION_KEY = 'arjun.conversation.last';
 
@@ -77,6 +83,32 @@ export function isMessageEvent(event: AgentEvent): event is MessageEvent {
 }
 
 /**
+ * Events that describe progress rather than content.
+ *
+ * Both carry the assistant `messageId`, which is what lets a reducer accept
+ * one before the server has issued its own run id without ever accepting
+ * another run's.
+ */
+export type ProgressEvent = Extract<
+  AgentEvent,
+  { type: 'run_stage' | 'model_thinking' }
+>;
+
+export function isProgressEvent(event: AgentEvent): event is ProgressEvent {
+  return event.type === 'run_stage' || event.type === 'model_thinking';
+}
+
+/** The `messageId` an event names, or null if it names none. */
+export function eventMessageId(event: AgentEvent): string | null {
+  if (isMessageEvent(event)) return event.messageId;
+  if (event.type === 'model_thinking') return event.messageId;
+  if (event.type === 'run_stage') {
+    return typeof event.messageId === 'string' ? event.messageId : null;
+  }
+  return null;
+}
+
+/**
  * The streaming reducer for a single run.
  *
  * Each `send()` creates exactly one `RunReducer`. The reducer holds the
@@ -109,6 +141,14 @@ export class RunReducer {
   readonly startedAt: number;
   /** Set when `dispose()` runs. Late events are dropped on the floor. */
   private disposed = false;
+  /**
+   * The steps this turn has been through, newest last.
+   *
+   * Held on the reducer rather than in React state for the same reason the
+   * content buffer is: two runs in flight each own their own list, and an
+   * event that matched neither cannot append to either.
+   */
+  private progress: ProgressStep[] = [];
 
   constructor(
     private readonly registry: RunReducerRegistry,
@@ -117,6 +157,32 @@ export class RunReducer {
     readonly messageId: string,
   ) {
     this.startedAt = Date.now();
+    // Seeded before any event arrives, so the cell has a line to show during
+    // the IPC round trip that reserves the turn. It names work that is
+    // genuinely under way — the request has been handed over — rather than
+    // filling the gap with a spinner that means nothing.
+    this.pushProgress({ kind: 'submitted' });
+  }
+
+  /**
+   * Folds in progress that arrived on a channel other than `agent://event`.
+   *
+   * The document reader reports its pages on `attachment:progress`, which is
+   * an application-wide channel; the registry routes one of those to this
+   * reducer only when it names this reducer's message. A read that names no
+   * message reaches nobody, which is the safe direction to fail.
+   */
+  ingest(input: ProgressInput): void {
+    if (this.disposed) return;
+    this.pushProgress(input);
+  }
+
+  /** Folds one progress event in and publishes the new list. */
+  private pushProgress(input: ProgressInput): void {
+    const next = applyProgress(this.progress, input, Date.now());
+    if (next === this.progress) return;
+    this.progress = next;
+    this.registry.publishProgress(this.messageId, next);
   }
 
   /** Push the latest content into React state on the next microtask. */
@@ -177,31 +243,72 @@ export class RunReducer {
   apply(envelope: AgentEventEnvelope): boolean {
     if (this.disposed) return false;
     const event = envelope.event;
-    // The runId filter is the primary identifier once the server has
-    // assigned its own id. Until that happens we match on the
-    // `correlationId` echoed on the first `plan_ready` envelope.
-    if (this.actualRunId !== null) {
-      if (envelope.runId !== this.actualRunId) return false;
-    } else if (envelope.event.type === 'plan_ready') {
-      if (envelope.event.correlationId === this.runId) {
+
+    // `plan_ready` is the one envelope that teaches this reducer the
+    // server's run id, by echoing back the correlation id the caller sent.
+    if (event.type === 'plan_ready') {
+      if (event.correlationId === this.runId) {
         this.actualRunId = envelope.runId;
-      } else {
-        return false;
+        return true;
       }
-    } else {
-      // The server has not yet issued its own runId, and this envelope
-      // is not a `plan_ready` we can use to learn it. Accept the
-      // envelope based on the messageId the runtime stamps on every
-      // `message_*` event, so a fast-streaming model whose first
-      // `message_start` arrives in the same tick as the subscriber
-      // attaches is not dropped.
-      if (!isMessageEvent(event)) return false;
-      if (event.messageId !== this.messageId) return false;
+      return this.actualRunId !== null && envelope.runId === this.actualRunId;
+    }
+
+    // Two ids can identify this run, and both are needed.
+    //
+    // The server's run id is authoritative once `plan_ready` has taught it
+    // to us. Before that — which is most of a cold turn, because the stages
+    // that report attachment reading, routing and model loading all happen
+    // before the run has an id — the envelope carries the caller's own
+    // correlation id, which is this reducer's `runId`. Matching only the
+    // first would drop every stage emitted before generation started, which
+    // is exactly the silence this work exists to remove.
+    const namedMessage = eventMessageId(event);
+    const matchesRun =
+      (this.actualRunId !== null && envelope.runId === this.actualRunId) ||
+      envelope.runId === this.runId;
+    const matchesMessage =
+      namedMessage !== null && namedMessage === this.messageId;
+    if (!matchesRun && !matchesMessage) return false;
+
+    // An event that names a message must name OURS, whatever run it claims.
+    // Without this, a run holding two assistant cells would let the second
+    // cell's tokens land in the first.
+    if (namedMessage !== null && namedMessage !== this.messageId) return false;
+
+    // A message event is stamped with the server's run id even before
+    // `plan_ready` arrives, so a fast model whose first `message_start`
+    // beats the plan still teaches us the id.
+    if (
+      this.actualRunId === null &&
+      matchesMessage &&
+      envelope.runId !== this.runId
+    ) {
       this.actualRunId = envelope.runId;
     }
 
+    if (isProgressEvent(event)) {
+      if (event.type === 'model_thinking') {
+        this.pushProgress({
+          kind: 'thinking',
+          state: event.state,
+          characters: event.characters,
+          elapsedMs: event.elapsedMs,
+        });
+      } else {
+        const { type, stage, elapsedMs, ...detail } = event;
+        void type;
+        this.pushProgress({
+          kind: 'stage',
+          stage,
+          elapsedMs,
+          detail: detail as Record<string, unknown>,
+        });
+      }
+      return true;
+    }
+
     if (!isMessageEvent(event)) return true; // consume but no-op
-    if (event.messageId !== this.messageId) return false;
 
     switch (event.type) {
       case 'message_start':
@@ -210,7 +317,11 @@ export class RunReducer {
         return true;
       case 'message_update': {
         const next = this.content + event.delta;
-        this.content = collapseRepeats(next);
+        this.content = collapseRepeats(next, /[.!?]/.test(event.delta));
+        // The first visible token is the only place composition can be
+        // observed starting. No stage on the Rust side can know it, because
+        // the Rust side is blocked on the loop by then.
+        if (this.content.length > 0) this.pushProgress({ kind: 'text' });
         this.scheduleMirror();
         this.schedulePersist();
         return true;
@@ -218,6 +329,10 @@ export class RunReducer {
       case 'message_end': {
         if (this.receivedEnd) return true;
         this.receivedEnd = true;
+        // Closes whatever was still open. A panel left showing an unfinished
+        // "Writing the answer" under a finished answer is the same class of
+        // lie as showing nothing at all.
+        this.pushProgress({ kind: 'done' });
         if (this.mirrorTimer !== null) {
           window.clearTimeout(this.mirrorTimer);
           this.mirrorTimer = null;
@@ -285,6 +400,7 @@ export class RunReducerRegistry {
   constructor(
     private readonly publish: {
       onContent: (messageId: string, content: string) => void;
+      onProgress: (messageId: string, steps: ProgressStep[]) => void;
       onConversation: (next: Conversation) => void;
       onRunDone: (reducer: RunReducer) => void;
     },
@@ -332,10 +448,12 @@ export class RunReducerRegistry {
       // `message_start` from a fast-streaming model).
       let reducer = this.reducers.get(envelope.runId);
       if (!reducer) {
-        const ev = envelope.event;
-        if (isMessageEvent(ev)) {
-          reducer = this.byMessageId.get(ev.messageId);
-        }
+        // The table is keyed by the caller's own run id, so every envelope
+        // stamped with the *server's* id misses it. Both message events and
+        // progress events name the assistant message, and that name is what
+        // finds the reducer in that case.
+        const named = eventMessageId(envelope.event);
+        if (named !== null) reducer = this.byMessageId.get(named);
       }
       if (!reducer) return;
       reducer.apply(envelope);
@@ -351,6 +469,15 @@ export class RunReducerRegistry {
 
   publishContent(messageId: string, content: string): void {
     this.publish.onContent(messageId, content);
+  }
+
+  publishProgress(messageId: string, steps: ProgressStep[]): void {
+    this.publish.onProgress(messageId, steps);
+  }
+
+  /** Hands an off-channel progress event to the reducer that owns it. */
+  ingestForMessage(messageId: string, input: ProgressInput): void {
+    this.byMessageId.get(messageId)?.ingest(input);
   }
 
   publishConversation(next: Conversation): void {
@@ -382,8 +509,22 @@ export class RunReducerRegistry {
  *  2. Word-level: if the last 200 chars contain an immediate repeat
  *     of a chunk (8..200 chars), strip one copy.
  */
-function collapseRepeats(s: string): string {
+function collapseRepeats(s: string, deltaHadTerminator = true): string {
   if (s.length < 20) return s;
+
+  // The sentence pass is the expensive half: it builds a `RegExp` and runs it
+  // over the *whole* accumulated answer, so running it on every delta makes
+  // the cost of streaming quadratic in the length of the answer. At a few
+  // hundred characters that is invisible; at ten thousand it is the reducer
+  // stuttering the stream it exists to smooth.
+  //
+  // It is also unnecessary. The pass can only find a new duplicate once a new
+  // sentence has been *completed*, and that cannot happen in a delta with no
+  // terminator in it. Skipping those is not an approximation — the result is
+  // the same string, arrived at without re-scanning the answer a thousand
+  // times. The word-level pass below is already bounded to the last 400
+  // characters and runs every time.
+  if (!deltaHadTerminator) return collapseTail(s);
 
   const sentenceRe = /[.!?]\s+([^.!?]{8,200})[.!?]/g;
   const tail1 = s.slice(-500);
@@ -409,6 +550,16 @@ function collapseRepeats(s: string): string {
     }
   }
 
+  return collapseTail(s);
+}
+
+/**
+ * The cheap half: strip an immediate repeat of the last 8..200 characters.
+ *
+ * Bounded to the last 400 characters, so its cost does not grow with the
+ * length of the answer.
+ */
+function collapseTail(s: string): string {
   const tail = s.slice(-400);
   for (let len = Math.min(200, Math.floor(tail.length / 2)); len >= 8; len -= 1) {
     const last = tail.slice(-len);
@@ -427,6 +578,14 @@ export interface UseConversation {
   activeMessageId: string | null;
   activeRunId: string | null;
   streamingContents: Map<string, string>;
+  /**
+   * What each in-flight turn is doing, keyed by assistant `messageId`.
+   *
+   * Keyed by message rather than by run because that is what the cell that
+   * renders it is keyed by, and a map from the thing rendering to the thing
+   * rendered cannot put one turn's progress under another's answer.
+   */
+  progressByMessage: Map<string, ProgressStep[]>;
   send: (
     prompt: string,
     classification?: Classification,
@@ -462,6 +621,9 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
   const [streamingContents, setStreamingContents] = useState<Map<string, string>>(
     () => new Map(),
   );
+  const [progressByMessage, setProgressByMessage] = useState<
+    Map<string, ProgressStep[]>
+  >(() => new Map());
 
   /**
    * A ref-based lock so two rapid `send()` invocations cannot both
@@ -485,6 +647,13 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
           return next;
         });
       },
+      onProgress: (messageId, steps) => {
+        setProgressByMessage((prev) => {
+          const next = new Map(prev);
+          next.set(messageId, steps);
+          return next;
+        });
+      },
       onConversation: (next) => {
         setConversation(next);
       },
@@ -499,6 +668,27 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
       },
     });
   }
+
+  // The document reader's own page counter, folded into the same step list
+  // as everything else so a person sees one account of the turn rather than
+  // two. Subscribed once for the life of the provider; the routing is by the
+  // message id the reader stamps, never by which turn happens to be newest.
+  useEffect(() => {
+    const sub = listenAttachmentProgress((payload) => {
+      const registry = registryRef.current;
+      if (!registry || !payload.messageId) return;
+      registry.ingestForMessage(payload.messageId, {
+        kind: 'attachmentPage',
+        name: payload.name,
+        page: payload.page,
+        pages: payload.pages,
+        phase: payload.phase,
+      });
+    });
+    return () => {
+      void sub.then((un) => un());
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -793,6 +983,23 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
       }
       return changed ? next : prev;
     });
+    // Progress is pruned on a different rule from content: a step list stays
+    // after its turn finishes, because "what did it spend forty seconds on"
+    // is a question asked *after* the answer arrives, not during. What it
+    // does not survive is leaving the conversation — the durable account of
+    // a past run is the task record behind "View details", not a list this
+    // session happened to still be holding.
+    setProgressByMessage((prev) => {
+      if (prev.size === 0) return prev;
+      const known = new Set(conversation.messages.map((m) => m.id));
+      let changed = false;
+      const next = new Map<string, ProgressStep[]>();
+      for (const [id, steps] of prev) {
+        if (known.has(id)) next.set(id, steps);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
   }, [conversation]);
 
   const value = useMemo<UseConversation>(
@@ -803,6 +1010,7 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
       activeMessageId,
       activeRunId,
       streamingContents,
+      progressByMessage,
       send,
       open,
       newConversation,
@@ -817,6 +1025,7 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
       activeMessageId,
       activeRunId,
       streamingContents,
+      progressByMessage,
       send,
       open,
       newConversation,

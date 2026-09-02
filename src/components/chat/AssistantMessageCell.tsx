@@ -25,6 +25,8 @@ import {
 import { formatDuration, formatTokens } from './format';
 import { ChatOrb } from './ChatOrb';
 import { ThinkingTree, type ThinkingNode } from './ThinkingTree';
+import { RunProgressPanel } from './RunProgressPanel';
+import type { ProgressStep } from './runProgress';
 import { useTokenMetrics, type TokenMetrics } from './useTokenMetrics';
 import { Markdown } from './Markdown';
 import styles from './ChatSurface.module.css';
@@ -140,6 +142,14 @@ interface AssistantMessageCellProps {
     errorMessage?: string;
   }[];
   runSummary?: RunSummary | null;
+  /**
+   * What this turn has been doing, newest last.
+   *
+   * Keyed to this message by the reducer, never matched by position in the
+   * log: a list found by index is how one turn's progress ends up under
+   * another turn's answer.
+   */
+  progress?: ProgressStep[];
   /** Only the newest assistant cell draws the orb. */
   showAvatar?: boolean;
   onOpenInspector?: (runId: string) => void;
@@ -153,6 +163,7 @@ export function AssistantMessageCell({
   isLive,
   activity,
   runSummary,
+  progress,
   showAvatar,
   onOpenInspector,
   onRetry,
@@ -255,6 +266,18 @@ export function AssistantMessageCell({
             </p>
           ) : (
             <>
+              {/* What the turn is doing, above the answer. Rendered before
+                * the tool timeline because it covers the earlier interval:
+                * the reading, routing and loading that happen before the
+                * model is asked anything. */}
+              {progress && progress.length > 0 && (
+                <RunProgressPanel
+                  steps={progress}
+                  isLive={isStreaming}
+                  hasAnswer={displayContent.length > 0}
+                />
+              )}
+
               {/* The record of the turn. It stays after the run ends:
                 * this is what happened, not a progress spinner. */}
               {timelineNodes.length > 0 && (

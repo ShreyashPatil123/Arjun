@@ -86,6 +86,17 @@ export interface AttachmentProgress {
   pages: number | null;
   /** `image` | `pdf-text` | `pdf-scan` | `text` | `docx` | `xlsx` */
   kind: string | null;
+  /**
+   * The turn this read belongs to.
+   *
+   * A filename cannot say which turn asked for a read, so a surface that
+   * matched on the name alone would put one conversation's page counter under
+   * another's question. Stamped by `agent_start_run` from the same tag the
+   * `run_stage` events carry.
+   */
+  correlationId: string | null;
+  messageId: string | null;
+  conversationId: string | null;
 }
 
 export async function listenAttachmentProgress(
@@ -789,6 +800,27 @@ export interface TaskEventPage {
  * can carry document text and the audit record already holds them under access
  * control, so they do not travel a second path just to be displayed.
  */
+/**
+ * A stage of the work a run does before, during, and after generation.
+ *
+ * Mirrors `Stage` in `src-tauri/src/agent_runtime/stages.rs`. Adding a stage
+ * on one side and not the other is a type error here rather than a silently
+ * ignored event.
+ */
+export type RunStageName =
+  | 'accepted'
+  | 'readingAttachment'
+  | 'attachmentsRead'
+  | 'routing'
+  | 'routed'
+  | 'loadingModel'
+  | 'modelReady'
+  | 'planning'
+  | 'generating'
+  | 'thinking'
+  | 'verifying'
+  | 'complete';
+
 export type AgentEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end' }
@@ -901,6 +933,44 @@ export type AgentEvent =
       finishReason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error';
       tokensIn?: number;
       tokensOut?: number;
+    }
+  // ─── Progress (emitted by the Rust command and by the runtime) ────────
+  //
+  // Neither of these is durable. They exist so the surface can say what is
+  // happening while it happens; what actually happened is in the task record.
+  | {
+      /**
+       * A stage of the run, emitted by `agent_start_run` as it reaches it.
+       *
+       * `runId` on the envelope is the caller's `correlationId` until the
+       * server has issued its own id, which is what lets a stage emitted
+       * before the run existed still reach the cell waiting for it.
+       */
+      type: 'run_stage';
+      stage: RunStageName;
+      /** Milliseconds since the command was entered. Measured, not modelled. */
+      elapsedMs: number;
+      correlationId?: string | null;
+      messageId?: string | null;
+      conversationId?: string | null;
+      /** Stage-specific detail. Every field is something the backend measured. */
+      [detail: string]: unknown;
+    }
+  | {
+      /**
+       * The model is reasoning privately, or has stopped.
+       *
+       * **Carries no reasoning.** `characters` is the size of what the model
+       * produced and `elapsedMs` is how long it has been at it; neither can
+       * be turned back into a token of the thought. See the translator in
+       * `agent-runtime/src/run.ts`, which is the only place the reasoning
+       * stream is read and the only place this is produced.
+       */
+      type: 'model_thinking';
+      messageId: string;
+      state: 'start' | 'active' | 'end';
+      characters: number;
+      elapsedMs: number;
     };
 
 /** One event, tagged with the run it belongs to. */

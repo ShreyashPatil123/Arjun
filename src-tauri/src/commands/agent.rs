@@ -24,6 +24,7 @@ use crate::agent_runtime::events::{
     SYSTEM_ACTOR,
 };
 use crate::agent_runtime::retrieval::RunPassages;
+use crate::agent_runtime::stages::{Stage, StageReporter, StageTag};
 use crate::agent_runtime::tasks::{
     ApprovalRecord, PlanRecord, TaskRecord, TaskSummary, ToolCallRecord,
 };
@@ -468,6 +469,27 @@ pub async fn agent_start_run(
     // session ended mid-run.
     let signed_in = require_permission(&session, Permission::UseModel)?;
 
+    // Everything below this line used to happen in silence. Reading a scanned
+    // page, probing the GPU, choosing a model and loading several gigabytes of
+    // weights all happen before the agent loop is handed anything, and none of
+    // it emitted an event, so the chat surface sat on a motionless "Thinking"
+    // pill from the button press until the first token. The reporter is built
+    // at the first instruction of the command so its clock starts where the
+    // person's wait starts.
+    //
+    // Tagged with the caller's own ids because the run has none yet: the
+    // envelope carries the correlation id until `run_id` exists further down.
+    // See [`crate::agent_runtime::stages`].
+    let mut reporter = StageReporter::new(
+        app.clone(),
+        StageTag::new(
+            request.correlation_id.clone(),
+            request.message_id.clone(),
+            request.conversation_id.clone(),
+        ),
+    );
+    reporter.stage(Stage::Accepted);
+
     // Attachments are read before anything else, because what they say has to
     // be in the prompt the router sees — a turn asking "what does this drawing
     // show" routes on the drawing, not on the sentence.
@@ -479,16 +501,47 @@ pub async fn agent_start_run(
         .ocr_detent
         .unwrap_or(crate::ai_engine::ocr_profile::OcrDetent::Detailed);
     let mut attachment_reads = Vec::new();
-    for attachment in &request.attachments {
+    let attachment_count = request.attachments.len();
+    let attachments_started = std::time::Instant::now();
+    for (index, attachment) in request.attachments.iter().enumerate() {
+        // One stage per file, named for the file. The per-page detail comes
+        // from the reader itself on `attachment:progress`; this says which of
+        // how many is being started, which is the part the reader cannot know.
+        reporter.stage_with(
+            Stage::ReadingAttachment,
+            json!({
+                "name": attachment.name,
+                "index": index + 1,
+                "of": attachment_count,
+                "detent": detent.label(),
+            }),
+        );
         let read = crate::commands::ocr::read_attachment(
             &app,
             registry.inner(),
             servers.inner(),
             attachment,
             detent,
+            reporter.tag(),
         )
         .await?;
         attachment_reads.push(read);
+    }
+    if attachment_count > 0 {
+        // Counted from what the reads returned, never estimated: a file that
+        // carried its own text reports the characters it actually yielded.
+        reporter.stage_with(
+            Stage::AttachmentsRead,
+            json!({
+                "files": attachment_count,
+                "pages": attachment_reads.iter().map(|r| r.pages).sum::<u32>(),
+                "characters": attachment_reads
+                    .iter()
+                    .map(|r| r.text.chars().count())
+                    .sum::<usize>(),
+                "tookMs": attachments_started.elapsed().as_millis() as u64,
+            }),
+        );
     }
     let request = {
         let mut request = request;
@@ -497,6 +550,10 @@ pub async fn agent_start_run(
         }
         request
     };
+
+    // Hardware inspection and routing are one stage as far as the person is
+    // concerned: together they answer which model is going to do this.
+    reporter.stage(Stage::Routing);
 
     // Read from the live hardware rather than a stored figure: the right model
     // on a workstation is the wrong one on a laptop. The largest GPU wins on a
@@ -538,6 +595,17 @@ pub async fn agent_start_run(
         routing.reasons = preamble;
     }
 
+    reporter.stage_with(
+        Stage::Routed,
+        json!({
+            "modelId": routing.model_id,
+            "modelName": routing.model_name,
+            "role": routing.role.label(),
+            "intent": routing.intent,
+            "usedFallback": routing.used_fallback,
+        }),
+    );
+
     let entry = registry.find(&routing.model_id).ok_or_else(|| {
         format!(
             "{} was routed to but is not in the registry.",
@@ -555,10 +623,36 @@ pub async fn agent_start_run(
         entry.context_length,
         None,
     );
+    // Asked before the call, not after: once `endpoint_for` returns there is
+    // no way to tell a server that was already up from one that took forty
+    // seconds to load, and those are exactly the two cases the person needs
+    // told apart. A warm model produces no loading line at all.
+    let warm = servers.is_warm(&entry.id);
+    if !warm {
+        reporter.stage_with(
+            Stage::LoadingModel,
+            json!({
+                "modelName": routing.model_name,
+                "weightsBytes": entry.weights_bytes,
+                "fullyOnGpu": plan.full_offload,
+                "gpuPlan": plan.reason,
+            }),
+        );
+    }
+    let load_started = std::time::Instant::now();
     let endpoint = servers
         .endpoint_for(entry, registry.models_dir(), &plan)
         .await
         .map_err(|error| error.to_string())?;
+    reporter.stage_with(
+        Stage::ModelReady,
+        json!({
+            "modelName": routing.model_name,
+            "warm": warm,
+            "tookMs": load_started.elapsed().as_millis() as u64,
+            "runtime": endpoint.runtime.label(),
+        }),
+    );
 
     let state = RuntimeState {
         index: &index,
@@ -577,6 +671,10 @@ pub async fn agent_start_run(
     };
     let runtime = runtime(&handle, &app, &state)?;
     let run_id = uuid::Uuid::new_v4().to_string();
+    // From here the run has an id of its own and every later stage is
+    // addressed by it. The correlation id stays on the event as well, so a
+    // reducer that has not yet seen `plan_ready` still recognises its own run.
+    reporter.tag_mut().with_run_id(&run_id);
     let started_at = chrono::Utc::now();
 
     // The lifecycle, written as it happens rather than summarised at the end.
@@ -628,6 +726,8 @@ pub async fn agent_start_run(
             );
         }
     }
+
+    reporter.stage(Stage::Planning);
 
     // The run's own directory, created before the model is told anything — so
     // the instructions can name it, and so a tool call cannot arrive before the
@@ -822,6 +922,18 @@ pub async fn agent_start_run(
     // whether it may continue. Without a deadline on this side, that run waits
     // for as long as the application is open.
     let allowed = std::time::Duration::from_secs(planned.max_duration_seconds.max(1));
+
+    // The last stage this side can report. From here the loop owns the
+    // narrative: `message_start`, the token stream and the tool events are all
+    // emitted by the runtime as the work happens.
+    reporter.stage_with(
+        Stage::Generating,
+        json!({
+            "modelName": routing.model_name,
+            "preparationMs": reporter.elapsed_ms(),
+        }),
+    );
+
     let (outcome, ending) =
         match tokio::time::timeout(allowed, runtime.request("run.start", params)).await {
             Ok(Ok(value)) => (Ok(value), TaskEventType::RunCompleted),
@@ -918,6 +1030,10 @@ pub async fn agent_start_run(
     // there is no answer to check — reporting "nothing to verify" as a pass
     // would be the one misleading outcome available here.
     if !answer.trim().is_empty() {
+        reporter.stage_with(
+            Stage::Verifying,
+            json!({ "answerChars": answer.chars().count() }),
+        );
         let _ = record_and_publish(
             &app,
             &events,
@@ -1190,6 +1306,18 @@ pub async fn agent_start_run(
         &signed_in.user.id,
     );
     run_to_conversation.0.unbind(&run_id);
+
+    // The closing stage. Emitted for a run that failed as well as one that
+    // worked: a surface still showing "Generating…" for a run that ended three
+    // minutes ago is the same defect this whole channel exists to fix.
+    reporter.stage_with(
+        Stage::Complete,
+        json!({
+            "failed": run_failed,
+            "totalMs": reporter.elapsed_ms(),
+            "answerChars": answer.chars().count(),
+        }),
+    );
 
     Ok(RunSummary {
         run_id,

@@ -12,13 +12,15 @@
  * The fix is in `run.ts::translateForWire`. These tests assert:
  *   1. `message_start` carries the front-end's `messageId`.
  *   2. `message_update` from a `text_delta` produces a `delta` string.
- *   3. `thinking_delta` is not exposed as visible text.
+ *   3. `thinking_delta` is not exposed as visible text, and the
+ *      content-free `model_thinking` signal that replaced silence carries
+ *      no fragment of the reasoning.
  *   4. `toolcall_delta` is not exposed as visible text.
  *   5. `message_end` carries the right `messageId` and a mapped `finishReason`.
  */
 
 import { describe, expect, it } from "vitest";
-import { translateForWire } from "./run.js";
+import { MessageTranslator, translateForWire } from "./run.js";
 import type { AgentEvent, AgentToolCall } from "@openclaw/agent-core";
 import type { AssistantMessage, StopReason, Usage, TextContent } from "@openclaw/llm-core";
 
@@ -108,35 +110,120 @@ describe("translateForWire: message_update with text_delta", () => {
   });
 });
 
-describe("translateForWire: message_update does not leak thinking", () => {
-  it("drops thinking_delta entirely", () => {
-    const event: AgentEvent = {
-      type: "message_update",
-      message: assistantMessage("stop"),
-      assistantMessageEvent: {
-        type: "thinking_delta",
-        contentIndex: 0,
-        delta: "private chain-of-thought that must not be shown",
-        partial: assistantMessage("stop"),
-      },
-    };
-    const out = translateForWire(event, RUN_ID, MESSAGE_ID);
-    expect(out).toEqual([]);
+const SECRET = "private chain-of-thought that must not be shown";
+
+function thinkingDelta(delta: string): AgentEvent {
+  return {
+    type: "message_update",
+    message: assistantMessage("stop"),
+    assistantMessageEvent: {
+      type: "thinking_delta",
+      contentIndex: 0,
+      delta,
+      partial: assistantMessage("stop"),
+    },
+  } as AgentEvent;
+}
+
+describe("translateForWire: private reasoning is signalled but never disclosed", () => {
+  it("never produces a message_update from a thinking_delta", () => {
+    const out = translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID);
+    expect(out.every((e) => e.type !== "message_update")).toBe(true);
   });
 
-  it("drops thinking_start and thinking_end", () => {
-    const starts: AgentEvent = {
-      type: "message_update",
-      message: assistantMessage("stop"),
-      assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: assistantMessage("stop") },
-    };
+  it("emits a content-free model_thinking signal instead of silence", () => {
+    const out = translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID);
+    expect(out).toEqual([
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "start",
+        characters: SECRET.length,
+        elapsedMs: 0,
+      },
+    ]);
+  });
+
+  it("carries no fragment of the reasoning anywhere in the serialised event", () => {
+    // Serialised rather than field-checked: a future field that accidentally
+    // carried the text would pass a per-field assertion and fail this one.
+    const wire = JSON.stringify(translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID));
+    expect(wire).not.toContain(SECRET);
+    expect(wire).not.toContain("chain-of-thought");
+    for (const word of SECRET.split(" ")) {
+      expect(wire).not.toContain(word);
+    }
+  });
+
+  it("reports size and duration without the text, and closes on thinking_end", () => {
+    let clock = 1_000;
+    const translator = new MessageTranslator(MESSAGE_ID, () => clock);
+    expect(translator.translate(thinkingDelta("abcde"))).toEqual([
+      { type: "model_thinking", messageId: MESSAGE_ID, state: "start", characters: 5, elapsedMs: 0 },
+    ]);
+    // Inside the tick window: counted, not sent.
+    clock = 1_500;
+    expect(translator.translate(thinkingDelta("fghij"))).toEqual([]);
+    // Past it: one tick carrying the running total.
+    clock = 2_600;
+    expect(translator.translate(thinkingDelta("klm"))).toEqual([
+      { type: "model_thinking", messageId: MESSAGE_ID, state: "active", characters: 13, elapsedMs: 1_600 },
+    ]);
+    clock = 4_000;
     const ends: AgentEvent = {
       type: "message_update",
       message: assistantMessage("stop"),
-      assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "secret", partial: assistantMessage("stop") },
-    };
-    expect(translateForWire(starts, RUN_ID, MESSAGE_ID)).toEqual([]);
-    expect(translateForWire(ends, RUN_ID, MESSAGE_ID)).toEqual([]);
+      assistantMessageEvent: {
+        type: "thinking_end",
+        contentIndex: 0,
+        content: SECRET,
+        partial: assistantMessage("stop"),
+      },
+    } as AgentEvent;
+    expect(translator.translate(ends)).toEqual([
+      { type: "model_thinking", messageId: MESSAGE_ID, state: "end", characters: 13, elapsedMs: 3_000 },
+    ]);
+  });
+
+  it("closes the thinking block when the model answers without a thinking_end", () => {
+    let clock = 0;
+    const translator = new MessageTranslator(MESSAGE_ID, () => clock);
+    translator.translate(thinkingDelta(SECRET));
+    clock = 900;
+    const text: AgentEvent = {
+      type: "message_update",
+      message: assistantMessage("stop"),
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hello" },
+    } as AgentEvent;
+    expect(translator.translate(text)).toEqual([
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "end",
+        characters: SECRET.length,
+        elapsedMs: 900,
+      },
+      { type: "message_update", messageId: MESSAGE_ID, delta: "Hello" },
+    ]);
+  });
+
+  it("closes an open thinking block on message_end so the surface stops spinning", () => {
+    let clock = 0;
+    const translator = new MessageTranslator(MESSAGE_ID, () => clock);
+    translator.translate(thinkingDelta("thought"));
+    clock = 2_000;
+    const out = translator.translate({
+      type: "message_end",
+      message: assistantMessage("stop"),
+    } as AgentEvent);
+    expect(out[0]).toEqual({
+      type: "model_thinking",
+      messageId: MESSAGE_ID,
+      state: "end",
+      characters: 7,
+      elapsedMs: 2_000,
+    });
+    expect(out[1]?.type).toBe("message_end");
   });
 });
 

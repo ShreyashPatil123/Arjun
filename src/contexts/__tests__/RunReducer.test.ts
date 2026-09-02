@@ -75,6 +75,7 @@ describe('RunReducer: per-run content isolation', () => {
     const seen: Array<{ messageId: string; content: string }> = [];
     const registry = new RunReducerRegistry({
       onContent: (messageId, content) => seen.push({ messageId, content }),
+      onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
     });
@@ -113,6 +114,7 @@ describe('RunReducer: per-run content isolation', () => {
   it('an event for a different run is dropped, not routed to this reducer', () => {
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
     });
@@ -133,6 +135,7 @@ describe('RunReducer: per-run content isolation', () => {
     const seen: Array<{ messageId: string; content: string }> = [];
     const registry = new RunReducerRegistry({
       onContent: (messageId, content) => seen.push({ messageId, content }),
+      onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
     });
@@ -147,6 +150,7 @@ describe('RunReducer: per-run content isolation', () => {
     const seen: Array<{ messageId: string; content: string }> = [];
     const registry = new RunReducerRegistry({
       onContent: (messageId, content) => seen.push({ messageId, content }),
+      onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
     });
@@ -188,6 +192,7 @@ describe('collapseRepeats: sentence-level dedup', () => {
     // sentence in the live content.
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
     });
@@ -232,6 +237,7 @@ describe('Registry: publish callbacks', () => {
     const conversations: Conversation[] = [];
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onProgress: () => undefined,
       onConversation: (next) => conversations.push(next),
       onRunDone: () => undefined,
     });
@@ -239,5 +245,153 @@ describe('Registry: publish callbacks', () => {
     const conv = makeConversation('conv-1', [makeMessage('msg-a', 'assistant')]);
     registry.publishConversation(conv);
     expect(conversations).toEqual([conv]);
+  });
+});
+
+/**
+ * Progress routing.
+ *
+ * The stages that matter most — attachment reading, routing, model loading —
+ * are emitted *before* the server has issued a run id, so their envelope
+ * carries the caller's correlation id instead. A reducer that only recognised
+ * the server id would drop exactly the events that cover the long silent part
+ * of a cold turn, which is the interval this feature exists to fill.
+ *
+ * These tests hold both halves: the events must reach their own turn, and
+ * they must never reach another one.
+ */
+describe('RunReducer: progress events reach the right turn and no other', () => {
+  function harness() {
+    const progress: Array<{ messageId: string; labels: string[] }> = [];
+    const registry = new RunReducerRegistry({
+      onContent: () => undefined,
+      onProgress: (messageId, steps) =>
+        progress.push({ messageId, labels: steps.map((s) => s.label) }),
+      onConversation: () => undefined,
+      onRunDone: () => undefined,
+    });
+    return { registry, progress };
+  }
+
+  const stage = (
+    name: string,
+    messageId: string,
+    detail: Record<string, unknown> = {},
+  ) =>
+    ({
+      type: 'run_stage',
+      stage: name,
+      elapsedMs: 0,
+      messageId,
+      ...detail,
+    }) as unknown as AgentEventEnvelope['event'];
+
+  it('seeds a first step at construction, before any event arrives', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    expect(progress).toHaveLength(1);
+    expect(progress[0].messageId).toBe('msg-a');
+    expect(progress[0].labels).toEqual(['Sending the request']);
+    a.dispose();
+  });
+
+  it('accepts a stage addressed by the correlation id, before plan_ready', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    // The envelope carries the caller's own run id: the server has none yet.
+    const consumed = a.apply({
+      runId: 'run-a',
+      event: stage('routing', 'msg-a'),
+    });
+    expect(consumed).toBe(true);
+    expect(progress[progress.length - 1].labels).toContain('Choosing a model');
+    a.dispose();
+  });
+
+  it('accepts a stage addressed by the server run id, after plan_ready', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    a.apply({
+      runId: 'srv-9',
+      event: {
+        type: 'plan_ready',
+        correlationId: 'run-a',
+      } as unknown as AgentEventEnvelope['event'],
+    });
+    const consumed = a.apply({
+      runId: 'srv-9',
+      event: stage('planning', 'msg-a'),
+    });
+    expect(consumed).toBe(true);
+    expect(progress[progress.length - 1].labels).toContain('Planning the work');
+    a.dispose();
+  });
+
+  it('rejects a stage that names another turn even on a matching run id', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    const before = progress.length;
+    const consumed = a.apply({
+      runId: 'run-a',
+      event: stage('generating', 'msg-somebody-else'),
+    });
+    expect(consumed).toBe(false);
+    expect(progress).toHaveLength(before);
+    a.dispose();
+  });
+
+  it('rejects a stage from an unrelated run', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    const before = progress.length;
+    expect(
+      a.apply({ runId: 'run-b', event: stage('generating', 'msg-b') }),
+    ).toBe(false);
+    expect(progress).toHaveLength(before);
+    a.dispose();
+  });
+
+  it('keeps two concurrent turns' + " progress lists apart", () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    const b = new RunReducer(registry, 'run-b', 'conv-1', 'msg-b');
+    a.apply({ runId: 'run-a', event: stage('routing', 'msg-a') });
+    b.apply({ runId: 'run-b', event: stage('planning', 'msg-b') });
+
+    const forA = progress.filter((p) => p.messageId === 'msg-a').pop();
+    const forB = progress.filter((p) => p.messageId === 'msg-b').pop();
+    expect(forA?.labels).toEqual(['Sending the request', 'Choosing a model']);
+    expect(forB?.labels).toEqual(['Sending the request', 'Planning the work']);
+    a.dispose();
+    b.dispose();
+  });
+
+  it('records that the model is thinking without recording what it thought', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    const secret = 'private chain of thought';
+    a.apply({
+      runId: 'run-a',
+      event: {
+        type: 'model_thinking',
+        messageId: 'msg-a',
+        state: 'start',
+        characters: secret.length,
+        elapsedMs: 0,
+      } as unknown as AgentEventEnvelope['event'],
+    });
+    const latest = progress[progress.length - 1];
+    expect(latest.labels).toContain('Thinking');
+    expect(JSON.stringify(latest)).not.toContain(secret);
+    a.dispose();
+  });
+
+  it('a disposed reducer takes no further progress', () => {
+    const { registry, progress } = harness();
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    a.dispose();
+    const before = progress.length;
+    a.apply({ runId: 'run-a', event: stage('generating', 'msg-a') });
+    expect(progress).toHaveLength(before);
   });
 });
