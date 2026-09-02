@@ -1,8 +1,9 @@
 //! The record a finished run leaves behind.
 //!
-//! PS 26117 asks for a Tasks surface showing *"every task you have run, with
+//! ARJUN design rule: a Tasks surface showing every task that has run, with
 //! its plan, the models it chose and why, the evidence it retrieved, and the
-//! artifacts it produced."* Until now a run left nothing at all: the answer went
+//! artifacts it produced. PS 26117 does not ask for this surface; it is how
+//! ARJUN makes an agentic run checkable after the fact. Until now a run left nothing at all: the answer went
 //! to whoever was watching, and everything that made it checkable — the plan it
 //! was held to, the passages it stood on, the working behind its figures — was
 //! dropped when the process moved on.

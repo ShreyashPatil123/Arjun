@@ -241,25 +241,15 @@ export function getEnvApiKey(provider: string): string | undefined {
     }
   }
 
-  if (provider === "amazon-bedrock") {
-    // Amazon Bedrock supports multiple credential sources:
-    // 1. AWS_PROFILE - named profile from ~/.aws/credentials
-    // 2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY - standard IAM keys
-    // 3. AWS_BEARER_TOKEN_BEDROCK - Bedrock bearer token
-    // 4. AWS_CONTAINER_CREDENTIALS_RELATIVE_URI - ECS task roles
-    // 5. AWS_CONTAINER_CREDENTIALS_FULL_URI - ECS task roles (full URI)
-    // 6. AWS_WEB_IDENTITY_TOKEN_FILE - IRSA (IAM Roles for Service Accounts)
-    if (
-      getEnvValue("AWS_PROFILE") ||
-      (getEnvValue("AWS_ACCESS_KEY_ID") && getEnvValue("AWS_SECRET_ACCESS_KEY")) ||
-      getEnvValue("AWS_BEARER_TOKEN_BEDROCK") ||
-      getEnvValue("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") ||
-      getEnvValue("AWS_CONTAINER_CREDENTIALS_FULL_URI") ||
-      getEnvValue("AWS_WEB_IDENTITY_TOKEN_FILE")
-    ) {
-      return "<authenticated>";
-    }
-  }
+  // ARJUN prune: the upstream amazon-bedrock branch is removed.
+  //
+  // It read AWS_PROFILE, AWS_ACCESS_KEY_ID/SECRET, AWS_BEARER_TOKEN_BEDROCK and
+  // the ECS/IRSA credential variables. ARJUN reaches exactly two local
+  // inference servers over loopback and holds no cloud credential of any kind,
+  // so the branch could only ever have reported a credential this product must
+  // not possess — and its presence put the string "amazon-bedrock" in the
+  // shipped bundle, where a reviewer auditing the air-gap claim would find it
+  // and quite reasonably ask what it was for.
 
   return undefined;
 }

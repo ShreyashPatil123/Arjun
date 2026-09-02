@@ -1,6 +1,6 @@
 //! Where documents live once they are in the workbench.
 //!
-//! PS step 12 asks for the original file *and* the derived representations to be
+//! ARJUN design rule 12 asks for the original file *and* the derived representations to be
 //! stored locally. Both halves matter, and for different reasons:
 //!
 //! - The **original** is the evidence. A citation that points at page 4 of an

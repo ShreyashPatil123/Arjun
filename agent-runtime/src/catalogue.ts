@@ -81,10 +81,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     description:
       "Searches the organisation's indexed documents and returns passages with their source and " +
       "page, each marked [E1], [E2] and so on for citation. " +
-      "Use it before answering anything about internal procedure, specification, correspondence " +
-      "or a figure — and use it first, before reasoning about what the answer might be. " +
-      "Do not use it to answer from memory, and do not treat an empty result as proof a thing is " +
-      "false: results are filtered by what the signed-in person may read, so an absent document " +
+      "Use it before answering anything about this organisation's own procedure, specification, " +
+      "correspondence or figures — and use it first, before reasoning about what the answer " +
+      "might be. Do not use it for greetings, small talk, general knowledge, mathematics or " +
+      "writing code: none of those live in the collections, and searching for them wastes a " +
+      "turn and produces a refusal where an answer belonged. " +
+      "Do not answer such questions from memory, and do not treat an empty result as proof a thing is " +
+      "false: results are filtered by what the signed-in person is permitted to read, so a document " +
       "may exist and be out of scope. " +
       "Effects: none. It only reads, needs nobody's approval, and touches no network. " +
       "Limits: at most 6 passages per call, and a long result is cut deterministically with a " +
@@ -92,8 +95,10 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       'Set detail to "citations" to see only sources and pages, which is much cheaper when you ' +
       "are deciding which passages you want. Use page to fetch the next batch when a result " +
       "says it was truncated. " +
-      "If it finds nothing: say no source was found rather than answering anyway, or search " +
-      "again with the specific technical term rather than a paraphrase.",
+      "If it finds nothing: search again with the specific technical term rather than a " +
+      "paraphrase, and if that also finds nothing say no source was found rather than " +
+      "answering the document question anyway. That applies to the document question you " +
+      "searched for, not to the rest of the conversation.",
     parameters: closed({
       query: Type.String({
         description:
@@ -173,7 +178,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "reaches no outside network. " +
       "Limits: the same 10-page range as load_evidence_region. This deployment may have no OCR or " +
       "vision model installed, in which case it says so. " +
-      "If pages come back unread: say the pages could not be read and that a person needs to look " +
+      "If it reports pages unread: say the pages could not be read and that a person needs to look " +
       "at them. Never describe or quote a page reported as unread.",
     parameters: closed({
       documentSha256: Type.String({
@@ -259,7 +264,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "(the signed-in person's preferences). " +
       "Use it before settling on wording a project has already agreed, so the same term does not " +
       "get re-derived differently on every task. " +
-      "Do not treat what it returns as a citable source: these are the deployment's own notes, " +
+      "Do not use what it returns as a citable source: these are the deployment's own notes, " +
       "not retrieved passages, and a claim that needs a citation still needs a search. " +
       "Effects: none. It only reads, needs nobody's approval, and touches no network. " +
       "Limits: you cannot name a project or a person — both are taken from who is signed in, and " +
@@ -283,13 +288,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "and a version. " +
       "Use it when a task looks like one somebody has written guidance for — a template to " +
       "follow, a checklist, a house convention — before inventing your own approach. " +
-      "Do not expect instructions from it: it returns descriptions only, and reading a skill's " +
+      "Do not use it to read instructions: it returns descriptions only, and reading a skill's " +
       "instructions is a separate, deliberate step. " +
       "Effects: none. It only reads local metadata, needs nobody's approval, and touches no " +
       "network. " +
       "Limits: filtered to what the signed-in person may see and to what this task is permitted " +
       "to do, so a skill needing a tool you do not have is not offered. " +
-      "If nothing matches: there is no installed guidance for this. Carry on with the task.",
+      "If it matches nothing: there is no installed guidance for this. Carry on with the task.",
     parameters: closed({
       query: Type.String({
         description: "What kind of guidance you are looking for, in a few words.",
@@ -364,7 +369,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "with every step of the working. " +
       "Use it for any number that will appear in a deliverable. A figure you worked out in your " +
       "head is not verifiable and may be wrong; one from here is recorded and can be shown. " +
-      "Do not recompute or re-round what it returns — quote the result exactly as given. " +
+      "Do not use your own arithmetic to recompute or re-round what it returns — quote the result exactly as given. " +
       "Effects: none that a person must approve, but each call is recorded and the workbook tool " +
       "draws on that record, so the order you run them in is the order they appear. " +
       "Limits: arithmetic with units, not algebra or code. " +
@@ -412,7 +417,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "which is why it needs nobody's approval. " +
       "Limits: one level deep — a child cannot delegate further — and it is bounded by its own " +
       "time and step budget. " +
-      "If the child fails or times out: you get what it had reached. Do the work yourself or say " +
+      "If it fails or times out: you get what it had reached. Do the work yourself or say " +
       "what could not be checked; do not present its partial findings as complete.",
     parameters: closed({
       profile: Type.Union(
@@ -473,7 +478,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "Effects: creates or overwrites a file. A person must approve it before it happens, so " +
       "expect a pause; nothing is written until they answer. " +
       'Limits: relative names inside this task\'s directory only. Any other path is refused. ' +
-      "If a person declines: do not write it elsewhere or under another name. Say it was not " +
+      "If it is declined: do not write it elsewhere or under another name. Say it was not " +
       "written and carry on with what you can do.",
     parameters: closed({
       path: Type.String({
@@ -498,7 +503,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "Limits: every field the template asks for must be present, as text; a missing required " +
       "field fails the render rather than producing a document with a gap in it. Available " +
       "templates: approval_note. " +
-      "If the render fails: it names the field that was missing. Supply it and call again — do " +
+      "If it fails to render: it names the field that was missing. Supply it and call again — do " +
       "not claim a document was produced. Afterwards, check it with artifact.verify_docx before " +
       "saying it is ready.",
     parameters: closed({
@@ -523,7 +528,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "Produces an Excel workbook showing the working behind every figure this task calculated, " +
       "as live formulas Excel recomputes. " +
       "Use it when somebody needs to check the arithmetic rather than take it on trust. " +
-      "Do not expect to pass figures to it: it draws on the calculation.evaluate_with_units calls " +
+      "Do not use it to pass figures directly: it draws on the calculation.evaluate_with_units calls " +
       "already made, so run the calculations first or the workbook will be empty. " +
       "Effects: creates a file. A person must approve it before it happens, so expect a pause. " +
       "Limits: it can only show what was actually calculated through the engine. Arithmetic you " +
@@ -535,22 +540,59 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   },
 
   {
+    name: "artifact.create_briefing_deck",
+    label: "Produce a briefing deck",
+    readOnly: false,
+    description:
+      "Produces a PowerPoint briefing from a fixed four-section template: Findings, " +
+      "Recommendation, Assumptions, Evidence, in that order. " +
+      "Use it when somebody needs to present what this task found, rather than read it. " +
+      "Do not use it to write a document — artifact.create_approval_note produces prose, and a " +
+      "deck of full paragraphs is neither. You supply the bullets; you do not choose the " +
+      "headings, and each of the four needs at least one. Evidence is required for the reason a " +
+      "citation is: a briefing whose findings have no source is not a briefing. " +
+      "Effects: creates a file. A person must approve it before it happens, so expect a pause. " +
+      "Limits: the deck is marked DRAFT until somebody signs it, and the word is printed on the " +
+      "slide rather than only stored. " +
+      "If it refuses a section as empty: that section had nothing under it. A heading with no " +
+      "bullets reads as a finding of nothing, which is not the same as having nothing to say.",
+    parameters: closed({
+      path: Type.String({ description: 'Relative, for example "briefing.pptx".', minLength: 1 }),
+      content: Type.Object(
+        {
+          title: Type.String({ description: "Deck title, shown on the cover slide.", minLength: 1 }),
+          findings: Type.Array(Type.String(), { description: "What this task established." }),
+          recommendation: Type.Array(Type.String(), { description: "What should happen next." }),
+          assumptions: Type.Array(Type.String(), { description: "What was taken as given." }),
+          evidence: Type.Array(Type.String(), { description: "Where the findings came from." }),
+        },
+        {
+          description:
+            "Title plus one list of bullet strings per section. A single string is accepted " +
+            "where a section is one sentence.",
+        },
+      ),
+    }),
+  },
+
+  {
     name: "sandbox.run_code",
     label: "Run code in the sandbox",
     readOnly: false,
     description:
-      "Runs a short program in an isolated sandbox with no network access. " +
+      "Runs a short program in a container with the network switched off, a read-only root " +
+      "filesystem, capped CPU and memory, no host credentials, and a wall-clock ceiling. " +
       "Use it only when a result genuinely needs code. " +
-      "Do not use it for arithmetic — calculation.evaluate_with_units does that deterministically, " +
-      "records the working, and actually runs. " +
+      "Do not use it for arithmetic — calculation.evaluate_with_units does that deterministically " +
+      "and records the working. " +
       "Effects: executes code. A person must approve it before it happens. " +
-      "NOTE: execution is not built on this deployment. The call is accepted, checked, and then " +
-      "refused, and nothing runs. " +
-      "Limits: no network from inside the sandbox, and a short wall-clock ceiling. " +
+      "Limits: it runs only where a container runtime is responding and the base image is already " +
+      "on the machine. ARJUN never fetches an image, because that would be an outbound call. On a " +
+      "machine with weaker isolation than a container, the call is refused rather than run. " +
       "If it is refused: treat the refusal as final. Say the code was not run — never describe " +
       "what it would have produced, and never present imagined output as a result.",
     parameters: closed({
-      language: Type.Union([Type.Literal("python")], {
+      language: Type.Union([Type.Literal("python"), Type.Literal("javascript")], {
         description: "Which language runtime to use.",
       }),
       source: Type.String({ description: "The complete program.", minLength: 1 }),

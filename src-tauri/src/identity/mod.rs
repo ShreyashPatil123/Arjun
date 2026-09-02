@@ -1,6 +1,6 @@
 //! Who is acting, and what that entitles them to.
 //!
-//! PS 26117 step 8 is explicit that the model must never decide permissions. So
+//! ARJUN design rule 8 is explicit that the model must never decide permissions. So
 //! entitlement is decided here, from the signed-in user's roles, and nothing in
 //! this module can be reached by anything a model emits — it only ever sees a
 //! [`Session`] the application already established.
@@ -39,7 +39,7 @@ pub use credentials::{
 
 /// A distinct thing someone can be entitled to do.
 ///
-/// Taken from PS step 8's own list, plus [`Permission::EnterProvisioning`] —
+/// Taken from ARJUN design rule 8's own list, plus [`Permission::EnterProvisioning`] —
 /// making the network reachable is the single most consequential action in the
 /// product, so it is a permission in its own right rather than a side effect of
 /// being an administrator.

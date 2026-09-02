@@ -11,7 +11,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "a53025ada23b8a9672bc900ed8dfd5b70eea93f3a7203ebe9fc3d4ba68e40030"
+          "content": "96c6454ccdd6db8cac6a0164c6d6d3b4ced7ee6202afe4de4400bb6dd46036a8"
         }
       ]
     }
@@ -4540,18 +4540,6 @@
         }
       ],
       "purl": "pkg:cargo/ryu@1.0.23"
-    },
-    {
-      "type": "library",
-      "name": "safetensors",
-      "version": "0.4.5",
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
-        }
-      ],
-      "purl": "pkg:cargo/safetensors@0.4.5"
     },
     {
       "type": "library",

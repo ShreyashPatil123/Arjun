@@ -23,6 +23,7 @@ use std::path::Path;
 use super::calculation;
 use super::executor::ToolRunner;
 use super::sandbox::{assess, SandboxPolicy, SandboxTier};
+use super::sandbox_exec;
 use super::tools::{spec_for, ToolCall, ToolName};
 use crate::identity::Session;
 use crate::knowledge::{
@@ -101,7 +102,10 @@ pub fn render_passages(query: &str, marked: &[(usize, &SearchResult)]) -> String
         // Part C asks for exactly this behaviour.
         return format!(
             "No passages matched {query:?}. Nothing in the connected collections says this, \
-             so do not assert it. Either try different wording or state that no source was found."
+             so do not assert it. Try different wording, or state that no source was \
+             found. If the question was not about this organisation's documents \
+             in the first place, this search was the wrong move: answer it directly \
+             instead of reporting a missing source."
         );
     }
 
@@ -725,19 +729,96 @@ impl<'a> LocalToolRunner<'a> {
         }
     }
 
-    fn execute_code(&self) -> Result<String, String> {
+    /// Runs a program the model wrote, in a container, and reports what it did.
+    ///
+    /// Two gates before anything runs, and they answer different questions.
+    /// [`assess`] asks whether this *machine* may run untrusted code at all;
+    /// [`sandbox_exec::run_in_container`] asks whether the isolation it would
+    /// actually get keeps the promise. A tier an administrator has accepted the
+    /// risk on passes the first and is refused by the second, because accepting
+    /// a risk is a statement about policy, not a container this code knows how
+    /// to drive.
+    ///
+    /// The result is written for a model to read, and the rule it exists to
+    /// enforce is in the first line of every failure: **nothing ran, so there is
+    /// no output to describe**. A model told that a program failed will
+    /// otherwise reach for what the program would have printed.
+    fn execute_code(&self, call: &ToolCall) -> Result<String, String> {
         let assessment = assess(self.sandbox_tier, &self.sandbox_policy);
-        match assessment {
-            super::sandbox::SandboxAssessment::Refused { reason } => Err(format!(
+        if let super::sandbox::SandboxAssessment::Refused { reason } = assessment {
+            return Err(format!(
                 "Code was not run: {reason} Nothing was executed, so no result exists — do not \
                  describe what the code would have produced."
-            )),
-            _ => Err(
-                "Running code is not implemented yet, even though this machine could isolate it. \
-                 No result exists."
-                    .to_string(),
-            ),
+            ));
         }
+
+        let language = call.text("language").ok_or_else(|| {
+            format!(
+                "sandbox.run_code needs a language. Supported: {}.",
+                sandbox_exec::SUPPORTED_LANGUAGES
+            )
+        })?;
+        let source = call
+            .text("source")
+            .ok_or("sandbox.run_code needs the program to run, as `source`.")?;
+
+        let workspace = self.run_workspace.ok_or(
+            "this run has no workspace, so there is nowhere to put the program or its output. \
+             Nothing was executed.",
+        )?;
+
+        let execution = sandbox_exec::run_in_container(
+            self.sandbox_tier,
+            &self.sandbox_policy,
+            workspace,
+            language,
+            source,
+        )?;
+
+        // The tier goes in the result, not only in the audit record: a reader
+        // deciding whether to trust an output needs to know what contained it.
+        let mut out = format!(
+            "Ran {language} in a {} sandbox ({:.1}s).\n",
+            self.sandbox_tier.label(),
+            execution.duration.as_secs_f64()
+        );
+
+        if execution.timed_out {
+            out.push_str(&format!(
+                "\nThe program did not finish within {}s and was stopped. Any output below is \
+                 partial, and the work it was doing did not complete.\n",
+                self.sandbox_policy.timeout.as_secs()
+            ));
+        } else {
+            match execution.exit_code {
+                Some(0) => out.push_str("Exit status: 0 (success).\n"),
+                Some(code) => out.push_str(&format!(
+                    "Exit status: {code}. The program ran and failed; the error is below, and it \
+                     is the program's, not the sandbox's.\n"
+                )),
+                None => out.push_str("The program was terminated by a signal.\n"),
+            }
+        }
+
+        if execution.stdout.trim().is_empty() {
+            out.push_str("\nstdout: (empty)\n");
+        } else {
+            out.push_str(&format!("\nstdout:\n{}\n", execution.stdout));
+        }
+
+        if !execution.stderr.trim().is_empty() {
+            out.push_str(&format!("\nstderr:\n{}\n", execution.stderr));
+        }
+
+        if execution.truncated_bytes > 0 {
+            out.push_str(&format!(
+                "\n{} byte(s) of output were dropped at the limit. What is shown above is the \
+                 beginning of the output, not all of it.\n",
+                execution.truncated_bytes
+            ));
+        }
+
+        Ok(out)
     }
 
     fn validate(&self, path: Option<&Path>) -> Result<String, String> {
@@ -862,7 +943,7 @@ impl ToolRunner for LocalToolRunner<'_> {
             ToolName::ReadScopedFile => self.read(call, resolved_path),
             ToolName::WriteScopedFile => self.write(call, resolved_path),
             ToolName::RunCalculation => self.calculate(call),
-            ToolName::ExecuteCode => self.execute_code(),
+            ToolName::ExecuteCode => self.execute_code(call),
             ToolName::ValidateArtifact => self.validate(resolved_path),
             ToolName::SovereigntyGetEvidence => self.sovereignty_evidence(),
             // Handled on the agent path, where the run's session and the memory
@@ -887,9 +968,19 @@ impl ToolRunner for LocalToolRunner<'_> {
             ToolName::AgentDelegateReadonly => self.delegate_to_subagent(call).await,
             // Phase 6. Said plainly so a model does not describe a document it
             // has not produced.
-            ToolName::CreateDocx | ToolName::CreateXlsx => Err(format!(
-                "Producing a {} is not built yet, so no file was created and none exists.",
-                if tool == ToolName::CreateDocx { "Word document" } else { "spreadsheet" }
+            // Artifact production needs the run's accumulated state — its
+            // calculations, its evidence, the files it has already produced —
+            // which this runner is rebuilt too often to hold. The agent path
+            // handles all three in `agent_runtime::artifacts`. Said plainly so
+            // a model on the orchestrator path does not describe a document it
+            // has not produced.
+            ToolName::CreateDocx | ToolName::CreateXlsx | ToolName::CreatePptx => Err(format!(
+                "Producing a {} is not available on this path, so no file was created and none exists.",
+                match tool {
+                    ToolName::CreateDocx => "Word document",
+                    ToolName::CreateXlsx => "spreadsheet",
+                    _ => "briefing deck",
+                }
             )),
         }
     }
@@ -1109,18 +1200,34 @@ mod tests {
         assert!(error.contains("do not describe what the code would have produced"));
     }
 
+    /// Artifact production is not on this path, and says so without ambiguity.
+    ///
+    /// All three artifact tools are handled by `agent_runtime::artifacts`,
+    /// which holds the run's accumulated calculations and evidence. This runner
+    /// is rebuilt per call and holds none of it, so it refuses.
+    ///
+    /// The assertion that matters is the second one. A model told only that
+    /// something "is not available" may still write a sentence describing the
+    /// document; one told plainly that no file exists has nothing to describe.
     #[tokio::test]
-    async fn an_unbuilt_document_tool_says_no_file_exists() {
-        let f = fixture();
-        let error = runner(&f)
-            .run(
-                ToolName::CreateDocx,
-                &ToolCall::new("create_docx", json!({})),
-                Some(&f.root.join("note.docx")),
-            ).await.unwrap_err();
+    async fn an_artifact_tool_on_this_path_says_no_file_exists() {
+        for (tool, wire, name, label) in [
+            (ToolName::CreateDocx, "create_docx", "note.docx", "Word document"),
+            (ToolName::CreateXlsx, "create_xlsx", "working.xlsx", "spreadsheet"),
+            (ToolName::CreatePptx, "create_pptx", "deck.pptx", "briefing deck"),
+        ] {
+            let f = fixture();
+            let error = runner(&f)
+                .run(tool, &ToolCall::new(wire, json!({})), Some(&f.root.join(name)))
+                .await
+                .unwrap_err();
 
-        assert!(error.contains("not built yet"));
-        assert!(error.contains("none exists"));
+            assert!(error.contains(label), "{wire}: refusal should name what it is: {error}");
+            assert!(
+                error.contains("no file was created and none exists"),
+                "{wire}: refusal must foreclose describing a document that does not exist: {error}"
+            );
+        }
     }
 
     // ── Validation ───────────────────────────────────────────────────────

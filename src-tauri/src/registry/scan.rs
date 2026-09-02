@@ -200,6 +200,7 @@ pub fn entry_for(gguf: &ScannedGguf) -> ModelEntry {
         // Cleared for nothing. See the module note above.
         permitted_classifications: Vec::new(),
         path: gguf.path.clone(),
+        projector: gguf.mmproj_path.clone(),
         load: Some(LoadSpec {
             provider_id,
             model_id,

@@ -1,78 +1,102 @@
-# Why ARJUN wins PS 26117
+# ARJUN against PS 26117
 
-This document maps every requirement in the MRPL problem statement
-to a specific ARJUN feature. The mapping is the substantive answer
-to the "why this project" question. A reviewer should be able to
-point at any row in the table and find the file, command, or UI
-that delivers it.
+The authoritative problem statement text is in
+[`ps-26117-official.md`](ps-26117-official.md), retrieved from
+`https://sih.gov.in/sih2026PS`. Check any claim here against that file before
+repeating it to a judge.
+
+An earlier version of this page presented a 20-row table headed **"PS 26117
+requirements"**. Around half of those rows are things the problem statement
+never asks for. They are good engineering and several are real differentiators,
+but presenting them as MRPL's requirements is a claim an MRPL judge can falsify
+by reading their own brief. The table is therefore split in two.
 
 ---
 
-## PS 26117 requirements (paraphrased; refer to the original PS for
-the authoritative text)
+## Part 1 — What PS 26117 actually asks for
 
-| # | Requirement | ARJUN feature | Where to find it |
+Every row quotes the official text. This is the table to defend.
+
+| # | Requirement (official wording) | Where it lives | State |
 |---|---|---|---|
-| 1 | A local LLM that runs on a refinery laptop | Rust core + `llama.cpp` (CUDA / Vulkan / CPU) | `src-tauri/src/ai_engine/` |
-| 2 | No internet — air-gapped | Single outbound chokepoint (`sovereignty::broker`); static egress gate | `scripts/check-egress.mjs` |
-| 3 | Multimodal: P&IDs, datasheets, photos | Vision bridge to local vLLM/llama.cpp | `src-tauri/src/ai_engine/vision_bridge.rs` |
-| 4 | Reads the site's own documents | Knowledge service over local folders | `src-tauri/src/knowledge/` |
-| 5 | Plans a multi-step task | Plan-then-execute orchestrator | `src-tauri/src/orchestrator/` |
-| 6 | Calls the right tool for the right step | Capability router with policy gateway | `src-tauri/src/capability/`, `src-tauri/src/policy/` |
-| 7 | Produces Word / Excel / PowerPoint | OOXML writers from the artifacts module | `src-tauri/src/artifacts/` |
-| 8 | Calculations are reproducible, not invented | Calculation engine with audit-trail | `src-tauri/src/orchestrator/calculation.rs` |
-| 9 | Human-in-the-loop approval | Approval queue, zero-trust gate | `src/pages/Approvals.tsx`, `src-tauri/src/sovereignty/zero_trust.rs` |
-| 10 | Tamper-evident audit log | Hash-chained SQLite + Merkle snapshots | `src-tauri/src/audit/` |
-| 11 | Off-machine verification of the audit | HMAC provenance + Merkle root | `src-tauri/src/audit/merkle.rs`, `provenance_hmac.rs` |
-| 12 | Model integrity (no silent swap) | SHA-256 hash-on-load check | `src-tauri/src/audit/model_integrity.rs` |
-| 13 | Visible attribution on every artifact | Visible watermark (stego refused) | `src-tauri/src/artifacts/visible_watermark.rs` |
-| 14 | Field-ready (engineer wearing gloves) | Push-to-talk voice, dark industrial UI | `src-tauri/src/voice/`, `src/pages/SIHDashboard.tsx` |
-| 15 | Auto model selection within hardware | Routing by size, VRAM, capability | `src-tauri/src/registry/router.rs` |
-| 16 | Live model health | Per-model telemetry + model-health page | `src-tauri/src/model_intelligence/telemetry.rs`, `src/pages/ModelHealth.tsx` |
-| 17 | No covert exfiltration channel | No steganography (refused with reasoning) | `src-tauri/src/artifacts/stego_watermark.rs` |
-| 18 | Industrial skills, calibrated to standards | 5 shipped skills (HAZOP, P&ID, equipment, safety, vendor) | `skills/` |
-| 19 | One-click demo scenarios | Demo page with 3 end-to-end runs | `src/pages/Demo.tsx` |
-| 20 | Performance within hardware budget | Benchmarks across 3 tiers | `scripts/bench.py`, `docs/sih/benchmarks.md` |
+| 1 | "self-hosted, air gapped AI workbench running entirely on the organization's own GPU server" | `src-tauri/src/ai_engine/` | ✅ |
+| 2 | "Nothing leaves the premises." | `sovereignty/broker.rs`, `scripts/check-egress.mjs` | ✅ |
+| 3 | "support multiple open weight models at once" | `src-tauri/src/serving/` | ✅ |
+| 4 | "automatically pick the right one for a given task…a coding request handled differently from a document summary request" | `registry/router.rs` | ✅ |
+| 5 | "New open weight models should be addable later without redesigning the system" | `registry/`, `serving/` | ✅ |
+| 6 | "Plan out multi step work" | `orchestrator/plan.rs` | ✅ |
+| 7 | "call local tools such as file read and write, code execution in a sandbox, spreadsheet work, internal document search" | `orchestrator/tools.rs` | ✅ |
+| 8 | "iterate on a task instead of answering once and stopping" | `orchestrator/executor.rs` | ✅ |
+| 9 | "scanned PDFs, handwritten notes, engineering drawings, photographs, read through on device OCR and vision models" | `ai_engine/vision_bridge.rs`, `sidecars/document_sidecar/` | ✅ |
+| 10 | "Output should be real deliverables, approval notes, PPT/Word/Excel files, working code, calculations with steps shown" | `artifacts/{docx,xlsx,pptx}.rs` | ✅ |
+| 11 | "ground itself in the organization's own manuals, SOPs and past correspondence through a local knowledge base connector" | `knowledge/` | ✅ |
 
-## Honest gaps
+### The five things the Expected Solution says to demonstrate
 
-The table above is the *delivered* state. A few PS 26117 asks are
-still in flight and the README points to the open issue:
+| # | Demonstration | State |
+|---|---|---|
+| E1 | "A working local deployment…on a single workstation or server with a mid range GPU" | ✅ |
+| E2 | "model auto selection across at least two different task types" | ✅ 23 routing checks, each with a recorded reason |
+| E3 | "reading a scanned inspection report, pulling out key findings and drafting an approval note as a Word file" | ✅ 259 checks |
+| E4 | "A coding task run and verified in a sandbox" | ⚠️ **Implemented; needs a container runtime and a pre-loaded base image at the venue.** See below. |
+| E5 | "A multimodal task involving image or scanned document understanding" | ✅ |
+| E6 | "show, through logs or a visible network monitor, that no external calls are made at any point" | ✅ `pages/AuditNetwork.tsx` — live mode, egress events, OS-level connection observation, one-click canary |
 
-- **Voice wake-word** ("Hey Arjun") — push-to-talk is shipped;
-  always-on wake-word is a multi-day integration.
-- **Long-form video** — the demo script and PPT outline are
-  written; the recording is on the team.
-- **OTA model updates** — the operator workflow is "drop a model
-  in `F:\Models\...` and re-import". A push channel is out of
-  scope for an air-gapped tool.
-- **Multi-lingual SOPs** — the system handles any UTF-8 text, but
-  the shipped skills are English. Translating the skills is a
-  partnership with the site, not a code change.
+Run `npm run accept` for the current state. It reports **BLOCKED**, never PASS,
+for anything it could not actually demonstrate.
 
-## What we are *not* claiming
+**On E4, say this and nothing more:** container execution is implemented
+(`orchestrator/sandbox_exec.rs`) with the network switched off, a read-only root
+filesystem, capped CPU and memory, dropped capabilities, and no host
+credentials. It refuses to run on any weaker isolation tier. It needs a
+responding Podman or Docker runtime and the base image already present — ARJUN
+will not pull one, because pulling is an outbound call a subprocess makes where
+the broker cannot see it. **Do not claim a coding task has been demonstrated
+until one has been.**
 
-- We are not claiming **zero risk**. A process the attacker owns
-  can disable the chokepoint, drop the triggers, and rewrite the
-  log. The features here make tampering *detectable* and *costly*,
-  not impossible.
-- We are not claiming **better than cloud LLMs on benchmarks**.
-  We are claiming **better fit for the refinery use case** —
-  because the data does not leave the plant.
-- We are not claiming **the only approach**. Other sovereign LLMs
-  exist; the differentiation here is the workflow shell (skills,
-  audit, approval, voice) around a small set of local models.
+---
+
+## Part 2 — What ARJUN adds beyond the ask
+
+None of this appears in PS 26117. It is a considered response to what an
+air-gapped refinery deployment actually needs, and it is the honest basis for
+"why this one" — but introduce it as *our* addition, never as their requirement.
+
+| Addition | Why it matters for MRPL | Where |
+|---|---|---|
+| Tamper-evident audit ledger — append-only SQLite triggers plus a hash chain | An approval note that reaches a regulator needs a record whose edits are detectable | `audit/` |
+| Off-machine verification — Merkle root, HMAC provenance | Lets an auditor check the log without trusting the machine that wrote it | `audit/merkle.rs`, `provenance_hmac.rs` |
+| Model integrity — SHA-256 on load | A silently swapped model is otherwise undetectable | `audit/model_integrity.rs` |
+| Human-in-the-loop approval queue | Nothing consequential happens without a person | `orchestrator/approvals.rs` |
+| Bounded, narrowing subagents | A child is never more capable than its parent — enforced, not documented | `subagents/inherit.rs` |
+| Refusal of steganographic watermarking, with the reasoning kept | Covert channels are the opposite of a sovereignty claim | `artifacts/stego_watermark.rs` |
+| Visible DRAFT watermark on every artifact | A file that escapes into an inbox still says what it is | `artifacts/visible_watermark.rs` |
+| Five industrial skills (HAZOP, P&ID, equipment, safety, vendor) | Domain fit | `skills/` |
+| Push-to-talk voice, dark industrial UI | Field use | `voice/`, `pages/SIHDashboard.tsx` |
+
+---
+
+## What we are not claiming
+
+- **Not zero risk.** A process the attacker owns can disable the chokepoint,
+  drop the triggers and rewrite the log. These controls make tampering
+  *detectable* and *costly*, not impossible.
+- **Not better than cloud LLMs on benchmarks.** Better *fit*, because the data
+  does not leave the plant — which is the Background section's entire argument.
+- **No performance numbers.** [`benchmarks.md`](benchmarks.md) is deliberately
+  empty. The figures previously on that page came from a hardcoded fallback in
+  `scripts/bench.py`, not from measurement. Do not quote tokens/second until
+  somebody has run the benchmark on the demo machine.
+- **No model certification scores.** The 16-point "certification" emitted the
+  same 93.0 for any input, including package ids naming nothing that exists. The
+  generator now refuses and the artifacts are deleted.
 
 ## Where the proof lives
 
-- **Egress proof**: `npm run check:egress` exits with 0.
-- **Audit proof**: `verify_audit_chain` returns `intact: true` on
-  any run; `verify_audit_merkle` returns the last root and the
-  events-since count.
-- **Tamper proof**: the SQLite triggers abort any UPDATE/DELETE;
-  the Merkle root mismatches a single rewritten row.
-- **Performance proof**: `scripts/bench.py` produces a CSV that
-  the README quotes.
-- **Skill proof**: each skill in `skills/` is a `SKILL.md` plus a
-  `references/` directory; the SKILL.md names the standard, the
-  output schema, the tools required, and a worked example.
+| Claim | Command |
+|---|---|
+| Zero egress | `npm run check:egress` |
+| No cloud-vendor code in the shipped bundle | `npm run check:bundle` |
+| The bundle gate actually catches regressions | `npm run check:bundle:self` |
+| Acceptance criteria, honestly reported | `npm run accept` |
+| Audit chain intact | `verify_audit_chain` / `verify_audit_merkle` in-app |

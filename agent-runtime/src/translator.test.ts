@@ -288,3 +288,96 @@ describe("translateForWire: messageId isolation", () => {
     ]);
   });
 });
+
+describe("MessageTranslator: deduplication", () => {
+  it("text_start + text_delta + text_end produces the text exactly once", async () => {
+    const { MessageTranslator } = await import("./run.js");
+    const t = new MessageTranslator("msg-1");
+    const events: AgentEvent[] = [
+      { type: "message_start", message: assistantMessageWithText("") },
+      {
+        type: "message_update",
+        message: assistantMessageWithText("Hello, world."),
+        assistantMessageEvent: {
+          type: "text_start",
+          contentIndex: 0,
+          partial: assistantMessageWithText("Hello, world."),
+        },
+      },
+      {
+        type: "message_update",
+        message: assistantMessageWithText("Hello, world."),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hello, world." },
+      },
+      {
+        type: "message_update",
+        message: assistantMessageWithText("Hello, world."),
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          // `text_end` carries the finished block as `content` as well as the
+          // message so far as `partial` — see the provider that emits it,
+          // `openai-completions.ts:163`. Omitting `content` made this a shape
+          // no provider ever sends.
+          content: "Hello, world.",
+          partial: assistantMessageWithText("Hello, world."),
+        },
+      },
+    ];
+    const allWire = events.flatMap(e => t.translate(e));
+    const textUpdates = allWire.filter(w => w.type === "message_update");
+    expect(textUpdates).toHaveLength(1);
+    expect(textUpdates[0]).toEqual({
+      type: "message_update",
+      messageId: "msg-1",
+      delta: "Hello, world.",
+    });
+  });
+
+  it("text_delta only (no text_start/text_end) streams each delta once", async () => {
+    const { MessageTranslator } = await import("./run.js");
+    const t = new MessageTranslator("msg-1");
+    const events: AgentEvent[] = [
+      { type: "message_start", message: assistantMessageWithText("") },
+      {
+        type: "message_update",
+        message: assistantMessageWithText("He"),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "He" },
+      },
+      {
+        type: "message_update",
+        message: assistantMessageWithText("llo"),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "llo" },
+      },
+    ];
+    const allWire = events.flatMap(e => t.translate(e));
+    const textUpdates = allWire.filter(w => w.type === "message_update");
+    expect(textUpdates).toHaveLength(2);
+    expect(textUpdates[0]?.type === "message_update" && textUpdates[0].delta).toBe("He");
+    expect(textUpdates[1]?.type === "message_update" && textUpdates[1].delta).toBe("llo");
+  });
+
+  it("message_start only emitted once even if multiple arrive", async () => {
+    const { MessageTranslator } = await import("./run.js");
+    const t = new MessageTranslator("msg-1");
+    const ev: AgentEvent = {
+      type: "message_start",
+      message: assistantMessageWithText(""),
+    };
+    expect(t.translate(ev)).toHaveLength(1);
+    expect(t.translate(ev)).toHaveLength(0);
+    expect(t.translate(ev)).toHaveLength(0);
+  });
+
+  it("message_end only emitted once even if multiple arrive", async () => {
+    const { MessageTranslator } = await import("./run.js");
+    const t = new MessageTranslator("msg-1");
+    t.translate({ type: "message_start", message: assistantMessageWithText("") });
+    const ev: AgentEvent = {
+      type: "message_end",
+      message: assistantMessageWithText("done", "stop"),
+    };
+    expect(t.translate(ev)).toHaveLength(1);
+    expect(t.translate(ev)).toHaveLength(0);
+  });
+});

@@ -2,15 +2,18 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { AppStateProvider } from './contexts/AppStateContext';
 import { ConfigProvider } from './contexts/ConfigContext';
+import { ConversationProvider } from './contexts/ConversationContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
 import { PermissionsProvider, usePermissions } from './contexts/PermissionsContext';
 import { AppShell } from './components/layout';
 import { RequirePermission } from './components/auth/RequirePermission';
 import { Workbench } from './pages/Workbench';
+import { DocumentScan } from './pages/DocumentScan';
 import { Tasks } from './pages/Tasks';
 import { Conversations } from './pages/Conversations';
 import { Placeholder } from './pages/Placeholder';
+import { Knowledge } from './pages/Knowledge';
 import { AuditNetwork } from './pages/AuditNetwork';
 import { SignIn } from './pages/SignIn';
 import { governanceService, type Session } from './services/governance.service';
@@ -72,7 +75,8 @@ function App() {
         <ThemeProvider>
           <ToastProvider>
             <PermissionsProvider>
-              <BrowserRouter>
+              <ConversationProvider>
+                <BrowserRouter>
                 <Routes>
                   <Route path="/" element={<AppShell />}>
                     <Route index element={<Workbench />} />
@@ -80,18 +84,16 @@ function App() {
                     <Route path="tasks" element={<Tasks />} />
                     <Route path="conversations" element={<Conversations />} />
 
-                    {/* Surfaces PS 26117 requires that do not exist yet. Routed and
-                      * named now so the shell is complete and the gaps are visible. */}
-                    <Route
-                      path="knowledge"
-                      element={
-                        <Placeholder
-                          title="Knowledge"
-                          purpose="Connected collections of manuals, SOPs, inspection reports and past correspondence — indexed on this machine, from a local folder or an internal network share."
-                          phase="Phase 4 — knowledge service and connectors"
-                        />
-                      }
-                    />
+                    <Route path="knowledge" element={<Knowledge />} />
+                    {/* Diagnostic surface, deliberately not in the menu.
+                      * Ordinary OCR happens in chat: attach a document to a
+                      * message and the runtime reads it before answering.
+                      * This page exists to exercise one page at a chosen
+                      * accuracy stop and to see the model's own bounding
+                      * boxes — which is how the coordinate space was
+                      * calibrated, and how a bad page is diagnosed. Reachable
+                      * at /scan?doc=<sha256>&page=<n> for that purpose. */}
+                    <Route path="scan" element={<DocumentScan />} />
                     {/* Approvals queue: gated on `ApproveOutput`, which in the
                       * 2-role model only `Administrator` holds. (An Employee can
                       * decide approvals for tasks they themselves own, but cannot
@@ -151,7 +153,8 @@ function App() {
                   </Route>
                 </Routes>
               </BrowserRouter>
-            </PermissionsProvider>
+            </ConversationProvider>
+          </PermissionsProvider>
           </ToastProvider>
         </ThemeProvider>
       </ConfigProvider>

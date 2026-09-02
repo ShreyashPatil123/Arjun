@@ -23,6 +23,13 @@
   min-height: 0;
   background: var(--bg-primary);
   color: var(--text-primary);
+
+  /* One column width for the whole surface: the log, the composer and
+   * everything docked to it read as a single measure. It was a fixed
+   * 44rem, which on a 1080p window left the conversation as a narrow
+   * ribbon with most of the screen unused. It now grows with the
+   * viewport and stops before lines get too long to scan. */
+  --chat-column: clamp(48rem, 88vw, 68rem);
 }
 
 @media (max-width: 1100px) {
@@ -36,7 +43,7 @@
   min-width: 0;
   min-height: 0;
   position: relative;
-  max-width: 44rem;
+  max-width: var(--chat-column);
   width: 100%;
   margin: 0 auto;
 }
@@ -101,26 +108,46 @@
 .chip:hover { background: var(--bg-hover); border-color: var(--text-tertiary); color: var(--text-primary); }
 .chip:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 1px; }
 
-.unseenPill {
+/* The round "back to the newest message" button. It rides just above
+ * the composer on the right, and carries a dot when messages arrived
+ * while the user was reading further up. */
+.scrollDownBtn {
   position: absolute;
-  bottom: calc(140px);
-  left: 50%;
-  transform: translateX(-50%);
-  display: inline-flex;
+  right: 20px;
+  bottom: 16px;
+  display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 10px;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
   background: var(--bg-secondary);
   border: 1px solid var(--border-default);
-  border-radius: 999px;
-  color: var(--text-primary);
-  font-size: var(--text-xs);
-  font-family: inherit;
+  border-radius: 50%;
+  color: var(--text-secondary);
   cursor: pointer;
   z-index: 2;
   box-shadow: var(--shadow-md, 0 4px 6px -1px rgba(0, 0, 0, 0.4));
+  transition: background var(--transition-fast, 120ms) ease,
+              color var(--transition-fast, 120ms) ease;
 }
-.unseenPill:hover { background: var(--bg-hover); }
+
+.scrollDownBtn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.scrollDownBtn:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 2px; }
+
+/* Unread marker — a word is not available in a 34px circle, so the
+ * button's title and aria-label carry the count instead. */
+.scrollDownBtn[data-unseen]::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  border: 2px solid var(--bg-secondary);
+}
 
 /* ------------------------------------------------------------------ *
  * Message cells — user and system. (FIX 7: polish, accent color.)
@@ -357,15 +384,23 @@
 }
 
 .assistantPlaceholder {
-  color: var(--text-tertiary);
-  letter-spacing: 0.05em;
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  vertical-align: text-bottom;
+  background: var(--text-tertiary);
+  border-radius: 1px;
+  animation: chat-caret 1s steps(1, end) infinite;
 }
 
 .caret {
   display: inline-block;
-  width: 0;
+  width: 0.5em;
+  height: 1em;
   margin-left: 1px;
-  color: var(--text-primary);
+  vertical-align: text-bottom;
+  background: var(--text-primary);
+  border-radius: 1px;
   animation: chat-caret 1s steps(1, end) infinite;
 }
 @keyframes chat-caret {
@@ -721,7 +756,7 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-width: 44rem;
+  max-width: var(--chat-column);
   margin: 0 auto;
   padding: 10px 12px;
   background: var(--bg-secondary);
@@ -760,6 +795,44 @@
 }
 
 .attachmentName { max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Messages typed during a run and waiting their turn. */
+.queuedList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.queuedChip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-primary);
+  border: 1px dashed var(--border-default);
+  border-radius: 10px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.queuedBadge {
+  flex: none;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.queuedText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .attachmentRemove {
   display: flex;
@@ -1186,148 +1259,106 @@
   font-variant-numeric: tabular-nums;
 }
 
-.chatOrb {
-  display: block;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
 /* ------------------------------------------------------------------ *
- * ThinkingTree — expandable reasoning blocks with tree timeline
+ * ChatOrb — the assistant avatar.
+ *
+ * After the Siri Orb pattern from 21st.dev (Edu Calvo): six conic
+ * gradients on one layer, turned by a registered `--orb-angle` so the
+ * angle itself can be animated, blurred and pushed through a contrast
+ * filter so the bands melt into one moving light, then masked to a
+ * ring. Every measurement derives from `--orb-size`, which the
+ * component sets inline, so one number resizes the whole orb.
+ *
+ * The `rotate` on the same layer is deliberate belt-and-braces: where
+ * `@property` is unavailable the angle cannot animate, and the spin
+ * carries the motion on its own.
  * ------------------------------------------------------------------ */
-.thinkingTree {
-  margin: 8px 0 12px;
-  padding: 12px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  animation: fadeIn 0.2s ease-out;
+@property --orb-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
 }
 
-.thinkingHeader {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border-default);
-}
+.chatOrb {
+  --orb-size: 36px;
+  --orb-violet: #c084fc;
+  --orb-sky: #38bdf8;
+  --orb-magenta: #f0abfc;
+  --orb-indigo: #818cf8;
+  --orb-spin: 9s;
+  --orb-glow: 0.30;
 
-.thinkingTitle {
-  font-size: var(--text-sm);
-  font-weight: 500;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.thinkingNodes {
   position: relative;
+  display: block;
+  flex-shrink: 0;
+  width: var(--orb-size);
+  height: var(--orb-size);
+  border-radius: 50%;
+  overflow: hidden;
+  isolation: isolate;
+  /* The glow sits outside the clipped disc, so it is a shadow rather
+   * than another layer. */
+  box-shadow: 0 0 calc(var(--orb-size) * 0.33) rgba(168, 85, 247, var(--orb-glow));
 }
 
-.thinkingNode {
-  position: relative;
-  padding-left: 24px;
-}
-
-.thinkingNode::before {
+.chatOrb::before {
   content: '';
   position: absolute;
-  left: 7px;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  border-left: 1px dotted var(--border-default);
-}
-
-.thinkingNode:last-child::before {
-  display: none;
-}
-
-.thinkingNodeMain {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-  min-height: 24px;
-}
-
-.thinkingConnector {
-  width: 8px;
-  flex-shrink: 0;
-}
-
-.thinkingBullet {
-  width: 6px;
-  height: 6px;
+  /* Overhang gives the blur something to bleed into; without it the
+   * filter feathers the disc's own edge and the orb goes soft. */
+  inset: calc(var(--orb-size) * -0.25);
   border-radius: 50%;
-  background: var(--text-tertiary);
-  flex-shrink: 0;
-  margin-left: 2px;
+  background:
+    conic-gradient(from calc(var(--orb-angle) * 1) at 30% 32%,
+      transparent 0%, var(--orb-violet) 10%, transparent 24%),
+    conic-gradient(from calc(var(--orb-angle) * -1.4) at 70% 30%,
+      transparent 0%, var(--orb-sky) 12%, transparent 28%),
+    conic-gradient(from calc(var(--orb-angle) * 1.8) at 68% 70%,
+      transparent 0%, var(--orb-magenta) 9%, transparent 22%),
+    conic-gradient(from calc(var(--orb-angle) * -1) at 32% 68%,
+      transparent 0%, var(--orb-indigo) 14%, transparent 30%),
+    conic-gradient(from calc(var(--orb-angle) * 2.2) at 50% 50%,
+      transparent 0%, var(--orb-violet) 7%, transparent 18%),
+    radial-gradient(circle at 50% 50%,
+      rgba(168, 85, 247, 0.45) 0%, transparent 62%);
+  filter: blur(calc(var(--orb-size) * 0.11)) contrast(1.7) saturate(1.25);
+  animation:
+    orb-angle var(--orb-spin) linear infinite,
+    orb-spin calc(var(--orb-spin) * 2.4) linear infinite;
 }
 
-.thinkingStatusIcon {
-  flex-shrink: 0;
-  color: var(--text-tertiary);
+/* The ring: a dark core punched out of the middle, which is what makes
+ * the orb read as a rim of light rather than a blob. */
+.chatOrb::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 50%,
+    var(--bg-primary) 0%,
+    var(--bg-primary) 34%,
+    rgba(139, 92, 246, 0.16) 52%,
+    transparent 70%
+  );
 }
 
-.thinkingStatusIcon[data-status="running"] {
-  color: var(--text-primary);
-  animation: spin 1s linear infinite;
+/* Streaming: faster, brighter. */
+.chatOrb[data-active] {
+  --orb-spin: 3.4s;
+  --orb-glow: 0.55;
 }
 
-.thinkingStatusIcon[data-status="done"] {
-  color: var(--success, #22c55e);
+@keyframes orb-angle {
+  to { --orb-angle: 360deg; }
 }
 
-.thinkingStatusIcon[data-status="failed"] {
-  color: var(--error, #fca5a5);
+@keyframes orb-spin {
+  to { transform: rotate(360deg); }
 }
 
-.thinkingIcon {
-  flex-shrink: 0;
-  color: var(--text-tertiary);
-}
-
-.thinkingLabel {
-  flex: 1;
-  font-size: var(--text-sm);
-  color: var(--text-secondary);
-  line-height: 1.4;
-  min-width: 0;
-}
-
-.thinkingMeta {
-  font-size: var(--text-xs);
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.thinkingExpand {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border: none;
-  background: transparent;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: background var(--transition-fast), color var(--transition-fast);
-  flex-shrink: 0;
-}
-
-.thinkingExpand:hover {
-  background: var(--bg-tertiary);
-  color: var(--text-secondary);
-}
-
-.thinkingChildren {
-  padding-left: 8px;
-  border-left: 1px dotted var(--border-default);
-  margin-left: 4px;
+@media (prefers-reduced-motion: reduce) {
+  .chatOrb::before { animation: none; }
 }
 
 @keyframes fadeIn {
@@ -1358,11 +1389,6 @@
   margin-top: 2px;
 }
 
-.chatOrb {
-  display: block;
-  border-radius: 50%;
-}
-
 .assistantCol {
   flex: 1;
   display: flex;
@@ -1377,215 +1403,215 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Thinking Tree - dotted timeline like Kimi */
-.thinkingTree {
+/* ------------------------------------------------------------------ *
+ * Activity timeline — the running account of what the model is doing.
+ *
+ * One or more cards, each a stack of rows joined by a dotted rail that
+ * runs down the left gutter and through every icon. A row reads
+ * `[icon] label … [source] [count] [chevron]`; the chevron column keeps
+ * its width on rows that cannot expand, so every row in a card ends on
+ * the same line. Colour comes from theme tokens only, so the timeline
+ * is correct in both themes.
+ * ------------------------------------------------------------------ */
+.activityStack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-bottom: 10px;
+  gap: 10px;
+  margin: 2px 0 4px;
+  animation: fadeIn var(--motion-base, 200ms) ease-out;
+}
+
+.activityCard {
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-default);
-  border-radius: 12px;
-  padding: 10px 12px;
+  border-radius: 14px;
 }
 
-.thinkingTreeHeader {
-  display: inline-flex;
+.activityItem {
+  display: flex;
+  flex-direction: column;
+}
+
+.activityRow {
+  display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 2px 0;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
   background: transparent;
   border: none;
-  color: var(--text-secondary);
+  border-radius: 10px;
   font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: 500;
-  cursor: pointer;
-  align-self: flex-start;
-}
-
-.thinkingTreeTitle {
-  color: var(--text-primary);
-  font-weight: 500;
-}
-
-.thinkingTreeDoneIcon {
-  color: var(--success, #22c55e);
-}
-
-.thinkingTreeBody {
-  display: flex;
-  flex-direction: column;
-  padding-left: 4px;
-}
-
-/* Thinking Node - vertical dotted line + dot */
-.thinkingNode {
-  display: flex;
-  flex-direction: row;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.thinkingNodeLineWrap {
-  flex: none;
-  width: 14px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  position: relative;
-  min-height: 22px;
-}
-
-.thinkingNodeLine {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: 0;
-  border-left: 1.5px dashed var(--border-default);
-  transform: translateX(-50%);
-}
-
-.thinkingNodeLineLast {
-  bottom: auto;
-  height: 8px;
-}
-
-.thinkingNodeDot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--text-tertiary);
-  margin-top: 7px;
-  flex: none;
-  z-index: 1;
-}
-
-.thinkingNodeContent {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  padding-bottom: 6px;
-}
-
-.thinkingNodeHeader {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 0;
-  background: transparent;
-  border: none;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
-  font-family: inherit;
-  font-size: var(--text-xs);
-  cursor: pointer;
   text-align: left;
+  transition: background var(--transition-fast, 120ms) ease;
 }
 
-.thinkingNodeHeader:hover .thinkingNodeLabel {
-  color: var(--text-primary);
+.activityRow[data-expandable] { cursor: pointer; }
+.activityRow[data-expandable]:hover { background: var(--bg-tertiary); }
+.activityRow[data-expandable]:hover .activityLabel { color: var(--text-primary); }
+.activityRow[data-expandable]:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: -1px;
 }
 
-.thinkingNodeLabel {
-  color: var(--text-secondary);
-  line-height: 1.4;
-}
-
-.thinkingNodeMeta {
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-  margin-left: 4px;
-}
-
-.thinkingNodeFail {
-  color: var(--error, #ef4444);
-  font-size: 10px;
-  font-weight: 600;
-}
-
-.thinkingNodeBullet {
-  color: var(--text-tertiary);
-  font-size: 10px;
-}
-
-/* Thinking Node Children (nested rows) */
-.thinkingNodeChildren {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding-top: 2px;
-}
-
-.thinkingChildRow {
-  display: flex;
-  flex-direction: row;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.thinkingChildLineWrap {
-  flex: none;
-  width: 14px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+/* Gutter: the icon, with the dotted rail running through it up to the
+ * row above and down to the row below. The rail bleeds over the row's
+ * vertical padding so the line is continuous between icons. */
+.activityGutter {
   position: relative;
-  min-height: 18px;
+  flex: none;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
 }
 
-.thinkingChildLine {
+.activityRail {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: -8px;
+  bottom: -8px;
   left: 50%;
   width: 0;
-  border-left: 1.5px dashed var(--border-default);
+  border-left: 1px dashed var(--border-default);
   transform: translateX(-50%);
 }
 
-.thinkingChildDot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--border-default);
-  margin-top: 5px;
-  flex: none;
+/* The rail starts at the first icon and stops at the last, so a card
+ * never trails a line into its own padding. */
+.activityRail[data-first] { top: 50%; }
+.activityRail[data-last] { bottom: 50%; }
+.activityRail[data-first][data-last] { display: none; }
+
+.activityIcon {
+  position: relative;
   z-index: 1;
-}
-
-.thinkingChildContent {
-  flex: 1;
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 0;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
   color: var(--text-tertiary);
-  font-size: 11px;
-  line-height: 1.4;
 }
 
-.thinkingChildLabel {
+.activityRow[data-expandable]:hover .activityIcon { background: var(--bg-tertiary); }
+
+.activityBullet {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-tertiary);
+}
+
+.activityIconFail { color: var(--error); }
+.activityRow[data-status="failed"] .activityLabel { color: var(--text-primary); }
+
+.activityLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.4;
   color: var(--text-secondary);
 }
 
-.thinkingChildMeta {
+/* Source monogram: a hairline rule then a round chip — the "Fetch URLs
+ * | ◍" shape of a tool call that names where it went. */
+.activityBadge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.activityBadgeRule {
+  width: 1px;
+  height: 14px;
+  background: var(--border-default);
+}
+
+.activityBadgeDot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.activityMeta {
+  flex: none;
+  font-size: var(--text-xs);
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-.thinkingChildLink {
-  color: var(--info, #3b82f6);
-  text-decoration: none;
-  margin-left: 2px;
-  font-size: 10px;
+.activityChevron {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 16px;
+  color: var(--text-tertiary);
 }
 
-.thinkingChildLink:hover {
-  text-decoration: underline;
+/* Expanded body: under the row, indented past the gutter. */
+.activityDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 10px 8px 42px;
+  padding-left: 10px;
+  border-left: 1px dashed var(--border-default);
 }
+
+.activityDetailText {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activityChild {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.activityChildLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.activityChildLink {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-tertiary);
+}
+
+.activityChildLink:hover { color: var(--text-primary); }
 
 /* ------------------------------------------------------------------ *
  * Markdown rendering (FIX 6: proper paragraphs, lists, code blocks).
@@ -1726,4 +1752,417 @@
 
 .thinkingDoneIcon {
   color: var(--success, #22c55e);
+}
+
+/* The collapsed resting state of the timeline: one honest line saying
+ * what the turn did, with the cards behind it. */
+.activitySummary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 4px 10px 4px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background var(--transition-fast, 120ms) ease,
+              border-color var(--transition-fast, 120ms) ease,
+              color var(--transition-fast, 120ms) ease;
+}
+
+.activitySummary:hover {
+  background: var(--bg-secondary);
+  border-color: var(--border-default);
+  color: var(--text-secondary);
+}
+
+.activitySummary:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.activitySummaryIcon { color: var(--success); }
+.activitySummaryLabel { color: inherit; }
+
+/* Per-message actions. Quiet until the message is hovered or the
+ * button itself is focused, so the log stays clean but the action is
+ * still reachable from the keyboard. */
+.messageActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  opacity: 0;
+  transition: opacity var(--transition-fast, 120ms) ease;
+}
+
+.assistantRow:hover .messageActions,
+.messageActions:focus-within {
+  opacity: 1;
+}
+
+.messageAction {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background var(--transition-fast, 120ms) ease,
+              color var(--transition-fast, 120ms) ease;
+}
+
+.messageAction:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.messageAction:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+/* Holds the message list and the jump-to-latest button together, so
+ * the button floats above the list no matter how tall the composer
+ * grows with attachments or queued messages. */
+.chatScrollWrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Motion is decoration here — every one of these has a static resting
+ * state that reads the same. */
+@media (prefers-reduced-motion: reduce) {
+  .assistantRow,
+  .activityStack,
+  .chatScroll {
+    animation: none;
+    scroll-behavior: auto;
+  }
+
+  .spin { animation: none; }
+  .caret { animation: none; opacity: 1; }
+  .assistantPlaceholder { animation: none; }
+
+  .activityRow,
+  .messageActions,
+  .messageAction,
+  .activitySummary,
+  .scrollDownBtn {
+    transition: none;
+  }
+}
+
+/* Reading status: what the backend is actually doing with an attachment.
+ * Sits with the composer, on the live run, and vanishes when the answer is
+ * ready. Deliberately a line rather than a progress bar — a bar implies a
+ * fraction we do not always have. */
+.readingStatus {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--text-secondary, #6b7280);
+  flex-wrap: wrap;
+}
+
+.readingFile {
+  color: var(--text-muted, #9aa3ab);
+  font-variant-numeric: tabular-nums;
+}
+
+.readingPulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: readingPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes readingPulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .readingPulse { animation: none; opacity: 0.6; }
+}
+
+/* ------------------------------------------------------------------ *
+ * Attachments: what will read them, what it read, and how carefully.
+ *
+ * Three pieces, all docked to the composer because that is where the
+ * person is looking when they attach a file:
+ *   1. `.attachmentPlan`  — before sending: which model will read this.
+ *   2. `.ocrReadout`      — during: the model's own output, arriving.
+ *   3. `.ocrSlider`       — the accuracy/speed stop for the next read.
+ * ------------------------------------------------------------------ */
+
+.attachmentPlans {
+  list-style: none;
+  margin: 0 auto 6px;
+  padding: 0 12px;
+  max-width: var(--chat-column);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.attachmentPlan {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--text-tertiary);
+}
+.attachmentPlan svg { flex: none; margin-top: 2px; }
+/* A file that will reach a model reads louder than one handled locally. */
+.attachmentPlan[data-route='image'] { color: var(--text-secondary); }
+.attachmentPlan[data-route='rejected'] { color: var(--color-danger, #e5484d); }
+
+/* --- The live read ------------------------------------------------- */
+
+.ocrReadout {
+  max-width: var(--chat-column);
+  margin: 0 auto 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+.ocrReadout[data-live] { border-color: var(--text-tertiary); }
+
+.ocrReadoutHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+.ocrReadoutHead:hover { background: var(--bg-hover); }
+.ocrReadoutHead:focus-visible { outline: 1px solid var(--border-focus); outline-offset: -2px; }
+
+.ocrReadoutIcon { flex: none; color: var(--text-tertiary); }
+
+.ocrReadoutTitle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text-primary);
+}
+
+.ocrReadoutFile {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+}
+
+.ocrReadoutModel {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.ocrReadoutChevron {
+  flex: none;
+  color: var(--text-tertiary);
+  transition: transform var(--transition-fast);
+}
+.ocrReadoutChevron[data-open] { transform: rotate(180deg); }
+
+.ocrReadoutBody {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px 12px 10px;
+  border-top: 1px solid var(--border-default);
+}
+
+.ocrPage + .ocrPage { margin-top: 10px; }
+
+.ocrPageHead {
+  margin: 8px 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.ocrPageEmpty {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* One region per row: the label the model assigned, then what it read
+ * there. The label is the model's own word, not a category this UI
+ * invented, so an unexpected one is shown as-is rather than dropped. */
+.ocrRegion {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+  align-items: start;
+}
+
+.ocrRegionLabel {
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding-top: 2px;
+}
+.ocrRegionLabel[data-label='title'] { color: var(--text-primary); }
+.ocrRegionLabel[data-label='table'] { color: var(--text-secondary); }
+.ocrRegionLabel[data-label='loose'] { font-style: italic; }
+
+.ocrRegionText {
+  margin: 0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* --- The accuracy-to-speed slider ---------------------------------- */
+
+.ocrSlider {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: var(--chat-column);
+  margin: 6px auto 0;
+  padding: 0 14px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  /* Quiet until it governs something on this turn — see `engaged`. */
+  opacity: 0.72;
+  transition: opacity var(--transition-fast);
+}
+.ocrSlider:hover,
+.ocrSlider:focus-within,
+.ocrSlider[data-engaged] { opacity: 1; }
+.ocrSlider[data-disabled] { opacity: 0.45; }
+
+.ocrSliderIcon { flex: none; }
+
+.ocrSliderLabel {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.ocrSliderEnd {
+  flex: none;
+  font-size: 11px;
+}
+
+.ocrSliderInput {
+  flex: 0 1 190px;
+  min-width: 120px;
+  accent-color: var(--text-secondary);
+  cursor: pointer;
+}
+.ocrSliderInput:disabled { cursor: not-allowed; }
+.ocrSliderInput:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 3px; }
+
+.ocrSliderValue {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.ocrSliderValue strong {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.ocrSliderDetail {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.ocrSliderReload {
+  flex-basis: 100%;
+  padding-left: 22px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+@media (max-width: 720px) {
+  /* The captions are the first thing to go: the control itself has to
+   * stay reachable, its explanation does not have to stay inline. */
+  .ocrSliderEnd,
+  .ocrSliderDetail { display: none; }
+}
+
+/* The shader orb's frame. The canvas fills it; the disc shape, the glow and
+ * the size all live here so the WebGL orb and the CSS fallback occupy exactly
+ * the same box and swapping between them moves nothing. */
+.chatOrbShader {
+  --orb-size: 36px;
+  position: relative;
+  display: block;
+  flex-shrink: 0;
+  width: var(--orb-size);
+  height: var(--orb-size);
+  border-radius: 50%;
+  overflow: hidden;
+  isolation: isolate;
+  box-shadow: 0 0 calc(var(--orb-size) * 0.3) rgba(90, 110, 255, 0.22);
+  transition: box-shadow var(--transition-base);
+}
+.chatOrbShader[data-active] {
+  box-shadow: 0 0 calc(var(--orb-size) * 0.46) rgba(120, 90, 255, 0.38);
+}
+
+.chatOrbShader canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The shader freezes itself; this stops the glow from breathing too. */
+  .chatOrbShader { transition: none; }
+}
+
+/* A read that ran out of decode budget. Stated plainly rather than styled as
+ * a hard error: the text is still shown, because a partial read is often
+ * still useful — it just must not be mistaken for the whole page. */
+.ocrPageWarning {
+  margin: 0 0 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--color-warning, #d29922);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
 }

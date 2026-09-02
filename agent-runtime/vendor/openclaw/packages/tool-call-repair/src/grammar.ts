@@ -9,7 +9,15 @@ export const HARMONY_CALL_MARKER = "<|call|>";
 
 /** Tool names in bracket/plain-text repairs intentionally match provider-safe ids only. */
 export function isPlainTextToolNameChar(char: string | undefined): boolean {
-  return Boolean(char && /[A-Za-z0-9_-]/.test(char));
+  // The dot is here for the same reason `isXmlishNameChar` below allows it:
+  // namespaced tool names. ARJUN's whole catalogue is dotted
+  // (`knowledge.search_authorized`, `workspace.write_text`), so without it
+  // the bracket syntaxes stopped scanning at the dot, matched no known tool,
+  // and no plain-text call was ever repaired - which is the entire failure
+  // this package exists to fix. Promotion still requires the parsed name to
+  // resolve against the run's allowed tools, so widening the scan cannot
+  // invent a call to something that is not a tool.
+  return Boolean(char && /[A-Za-z0-9_.-]/.test(char));
 }
 
 /** XML-ish function tags allow namespace punctuation used by some model families. */

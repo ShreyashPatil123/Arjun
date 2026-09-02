@@ -309,6 +309,7 @@ mod tests {
             supports_structured_output: false,
             permitted_classifications: Vec::new(),
             path: PathBuf::from(path),
+            projector: None,
             load: Some(LoadSpec {
                 provider_id: "llama-cpp".to_string(),
                 model_id: id.to_string(),

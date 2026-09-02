@@ -163,12 +163,22 @@ camera holds on the dashboard for 2 seconds. Cut.
    snapshots, HMAC provenance, hash-on-load for models, no
    steganography.
 3. **MRPL relevance**: HAZOP analyzer, P&ID reader, equipment
-   lookup, safety compliance, vendor evaluator. Each skill maps to
-   a PS 26117 requirement.
-4. **Performance**: time-to-first-token, tokens/second by model
-   tier, VRAM per task type, accuracy on demo tasks (see
-   `docs/sih/benchmarks.md`).
-5. **Why ARJUN wins PS 26117**: see `docs/sih/why-arjun-wins.md`.
+   lookup, safety compliance, vendor evaluator. These are ARJUN's
+   own domain work — PS 26117 asks for grounding in "the
+   organization's own manuals, SOPs and past correspondence", not
+   for any particular skill. Present them as fit, not as a
+   requirement being ticked off.
+4. **Performance**: **we have no measured figures, and must not
+   quote any.** The numbers previously on this slide came from a
+   hardcoded fallback in `scripts/bench.py`, not from a benchmark
+   run; see `docs/sih/benchmarks.md`. If asked for throughput, say
+   we do not publish figures we have not measured on the hardware
+   in question, and offer to run `scripts/bench.py` on the spot.
+5. **Requirements**: `docs/sih/why-arjun-wins.md`. Part 1 is what
+   PS 26117 actually states, quoted. Part 2 is what ARJUN adds
+   beyond it — the audit ledger, approval queue, watermarking and
+   voice are ours, not MRPL's ask. Keep the two apart; an MRPL
+   judge knows which is which.
 
 ## Failure recovery
 

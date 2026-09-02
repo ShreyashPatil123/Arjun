@@ -30,6 +30,9 @@ pub mod request_context;
 pub mod vram_planner;
 pub mod gguf_meta;
 pub mod vision_bridge;
+pub mod ocr_spans;
+pub mod ocr_profile;
+pub mod ocr_stream;
 
 pub use traits::*;
 pub use manager::InferenceManager;
@@ -39,7 +42,6 @@ pub use orchestrator_state::{
     is_valid_transition, ModelPhase, ModelState, ORCHESTRATOR_COOLDOWN,
 };
 pub use orchestrator_path::{
-    resolve_orchestrator_path, OrchestratorPathError, ResolvedOrchestrator,
-    ORCHESTRATOR_CONTRACT_PATH,
+    declared_path, resolve_orchestrator_path, OrchestratorPathError, ResolvedOrchestrator,
 };
 pub use request_context::{RequestContext, RequestRegistry, DEFAULT_SLOT_COUNT};

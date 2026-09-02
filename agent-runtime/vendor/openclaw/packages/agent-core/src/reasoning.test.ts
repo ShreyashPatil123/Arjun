@@ -50,7 +50,13 @@ describe("resolveAgentReasoningOption", () => {
     ).toBe("low");
   });
 
-  it.each(["anthropic-messages", "bedrock-converse-stream"] as const)(
+  // ARJUN prune: `bedrock-converse-stream` was dropped from this case. The arm
+  // it exercised is gone from reasoning.ts, because ARJUN registers exactly one
+  // protocol adapter — `openai-completions` — and scripts/check-bundle.mjs
+  // fails the build if a second one ever appears in the artifact. A test
+  // asserting behaviour for an api this build cannot carry would pass forever
+  // without telling anyone anything.
+  it.each(["anthropic-messages"] as const)(
     "maps explicit off to low for canonical Fable aliases on %s",
     (api) => {
       expect(

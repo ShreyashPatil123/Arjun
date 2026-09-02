@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{ModelEntry, ModelRegistry, ModelRole, Modality};
+use crate::ai_engine::startup::StartupModelTarget;
 use crate::ai_engine::vram_planner::{plan_gpu_offload, GpuOffloadPlan};
 use crate::capability::classifier::IntentClassifier;
 use crate::model_intelligence::intent::PromptIntent;
@@ -70,6 +71,78 @@ pub struct RoutingFailure {
 
 pub struct ModelRouter;
 
+/// How strong this entry's claim to be the orchestrator is. Higher wins.
+///
+/// The two claims are not equal, and the difference matters. An administrator
+/// choosing a model in Models is a decision made now, about this machine; an
+/// `orchestrator.*` id in the manifest is something a deployment (or a stray
+/// provisioning script) wrote at some point in the past. When both are present
+/// the live decision has to win, or the person who just picked a model watches
+/// the chat answer from a different one and has no way to tell why.
+///
+/// The choice is matched on the exact installed coordinates rather than a name,
+/// because two quantizations of one model share a name and are different files
+/// — and because no model name belongs in the router at all. Which model runs
+/// the chat is a runtime fact about this machine, not a compile-time one.
+fn orchestrator_rank(entry: &ModelEntry, chosen: Option<&StartupModelTarget>) -> u8 {
+    let matches_choice = chosen
+        .and_then(|chosen| entry.load.as_ref().map(|load| (load, chosen)))
+        .map(|(load, chosen)| {
+            normalized(&load.provider_id) == normalized(&chosen.provider_id)
+                && normalized(&load.model_id) == normalized(&chosen.model_id)
+                // A choice saved before the installer could read a quantisation
+                // out of a file name carries "GGUF", which names the container
+                // and identifies no variant. Demanding it match the registry's
+                // real label is what made this setting inert: every stored
+                // choice failed here, the rank stayed 0, and the chat answered
+                // from whichever model the size sort reached first while the
+                // Models screen still showed the star beside the chosen one.
+                //
+                // Such a choice selects the package and leaves the variant
+                // open. That is ambiguous only when one package is registered
+                // at two quantisations, and a choice saved by this build no
+                // longer carries a placeholder at all — the coordinates are
+                // resolved to the registry's spelling before they are written.
+                && (is_placeholder_quantization(&chosen.quantization)
+                    || normalized(&load.quantization) == normalized(&chosen.quantization))
+        })
+        .unwrap_or(false);
+    if matches_choice {
+        return 2;
+    }
+    // A manifest tag only speaks when nobody has chosen. Otherwise a stale tag
+    // would quietly outrank the administrator who chose today.
+    if chosen.is_none() && (entry.id == "orchestrator" || entry.id.starts_with("orchestrator.")) {
+        return 1;
+    }
+    0
+}
+
+/// Whether this entry is the orchestrator by either route.
+fn is_orchestrator(entry: &ModelEntry, chosen: Option<&StartupModelTarget>) -> bool {
+    orchestrator_rank(entry, chosen) > 0
+}
+
+/// Whether a stored quantisation names the container rather than the weights.
+///
+/// "GGUF" is what a package manifest records when the file name declares
+/// nothing it can parse. It picks out no particular variant, so a choice
+/// carrying it selects the package and leaves the variant to the registry.
+fn is_placeholder_quantization(quantization: &str) -> bool {
+    let trimmed = quantization.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("gguf")
+}
+
+/// Punctuation- and case-insensitive form, so `org/Model-GGUF` and
+/// `org/model_gguf` are recognised as the same package id.
+fn normalized(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl ModelRouter {
     /// Maps a classified intent onto the role that should handle it.
     ///
@@ -87,7 +160,9 @@ impl ModelRouter {
         }
     }
 
-    /// Routes a text prompt.
+    /// Routes a text prompt, with no administrator-configured orchestrator to
+    /// honour. Callers that can reach the configuration should prefer
+    /// [`Self::route_with_orchestrator`] so the chosen chat model wins.
     pub fn route(
         registry: &ModelRegistry,
         prompt: &str,
@@ -97,6 +172,40 @@ impl ModelRouter {
         require_structured_output: bool,
         available_runtime_profiles: &[String],
         allowed_licenses: &[String],
+    ) -> Result<RoutingDecision, RoutingFailure> {
+        Self::route_with_orchestrator(
+            registry,
+            prompt,
+            classification,
+            vram_total_bytes,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
+            None,
+        )
+    }
+
+    /// Routes a text prompt, preferring the orchestrator an administrator
+    /// chose in Models → *Set as orchestrator*.
+    ///
+    /// `orchestrator` is the exact installed package coordinates from
+    /// `ai_settings`, or `None` when nobody has chosen. It is a preference and
+    /// not a bypass: the chosen model still has to clear every hard gate — the
+    /// right role for the prompt, the parameter floor, the classification it is
+    /// cleared for. A choice that fails a gate loses to a model that passes,
+    /// and the reasons say which gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_with_orchestrator(
+        registry: &ModelRegistry,
+        prompt: &str,
+        classification: Option<Classification>,
+        vram_total_bytes: u64,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
+        orchestrator: Option<&StartupModelTarget>,
     ) -> Result<RoutingDecision, RoutingFailure> {
         let classified = IntentClassifier::classify(prompt);
         // Taken before `intent` is moved into `role_for` below.
@@ -134,6 +243,7 @@ impl ModelRouter {
             require_structured_output,
             available_runtime_profiles,
             allowed_licenses,
+            orchestrator,
         )
     }
 
@@ -166,9 +276,11 @@ impl ModelRouter {
             require_structured_output,
             available_runtime_profiles,
             allowed_licenses,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn route_to_role(
         registry: &ModelRegistry,
         role: ModelRole,
@@ -181,6 +293,7 @@ impl ModelRouter {
         require_structured_output: bool,
         available_runtime_profiles: &[String],
         allowed_licenses: &[String],
+        orchestrator: Option<&StartupModelTarget>,
     ) -> Result<RoutingDecision, RoutingFailure> {
         // Step 3: real candidates only.
         let mut candidates = registry.candidates(
@@ -216,10 +329,17 @@ impl ModelRouter {
         }
 
         // Step 4: orchestrator first, then largest, so the first that fits
-        // is the best that fits. The orchestrator (the model tagged with
-        // id starting "orchestrator.") is the user-configured chat model
-        // and should win when it fits; only when it does not fit do we
-        // fall back to the largest cleared model that does.
+        // is the best that fits. The orchestrator is the chat model an
+        // administrator chose in Models → "Set as orchestrator" (matched on
+        // the exact installed coordinates), or a manifest entry tagged with an
+        // id starting "orchestrator.". It should win when it fits; only when
+        // it does not fit do we fall back to the largest cleared model that
+        // does.
+        //
+        // Nothing here knows a model by name. A router that carried a
+        // compiled-in favourite would answer from that model however loudly
+        // the administrator had chosen another one — which is the bug this
+        // ordering exists to prevent.
         //
         // The sort key is (is_orchestrator desc, size desc, preferred desc,
         // rank asc). The orchestrator flag is the dominant factor so the
@@ -230,8 +350,8 @@ impl ModelRouter {
         // knob, and `rank_within_band` is the telemetry-driven ordering,
         // so the deterministic default is preserved when both are absent.
         candidates.sort_by(|a, b| {
-            let a_is_orch = a.id == "orchestrator" || a.id.starts_with("orchestrator.");
-            let b_is_orch = b.id == "orchestrator" || b.id.starts_with("orchestrator.");
+            let a_is_orch = orchestrator_rank(a, orchestrator);
+            let b_is_orch = orchestrator_rank(b, orchestrator);
             b_is_orch
                 .cmp(&a_is_orch)
                 .then_with(|| {
@@ -254,7 +374,7 @@ impl ModelRouter {
         for entry in &candidates {
             let plan = plan_gpu_offload(vram_total_bytes, entry.weights_bytes, entry.context_length, None);
             if plan.full_offload {
-                let is_orch = entry.id == "orchestrator" || entry.id.starts_with("orchestrator.");
+                let is_orch = is_orchestrator(entry, orchestrator);
                 let reason_msg = if is_orch {
                     format!(
                         "{} is configured as the orchestrator and fits in VRAM.",
@@ -273,27 +393,48 @@ impl ModelRouter {
             }
         }
 
-        // Step 5: nothing fits entirely. Take the smallest and say so, rather
-        // than refusing to work on a machine that can still do the job slowly.
-        let smallest = candidates
-            .last()
-            .expect("candidates was checked non-empty above");
+        // Step 5: nothing fits entirely. The configured orchestrator still wins
+        // here — an administrator who chose a model slightly too big for this
+        // GPU asked for that model, not for a different one — and otherwise the
+        // smallest candidate runs partly on the CPU. Either way ARJUN keeps
+        // working on a machine that can still do the job slowly, rather than
+        // refusing.
+        let chosen = candidates
+            .iter()
+            .find(|entry| is_orchestrator(entry, orchestrator))
+            .copied();
+        let fallback = chosen.unwrap_or_else(|| {
+            candidates
+                .last()
+                .copied()
+                .expect("candidates was checked non-empty above")
+        });
         let plan = plan_gpu_offload(
             vram_total_bytes,
-            smallest.weights_bytes,
-            smallest.context_length,
+            fallback.weights_bytes,
+            fallback.context_length,
             None,
         );
 
-        reasons.push(format!(
-            "No cleared {} model fits entirely in this machine's VRAM, so ARJUN fell back to \
-             {}, the smallest one available. It will run more slowly.",
-            role.label(),
-            smallest.name
-        ));
+        reasons.push(if chosen.is_some() {
+            format!(
+                "No cleared {} model fits entirely in this machine's VRAM. {} is configured as \
+                 the orchestrator, so it runs partly on the CPU rather than being replaced. It \
+                 will run more slowly.",
+                role.label(),
+                fallback.name
+            )
+        } else {
+            format!(
+                "No cleared {} model fits entirely in this machine's VRAM, so ARJUN fell back to \
+                 {}, the smallest one available. It will run more slowly.",
+                role.label(),
+                fallback.name
+            )
+        });
         reasons.push(plan.reason.clone());
 
-        Ok(Self::decide(smallest, role, intent_label, confidence, plan, true, reasons))
+        Ok(Self::decide(fallback, role, intent_label, confidence, plan, true, reasons))
     }
 
     /// Says which filter emptied the candidate list, so the fix is obvious.
@@ -544,16 +685,25 @@ mod tests {
         assert!(!decision.used_fallback);
     }
 
+    /// The coordinates an administrator persisted with "Set as orchestrator".
+    fn chose(model_id: &str) -> StartupModelTarget {
+        StartupModelTarget {
+            provider_id: "huggingface".to_string(),
+            model_id: model_id.to_string(),
+            quantization: "Q4_K_M".to_string(),
+        }
+    }
+
     /// The orchestrator is the user-configured chat model. When it fits in
     /// VRAM, the router should pick it instead of a larger cleared model.
-    /// (The orchestrator is tagged by having an id starting with
+    /// (A manifest can also tag one by giving it an id starting with
     /// "orchestrator." — see [`ModelRegistry::orchestrator_entry`].)
     #[test]
     fn the_orchestrator_wins_over_a_larger_cleared_model() {
         let mut r = stocked();
         // Mark qwen-8b (smaller than qwen-32b) as the orchestrator.
         if let Some(qwen8b) = r.entries.iter_mut().find(|e| e.id == "qwen-8b") {
-            qwen8b.id = "orchestrator.gemma-4-12b-it".to_string();
+            qwen8b.id = "orchestrator.qwen-8b".to_string();
         }
         let decision = ModelRouter::route(
             &r,
@@ -568,8 +718,200 @@ mod tests {
         .unwrap();
         // qwen-8b is 8B and fits in 80 GB. qwen-32b is 32B and also fits.
         // The orchestrator should win, even though it is smaller.
-        assert_eq!(decision.model_id, "orchestrator.gemma-4-12b-it");
+        assert_eq!(decision.model_id, "orchestrator.qwen-8b");
         assert!(!decision.used_fallback);
+    }
+
+    /// The bug this exists to prevent: an administrator picks a chat model in
+    /// Models, and the router answers from a different one because that other
+    /// model happens to be bigger. The choice is coordinates in the config, not
+    /// a marker in the manifest, so the router has to be told about it.
+    #[test]
+    fn the_administrator_choice_beats_the_largest_model_that_fits() {
+        let registry = stocked();
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&chose("qwen-8b")),
+        )
+        .unwrap();
+
+        assert_eq!(decision.model_id, "qwen-8b", "qwen-32b is larger and also fits");
+        assert!(!decision.used_fallback);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("configured as the orchestrator")),
+            "the trace has to say why the smaller model won: {:?}",
+            decision.reasons
+        );
+    }
+
+    /// The reported bug, with the coordinates that actually produced it.
+    ///
+    /// The installed package could not read `Q4_K_M` out of its file name, so
+    /// it recorded the container word "GGUF" and that is what the choice was
+    /// saved as. The registry says `Q4_K_M`. The two never matched, the rank
+    /// stayed at zero, and the chat answered from the largest model that fitted
+    /// — with the Models screen still showing the star beside the chosen one.
+    #[test]
+    fn a_choice_saved_with_a_placeholder_quantisation_is_still_honoured() {
+        let registry = stocked();
+        let saved = StartupModelTarget {
+            provider_id: "huggingface".to_string(),
+            model_id: "qwen-8b".to_string(),
+            // What was really in config.json on the machine this was found on.
+            quantization: "GGUF".to_string(),
+        };
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&saved),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision.model_id, "qwen-8b",
+            "qwen-32b is larger and also fits, and used to win this"
+        );
+    }
+
+    /// The tolerance above only relaxes the quantisation. A choice naming a
+    /// different package is still a different package.
+    #[test]
+    fn a_placeholder_quantisation_does_not_match_a_different_model() {
+        let registry = stocked();
+        let saved = StartupModelTarget {
+            provider_id: "huggingface".to_string(),
+            model_id: "qwen-8b".to_string(),
+            quantization: "GGUF".to_string(),
+        };
+
+        assert!(
+            !is_orchestrator(
+                registry.find("qwen-32b").expect("registered"),
+                Some(&saved)
+            ),
+            "a loose quantisation must not make every model the orchestrator"
+        );
+    }
+
+    /// The exact shape of the reported bug: a provisioning script had written
+    /// an `orchestrator.*` entry into the live manifest, so every chat answered
+    /// from that model no matter which one the administrator picked in Models.
+    /// A choice made today outranks a tag written at some point in the past.
+    #[test]
+    fn a_stale_manifest_tag_does_not_outrank_the_administrator_choice() {
+        let mut r = stocked();
+        // A leftover tag on the 32B model — larger, so it also wins on size.
+        if let Some(stale) = r.entries.iter_mut().find(|e| e.id == "qwen-32b") {
+            stale.id = "orchestrator.qwen-32b".to_string();
+        }
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &r,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&chose("qwen-8b")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision.model_id, "qwen-8b",
+            "the tagged entry is stale; the administrator chose qwen-8b"
+        );
+    }
+
+    /// The choice is a preference, not a bypass. A chat model chosen for
+    /// general work is not thereby a coding model, and a coding prompt still
+    /// routes to the coding specialist.
+    #[test]
+    fn a_choice_that_cannot_serve_the_role_does_not_hijack_the_decision() {
+        let registry = stocked();
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Refactor this Python function and write a unit test for the null pointer case",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            // An OCR model, which serves neither coding nor reasoning.
+            Some(&chose("surya")),
+        )
+        .unwrap();
+
+        assert_eq!(decision.role, ModelRole::Coding);
+        assert_eq!(decision.model_id, "qwen-coder-14b");
+    }
+
+    /// A choice slightly too big for the GPU is still the administrator's
+    /// choice: run it partly on the CPU rather than silently answering from a
+    /// different model.
+    #[test]
+    fn the_choice_survives_a_gpu_too_small_to_hold_it() {
+        let registry = stocked();
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            6 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&chose("qwen-32b")),
+        )
+        .unwrap();
+
+        assert_eq!(decision.model_id, "qwen-32b");
+        assert!(decision.used_fallback, "it does not fit, and the trace must say so");
+        assert!(!decision.fully_on_gpu);
+    }
+
+    /// With nobody having chosen, the router is back to judging on capability
+    /// alone — no compiled-in favourite quietly winning.
+    #[test]
+    fn no_choice_means_the_largest_that_fits_still_wins() {
+        let registry = stocked();
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            80 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(decision.model_id, "qwen-32b");
     }
 
     /// If the orchestrator does not fit in VRAM, fall back to the largest

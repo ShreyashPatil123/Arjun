@@ -1,0 +1,234 @@
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  min-height: 0;
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.sub {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--text-secondary, #6b7280);
+  /* The counters change every few hundred milliseconds; without tabular
+   * figures the whole line reflows on each tick. */
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.slider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sliderLabel {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-secondary, #6b7280);
+}
+
+.slider input[type='range'] {
+  flex: 1 1 auto;
+  max-width: 320px;
+}
+
+.sliderValue {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary, #6b7280);
+}
+
+.reload,
+.notice,
+.error,
+.empty {
+  margin: 0;
+  font-size: 12.5px;
+  padding-left: 10px;
+  /* A single-sided accent: no radius, or the corners read as a broken box. */
+  border-left: 2px solid currentColor;
+  border-radius: 0;
+}
+
+.reload,
+.notice {
+  color: var(--text-warning, #a9660f);
+}
+
+.error {
+  color: var(--text-danger, #b42318);
+}
+
+.empty {
+  color: var(--text-secondary, #6b7280);
+  border-left-color: transparent;
+  padding-left: 0;
+}
+
+.split {
+  display: grid;
+  /* minmax(0,·) so a wide page image cannot push the rail off-screen. */
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+}
+
+.pane {
+  background: var(--surface-1, #f6f7f8);
+  border: 1px solid var(--border, #e4e7eb);
+  border-radius: 8px;
+  padding: 8px;
+  overflow: auto;
+}
+
+/* The overlay sits in the image's own box, at its own scale, so the SVG
+ * viewBox and the rendered image always describe the same rectangle. */
+.pageStack {
+  position: relative;
+  display: block;
+  line-height: 0;
+}
+
+.page {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.box {
+  fill-opacity: 0.12;
+  stroke-width: 2;
+  transition: fill-opacity 140ms ease, stroke-width 140ms ease;
+}
+
+.label_title {
+  fill: #7f77dd;
+  stroke: #534ab7;
+}
+
+.label_text {
+  fill: #888780;
+  stroke: #5f5e5a;
+}
+
+.label_table {
+  fill: #1d9e75;
+  stroke: #0f6e56;
+}
+
+.label_figure {
+  fill: #d85a30;
+  stroke: #993c1d;
+}
+
+/* The model labels page furniture separately from body text. Observed on a
+ * real run: it emitted `footer` for a corner marker, which fell through to
+ * .label_text and drew grey — losing the distinction the model had made. */
+.label_footer,
+.label_header {
+  fill: #7f77dd;
+  stroke: #534ab7;
+}
+
+/* The region the model is on right now. This is what turns a pile of
+ * rectangles into a visible reading order. */
+.readHead {
+  stroke-width: 3;
+  fill-opacity: 0.24;
+}
+
+.linked {
+  fill-opacity: 0.3;
+  stroke-width: 3;
+}
+
+/* A box outside the page is evidence that the coordinate space is wrong.
+ * Drawn loudly rather than dropped. */
+.offPage {
+  fill: #e24b4a;
+  stroke: #a32d2d;
+  stroke-dasharray: 6 4;
+}
+
+.rail {
+  background: var(--surface-1, #f6f7f8);
+  border: 1px solid var(--border, #e4e7eb);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.block:hover {
+  background: var(--surface-2, #ffffff);
+}
+
+.blockCurrent {
+  background: var(--surface-2, #ffffff);
+}
+
+.blockLabel {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-secondary, #6b7280);
+}
+
+.blockText {
+  font-family: var(--font-mono, ui-monospace, 'Cascadia Mono', monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .box {
+    transition: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

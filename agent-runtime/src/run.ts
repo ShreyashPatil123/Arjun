@@ -342,18 +342,24 @@ export async function startRun(
   }
 
   let turns = 0;
+  // Stateful translator. Without state, llama-server's `text_start` +
+  // `text_delta*` + `text_end` triple would each carry the full accumulated
+  // text, producing the same answer 2-3 times in a row. The translator
+  // tracks which (run, content block) has been sent and only emits a
+  // `message_update` for genuinely new text.
+  const translator = new MessageTranslator(request.messageId);
   agent.subscribe((event: AgentEvent) => {
     if (event.type === "turn_end") turns += 1;
     // Best-effort by design: a dropped event costs the operator a progress line,
     // whereas awaiting delivery would let a slow UI stall the run.
     //
     // Two-pass forwarding. The OpenClaw `message_*` events carry a different
-    // shape than the Arjun chat surface expects, so `translateForWire` maps
-    // them to the wire contract (with the front-end's `messageId` attached).
+    // shape than the Arjun chat surface expects, so `Translator` maps them
+    // to the wire contract (with the front-end's `messageId` attached).
     // Everything else is forwarded as-is after `redactEvent` strips tool
     // arguments. Both lists are merged so the chat sees a single ordered
     // stream of `run.event` frames.
-    const translated = translateForWire(event, runId, request.messageId);
+    const translated = translator.translate(event);
     if (translated.length > 0) {
       for (const wire of translated) {
         peer.notify("run.event", { runId, event: wire });
@@ -494,76 +500,116 @@ type WireEvent =
  *  - One OpenClaw `message_update` may carry several `assistantMessageEvent`
  *    sub-events, so the translator yields zero or more wire events per input.
  */
+export class MessageTranslator {
+  private sentTextStart = new Set<number>();
+  private sentTextEnd = new Set<number>();
+  private sawTextDelta = new Set<number>();
+  private seenStart = false;
+  private seenEnd = false;
+
+  constructor(private readonly messageId: string) {}
+
+  translate(event: AgentEvent): WireEvent[] {
+    if (event.type === "message_start") {
+      if (this.seenStart) return [];
+      this.seenStart = true;
+      this.seenEnd = false;
+      this.sentTextStart.clear();
+      this.sentTextEnd.clear();
+      this.sawTextDelta.clear();
+      return [{ type: "message_start", messageId: this.messageId, role: "assistant" }];
+    }
+
+    if (event.type === "message_update") {
+      const inner = event.assistantMessageEvent;
+
+      if (inner.type === "text_delta") {
+        const delta = (inner as { delta?: unknown }).delta;
+        if (typeof delta !== "string" || delta.length === 0) return [];
+        const contentIndex = (inner as { contentIndex?: number }).contentIndex ?? 0;
+        this.sawTextDelta.add(contentIndex);
+        // Once we've sent the full block via text_start or text_end, ignore
+        // further deltas for that block — the wire contract is "delta = new
+        // text", and the deltas are echoes of the text_start/text_end payload.
+        if (this.sentTextStart.has(contentIndex)) return [];
+        if (this.sentTextEnd.has(contentIndex)) return [];
+        return [{ type: "message_update", messageId: this.messageId, delta }];
+      }
+
+      if (inner.type === "text_start" || inner.type === "text_end") {
+        const partial = (inner as { partial?: { content?: Array<{ type: string; text?: string }> } })
+          .partial;
+        const block = partial?.content?.[0];
+        if (!block || block.type !== "text" || typeof block.text !== "string" || block.text.length === 0) {
+          return [];
+        }
+        const contentIndex = (inner as { contentIndex?: number }).contentIndex ?? 0;
+
+        if (inner.type === "text_start") {
+          // If deltas already arrived for this block, suppress the text_start
+          // payload: the consumer has the text already.
+          if (this.sawTextDelta.has(contentIndex)) {
+            this.sentTextStart.add(contentIndex);
+            return [];
+          }
+          if (this.sentTextStart.has(contentIndex)) return [];
+          this.sentTextStart.add(contentIndex);
+          return [{ type: "message_update", messageId: this.messageId, delta: block.text }];
+        }
+
+        // text_end: emit a final delta only if we have not streamed the
+        // text via deltas, and we have not already emitted a text_start
+        // for the same block (which would itself be a duplicate).
+        if (this.sawTextDelta.has(contentIndex)) {
+          this.sentTextEnd.add(contentIndex);
+          return [];
+        }
+        if (this.sentTextEnd.has(contentIndex)) return [];
+        this.sentTextEnd.add(contentIndex);
+        return [{ type: "message_update", messageId: this.messageId, delta: block.text }];
+      }
+
+      // thinking_delta / thinking_start / thinking_end / toolcall_* are
+      // either internal model state or wire-format repairs. None of it is
+      // the user's answer, so none of it becomes a `message_update` on the
+      // wire. The audit record holds the model-side view under access
+      // control; the chat surface only ever sees the assistant's text.
+      return [];
+    }
+
+    if (event.type === "message_end") {
+      if (this.seenEnd) return [];
+      this.seenEnd = true;
+      const message = event.message;
+      const stopReason = message.role === "assistant" ? message.stopReason : undefined;
+      const usage = message.role === "assistant" ? message.usage : undefined;
+      return [
+        {
+          type: "message_end",
+          messageId: this.messageId,
+          finishReason: mapStopReason(stopReason),
+          tokensIn: usage?.input,
+          tokensOut: usage?.output,
+        },
+      ];
+    }
+
+    return [];
+  }
+}
+
+/**
+ * Backwards-compatible stateless wrapper. Used by the unit tests; the
+ * production path uses {@link MessageTranslator} so a run cannot double-emit.
+ */
 export function translateForWire(
   event: AgentEvent,
   runId: string,
   messageId: string,
 ): WireEvent[] {
-  // Unused but kept as documentation: the runId is the wire-level key the
-  // chat already filters on; the messageId is the per-cell key the translator
-  // attaches so the chat can route each delta to the right assistant cell.
   void runId;
-
-  if (event.type === "message_start") {
-    return [{ type: "message_start", messageId, role: "assistant" }];
-  }
-
-  if (event.type === "message_update") {
-    const inner = event.assistantMessageEvent;
-    // The model may emit text in different shapes depending on the
-    // transport: `text_delta` is the per-token case, `text_start` /
-    // `text_end` arrive when a server delivers the whole text in one go
-    // (small models, some local llama.cpp builds, and OpenAI-compat
-    // providers that coalesce). We surface all three, with the
-    // understanding that the chat surface will re-render the same text
-    // if the model is consistent. Only the user-visible text block
-    // (index 0) is part of the answer; reasoning and tool-call blocks
-    // are explicitly excluded.
-    if (inner.type === "text_delta") {
-      const delta = (inner as { delta?: unknown }).delta;
-      if (typeof delta !== "string" || delta.length === 0) return [];
-      return [{ type: "message_update", messageId, delta }];
-    }
-    if (inner.type === "text_start" || inner.type === "text_end") {
-      const partial = (inner as { partial?: { content?: Array<{ type: string; text?: string }> } })
-        .partial;
-      const block = partial?.content?.[0];
-      if (!block || block.type !== "text" || typeof block.text !== "string") {
-        return [];
-      }
-      return [{ type: "message_update", messageId, delta: block.text }];
-    }
-    // thinking_delta / thinking_start / thinking_end / toolcall_* are
-    // either internal model state or wire-format repairs. None of it is
-    // the user's answer, so none of it becomes a `message_update` on the
-    // wire. The audit record holds the model-side view under access
-    // control; the chat surface only ever sees the assistant's text.
-    return [];
-  }
-
-  if (event.type === "message_end") {
-    // `event.message` is OpenClaw's `AgentMessage` union, but `message_end` is
-    // only emitted for an assistant turn. Narrow to access the assistant-only
-    // fields without an `any` cast — the alternative is a wrong cast that
-    // TypeScript would catch and a correct cast that a reader would not.
-    const message = event.message;
-    const stopReason = message.role === "assistant" ? message.stopReason : undefined;
-    const usage = message.role === "assistant" ? message.usage : undefined;
-    return [
-      {
-        type: "message_end",
-        messageId,
-        finishReason: mapStopReason(stopReason),
-        tokensIn: usage?.input,
-        tokensOut: usage?.output,
-      },
-    ];
-  }
-
-  // Every other event type (turn_start, turn_end, tool_execution_*, plan_ready,
-  // milestones, etc.) is forwarded as-is after `redactEvent` strips tool
-  // arguments. This helper only handles the message-stream contract.
-  return [];
+  const translator = new MessageTranslator(messageId);
+  return translator.translate(event);
 }
 
 /**

@@ -1,6 +1,6 @@
 //! Finding the right passage, and never returning one the asker may not see.
 //!
-//! PS step 22 is precise about the ordering: *"The policy gateway filters results
+//! ARJUN design rule 22 is precise about the ordering: *"The policy gateway filters results
 //! by document and user permissions **before** the passages reach the model."*
 //! That word does the work. A filter applied afterwards has already let the
 //! model see the text, and even discarding it leaks — result counts, ranking
@@ -39,6 +39,23 @@ pub enum Retrieval {
     Keyword,
     /// Vector similarity. Not yet available — no embedding model is installed.
     Vector,
+}
+
+/// One document the index holds, as a library screen lists it.
+///
+/// Metadata only. The passages themselves are reached by searching, which is
+/// where the citation and the evidence markers come from — a list that carried
+/// text would be a second, unaudited way to read the material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedDocument {
+    pub document_sha256: String,
+    pub document_name: String,
+    pub classification: Classification,
+    /// How many passages this document was split into.
+    pub chunks: usize,
+    /// The highest page number held for it.
+    pub pages: u32,
 }
 
 /// One passage, with everything needed to cite and to trust it.
@@ -164,6 +181,64 @@ impl KnowledgeIndex {
         Ok(count as usize)
     }
 
+    /// The documents this person may see.
+    ///
+    /// Filtered by exactly the clearance rule [`Self::search`] applies, and for
+    /// the same reason: a list naming a document somebody cannot retrieve from
+    /// would disclose that it exists, which is what the clearance withholds.
+    /// Somebody cleared for nothing sees an empty library, indistinguishable
+    /// from an empty index.
+    ///
+    /// Superseded chunks are excluded, so this and [`Self::document_count`]
+    /// describe the same set.
+    pub fn documents(&self, session: &Session) -> Result<Vec<IndexedDocument>> {
+        let cleared: Vec<String> = Classification::ALL
+            .iter()
+            .filter(|c| {
+                c.cleared_roles()
+                    .iter()
+                    .any(|role| session.user.roles.contains(role))
+            })
+            .filter_map(|c| serde_json::to_string(c).ok())
+            .collect();
+        if cleared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = cleared.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT c.document_sha256, c.document_name, c.classification,
+                    COUNT(*) AS chunks, MAX(c.page) AS pages
+             FROM chunks c
+             WHERE c.superseded = 0
+               AND c.classification IN ({placeholders})
+             GROUP BY c.document_sha256, c.document_name, c.classification
+             ORDER BY c.document_name"
+        );
+
+        let conn = self.conn.lock().expect("the index lock is never poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            cleared.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let classification: String = row.get(2)?;
+            Ok(IndexedDocument {
+                document_sha256: row.get(0)?,
+                document_name: row.get(1)?,
+                classification: serde_json::from_str(&classification)
+                    .unwrap_or(Classification::Internal),
+                chunks: row.get::<_, i64>(3)? as usize,
+                pages: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Adds a document's chunks to the index, replacing anything held for it.
     ///
     /// Replacing rather than appending means re-reading a document with a better
@@ -239,7 +314,7 @@ impl KnowledgeIndex {
     ///
     /// Its passages stay in the index and remain traceable — a citation made
     /// last year must still resolve — but they are not returned as current
-    /// guidance, which is what PS step 11 asks for.
+    /// guidance, which is what ARJUN design rule 11 asks for.
     pub fn supersede(&self, document_sha256: &str) -> Result<()> {
         let conn = self.conn.lock().expect("index lock poisoned");
         conn.execute(

@@ -410,14 +410,14 @@ impl InferenceManager {
         params: GenerationParams,
         manual_capability: Option<String>,
     ) -> Result<()> {
-        // Diagnostic: log every entry so the next chat send shows in
-        // the log. If Model Health stays empty after a chat, this line
-        // is the first thing to look for; if it does not appear, the
-        // chat did not reach this function. `eprintln!` writes to
-        // stderr which Start-Process on Windows exposes to the parent
-        // console host; the `log::info!` calls were observed not to
-        // reach `sarathi.log` for these new lines.
-        eprintln!(
+        // Instrumentation kept from diagnosing why Model Health stayed empty:
+        // if this line is absent, the chat never reached this function. It is
+        // `log::debug!` rather than `eprintln!` because it fires on every send,
+        // and an unconditional write to stderr floods a packaged build's
+        // console for a diagnostic almost nobody is currently reading. The
+        // question it was added to answer — whether telemetry was recording —
+        // is now answered by the row itself, which carries a real token count.
+        log::debug!(
             "[telemetry] send_chat_message entered; messages={}, capability_override={:?}",
             messages.len(),
             manual_capability
@@ -453,13 +453,26 @@ impl InferenceManager {
             / 10;
         let started = std::time::Instant::now();
 
+        // The runtime already counts what it generated and puts the figure on
+        // every chunk; this keeps the last value it reported. Telemetry used to
+        // record `tokens_out: 0` and explain itself in a note, which made every
+        // row on the Model Health page understate the work by exactly the
+        // quantity that matters — an honest zero is still a zero to somebody
+        // comparing two models' output rates.
+        let generated = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&generated);
+
         let app_handle_clone = app_handle.clone();
         let result = {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.generate(&final_messages, &final_params, |chunk| {
+                    if let Some(count) = chunk.tokens_generated {
+                        counter.store(count as u32, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let _ = app_handle_clone.emit("inference:token", &chunk);
                 })
         };
+        let tokens_out = generated.load(std::sync::atomic::Ordering::Relaxed);
 
         // Model Health: record the call to the in-memory telemetry sink so
         // the /model-health page can show real numbers after the first call.
@@ -474,13 +487,17 @@ impl InferenceManager {
         };
         let sink_state =
             app_handle.try_state::<Arc<crate::model_intelligence::telemetry::TelemetrySink>>();
-        eprintln!(
-            "[telemetry] sink lookup result: present={}, model_id={}, exit={:?}, \
-             tokens_in_estimate={}",
+        // `log::debug!`, not `eprintln!`. This fires on every generation, and
+        // an unconditional write to stderr both floods a packaged build's log
+        // and puts the loaded model's id there whether or not anybody asked for
+        // diagnostics.
+        log::debug!(
+            "[telemetry] sink present={}, model_id={}, exit={:?}, tokens_in~{}, tokens_out={}",
             sink_state.is_some(),
             model_id,
             exit,
-            tokens_in_estimate
+            tokens_in_estimate,
+            tokens_out
         );
         if let Some(sink) = sink_state {
             sink.record(
@@ -492,12 +509,12 @@ impl InferenceManager {
                     role: "reasoning".to_string(),
                     latency: started.elapsed(),
                     tokens_in: tokens_in_estimate,
-                    tokens_out: 0,
+                    tokens_out,
                     used_fallback,
                     exit,
                     note: Some(
-                        "tokens_in is a word-count estimate; tokens_out is 0 \
-                         because the streaming path does not sum generated tokens"
+                        "tokens_in is a word-count estimate; tokens_out is the \
+                         runtime's own count of what it generated"
                             .to_string(),
                     ),
                     complexity: None,

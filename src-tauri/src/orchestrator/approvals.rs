@@ -1,6 +1,6 @@
 //! The queue of actions waiting on a person.
 //!
-//! PS step 26: *"Before any risky action the application pauses and shows the
+//! ARJUN design rule 26: *"Before any risky action the application pauses and shows the
 //! user the target, the arguments, the supporting evidence, the expected output
 //! and the consequences."*
 //!
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(queue.pending_count(), 1);
 
-        // PS step 26 names five things. All five have to be there.
+        // ARJUN design rule 26 names five things. All five have to be there.
         let r = &pending[0].request;
         assert!(!r.target.is_empty());
         assert!(!r.arguments.is_empty());

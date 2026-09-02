@@ -1,4 +1,5 @@
 import React from 'react';
+import { CodeBlock } from './CodeBlock';
 import styles from './ChatSurface.module.css';
 
 /**
@@ -121,16 +122,54 @@ function findUnescaped(s: string, ch: string, start: number): number {
   return -1;
 }
 
+/** How a table column is aligned, from its delimiter row. */
+type ColumnAlign = 'left' | 'center' | 'right';
+
 interface Block {
-  kind: 'p' | 'h' | 'ul' | 'ol' | 'code' | 'blockquote';
+  kind: 'p' | 'h' | 'ul' | 'ol' | 'code' | 'blockquote' | 'table';
   level?: number;
   lang?: string;
   text: string;
+  /** `table` only: the header cells. */
+  header?: string[];
+  /** `table` only: the body rows, already split into cells. */
+  rows?: string[][];
+  /** `table` only: one entry per column. */
+  align?: ColumnAlign[];
+}
+
+/** Splits one table line into cells, tolerating the optional outer pipes. */
+function tableCells(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map(c => c.trim());
+}
+
+/**
+ * Whether this line is a table's delimiter row (`| :--- | ---: |`).
+ *
+ * The delimiter is what makes a table a table: a line of pipes on its own is
+ * far more often prose. Requiring it is why a sentence containing a vertical
+ * bar does not become a one-column table.
+ */
+function tableAlignments(line: string): ColumnAlign[] | null {
+  if (!line.includes('|')) return null;
+  const cells = tableCells(line);
+  if (cells.length === 0) return null;
+  const out: ColumnAlign[] = [];
+  for (const cell of cells) {
+    if (!/^:?-{1,}:?$/.test(cell)) return null;
+    const left = cell.startsWith(':');
+    const right = cell.endsWith(':');
+    out.push(left && right ? 'center' : right ? 'right' : 'left');
+  }
+  return out;
 }
 
 /**
  * Tokenize the input into a sequence of blocks. The tokenizer is
- * intentionally minimal — it recognises the most common shapes a model
+ * intentionally minimal ï¿½ it recognises the most common shapes a model
  * emits in chat and folds everything else into a paragraph.
  */
 function tokenize(input: string): Block[] {
@@ -154,6 +193,31 @@ function tokenize(input: string): Block[] {
       if (i < lines.length) i += 1; // skip closing fence
       blocks.push({ kind: 'code', lang, text: body.join('\n') });
       continue;
+    }
+
+    // Pipe table: a header row, a delimiter row, then body rows.
+    //
+    // Checked before the paragraph fallback, which is what used to swallow
+    // these: a model asked to lay out a work order emits a markdown table,
+    // and without this the reader got a wall of `| Item | Qty | Ref |` with
+    // the alignment colons still in it.
+    if (line.includes('|') && i + 1 < lines.length) {
+      const align = tableAlignments(lines[i + 1]);
+      if (align) {
+        const header = tableCells(line);
+        const rows: string[][] = [];
+        i += 2;
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+          const cells = tableCells(lines[i]);
+          // Ragged rows are padded rather than dropped. A row with a cell
+          // missing is still data somebody wrote down.
+          while (cells.length < header.length) cells.push('');
+          rows.push(cells.slice(0, Math.max(header.length, 1)));
+          i += 1;
+        }
+        blocks.push({ kind: 'table', text: '', header, rows, align });
+        continue;
+      }
     }
 
     // Heading: # ... ######
@@ -213,7 +277,10 @@ function tokenize(input: string): Block[] {
       !/^#{1,6}\s/.test(lines[i]) &&
       !/^[\s]*[-*]\s+/.test(lines[i]) &&
       !/^[\s]*\d+\.\s+/.test(lines[i]) &&
-      !/^>\s+/.test(lines[i])
+      !/^>\s+/.test(lines[i]) &&
+      // A table starting on the next line ends this paragraph, or its header
+      // row would be absorbed into the prose above it.
+      !(i + 1 < lines.length && lines[i].includes('|') && tableAlignments(lines[i + 1]))
     ) {
       para.push(lines[i]);
       i += 1;
@@ -222,6 +289,63 @@ function tokenize(input: string): Block[] {
   }
 
   return blocks;
+}
+
+/**
+ * A data table, rendered so it can actually be read.
+ *
+ * The scroll container is the load-bearing part: a wide table inside a chat
+ * column either wraps into unreadable slivers or pushes the whole page
+ * sideways. It scrolls in its own box instead, and the page never does.
+ */
+function MarkdownTable({
+  header,
+  rows,
+  align,
+  renderCell,
+}: {
+  header: string[];
+  rows: string[][];
+  align: ColumnAlign[];
+  renderCell: (text: string, key: string) => React.ReactNode;
+}) {
+  const alignFor = (i: number) => align[i] ?? 'left';
+  return (
+    <div className="my-4 overflow-x-auto rounded-lg border border-line">
+      <table className="w-full border-collapse text-[13px]">
+        <thead>
+          <tr>
+            {header.map((cell, i) => (
+              <th
+                key={`th-${i}`}
+                style={{ textAlign: alignFor(i) }}
+                className="border-b border-line bg-surface-hover/50 px-[14px] py-[10px]
+                           font-semibold text-ink"
+              >
+                {renderCell(cell, `th-i-${i}`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, r) => (
+            <tr key={`tr-${r}`} className="odd:bg-transparent even:bg-surface-raised/40">
+              {row.map((cell, c) => (
+                <td
+                  key={`td-${r}-${c}`}
+                  style={{ textAlign: alignFor(c) }}
+                  className="border-b border-line/60 px-[14px] py-[10px] align-top
+                             text-ink-muted last:border-r-0"
+                >
+                  {renderCell(cell, `td-i-${r}-${c}`)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 export function Markdown({ content }: { content: string }) {
@@ -234,7 +358,11 @@ export function Markdown({ content }: { content: string }) {
         switch (block.kind) {
           case 'h': {
             const level = Math.min(Math.max(block.level ?? 1, 1), 6);
-            const Tag = `h${level}` as keyof React.JSX.IntrinsicElements;
+            // Narrowed to the six heading tags rather than every intrinsic
+            // element. `keyof JSX.IntrinsicElements` stopped being callable
+            // once react-three-fiber augmented that interface with three.js
+            // elements, and the wider type was never what was meant here.
+            const Tag = `h${level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
             return (
               <Tag key={key} className={styles.mdHeading} data-level={level}>
                 {renderInline(block.text, `${key}-i`)}
@@ -248,10 +376,16 @@ export function Markdown({ content }: { content: string }) {
               </p>
             );
           case 'code':
+            return <CodeBlock key={key} code={block.text} lang={block.lang} />;
+          case 'table':
             return (
-              <pre key={key} className={styles.mdCodeBlock} data-lang={block.lang}>
-                <code>{block.text}</code>
-              </pre>
+              <MarkdownTable
+                key={key}
+                header={block.header ?? []}
+                rows={block.rows ?? []}
+                align={block.align ?? []}
+                renderCell={(text, cellKey) => renderInline(text, cellKey)}
+              />
             );
           case 'ul':
             return (

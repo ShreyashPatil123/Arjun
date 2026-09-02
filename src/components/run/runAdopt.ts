@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   agentService,
   type AgentEventEnvelope,
@@ -119,6 +119,94 @@ export function useAdoptedRun(runId: string | null) {
   }, [runId]);
 
   return state;
+}
+
+/**
+ * Activity for every run in a conversation, keyed by run id.
+ *
+ * The chat surface needs each assistant cell to show what its own run
+ * actually did, which is more than `useAdoptedRun` was built for. Two
+ * different costs are involved, so this hook pays them differently:
+ *
+ *  - The run in flight is adopted in full (snapshot, catch-up events,
+ *    then live + durable subscriptions) so its rows appear as the tools
+ *    run.
+ *  - Runs that already finished are read once from their snapshot. No
+ *    subscriptions, and `fetched` makes it once per run for the life of
+ *    the surface rather than once per render.
+ *
+ * A snapshot that fails to load leaves the run's entry alone instead of
+ * writing an empty list, so a transient backend error shows the rows we
+ * already had rather than blanking the turn.
+ */
+export function useConversationActivity(
+  runIds: string[],
+  liveRunId: string | null,
+): Map<string, Activity[]> {
+  const [byRun, setByRun] = useState<Map<string, Activity[]>>(new Map());
+  const fetched = useRef<Set<string>>(new Set());
+
+  // `runIds` is a fresh array every render; the joined key is what
+  // actually changes when the conversation gains or loses a run.
+  const runKey = runIds.join(',');
+
+  useEffect(() => {
+    const pending = runIds.filter(
+      id => id !== liveRunId && !fetched.current.has(id),
+    );
+    if (pending.length === 0) return;
+    for (const id of pending) fetched.current.add(id);
+
+    let cancelled = false;
+    void (async () => {
+      const results = await Promise.all(
+        pending.map(async id => {
+          const snapshot = await agentService.snapshot(id).catch(() => null);
+          return [id, snapshot ? fromSnapshot(snapshot).activity : null] as const;
+        }),
+      );
+      if (cancelled) return;
+      setByRun(prev => {
+        const next = new Map(prev);
+        let changed = false;
+        for (const [id, activity] of results) {
+          if (!activity) continue;
+          next.set(id, activity);
+          changed = true;
+        }
+        return changed ? next : prev;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runKey, liveRunId]);
+
+  useEffect(() => {
+    if (!liveRunId) return;
+    let cancelled = false;
+    let teardown: (() => void) | null = null;
+    void (async () => {
+      const adopted = await adoptRun(liveRunId, next => {
+        if (cancelled) return;
+        setByRun(prev => new Map(prev).set(liveRunId, next.activity));
+      });
+      if (cancelled) return;
+      if (adopted) {
+        setByRun(prev => new Map(prev).set(liveRunId, adopted.activity));
+        teardown =
+          (adopted.view as unknown as { _adoptTeardown?: () => void })
+            ._adoptTeardown ?? null;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      teardown?.();
+    };
+  }, [liveRunId]);
+
+  return byRun;
 }
 
 /**

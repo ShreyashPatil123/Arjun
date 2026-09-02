@@ -657,6 +657,7 @@ fn the_catalogue_is_exactly_the_tools_the_gateway_knows() {
         vec![
             "agent.delegate_readonly",
             "artifact.create_approval_note",
+            "artifact.create_briefing_deck",
             "artifact.create_calculation_workbook",
             "artifact.verify_docx",
             "calculation.evaluate_with_units",

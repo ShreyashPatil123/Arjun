@@ -59,38 +59,35 @@ def hand_grade(expected: str, response: str) -> float:
 def run_prompt(model_path: Path, prompt: str, max_tokens: int = 64) -> tuple[str, int, float, float]:
     """Returns (text, tokens, total_seconds, ttft_seconds).
 
-    Honest caveat: this wrapper requires `pyllamacpp` or a similar
-    binding; if it is missing, the function returns a synthetic
-    row that the SIH pitch quotes. The synthetic path is logged
-    loudly so the CSV row is not mistaken for a real measurement.
+    Requires a `llama_cpp` binding. If one is not installed, or the model
+    will not load, this **raises**. It does not invent a row.
+
+    An earlier version returned `(max_tokens / 38.0, 0.22)` on any failure —
+    a constant dressed as a measurement. Those exact figures then appeared in
+    `docs/sih/benchmarks.md` under the heading "These numbers are *measured*
+    on the listed hardware". A benchmark harness whose failure mode is a
+    plausible number is worse than one with no failure mode at all, because
+    the CSV it produces is indistinguishable from a real run.
+
+    So: measure, or fail and say why.
     """
-    try:
-        # The exact import depends on the binding the operator
-        # has installed. We try the most common one first and
-        # fall back gracefully.
-        from llama_cpp import Llama  # type: ignore
-        llm = Llama(model_path=str(model_path), n_ctx=2048, n_threads=4, n_gpu_layers=20)
-        t0 = time.time()
-        # pyllamacpp returns a generator of tokens; the first
-        # token's arrival is the TTFT.
-        stream = llm(prompt, max_tokens=max_tokens, stream=True)
-        first = None
-        tokens = 0
-        text_parts = []
-        for tok in stream:
-            if first is None:
-                first = time.time()
-            tokens += 1
-            text_parts.append(tok["choices"][0]["text"])
-        total = time.time() - t0
-        ttft = (first or t0) - t0
-        return "".join(text_parts), tokens, total, ttft
-    except Exception as e:
-        sys.stderr.write(f"[bench] binding unavailable ({e}); writing synthetic row\n")
-        # Synthetic but plausible. The SIH pitch quotes 38 t/s for
-        # gemma-3-12b-it at Q4_K_M on RTX 5060 4GB. We use the
-        # same number so the CSV is internally consistent.
-        return ("[synthetic] " + prompt, max_tokens, max_tokens / 38.0, 0.22)
+    from llama_cpp import Llama  # type: ignore
+
+    llm = Llama(model_path=str(model_path), n_ctx=2048, n_threads=4, n_gpu_layers=20)
+    t0 = time.time()
+    # The binding yields tokens one at a time; the first arrival is the TTFT.
+    stream = llm(prompt, max_tokens=max_tokens, stream=True)
+    first = None
+    tokens = 0
+    text_parts = []
+    for tok in stream:
+        if first is None:
+            first = time.time()
+        tokens += 1
+        text_parts.append(tok["choices"][0]["text"])
+    total = time.time() - t0
+    ttft = (first or t0) - t0
+    return "".join(text_parts), tokens, total, ttft
 
 
 def main() -> int:
@@ -103,6 +100,20 @@ def main() -> int:
 
     model_path = Path(args.model)
     out_path = Path(args.out)
+
+    try:
+        import llama_cpp  # noqa: F401
+    except ImportError:
+        sys.stderr.write(
+            "[bench] no llama_cpp binding is installed, so nothing can be measured.\n"
+            "[bench] Install one (`pip install llama-cpp-python`) and re-run.\n"
+            "[bench] No CSV row is written: an unmeasured benchmark is not a benchmark.\n"
+        )
+        return 2
+
+    if not model_path.exists():
+        sys.stderr.write(f"[bench] model not found: {model_path}\n")
+        return 2
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = []

@@ -1,10 +1,11 @@
 import React, { useState, useMemo } from 'react';
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   ChevronDown,
-  ChevronRight,
   CircleSlash,
+  Copy,
   Eye,
   FileSpreadsheet,
   FileText,
@@ -12,7 +13,6 @@ import {
   Loader2,
   RotateCcw,
   ShieldCheck,
-  Wrench,
   X,
 } from 'lucide-react';
 import {
@@ -22,10 +22,10 @@ import {
   type ChatMessage,
   type RunSummary,
 } from '../../services/agent.service';
-import { formatDuration } from './format';
+import { formatDuration, formatTokens } from './format';
 import { ChatOrb } from './ChatOrb';
 import { ThinkingTree, type ThinkingNode } from './ThinkingTree';
-import { useTokenMetrics } from './useTokenMetrics';
+import { useTokenMetrics, type TokenMetrics } from './useTokenMetrics';
 import { Markdown } from './Markdown';
 import styles from './ChatSurface.module.css';
 
@@ -49,7 +49,7 @@ function parseThinking(content: string): { reasoning: string; answer: string; no
   if (reasoning) {
     const lines = reasoning.split('\n').filter(l => l.trim());
     lines.forEach((line, idx) => {
-      const trimmed = line.trim().replace(/^[-•]\s*/, '');
+      const trimmed = line.trim().replace(/^[-Â·]\s*/, '');
       nodes.push({
         id: `r-${idx}`,
         label: trimmed,
@@ -62,6 +62,26 @@ function parseThinking(content: string): { reasoning: string; answer: string; no
   return { reasoning, answer, nodes };
 }
 
+/**
+ * The full reading, for the hover the pill cannot fit.
+ *
+ * The pill shows output tokens and the rate because those are what change
+ * while an answer is being written. The prompt size and whether the numbers
+ * were reported or estimated matter too, but only to someone who has stopped
+ * to look â€” so they live here rather than widening the line.
+ */
+function tokenTitle(metrics: TokenMetrics): string {
+  const parts: string[] = [];
+  if (metrics.tokensIn > 0) parts.push(`${metrics.tokensIn} tokens in`);
+  parts.push(
+    metrics.approx
+      ? `about ${metrics.tokensOut} tokens out, estimated from the text â€” this model reported no usage`
+      : `${metrics.tokensOut} tokens out`,
+  );
+  if (metrics.speed > 0) parts.push(`${metrics.speed} tokens/second`);
+  return parts.join(' Â· ');
+}
+
 function StatusPill({
   state,
   elapsedText,
@@ -71,13 +91,13 @@ function StatusPill({
   state: 'thinking' | 'usingTool' | 'composing' | 'verifying' | 'verified' | 'failed';
   elapsedText: string | null;
   runningTools: number;
-  metrics: { tokensIn: number; tokensOut: number; speed: number; elapsedMs: number };
+  metrics: TokenMetrics;
 }) {
   const labels: Record<typeof state, string> = {
-    thinking: 'Thinking…',
-    usingTool: runningTools > 1 ? `Using ${runningTools} tools…` : 'Using a tool…',
-    composing: 'Composing…',
-    verifying: 'Verifying…',
+    thinking: 'Thinking',
+    usingTool: runningTools > 1 ? `Using ${runningTools} toolsâ€¦` : 'Using a toolâ€¦',
+    composing: 'Composingâ€¦',
+    verifying: 'Verifyingâ€¦',
     verified: 'Verified',
     failed: 'Failed',
   };
@@ -92,10 +112,12 @@ function StatusPill({
         <X size={11} />
       )}
       <span>{labels[state]}</span>
-      {elapsedText && <span className={styles.statusPillSub}>· {elapsedText}</span>}
-      {(state === 'composing' || state === 'verified') && metrics.speed > 0 && (
-        <span className={styles.statusPillSub}>
-          · {metrics.tokensOut} tok · {metrics.speed} tok/s
+      {elapsedText && <span className={styles.statusPillSub}>Â· {elapsedText}</span>}
+      {(state === 'composing' || state === 'verified') && metrics.tokensOut > 0 && (
+        <span className={styles.statusPillSub} title={tokenTitle(metrics)}>
+          Â· {metrics.approx ? '~' : ''}
+          {formatTokens(metrics.tokensOut)} tok
+          {metrics.speed > 0 && ` Â· ${metrics.speed} tok/s`}
         </span>
       )}
     </span>
@@ -118,6 +140,8 @@ interface AssistantMessageCellProps {
     errorMessage?: string;
   }[];
   runSummary?: RunSummary | null;
+  /** Only the newest assistant cell draws the orb. */
+  showAvatar?: boolean;
   onOpenInspector?: (runId: string) => void;
   onRetry?: () => void;
   composerDisabled?: boolean;
@@ -129,6 +153,7 @@ export function AssistantMessageCell({
   isLive,
   activity,
   runSummary,
+  showAvatar,
   onOpenInspector,
   onRetry,
 }: AssistantMessageCellProps) {
@@ -162,11 +187,14 @@ export function AssistantMessageCell({
             : 'thinking'
         : 'thinking';
 
+  const [copied, setCopied] = useState(false);
+
   const metrics = useTokenMetrics(
     isStreaming,
     content.length,
     message.tokensIn,
     message.tokensOut,
+    elapsedMs,
   );
 
   // FIX 3: Parse thinking / reasoning.
@@ -176,36 +204,28 @@ export function AssistantMessageCell({
   );
   const displayContent = reasoning ? answer : content;
 
-  const thinkingNodes: ThinkingNode[] = useMemo(() => {
-    if (nodes.length > 0) return nodes;
-    if (activity && activity.length > 0) {
-      return activity.map(a => ({
-        id: a.id,
-        label: a.tool,
-        status: a.status === 'running' ? 'running' : a.status === 'done' ? 'done' : 'failed',
-        icon: a.tool.includes('search') ? 'search' : a.tool.includes('read') ? 'link' : 'tool',
-        meta: a.status === 'running'
-          ? 'in progress'
-          : a.endedAt && a.startedAt
-            ? formatDuration(Math.max(0, a.endedAt - a.startedAt))
-            : undefined,
-      }));
-    }
-    return [];
+  // The timeline for this turn: the model's own steps first, then the
+  // tool calls the run actually made. Two `group` keys means two cards,
+  // which is how thinking and doing read as separate passes of work.
+  const timelineNodes: ThinkingNode[] = useMemo(() => {
+    const out: ThinkingNode[] = nodes.map(node => ({
+      ...node,
+      group: 'reasoning',
+      // Row labels are ellipsised to one line, so anything long enough
+      // to be cut keeps its full text behind the chevron.
+      detail: node.label.length > 90 ? node.label : undefined,
+    }));
+    for (const item of activity ?? []) out.push(toolNode(item));
+    return out;
   }, [nodes, activity]);
-
-  // FIX 4: Auto-dismiss thinking once the answer is streaming or done.
-  const hasReasoningToShow = reasoning.length > 0 || (activity && activity.length > 0);
-  const showThinkingExpanded = isStreaming && displayContent.length === 0 && hasReasoningToShow;
-  const showThinkingCollapsed =
-    !isDone && isStreaming && displayContent.length > 0 && hasReasoningToShow;
-  const showThinkingDone = isDone && hasReasoningToShow;
 
   return (
     <div className={styles.assistantRow}>
-      {/* LEFT: Orb Avatar (36px) */}
+      {/* Left column: the orb on the newest cell only, and an empty
+        * slot of the same width on the rest so every message in the log
+        * stays on one left edge. */}
       <div className={styles.assistantAvatar}>
-        <ChatOrb active={isStreaming} size={36} />
+        {showAvatar && <ChatOrb active={isStreaming} size={36} />}
       </div>
 
       {/* RIGHT: Meta + Content */}
@@ -217,10 +237,10 @@ export function AssistantMessageCell({
             runningTools={runningTools}
             metrics={metrics}
           />
-          <span className={styles.assistantMetaSep}>·</span>
+          <span className={styles.assistantMetaSep}>Â·</span>
           <span className={styles.assistantModel}>
             {modelName}
-            {modelRole && <span className={styles.assistantModelRole}> · {modelRole}</span>}
+            {modelRole && <span className={styles.assistantModelRole}> Â· {modelRole}</span>}
             {usedFallback && (
               <span className={styles.assistantFallback}>fallback</span>
             )}
@@ -235,37 +255,55 @@ export function AssistantMessageCell({
             </p>
           ) : (
             <>
-              {/* FIX 3 & 4: Thinking block */}
-              {showThinkingExpanded && (
+              {/* The record of the turn. It stays after the run ends:
+                * this is what happened, not a progress spinner. */}
+              {timelineNodes.length > 0 && (
                 <ThinkingTree
-                  nodes={thinkingNodes}
-                  isLive={true}
-                />
-              )}
-              {showThinkingCollapsed && (
-                <ThinkingSummary
-                  reasoning={reasoning}
-                  nodes={thinkingNodes}
-                />
-              )}
-              {showThinkingDone && reasoning.length > 0 && (
-                <ThinkingSummary
-                  reasoning={reasoning}
-                  nodes={thinkingNodes}
+                  nodes={timelineNodes}
+                  isLive={isStreaming}
+                  summary={elapsedText}
                 />
               )}
 
               {/* FIX 2 & 6: Token-by-token streaming with markdown rendering. */}
-              <div className={styles.assistantText}>
+              <div
+                className={styles.assistantText}
+                aria-live={isStreaming ? 'polite' : undefined}
+                aria-busy={isStreaming || undefined}
+              >
                 {displayContent ? (
                   <Markdown content={displayContent} />
                 ) : isStreaming ? (
-                  <span className={styles.assistantPlaceholder}>…</span>
+                  <span className={styles.assistantPlaceholder} aria-hidden="true" />
                 ) : null}
                 {isStreaming && displayContent && (
-                  <span className={styles.caret} aria-hidden="true">?</span>
+                  <span className={styles.caret} aria-hidden="true" />
                 )}
               </div>
+
+              {/* Per-message actions sit after the text in the DOM so a
+                * screen reader reaches the answer before the controls. */}
+              {isDone && displayContent.length > 0 && (
+                <div className={styles.messageActions}>
+                  <button
+                    type="button"
+                    className={styles.messageAction}
+                    onClick={() => {
+                      void navigator.clipboard
+                        .writeText(displayContent)
+                        .then(() => {
+                          setCopied(true);
+                          window.setTimeout(() => setCopied(false), 1500);
+                        })
+                        .catch(() => setCopied(false));
+                    }}
+                    aria-label={copied ? 'Copied to clipboard' : 'Copy this answer'}
+                  >
+                    {copied ? <Check size={12} /> : <Copy size={12} />}
+                    <span>{copied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              )}
             </>
           )}
 
@@ -273,10 +311,6 @@ export function AssistantMessageCell({
             <button className={styles.retryBtn} onClick={onRetry} type="button">
               <RotateCcw size={12} /> Retry
             </button>
-          )}
-
-          {activity && activity.length > 0 && (
-            <ToolActivityList activity={activity} isLive={isStreaming} />
           )}
 
           {runSummary && runSummary.artifacts.length > 0 && (
@@ -293,8 +327,8 @@ export function AssistantMessageCell({
                 View details ?
               </button>
               <span className={styles.assistantFooterMeta}>
-                {toolsTotal > 0 && <>{toolsTotal} tool{toolsTotal === 1 ? '' : 's'} · </>}
-                {runSummary && <>{runSummary.plan.steps.length} step{runSummary.plan.steps.length === 1 ? '' : 's'} · </>}
+                {toolsTotal > 0 && <>{toolsTotal} tool{toolsTotal === 1 ? '' : 's'} Â· </>}
+                {runSummary && <>{runSummary.plan.steps.length} step{runSummary.plan.steps.length === 1 ? '' : 's'} Â· </>}
                 <ShieldCheck size={10} />
                 <span>verified</span>
               </span>
@@ -302,45 +336,6 @@ export function AssistantMessageCell({
           )}
         </div>
       </div>
-    </div>
-  );
-}
-
-function ThinkingSummary({
-  reasoning,
-  nodes,
-}: {
-  reasoning: string;
-  nodes: ThinkingNode[];
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const label = reasoning
-    ? `Reasoned for ${reasoning.length.toLocaleString()} chars`
-    : nodes.length > 0
-      ? `Reasoned (${nodes.length} step${nodes.length === 1 ? '' : 's'})`
-      : 'Reasoned';
-
-  return (
-    <div className={styles.thinkingSummary}>
-      <button
-        type="button"
-        className={styles.thinkingSummaryHeader}
-        onClick={() => setExpanded(e => !e)}
-        aria-expanded={expanded}
-      >
-        <CheckCircle2 size={11} className={styles.thinkingDoneIcon} />
-        <span>{label}</span>
-        {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-      </button>
-      {expanded && (
-        <div className={styles.thinkingSummaryBody}>
-          {reasoning ? (
-            <pre className={styles.thinkingReasoningText}>{reasoning}</pre>
-          ) : (
-            <ThinkingTree nodes={nodes} isLive={false} />
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -356,15 +351,6 @@ interface ActivityEntry {
   artifactPath?: string;
   errorMessage?: string;
 }
-
-const STATUS_ICON: Record<ActivityEntry['status'], React.ComponentType<{ size?: number; className?: string }>> = {
-  running: Loader2,
-  done: CheckCircle2,
-  failed: AlertTriangle,
-  refused: CircleSlash,
-  replayed: CheckCircle2,
-  unknown: AlertTriangle,
-};
 
 const STATUS_LABEL: Record<ActivityEntry['status'], string> = {
   running: 'running',
@@ -390,94 +376,50 @@ function toolLabel(tool: string) {
   return TOOL_LABEL[tool] ?? tool;
 }
 
-function ToolActivityList({ activity, isLive }: { activity: ActivityEntry[]; isLive: boolean }) {
-  const [open, setOpen] = useState(false);
-  const runningCount = activity.filter(a => a.status === 'running').length;
-  const doneCount = activity.filter(a => a.status === 'done').length;
-  const failedCount = activity.filter(a => a.status === 'failed').length;
-
-  return (
-    <div className={styles.toolBlock}>
-      <button type="button" className={styles.toolSummary} onClick={() => setOpen(o => !o)} aria-expanded={open}>
-        <Wrench size={11} className={styles.toolSummaryIcon} />
-        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        <span className={styles.toolSummaryText}>
-          {isLive && runningCount > 0
-            ? `Using a tool… (${doneCount} done${failedCount > 0 ? `, ${failedCount} failed` : ''})`
-            : `${activity.length} tool call${activity.length === 1 ? '' : 's'}`}
-        </span>
-      </button>
-      {open && (
-        <ul className={styles.toolList}>
-          {activity.map(item => (
-            <ToolRow key={item.id} item={item} />
-          ))}
-        </ul>
-      )}
-    </div>
-  );
+function toolIcon(tool: string): ThinkingNode['icon'] {
+  if (tool.includes('search')) return 'search';
+  if (tool.includes('read')) return 'link';
+  return 'tool';
 }
 
-function ToolRow({ item }: { item: ActivityEntry }) {
-  const [expanded, setExpanded] = useState(item.status === 'failed');
-  const Icon = STATUS_ICON[item.status];
-  const duration =
-    item.startedAt && item.endedAt
-      ? formatDuration(Math.max(0, item.endedAt - item.startedAt))
-      : item.status === 'running'
-        ? 'in progress'
-        : null;
-  const expandable = Boolean(item.inputSummary || item.outputSummary || item.errorMessage || item.artifactPath);
+/**
+ * What the chevron reveals for a tool row: what the tool was asked,
+ * what came back, what it produced, why it failed. Anything the run
+ * did not record is simply left out rather than shown as an empty
+ * field.
+ */
+function toolDetail(item: ActivityEntry): string | undefined {
+  const parts: string[] = [];
+  if (item.inputSummary) parts.push(`Asked: ${item.inputSummary}`);
+  if (item.outputSummary) parts.push(`Returned: ${item.outputSummary}`);
+  if (item.artifactPath) parts.push(`Produced: ${item.artifactPath}`);
+  if (item.errorMessage) parts.push(`Failed because: ${item.errorMessage}`);
+  if (parts.length === 0 && item.status !== 'done' && item.status !== 'running') {
+    parts.push(STATUS_LABEL[item.status]);
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
 
-  return (
-    <li className={styles.toolRow}>
-      <div className={styles.toolRowMain}>
-        <Icon size={11} className={styles[`statusIcon_${item.status}`]} />
-        <span className={styles.toolName}>{toolLabel(item.tool)}</span>
-        <span className={styles.toolStatus}>{STATUS_LABEL[item.status]}</span>
-        {duration && <span className={styles.toolDuration}>{duration}</span>}
-        {expandable && (
-          <button
-            type="button"
-            className={styles.toolExpand}
-            onClick={() => setExpanded(o => !o)}
-            aria-expanded={expanded}
-            aria-label={expanded ? 'Hide tool details' : 'Show tool details'}
-          >
-            {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-          </button>
-        )}
-      </div>
-      {expanded && expandable && (
-        <div className={styles.toolDetail}>
-          {item.inputSummary && (
-            <div className={styles.toolDetailRow}>
-              <span className={styles.toolDetailLabel}>Asked</span>
-              <span className={styles.toolDetailValue}>{item.inputSummary}</span>
-            </div>
-          )}
-          {item.outputSummary && (
-            <div className={styles.toolDetailRow}>
-              <span className={styles.toolDetailLabel}>Returned</span>
-              <span className={styles.toolDetailValue}>{item.outputSummary}</span>
-            </div>
-          )}
-          {item.artifactPath && (
-            <div className={styles.toolDetailRow}>
-              <span className={styles.toolDetailLabel}>Produced</span>
-              <span className={`${styles.toolDetailValue} ${styles.toolPath}`}>{item.artifactPath}</span>
-            </div>
-          )}
-          {item.errorMessage && (
-            <div className={styles.toolDetailRow}>
-              <span className={styles.toolDetailLabel}>Failed because</span>
-              <span className={`${styles.toolDetailValue} ${styles.toolErrorLine}`}>{item.errorMessage}</span>
-            </div>
-          )}
-        </div>
-      )}
-    </li>
-  );
+/** One backend activity record as a timeline row. */
+function toolNode(item: ActivityEntry): ThinkingNode {
+  const duration =
+    item.endedAt && item.startedAt
+      ? formatDuration(Math.max(0, item.endedAt - item.startedAt))
+      : undefined;
+  return {
+    id: item.id,
+    label: toolLabel(item.tool),
+    group: 'tools',
+    icon: toolIcon(item.tool),
+    status:
+      item.status === 'running'
+        ? 'running'
+        : item.status === 'done' || item.status === 'replayed'
+          ? 'done'
+          : 'failed',
+    meta: item.status === 'running' ? 'in progress' : duration,
+    detail: toolDetail(item),
+  };
 }
 
 const ARTIFACT_ICONS: Record<ArtifactReport['kind'], typeof FileText> = {
@@ -562,7 +504,7 @@ function ArtifactPreviewPane({ preview, name }: { preview: ArtifactPreview | 'lo
     return (
       <div className={styles.previewPane} aria-busy="true">
         <Loader2 size={12} className={styles.spin} />
-        <span>Reading {name}…</span>
+        <span>Reading {name}Â·</span>
       </div>
     );
   }

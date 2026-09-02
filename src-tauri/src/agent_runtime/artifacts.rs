@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::{check_document, check_workbook, write_document, write_workbook, DocumentMetadata};
+use crate::artifacts::{
+    check_deck, check_document, check_workbook, write_deck, write_document, write_workbook,
+    DocumentMetadata, Slide, BRIEFING_SECTIONS,
+};
 use crate::identity::Session;
 use crate::orchestrator::calculation::CalculationRecord;
 use crate::orchestrator::tools::ToolCall;
@@ -48,6 +51,8 @@ use super::CallParams;
 pub enum Kind {
     Document,
     Workbook,
+    /// A briefing deck.
+    Deck,
     /// A note or draft. Checked for being present and non-empty, no more —
     /// there is no structure to check it against.
     Text,
@@ -58,6 +63,7 @@ impl Kind {
         match self {
             Kind::Document => "Word document",
             Kind::Workbook => "Workbook",
+            Kind::Deck => "Briefing deck",
             Kind::Text => "Text file",
         }
     }
@@ -169,7 +175,7 @@ pub struct ArtifactReport {
 
 /// Re-opens a produced file and reports what is actually in it.
 ///
-/// PS step 30 asks that the application open the generated file locally and
+/// ARJUN design rule 30 asks that the application open the generated file locally and
 /// confirm it is not corrupt and that required sections exist. Checking the
 /// file rather than the code that wrote it is the whole point: a bug between
 /// the template and the ZIP passes every test of the template and still
@@ -238,6 +244,21 @@ pub fn check(produced: &Produced) -> ArtifactReport {
         }
         // Nothing to check it against beyond being there and having content,
         // and claiming more than that would be inventing a standard.
+        Kind::Deck => {
+            let check = check_deck(&path);
+            let detail = if check.is_sound() {
+                format!(
+                    "Opens, with {} slide(s): {}.",
+                    check.slides,
+                    check.headings.join("; ")
+                )
+            } else if check.opens {
+                "Opens, but the deck is not sound.".to_string()
+            } else {
+                "Does not open as a presentation.".to_string()
+            };
+            report(check.is_sound(), detail, check.problems, bytes)
+        }
         Kind::Text => report(true, format!("Present, {bytes} byte(s)."), Vec::new(), bytes),
     }
 }
@@ -336,6 +357,135 @@ fn fields_from(tool_call: &ToolCall) -> Result<BTreeMap<String, String>, String>
     Ok(fields)
 }
 
+/// Writes a briefing deck.
+///
+/// PS 26117 lists the deliverables as *"approval notes, PPT/Word/Excel files,
+/// working code, calculations with steps shown"*. `artifacts::pptx` has been
+/// able to write a deck since it was added; until this function it had no tool,
+/// no command and no caller, so a run could not ask for one. The renderer was
+/// finished work behind a missing doorway.
+///
+/// ## Why the sections are fixed
+///
+/// A deck is a template, exactly as an approval note is: the four headings in
+/// [`BRIEFING_SECTIONS`] in that order, each with at least one bullet. The model
+/// supplies the bullets, not the structure. A model free to invent headings
+/// produces a deck whose shape depends on the prompt, and `check_deck` could not
+/// then say whether what came back was what was asked for.
+///
+/// `Evidence` is required for the same reason a citation is required in a note:
+/// a briefing whose findings have no source is the failure this whole codebase
+/// is arranged to prevent.
+pub fn create_pptx(
+    call: &CallParams,
+    resolved_path: Option<&Path>,
+    tool_call: &ToolCall,
+) -> Result<String, String> {
+    let path = resolved_path
+        .ok_or_else(|| "No path was resolved for the deck, so nothing was written.".to_string())?;
+
+    let content = tool_call
+        .arguments
+        .get("content")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            format!(
+                "The deck's content must be an object with a \"title\" and one list of bullets per                  section. Sections: {}.",
+                BRIEFING_SECTIONS.join(", ")
+            )
+        })?;
+
+    let title = content
+        .get("title")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "The deck needs a \"title\", as non-empty text.".to_string())?;
+
+    let mut sections = Vec::with_capacity(BRIEFING_SECTIONS.len());
+    for heading in BRIEFING_SECTIONS {
+        let key = heading.to_ascii_lowercase();
+        let value = content.get(&key).ok_or_else(|| {
+            format!(
+                "The deck is missing the {heading:?} section. Supply {key:?} as a list of bullet                  strings. Sections: {}. Nothing was written.",
+                BRIEFING_SECTIONS.join(", ")
+            )
+        })?;
+
+        // One string is accepted as a single bullet: a section that is one
+        // sentence is common, and refusing it would teach the model to wrap
+        // every sentence in a list for no reason.
+        let raw = match value {
+            serde_json::Value::String(text) => vec![text.clone()],
+            serde_json::Value::Array(items) => {
+                let mut bullets = Vec::with_capacity(items.len());
+                for (n, item) in items.iter().enumerate() {
+                    let text = item.as_str().ok_or_else(|| {
+                        format!(
+                            "Bullet {} of {heading:?} must be text. Supply each bullet as a                              string.",
+                            n + 1
+                        )
+                    })?;
+                    bullets.push(text.to_string());
+                }
+                bullets
+            }
+            _ => {
+                return Err(format!(
+                    "{heading:?} must be a list of bullet strings, or one string."
+                ))
+            }
+        };
+
+        let bullets: Vec<String> = raw
+            .into_iter()
+            .filter(|bullet| !bullet.trim().is_empty())
+            .collect();
+
+        if bullets.is_empty() {
+            // Refused rather than written empty. A slide with a heading and
+            // nothing under it reads as a section that found nothing to report,
+            // which is a different and worse claim than one never assembled.
+            return Err(format!(
+                "The {heading:?} section has no bullets, so the deck was not written. A section                  with a heading and nothing under it reads as a finding of nothing, which is not                  the same as having nothing to say."
+            ));
+        }
+
+        sections.push(Slide {
+            heading: (*heading).to_string(),
+            bullets,
+        });
+    }
+
+    // Every deck a run produces is a draft until a person signs it, for the same
+    // reason every document is: the word goes on the slide, not only into a
+    // field, so a file that escapes into an inbox still says what it is.
+    write_deck(path, title, "Internal", &sections, true).map_err(|error| error.message)?;
+
+    // Re-opened and checked, not assumed. PowerPoint is stricter than Word about
+    // what it will open, so a deck that wrote without error is not yet a deck
+    // that opens.
+    let check = check_deck(path);
+    if !check.is_sound() {
+        return Err(format!(
+            "{} was written but did not pass its own check: {}. Correct the content and produce              it again.",
+            path.display(),
+            if check.problems.is_empty() {
+                "it does not open as a presentation".to_string()
+            } else {
+                check.problems.join("; ")
+            }
+        ));
+    }
+
+    let _ = call;
+    Ok(format!(
+        "Wrote {} with {} slide(s): {}. It is marked DRAFT until somebody approves it.",
+        path.display(),
+        check.slides,
+        check.headings.join("; ")
+    ))
+}
+
 /// Writes the run's calculations into a workbook Excel can recompute.
 pub fn create_xlsx(
     resolved_path: Option<&Path>,
@@ -404,6 +554,110 @@ mod tests {
 
     fn author() -> Session {
         Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]))
+    }
+
+    fn deck_content() -> serde_json::Value {
+        json!({
+            "path": "briefing.pptx",
+            "content": {
+                "title": "Q3 seal inspection",
+                "findings": ["Measured 8.2 mm against a 9.0 mm minimum [E1]", "No leak observed"],
+                "recommendation": ["Replace the seal at the next shutdown"],
+                "assumptions": "None.",
+                "evidence": ["Maintenance SOP rev C, page 4"]
+            }
+        })
+    }
+
+    #[test]
+    fn a_deck_is_written_re_opened_and_says_it_is_a_draft() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("briefing.pptx");
+        let tool_call = ToolCall::new("create_pptx", deck_content());
+
+        let message = create_pptx(&call_params("run-deck"), Some(&path), &tool_call)
+            .expect("the deck is written");
+
+        assert!(path.exists(), "no file was written");
+        // The point of the check: the file re-opens as a presentation, and the
+        // headings that come back are the ones the template promises.
+        let check = check_deck(&path);
+        assert!(check.is_sound(), "deck did not re-open: {:?}", check.problems);
+        for heading in BRIEFING_SECTIONS {
+            assert!(
+                check.headings.iter().any(|h| h.eq_ignore_ascii_case(heading)),
+                "{heading} missing from {:?}",
+                check.headings
+            );
+        }
+        assert!(message.contains("DRAFT"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_section_is_named_and_nothing_is_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("partial.pptx");
+        let tool_call = ToolCall::new(
+            "create_pptx",
+            json!({
+                "path": "partial.pptx",
+                "content": {
+                    "title": "Q3 seal inspection",
+                    "findings": ["Worn beyond limit"],
+                    "recommendation": ["Replace"],
+                    "assumptions": ["None"]
+                }
+            }),
+        );
+
+        let refusal = create_pptx(&call_params("run-deck"), Some(&path), &tool_call)
+            .expect_err("a deck without Evidence must be refused");
+
+        assert!(refusal.contains("Evidence"), "{refusal}");
+        assert!(refusal.contains("Nothing was written"), "{refusal}");
+        assert!(!path.exists(), "a refused deck must not leave a file behind");
+    }
+
+    #[test]
+    fn an_empty_section_is_refused_rather_than_written_as_a_blank_slide() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("blank.pptx");
+        let mut content = deck_content();
+        content["content"]["assumptions"] = json!([]);
+        let tool_call = ToolCall::new("create_pptx", content);
+
+        let refusal = create_pptx(&call_params("run-deck"), Some(&path), &tool_call)
+            .expect_err("an empty section must be refused");
+
+        assert!(refusal.contains("Assumptions"), "{refusal}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_bullet_that_is_not_text_is_refused_by_position() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("deck.pptx");
+        let mut content = deck_content();
+        content["content"]["findings"] = json!(["fine", 9.0]);
+        let tool_call = ToolCall::new("create_pptx", content);
+
+        let refusal = create_pptx(&call_params("run-deck"), Some(&path), &tool_call)
+            .expect_err("a numeric bullet must be refused");
+
+        // Named by position, so the model can find the one it got wrong.
+        assert!(refusal.contains("Bullet 2"), "{refusal}");
+        assert!(refusal.contains("Findings"), "{refusal}");
+    }
+
+    #[test]
+    fn one_string_is_accepted_as_a_single_bullet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("single.pptx");
+        let tool_call = ToolCall::new("create_pptx", deck_content());
+
+        create_pptx(&call_params("run-deck"), Some(&path), &tool_call)
+            .expect("assumptions supplied as one string is legitimate");
+        assert!(check_deck(&path).is_sound());
     }
 
     #[test]

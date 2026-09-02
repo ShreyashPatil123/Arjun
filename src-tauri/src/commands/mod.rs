@@ -13,5 +13,7 @@ pub mod benchmarks;
 pub mod conversations;
 pub mod governance;
 pub mod health;
+pub mod knowledge;
 pub mod registry;
 pub mod voice;
+pub mod ocr;

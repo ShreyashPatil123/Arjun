@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::config::ConfigManager;
@@ -13,12 +14,16 @@ use crate::ai_engine::activation::{ActivationOutcome, InferenceLoader, ModelActi
 use crate::audit::{AuditKind, AuditService};
 use crate::registry::router::{ModelRouter, RoutingDecision};
 use crate::registry::{ModelEntry, ModelRegistry};
+use crate::serving::ModelServers;
 use crate::system_analyzer::gpu_collector;
 use crate::ai_engine::startup::StartupModelTarget;
 use crate::download_manager::traits::InstalledModel;
 
 /// The activator, shared across commands.
 pub type SharedActivator = Arc<ModelActivator<InferenceLoader>>;
+
+/// Where a swap narrates itself. One channel, one step per message.
+const ORCHESTRATOR_SWAP_EVENT: &str = "models://orchestrator";
 
 /// A routed and loaded model, ready to run.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -28,34 +33,105 @@ pub struct PreparedModel {
     pub activation: ActivationOutcome,
 }
 
-/// The exact installed model variant selected to run the orchestrator.
+/// The orchestrator an administrator chose, or `None` when nobody has.
+///
+/// Read from the configuration on every call rather than cached at startup:
+/// the choice changes while the app is running, and a routing decision made
+/// after the change must reflect it. A configuration that cannot be read is
+/// treated as "nothing chosen" — the router then picks on capability alone,
+/// which is a worse answer than the administrator wanted but a working one.
+pub fn configured_orchestrator(app: &AppHandle) -> Option<StartupModelTarget> {
+    let config = ConfigManager::load(&ConfigManager::get_config_path(app))
+        .map_err(|e| {
+            log::warn!(
+                "[REGISTRY] the configuration could not be read, so no orchestrator is \
+                 being honoured for this decision: {e}"
+            );
+        })
+        .ok()?;
+    StartupModelTarget::configured(&config.ai_settings)
+}
+
+/// The exact installed model variant selected to run the orchestrator, or
+/// `null` when an administrator has not chosen one. No model is compiled in as
+/// a default, so "not chosen yet" is a real state the UI has to show.
 #[tauri::command]
 pub async fn get_orchestrator_model(
     app: AppHandle,
     session: State<'_, CurrentSession>,
-) -> Result<StartupModelTarget, String> {
+) -> Result<Option<StartupModelTarget>, String> {
     require_session(&session)?;
-    let config = ConfigManager::load(&ConfigManager::get_config_path(&app))
-        .map_err(|e| e.to_string())?;
-    Ok(StartupModelTarget {
-        provider_id: config.ai_settings.orchestrator_provider_id,
-        model_id: config.ai_settings.orchestrator_model_id,
-        quantization: config.ai_settings.orchestrator_quantization,
-    })
+    Ok(configured_orchestrator(&app))
 }
 
-/// Selects any ready installed model as the orchestrator. Administrator only.
-/// The exact provider/model/quantization coordinates are persisted so startup
-/// never guesses between two variants of the same model.
+/// One step of a swap, as it happens.
+///
+/// Emitted on `models://orchestrator` so the Models screen can show the change
+/// taking place rather than a spinner that says "Saving…" while a several-
+/// gigabyte model is read off disk. Every phase names the model it is about:
+/// during a release that is the model going away, not the one arriving.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorSwapStep {
+    /// `releasing` | `loading` | `ready` | `failed`.
+    pub phase: &'static str,
+    pub model_id: String,
+    pub model_name: String,
+    /// Present on `failed`, and on nothing else.
+    pub detail: Option<String>,
+}
+
+/// What `set_orchestrator_model` did.
+///
+/// The selection is reported separately from the swap because they can succeed
+/// independently: the choice is written to the configuration first and survives
+/// a server that then refuses to start, so the next launch still honours it.
+/// Reporting one field for both would have to lie about one of them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorChange {
+    /// The coordinates written to the configuration, as the registry states
+    /// them — which is not always how the installed package states them.
+    pub selected: StartupModelTarget,
+    pub model_id: String,
+    pub model_name: String,
+    /// Models whose servers were stopped to make room. Empty when none ran.
+    pub released: Vec<String>,
+    /// True when the new orchestrator is up and answering.
+    pub serving: bool,
+    /// Why it is not, when it is not.
+    pub detail: Option<String>,
+}
+
+/// Selects any ready installed model as the orchestrator, and swaps to it now.
+///
+/// Administrator only. Two things happen, in this order and for this reason:
+///
+/// 1. The choice is persisted, as the *registry* states the coordinates. It has
+///    to be the registry's spelling: routing matches an administrator's choice
+///    against registry entries, and the installed package describes its own
+///    quantisation from the file name, which is a different vocabulary. Storing
+///    the package's spelling is what made this setting do nothing at all — the
+///    star moved in the Models list and the chat carried on answering from the
+///    previous model, because no entry ever matched.
+/// 2. The running model server is swapped. Without this the change took effect
+///    at the next launch, which is not what choosing a model in a list means.
+///
+/// Step 1 is not rolled back when step 2 fails. A model that cannot be started
+/// right now — no VRAM free, a server that will not come up — is still the
+/// model the administrator chose, and discarding that choice would be a second
+/// surprise on top of the first.
 #[tauri::command]
 pub async fn set_orchestrator_model(
     app: AppHandle,
     session: State<'_, CurrentSession>,
     audit: State<'_, Arc<AuditService>>,
+    registry: State<'_, Arc<ModelRegistry>>,
+    servers: State<'_, Arc<ModelServers>>,
     provider_id: String,
     model_id: String,
     quantization: String,
-) -> Result<StartupModelTarget, String> {
+) -> Result<OrchestratorChange, String> {
     let signed_in = require_permission(&session, Permission::ModifyPolicy)?;
     let requested = StartupModelTarget {
         provider_id: provider_id.trim().to_string(),
@@ -71,7 +147,22 @@ pub async fn set_orchestrator_model(
 
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let installed = crate::model_manager::ModelManager::list_installed_models(&app_data);
-    let selected = resolve_installed_orchestrator(&installed, &requested)?;
+    let on_disk = resolve_installed_orchestrator(&installed, &requested)?;
+    // The whole fix, in one line: what gets saved is what routing can match.
+    let selected = registered_coordinates(&registry, &on_disk)?;
+
+    let entry = registry
+        .orchestrator_entry_for(Some(&selected))
+        .ok_or_else(|| {
+            format!(
+                "{} resolved to registry coordinates that then matched no entry. The registry \
+                 at {} may have changed while this was being saved.",
+                selected.model_id,
+                registry.manifest_path().display()
+            )
+        })?;
+    let entry_id = entry.id.clone();
+    let entry_name = entry.name.clone();
 
     let config_path = ConfigManager::get_config_path(&app);
     let mut config = ConfigManager::load(&config_path).map_err(|e| e.to_string())?;
@@ -86,21 +177,138 @@ pub async fn set_orchestrator_model(
         SarathiEvent::ConfigChanged,
         Some(serde_json::json!({ "orchestrator": &selected })),
     );
+
+    let swap = swap_to(&app, &registry, &servers, &entry_id, &entry_name).await;
+
     let _ = audit.record(
         &signed_in.user.id,
         AuditKind::ModelRegistry,
         format!(
-            "Set orchestrator to {} ({})",
-            selected.model_id, selected.quantization
+            "Set orchestrator to {} ({}){}",
+            selected.model_id,
+            selected.quantization,
+            match (&swap.serving, swap.released.as_slice()) {
+                (true, []) => ", now serving".to_string(),
+                (true, released) => format!(", now serving, releasing {}", released.join(", ")),
+                (false, _) => ", not yet serving".to_string(),
+            }
         ),
         Some(serde_json::json!({
             "providerId": &selected.provider_id,
             "modelId": &selected.model_id,
             "quantization": &selected.quantization,
+            "registryId": &entry_id,
+            "released": &swap.released,
+            "serving": swap.serving,
+            "detail": &swap.detail,
         })),
     );
 
-    Ok(selected)
+    Ok(OrchestratorChange {
+        selected,
+        model_id: entry_id,
+        model_name: entry_name,
+        released: swap.released,
+        serving: swap.serving,
+        detail: swap.detail,
+    })
+}
+
+/// What the swap half of `set_orchestrator_model` produced.
+struct SwapOutcome {
+    released: Vec<String>,
+    serving: bool,
+    detail: Option<String>,
+}
+
+/// Stops whatever is serving, starts the new orchestrator, and narrates it.
+///
+/// The order matters on a machine where both models do not fit at once, which
+/// is the ordinary case: releasing first is what makes room. It also means a
+/// failure to start leaves nothing serving, so the caller reports `serving:
+/// false` rather than the previous model quietly continuing to answer — which
+/// is the shape of the bug this whole change is about.
+async fn swap_to(
+    app: &AppHandle,
+    registry: &ModelRegistry,
+    servers: &ModelServers,
+    entry_id: &str,
+    entry_name: &str,
+) -> SwapOutcome {
+    let step = |phase: &'static str, model_id: &str, model_name: &str, detail: Option<String>| {
+        let _ = app.emit(
+            ORCHESTRATOR_SWAP_EVENT,
+            OrchestratorSwapStep {
+                phase,
+                model_id: model_id.to_string(),
+                model_name: model_name.to_string(),
+                detail,
+            },
+        );
+    };
+
+    let mut released = Vec::new();
+    for running in servers.running_model_ids() {
+        if running == entry_id {
+            continue;
+        }
+        // The display name if the registry knows it, the id if it does not. A
+        // server can outlive the entry that started it.
+        let name = registry
+            .find(&running)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| running.clone());
+        step("releasing", &running, &name, None);
+        servers.stop(&running).await;
+        released.push(name);
+    }
+
+    step("loading", entry_id, entry_name, None);
+
+    let Some(entry) = registry.find(entry_id) else {
+        let detail = format!("{entry_name} is no longer in the registry.");
+        step("failed", entry_id, entry_name, Some(detail.clone()));
+        return SwapOutcome {
+            released,
+            serving: false,
+            detail: Some(detail),
+        };
+    };
+
+    let vram = gpu_collector::installed_gpus()
+        .iter()
+        .map(|gpu| gpu.dedicated_video_memory_bytes)
+        .max()
+        .unwrap_or(0);
+    let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
+        vram,
+        entry.weights_bytes,
+        entry.context_length,
+        None,
+    );
+
+    match servers
+        .endpoint_for(entry, registry.models_dir(), &plan)
+        .await
+    {
+        Ok(_) => {
+            step("ready", entry_id, entry_name, None);
+            SwapOutcome {
+                released,
+                serving: true,
+                detail: None,
+            }
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            step("failed", entry_id, entry_name, Some(detail.clone()));
+            SwapOutcome {
+                released,
+                serving: false,
+                detail: Some(detail),
+            }
+        }
+    }
 }
 
 fn resolve_installed_orchestrator(
@@ -119,6 +327,102 @@ fn resolve_installed_orchestrator(
                 requested.model_id, requested.quantization
             )
         })
+}
+
+/// A placeholder quantisation names the container rather than the weights.
+/// `GGUF` is what the package manifest records when the file name declares
+/// nothing this build can parse, and it identifies no particular variant.
+fn is_placeholder_quantization(quantization: &str) -> bool {
+    let trimmed = quantization.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("gguf")
+}
+
+/// Translates a selection made from what is on disk into the coordinates the
+/// router matches on.
+///
+/// The bug this exists to close: the orchestrator was persisted from the
+/// installed package, whose quantisation comes from the file name, while
+/// routing compares against the registry, whose quantisation is what an
+/// administrator wrote in the manifest. On a machine holding `Q4_K_S` and
+/// `UD-Q4_K_XL` files the package side recorded both as "GGUF", so nothing ever
+/// matched, and the chat went on answering from whichever model the capability
+/// sort reached first — with the Models screen still showing the star beside
+/// the model nobody was talking to.
+///
+/// Selecting a model the registry does not know is refused rather than saved.
+/// Routing can only choose registered models, so persisting an unregistered one
+/// would store a preference that can never be honoured, which is the silence
+/// this function exists to break.
+fn registered_coordinates(
+    registry: &ModelRegistry,
+    installed: &StartupModelTarget,
+) -> Result<StartupModelTarget, String> {
+    let entries = registry.entries_for_package(&installed.provider_id, &installed.model_id);
+    if entries.is_empty() {
+        return Err(format!(
+            "{} is installed but is not in the model registry, so routing cannot select it. \
+             Add it to {} and try again.",
+            installed.model_id,
+            registry.manifest_path().display()
+        ));
+    }
+
+    // An exact quantisation match is the unambiguous case and is taken first,
+    // whatever else is registered for the same package.
+    let exact = entries.iter().find_map(|entry| {
+        let load = entry.load.as_ref()?;
+        load.quantization
+            .eq_ignore_ascii_case(&installed.quantization)
+            .then(|| StartupModelTarget::from_load(entry))
+            .flatten()
+    });
+    if let Some(target) = exact {
+        return Ok(target);
+    }
+
+    // No exact match. A selection carrying a real label means the registry does
+    // not hold that variant, and saying so is better than quietly substituting
+    // another one.
+    if !is_placeholder_quantization(&installed.quantization) {
+        return Err(format!(
+            "{} is registered, but not at quantisation {}. Registered: {}.",
+            installed.model_id,
+            installed.quantization,
+            describe_quantizations(&entries)
+        ));
+    }
+
+    // The selection says only "a GGUF of this model". That is enough when the
+    // registry holds one variant of the package and not enough when it holds
+    // several — guessing between two variants of the same model is the one
+    // thing the exact-coordinates design exists to prevent.
+    match entries.as_slice() {
+        [only] => StartupModelTarget::from_load(only).ok_or_else(|| {
+            format!(
+                "{} is registered but carries no load coordinates, so the runtime has no file \
+                 to open. Give its registry entry a load block.",
+                installed.model_id
+            )
+        }),
+        many => Err(format!(
+            "{} is registered at {} variants ({}), and the installed copy does not say which \
+             one it is. Name the quantisation in the registry entry, or keep only the variant \
+             you want installed.",
+            installed.model_id,
+            many.len(),
+            describe_quantizations(many)
+        )),
+    }
+}
+
+/// The registered quantisations of a package, for a message that has to say
+/// what the alternatives actually were.
+fn describe_quantizations(entries: &[&crate::registry::ModelEntry]) -> String {
+    entries
+        .iter()
+        .filter_map(|entry| entry.load.as_ref().map(|load| load.quantization.clone()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every registered model, including disabled ones.
@@ -154,6 +458,7 @@ pub async fn model_manifest_path(
 /// reasons that produced it.
 #[tauri::command]
 pub async fn preview_routing(
+    app: AppHandle,
     registry: State<'_, Arc<ModelRegistry>>,
     session: State<'_, CurrentSession>,
     prompt: String,
@@ -170,13 +475,13 @@ pub async fn preview_routing(
     // The largest GPU wins on a multi-GPU box, matching what the inference
     // engine will use. No GPU at all reports zero, and the planner turns that
     // into a CPU-only plan rather than an error.
-    let vram = gpu_collector::detect_gpus()
+    let vram = gpu_collector::installed_gpus()
         .iter()
         .map(|gpu| gpu.dedicated_video_memory_bytes)
         .max()
         .unwrap_or(0);
 
-    ModelRouter::route(
+    ModelRouter::route_with_orchestrator(
         &registry,
         &prompt,
         classification,
@@ -185,6 +490,7 @@ pub async fn preview_routing(
         false,
         &[],
         &[],
+        configured_orchestrator(&app).as_ref(),
     )
     .map_err(|failure| failure.reason)
 }
@@ -200,6 +506,7 @@ pub async fn preview_routing(
 /// it. The refusal names the holder so the wait is explicable.
 #[tauri::command]
 pub async fn prepare_model_for(
+    app: AppHandle,
     registry: State<'_, Arc<ModelRegistry>>,
     activator: State<'_, SharedActivator>,
     session: State<'_, CurrentSession>,
@@ -209,13 +516,13 @@ pub async fn prepare_model_for(
 ) -> Result<PreparedModel, String> {
     let signed_in = require_permission(&session, Permission::ImportModel)?;
 
-    let vram = gpu_collector::detect_gpus()
+    let vram = gpu_collector::installed_gpus()
         .iter()
         .map(|gpu| gpu.dedicated_video_memory_bytes)
         .max()
         .unwrap_or(0);
 
-    let routing = ModelRouter::route(
+    let routing = ModelRouter::route_with_orchestrator(
         &registry,
         &prompt,
         classification,
@@ -224,6 +531,7 @@ pub async fn prepare_model_for(
         false,
         &[],
         &[],
+        configured_orchestrator(&app).as_ref(),
     )
     .map_err(|failure| failure.reason)?;
 
@@ -312,5 +620,94 @@ mod tests {
         let model = installed("Q6_K", false);
         let requested = StartupModelTarget::from_installed(&model);
         assert!(resolve_installed_orchestrator(&[model], &requested).is_err());
+    }
+
+    /// A registry holding the same package the `installed` helper describes,
+    /// registered at each of `quantizations`.
+    fn registry_with(quantizations: &[&str]) -> ModelRegistry {
+        let entries = quantizations
+            .iter()
+            .map(|quantization| {
+                let mut entry = crate::registry::tests::entry(
+                    &format!("custom-{quantization}"),
+                    7.0,
+                    vec![crate::registry::ModelRole::Reasoning],
+                );
+                entry.load = Some(crate::registry::LoadSpec {
+                    provider_id: "huggingface".into(),
+                    model_id: "org/custom-orchestrator".into(),
+                    quantization: (*quantization).into(),
+                });
+                entry
+            })
+            .collect();
+        ModelRegistry::from_manifest(
+            crate::registry::ModelManifest { models: entries },
+            std::path::PathBuf::from("registry.json"),
+        )
+        .expect("the manifest is well formed")
+    }
+
+    /// The bug, exactly as it was found.
+    ///
+    /// The package manifest could not read `Q4_K_S` out of the file name and
+    /// recorded the container word "GGUF" instead. Persisting that is what made
+    /// the setting do nothing: the router compares an administrator's choice
+    /// against the registry, which says `Q4_K_S`, so the choice matched no
+    /// entry and the chat kept answering from a model nobody had picked — with
+    /// the star still showing beside the one they had.
+    #[test]
+    fn a_placeholder_quantisation_resolves_to_what_the_registry_calls_it() {
+        let registry = registry_with(&["Q4_K_S"]);
+        let on_disk = StartupModelTarget::from_installed(&installed("GGUF", true));
+
+        let stored = registered_coordinates(&registry, &on_disk).expect("resolvable");
+
+        assert_eq!(stored.quantization, "Q4_K_S", "the registry's spelling wins");
+        assert!(
+            registry.orchestrator_entry_for(Some(&stored)).is_some(),
+            "what is stored has to be what routing can find again"
+        );
+        // Matching also tolerates the unresolved form, so a choice saved by an
+        // earlier build starts being honoured without being re-made. Resolving
+        // on the way in is still what keeps a two-variant package unambiguous.
+        assert!(
+            registry.orchestrator_entry_for(Some(&on_disk)).is_some(),
+            "a choice already saved as a placeholder has to start working too"
+        );
+    }
+
+    #[test]
+    fn an_exact_quantisation_is_taken_as_given() {
+        let registry = registry_with(&["Q4_K_S", "Q6_K"]);
+        let on_disk = StartupModelTarget::from_installed(&installed("Q6_K", true));
+
+        let stored = registered_coordinates(&registry, &on_disk).expect("resolvable");
+
+        assert_eq!(stored.quantization, "Q6_K");
+    }
+
+    /// Two variants and nothing to tell them apart is the case the exact
+    /// coordinates exist to prevent, so it is refused rather than guessed.
+    #[test]
+    fn a_placeholder_against_several_variants_is_refused_not_guessed() {
+        let registry = registry_with(&["Q4_K_S", "Q6_K"]);
+        let on_disk = StartupModelTarget::from_installed(&installed("GGUF", true));
+
+        let error = registered_coordinates(&registry, &on_disk).expect_err("ambiguous");
+
+        assert!(error.contains("Q4_K_S") && error.contains("Q6_K"), "{error}");
+    }
+
+    /// Routing can only pick registered models, so storing an unregistered one
+    /// would save a preference that can never be honoured.
+    #[test]
+    fn choosing_a_model_the_registry_does_not_know_is_refused() {
+        let registry = registry_with(&[]);
+        let on_disk = StartupModelTarget::from_installed(&installed("Q4_K_S", true));
+
+        let error = registered_coordinates(&registry, &on_disk).expect_err("unregistered");
+
+        assert!(error.contains("not in the model registry"), "{error}");
     }
 }

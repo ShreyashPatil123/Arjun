@@ -1,6 +1,6 @@
 //! The calculation workbook — working a reviewer can check without redoing it.
 //!
-//! PS step 27 asks that numerical work be done by a deterministic engine and
+//! ARJUN design rule 27 asks that numerical work be done by a deterministic engine and
 //! shown step by step: *"inputs, units, formula, assumptions, intermediate
 //! values, result, rounding rule"*. [`orchestrator::calculation`] already
 //! produces exactly that record. This module writes it into a spreadsheet,

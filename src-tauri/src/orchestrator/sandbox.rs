@@ -1,6 +1,6 @@
 //! Where model-written code runs, and what that actually guarantees.
 //!
-//! PS step 28: *"The sandbox runs it with a read-only base image, no host
+//! ARJUN design rule 28: *"The sandbox runs it with a read-only base image, no host
 //! credentials, no unrestricted host mounts, blocked network, limited CPU/RAM, a
 //! timeout, and a restricted output directory."*
 //!
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// What a tier actually guarantees. Each field is a promise from PS step 28.
+/// What a tier actually guarantees. Each field is a promise from ARJUN design rule 28.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Isolation {
@@ -184,7 +184,7 @@ impl SandboxAssessment {
         }
     }
 
-    /// One line for the audit record. PS step 28 asks that the active tier be
+    /// One line for the audit record. ARJUN design rule 28 asks that the active tier be
     /// recorded, and a run on an accepted-risk tier must be distinguishable
     /// afterwards from a fully isolated one.
     pub fn audit_summary(&self) -> String {
@@ -208,7 +208,7 @@ impl SandboxAssessment {
 /// strong tier without being asked, and one that has not is told plainly rather
 /// than silently dropped to something weaker.
 pub fn detect_tier() -> SandboxTier {
-    if available("podman") || available("docker") {
+    if container_runtime_usable("podman") || container_runtime_usable("docker") {
         return SandboxTier::Container;
     }
     if available("wsl") {
@@ -253,6 +253,77 @@ fn assumed_absent(name: &str) -> bool {
 
 fn available(name: &str) -> bool {
     !assumed_absent(name) && command_exists(name)
+}
+
+/// How long the daemon probe waits before giving up.
+///
+/// A responsive daemon answers `info` in well under a second. The value is a
+/// deadline for a *broken* one, not a performance budget for a healthy one.
+const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a container runtime is not merely *installed* but actually able to
+/// run something.
+///
+/// `docker --version` answers from the CLI alone and succeeds with the daemon
+/// stopped — the state a Windows laptop is in whenever Docker Desktop has not
+/// been launched. Treating that as a container tier is the worst kind of wrong:
+/// it claims the one tier that promises a blocked network, so `assess` returns
+/// `Ready`, and the run proceeds believing it is isolated.
+///
+/// `info` is the cheapest call that has to reach the daemon, so it fails exactly
+/// when the runtime cannot run a container.
+///
+/// ## Why this waits rather than blocking
+///
+/// A half-started Docker Desktop — processes up, engine never initialised — does
+/// not make `info` *fail*. It makes it **hang**, indefinitely, and
+/// `Command::status` has no timeout. An earlier version of this function called
+/// it directly, and the result was a test suite that stalled and an application
+/// that would have frozen on startup, because `LocalToolRunner::new` calls
+/// `detect_tier`. A probe for whether something is healthy must not itself hang
+/// when it is not.
+///
+/// So the child is spawned, polled to a deadline, and killed if it overruns. The
+/// check errs toward refusing: a daemon too slow to answer reads as absent and
+/// ARJUN declines to run code it might have been able to sandbox. That is the
+/// safe direction — the opposite error claims an isolation boundary that is not
+/// there.
+fn container_runtime_usable(name: &str) -> bool {
+    use crate::system_analyzer::process_utils::create_hidden_command;
+
+    if !available(name) {
+        return false;
+    }
+
+    let Ok(mut child) = create_hidden_command(name)
+        .arg("info")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if deadline.elapsed() >= RUNTIME_PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn command_exists(name: &str) -> bool {

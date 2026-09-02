@@ -24,7 +24,9 @@ use crate::agent_runtime::events::{
     SYSTEM_ACTOR,
 };
 use crate::agent_runtime::retrieval::RunPassages;
-use crate::agent_runtime::tasks::{ApprovalRecord, PlanRecord, TaskRecord, TaskSummary, ToolCallRecord};
+use crate::agent_runtime::tasks::{
+    ApprovalRecord, PlanRecord, TaskRecord, TaskSummary, ToolCallRecord,
+};
 use crate::agent_runtime::workspace::Workspace;
 use crate::agent_runtime::{artifacts, planning, retrieval, tasks};
 use crate::agent_runtime::{AgentRuntime, RuntimeDeps, AGENT_DURABLE_EVENT, AGENT_EVENT};
@@ -61,8 +63,11 @@ pub type RunToolCalls = Arc<Mutex<std::collections::HashMap<String, Vec<ToolCall
 /// Application state for the same reason as the plans: `create_xlsx` writes the
 /// working from this table during the run, and the task record reads it
 /// afterwards to hand the verifier the figures the engine actually produced.
-pub type RunCalculations =
-    Arc<Mutex<std::collections::HashMap<String, Vec<crate::orchestrator::calculation::CalculationRecord>>>>;
+pub type RunCalculations = Arc<
+    Mutex<
+        std::collections::HashMap<String, Vec<crate::orchestrator::calculation::CalculationRecord>>,
+    >,
+>;
 
 /// The one runtime for this session, started on first use.
 pub type AgentRuntimeHandle = Arc<Mutex<Option<Arc<AgentRuntime>>>>;
@@ -114,6 +119,21 @@ pub struct StartRunRequest {
     /// `agent_append_turn`. Required when `conversationId` is set.
     #[serde(default)]
     pub message_id: Option<String>,
+    /// Files the user attached to this turn.
+    ///
+    /// Carried as bytes, not paths: the webview has no filesystem the backend
+    /// could re-open, and a path would let the frontend nominate any file on
+    /// the machine. They belong to THIS request — nothing is remembered
+    /// between runs, so one turn's attachment cannot reappear in another's.
+    #[serde(default)]
+    pub attachments: Vec<crate::commands::ocr::ChatAttachment>,
+    /// Where the accuracy-to-speed slider was left when this turn was sent.
+    ///
+    /// It governs only how attachments are read; the model that answers is
+    /// still the router's decision. `None` means the caller never showed a
+    /// slider, and the default stop is used.
+    #[serde(default)]
+    pub ocr_detent: Option<crate::ai_engine::ocr_profile::OcrDetent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,27 +165,48 @@ pub struct RunSummary {
 
 /// What the model is told it is, and what it must not do.
 ///
-/// Deliberately short and specific. The two rules that matter for PS 26117 are
-/// here rather than buried in a template: search before answering, and say when
-/// nothing was found instead of filling the silence.
+/// Deliberately short and specific. The rule that matters for PS 26117 is here
+/// rather than buried in a template: search before answering *about the
+/// organisation's own record*, and say when nothing was found instead of
+/// filling the silence.
+///
+/// The scope clause is load-bearing. An earlier version stated the grounding
+/// rule unconditionally, and a small local model reads that as applying to
+/// every turn — so a bare "hi" came back as "no source was found for the
+/// query", and a request to write a function came back empty. Retrieval is
+/// for questions whose answer lives in the collections; everything else is
+/// answered the way any assistant would answer it.
 const SYSTEM_PROMPT: &str = "\
-You are an assistant inside an organisation's own workbench. You run entirely on \
-this machine and have no access to the internet.
+You are an assistant inside an organisation's own workbench. You run entirely \
+on this machine and have no access to the internet.
 
-Answer questions about internal procedure, specification, drawings or \
-correspondence only from documents you have retrieved with the search_documents \
-tool. Do not answer them from memory: your training data is not this \
-organisation's record, and a plausible answer that is not in the documents is \
-worse than no answer.
+Two kinds of request reach you, and they are answered differently.
 
-When a search returns nothing, say so plainly and stop. Do not infer what a \
-document probably says.
+FIRST: anything about this organisation's own record — its internal procedure, \
+specification, drawings, correspondence, or a figure taken from them. Answer \
+these only from passages you have retrieved with the \
+knowledge.search_authorized tool. Do not answer them from memory: your \
+training data is not this organisation's record, and a plausible answer that \
+is not in the documents is worse than no answer. Cite every such claim with \
+the marker of the passage it came from, written as [E1], [E2] and so on — the \
+numbers the search gave those passages. Each marker is checked against what \
+you actually retrieved when the task finishes, so a citation to a passage you \
+were never given will be found and reported. Say a figure came from a \
+calculation rather than citing a passage for it. If a search for one of these \
+returns nothing, say so plainly and stop; do not infer what a document \
+probably says.
 
-Cite every claim with the marker of the passage it came from, written as [E1], \
-[E2] and so on — the numbers search_documents gave those passages. Each marker \
-is checked against what you actually retrieved when the task finishes, so a \
-citation to a passage you were never given will be found and reported. Say a \
-figure came from a calculation rather than citing a passage for it.";
+SECOND: everything else — a greeting, small talk, a general-knowledge \
+question, mathematics, or writing, explaining or debugging code. Answer these \
+directly and in full, from your own knowledge, in your own words. Do not \
+search first, do not write [E] markers, and never reply that no source was \
+found: nobody asked you for a source. Say hello back to a greeting. Write the \
+code when you are asked for code, and write all of it.
+
+When a request could be either, treat it as the second kind and answer it. You \
+can always search afterwards if the answer turns out to depend on a document. \
+Silence and a refusal are never the right answer to a question you are able to \
+answer.";
 
 /// Finds the runtime bundle.
 ///
@@ -227,8 +268,11 @@ pub type AgentMemory = crate::agent_runtime::memory::SharedMemory;
 ///
 /// Established when a run starts and dropped when it ends. See
 /// `agent_runtime::resume::CheckpointSeed` for why the deep loop needs it.
-pub type RunCheckpoints =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, crate::agent_runtime::resume::CheckpointSeed>>>;
+pub type RunCheckpoints = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, crate::agent_runtime::resume::CheckpointSeed>,
+    >,
+>;
 
 fn runtime(
     handle: &AgentRuntimeHandle,
@@ -321,6 +365,80 @@ fn record_and_publish(
 ///
 /// Long-running. The UI shows progress from the `agent://event` stream and this
 /// resolves with the final answer, the routing reasons, and where it ran.
+
+/// Folds what the OCR model read into the turn's prompt.
+///
+/// The document goes first and the person's question last, so the model reads
+/// the page before the instruction — the same ordering the vision schema uses
+/// when an image and a question share one message.
+///
+/// A file that produced no text is still named. "I could not read anything in
+/// this" is a true answer; pretending the attachment was not there is not.
+fn compose_prompt_with_attachments(
+    prompt: &str,
+    reads: &[crate::commands::ocr::AttachmentRead],
+) -> String {
+    let mut out = String::new();
+    for read in reads {
+        out.push_str("<attachment name=\"");
+        out.push_str(&read.name);
+        out.push_str(
+            "\">
+",
+        );
+        if read.text.is_empty() {
+            out.push_str("(no text could be read from this file)");
+        } else {
+            out.push_str(&read.text);
+        }
+        out.push_str(
+            "
+</attachment>
+
+",
+        );
+    }
+    out.push_str(prompt);
+    out
+}
+
+/// The routing reasons for the OCR stage of a turn that carried files.
+///
+/// Every sentence is a fact the read actually produced — which model ran, at
+/// which stop, over how many pages, and how much text came back. A file read
+/// without a model says so, because "an OCR model looked at your spreadsheet"
+/// would be a lie about work that never happened.
+fn describe_attachment_reads(reads: &[crate::commands::ocr::AttachmentRead]) -> Vec<String> {
+    reads
+        .iter()
+        .map(|read| {
+            let pages = if read.pages > 1 {
+                format!("{} pages", read.pages)
+            } else {
+                "1 page".to_string()
+            };
+            match (&read.ocr_model_id, read.ocr_detent) {
+                (Some(model), Some(detent)) => format!(
+                    "{} ({}) was read on this device by the document-OCR model {} at the {} stop — {}, {} characters recognised.",
+                    read.name,
+                    read.kind,
+                    model,
+                    detent.label(),
+                    pages,
+                    read.text.chars().count()
+                ),
+                _ => format!(
+                    "{} ({}) already carried its text, so it was extracted locally and no model was needed to read it — {}, {} characters.",
+                    read.name,
+                    read.kind,
+                    pages,
+                    read.text.chars().count()
+                ),
+            }
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn agent_start_run(
     app: AppHandle,
@@ -350,16 +468,52 @@ pub async fn agent_start_run(
     // session ended mid-run.
     let signed_in = require_permission(&session, Permission::UseModel)?;
 
+    // Attachments are read before anything else, because what they say has to
+    // be in the prompt the router sees — a turn asking "what does this drawing
+    // show" routes on the drawing, not on the sentence.
+    //
+    // Read here rather than in the frontend so the composer cannot decide
+    // whether a file is really looked at. Failure is surfaced to the person
+    // instead of silently answering about a document nobody read.
+    let detent = request
+        .ocr_detent
+        .unwrap_or(crate::ai_engine::ocr_profile::OcrDetent::Detailed);
+    let mut attachment_reads = Vec::new();
+    for attachment in &request.attachments {
+        let read = crate::commands::ocr::read_attachment(
+            &app,
+            registry.inner(),
+            servers.inner(),
+            attachment,
+            detent,
+        )
+        .await?;
+        attachment_reads.push(read);
+    }
+    let request = {
+        let mut request = request;
+        if !attachment_reads.is_empty() {
+            request.prompt = compose_prompt_with_attachments(&request.prompt, &attachment_reads);
+        }
+        request
+    };
+
     // Read from the live hardware rather than a stored figure: the right model
     // on a workstation is the wrong one on a laptop. The largest GPU wins on a
     // multi-GPU box; no GPU reports zero and the planner makes a CPU-only plan.
-    let vram = gpu_collector::detect_gpus()
+    let vram = gpu_collector::installed_gpus()
         .iter()
         .map(|gpu| gpu.dedicated_video_memory_bytes)
         .max()
         .unwrap_or(0);
 
-    let routing = ModelRouter::route(
+    // The chat model an administrator chose, read fresh rather than cached: the
+    // choice can change while the app is open, and a run starting a second later
+    // must use the new one. `None` means nobody has chosen, and the router then
+    // picks on capability alone.
+    let chosen_orchestrator = crate::commands::registry::configured_orchestrator(&app);
+
+    let mut routing = ModelRouter::route_with_orchestrator(
         &registry,
         &request.prompt,
         request.classification,
@@ -368,12 +522,28 @@ pub async fn agent_start_run(
         false,
         &[],
         &[],
+        chosen_orchestrator.as_ref(),
     )
     .map_err(|failure| failure.reason)?;
 
-    let entry = registry
-        .find(&routing.model_id)
-        .ok_or_else(|| format!("{} was routed to but is not in the registry.", routing.model_id))?;
+    // A turn that carried a document was answered by two models, not one. The
+    // reasons list used to name only the second, so a person who attached a
+    // scan and opened "Why?" saw a reasoning model explaining itself with no
+    // mention of the OCR stage that produced everything it was reasoning
+    // about. These lines go first because that is the order the work
+    // happened in.
+    if !attachment_reads.is_empty() {
+        let mut preamble = describe_attachment_reads(&attachment_reads);
+        preamble.append(&mut routing.reasons);
+        routing.reasons = preamble;
+    }
+
+    let entry = registry.find(&routing.model_id).ok_or_else(|| {
+        format!(
+            "{} was routed to but is not in the registry.",
+            routing.model_id
+        )
+    })?;
 
     // Where it will actually run. A GGUF model gets a llama-server ARJUN starts;
     // a Python-served one is an endpoint an operator already runs. Both end up
@@ -424,9 +594,9 @@ pub async fn agent_start_run(
         (
             TaskEventType::RunCreated,
             json!({
-                "promptShown": request.prompt,
-                "correlationId": request.correlation_id,
-            }),
+                           "promptShown": request.prompt,
+            "correlationId": request.correlation_id,
+                       }),
         ),
         (
             TaskEventType::RunClassified,
@@ -452,7 +622,10 @@ pub async fn agent_start_run(
     for (event_type, payload) in opening {
         let draft = EventDraft::new(&run_id, event_type, &signed_in.user.id).with(payload);
         if let Err(error) = record_and_publish(&app, &events, draft) {
-            log::error!("[tasks] run {run_id}: {} was not recorded: {error}", event_type.as_str());
+            log::error!(
+                "[tasks] run {run_id}: {} was not recorded: {error}",
+                event_type.as_str()
+            );
         }
     }
 
@@ -523,13 +696,13 @@ pub async fn agent_start_run(
     let _ = app.emit(
         AGENT_EVENT,
         json!({
-            "runId": run_id,
-            "event": {
-                "type": "plan_ready",
-                "plan": planned,
-                "correlationId": request.correlation_id,
-            },
-        }),
+                   "runId": run_id,
+                   "event": {
+        "type": "plan_ready",
+        "plan": planned,
+                       "correlationId": request.correlation_id,
+                   },
+               }),
     );
     // Kept as well as published. The published one reaches a window that is
     // listening now; this one reaches a window that opens in ten minutes.
@@ -550,14 +723,10 @@ pub async fn agent_start_run(
     // holds only that compactions happened. A run whose record was never
     // written has nothing to resume from, and saying so honestly is better than
     // reconstructing a plausible set of notes nobody actually recorded.
-    let resumed_notes = tasks::load(
-        &app_data_dir(&app)?,
-        &run_id,
-        Some(&signed_in.user.id),
-    )
-    .ok()
-    .and_then(|previous| previous.working_notes)
-    .filter(|notes| !notes.is_empty());
+    let resumed_notes = tasks::load(&app_data_dir(&app)?, &run_id, Some(&signed_in.user.id))
+        .ok()
+        .and_then(|previous| previous.working_notes)
+        .filter(|notes| !notes.is_empty());
 
     let params = json!({
         "runId": run_id,
@@ -736,7 +905,7 @@ pub async fn agent_start_run(
     let produced_files = artifacts::report_for_run(&produced, &run_id);
     let retrieved = retrieval::for_run(&passages, &run_id);
     // Read off the engine's own table, never rebuilt from the answer's figures.
-    // PS step 27 makes the engine the source of numerical truth, and a record
+    // ARJUN design rule 27 makes the engine the source of numerical truth, and a record
     // recovered from the text would be the model's account of its arithmetic
     // rather than the arithmetic.
     let worked = calculations
@@ -752,8 +921,12 @@ pub async fn agent_start_run(
         let _ = record_and_publish(
             &app,
             &events,
-            EventDraft::new(&run_id, TaskEventType::VerificationStarted, &signed_in.user.id)
-                .with(json!({ "answerChars": answer.chars().count() })),
+            EventDraft::new(
+                &run_id,
+                TaskEventType::VerificationStarted,
+                &signed_in.user.id,
+            )
+            .with(json!({ "answerChars": answer.chars().count() })),
         );
     }
 
@@ -900,8 +1073,7 @@ pub async fn agent_start_run(
     match record_and_publish(
         &app,
         &events,
-        EventDraft::idempotent(&run_id, ending, &signed_in.user.id, "ending")
-            .with(ending_payload),
+        EventDraft::idempotent(&run_id, ending, &signed_in.user.id, "ending").with(ending_payload),
     ) {
         Ok(()) => {}
         Err(error) => log::warn!("[tasks] run {run_id}: the ending was not recorded: {error}"),
@@ -1190,6 +1362,190 @@ pub async fn agent_abort_run(
         .unwrap_or(false))
 }
 
+/// What a person decided at a milestone gate, as the chat surface reads it.
+///
+/// Mirrors `MilestoneAcknowledgement` in `src/services/agent.service.ts`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MilestoneAcknowledgement {
+    pub checkpoint_id: String,
+    pub ordinal: u32,
+    /// `approved` or `rejected`.
+    pub decision: String,
+    pub acknowledged_by: String,
+    /// RFC 3339, UTC.
+    pub at: String,
+}
+
+/// Records a person's decision at a milestone, and acts on it.
+///
+/// The gate exists because ARJUN requires evidence-anchored decision points
+/// (an ARJUN design rule, not a PS 26117 requirement):
+/// the model says "I think we are here", the run pauses, and a person signs off
+/// before the next leg starts. Everything for that existed — the plan marks the
+/// step, `MilestoneRecord` is the durable artefact, `MilestoneGate.tsx` draws
+/// the buttons — except this command. Without it the front-end's call rejected
+/// with "command not found", and a run that reached a gate could never leave it.
+///
+/// Approving clears the pause and the run carries on. Rejecting stops it with
+/// [`StopReason::MilestoneRejected`], which is deliberately not a failure: the
+/// steps already done stay done, and the record says a person chose to stop
+/// rather than that something went wrong.
+///
+/// The parameters use the front-end's existing vocabulary (`runId`,
+/// `checkpointId`, `approved`/`rejected`) rather than a new one, because that
+/// contract is already typed end to end and renaming it would churn the UI, the
+/// service and their tests for no gain.
+#[tauri::command]
+pub async fn agent_acknowledge_milestone(
+    app: AppHandle,
+    run_id: String,
+    checkpoint_id: String,
+    decision: String,
+    session: State<'_, CurrentSession>,
+    audit: State<'_, Arc<AuditService>>,
+    events: State<'_, TaskEvents>,
+    plans: State<'_, RunPlans>,
+    handle: State<'_, AgentRuntimeHandle>,
+) -> Result<MilestoneAcknowledgement, String> {
+    // Signing off a milestone is the approval gesture, so it sits under the
+    // same permission as the approvals queue rather than under `UseModel`.
+    let signed_in = require_permission(&session, Permission::ApproveOutput)?;
+    let by = signed_in.user.id.clone();
+
+    let approved = match decision.as_str() {
+        "approved" => true,
+        "rejected" => false,
+        other => {
+            return Err(format!(
+                "{other:?} is not a decision. A milestone is either \"approved\" or \"rejected\"."
+            ))
+        }
+    };
+
+    // The plan is the only place that knows which step a checkpoint id belongs
+    // to. Both the ordinal and the intent go into the durable record, and
+    // neither may be invented, so a run whose plan is no longer in memory is
+    // refused rather than recorded against a guess.
+    let (ordinal, intent, stop_reason) = {
+        let mut held = plans
+            .lock()
+            .map_err(|_| "the plan table is poisoned".to_string())?;
+        let plan = held.get_mut(&run_id).ok_or_else(|| {
+            format!(
+                "Run {run_id} is not in flight, so its milestone cannot be decided from here. \
+                 A run that has already ended keeps the ending it reached."
+            )
+        })?;
+        let step = plan
+            .step_at_checkpoint(&checkpoint_id)
+            .ok_or_else(|| format!("This run has no milestone called {checkpoint_id:?}."))?;
+        let ordinal = step.ordinal;
+        let intent = step.intent.clone();
+
+        if approved {
+            plan.resume();
+            (ordinal, intent, None)
+        } else {
+            let reason = plan.reject_milestone(&checkpoint_id);
+            (ordinal, intent, reason)
+        }
+    };
+
+    let at = chrono::Utc::now().to_rfc3339();
+
+    // Durable before anything else acts on it. A decision that moved the run
+    // but was never written is one nobody can audit afterwards.
+    let app_data = app_data_dir(&app)?;
+    if let Ok(mut record) = tasks::load(&app_data, &run_id, Some(&by)) {
+        let mut notes = record.working_notes.take().unwrap_or_default();
+        notes
+            .milestones
+            .push(crate::agent_runtime::memory::MilestoneRecord {
+                checkpoint_id: checkpoint_id.clone(),
+                ordinal,
+                intent: intent.clone(),
+                acknowledged_by: by.clone(),
+                at: at.clone(),
+                decision: decision.clone(),
+            });
+        record.working_notes = Some(notes);
+        if let Err(error) = tasks::save(&app_data, &record) {
+            log::warn!("[tasks] run {run_id}: the milestone decision was not persisted: {error}");
+        }
+    }
+
+    // The continuation, or the ending, as the trace will show it.
+    if events.snapshot(&run_id).ok().flatten().is_some() {
+        let draft = if approved {
+            EventDraft::new(&run_id, TaskEventType::RunResumed, &by).with(json!({
+                "checkpointId": checkpoint_id,
+                "ordinal": ordinal,
+                "intent": intent,
+                "decidedBy": by,
+            }))
+        } else {
+            EventDraft::new(&run_id, TaskEventType::RunCancelled, &by).with(json!({
+                "failure": stop_reason
+                    .as_ref()
+                    .map(crate::orchestrator::plan::StopReason::explain)
+                    .unwrap_or_else(|| "Stopped at a milestone.".to_string()),
+                "checkpointId": checkpoint_id,
+                "ordinal": ordinal,
+                "intent": intent,
+                "stoppedBecause": stop_reason,
+                "cancelledBy": by,
+            }))
+        };
+        match events.record(draft) {
+            Ok(_) | Err(crate::agent_runtime::events::AppendError::AlreadyEnded { .. }) => {}
+            Err(error) => {
+                log::warn!("[tasks] run {run_id}: the milestone decision was not recorded: {error}")
+            }
+        }
+    }
+
+    // A rejection has to actually stop the loop. Marking the plan stopped ends
+    // it at the next check; asking the runtime to abort ends it now, which is
+    // what somebody who just pressed "reject" expects to have happened.
+    if !approved {
+        let runtime = {
+            let slot = handle
+                .lock()
+                .map_err(|_| "the agent runtime handle is poisoned".to_string())?;
+            slot.clone()
+        };
+        if let Some(runtime) = runtime {
+            if let Err(error) = runtime
+                .request("run.abort", json!({ "runId": run_id }))
+                .await
+            {
+                log::warn!("[tasks] run {run_id}: the loop did not stop on rejection: {error}");
+            }
+        }
+    }
+
+    let _ = audit.record(
+        &by,
+        AuditKind::Approval,
+        format!("Milestone {checkpoint_id} ({intent}) was {decision} on run {run_id}"),
+        Some(json!({
+            "runId": run_id,
+            "checkpointId": checkpoint_id,
+            "ordinal": ordinal,
+            "decision": decision,
+        })),
+    );
+
+    Ok(MilestoneAcknowledgement {
+        checkpoint_id,
+        ordinal,
+        decision,
+        acknowledged_by: by,
+        at,
+    })
+}
+
 /// Whether the runtime is up, and what it is.
 ///
 /// Shown on the health screen. Starts the child if it is not already running,
@@ -1413,7 +1769,8 @@ pub async fn agent_reconcile_effect(
         ));
     }
 
-    let settled = events.reconcile_effect(&run_id, &idempotency_key, happened, &signed_in.user.id)?;
+    let settled =
+        events.reconcile_effect(&run_id, &idempotency_key, happened, &signed_in.user.id)?;
     if settled {
         // On the permanent record as well as the run's own history: this is a
         // person asserting something about work the system could not establish,
@@ -1424,7 +1781,11 @@ pub async fn agent_reconcile_effect(
             format!(
                 "{} reconciled an interrupted action in run {run_id}: it {}",
                 signed_in.user.display_name,
-                if happened { "did take effect" } else { "did not take effect" }
+                if happened {
+                    "did take effect"
+                } else {
+                    "did not take effect"
+                }
             ),
             Some(json!({
                 "runId": run_id,
@@ -1656,6 +2017,7 @@ pub async fn artifact_preview(
     let kind_hint = match artifact.kind {
         crate::agent_runtime::artifacts::Kind::Document => "docx",
         crate::agent_runtime::artifacts::Kind::Workbook => "xlsx",
+        crate::agent_runtime::artifacts::Kind::Deck => "pptx",
         crate::agent_runtime::artifacts::Kind::Text => "text",
     };
     crate::commands::artifact_preview::preview(&path, kind_hint)
@@ -1695,12 +2057,7 @@ fn open_folder(path: &std::path::Path) -> std::io::Result<()> {
 /// visible zero on the other, rather than a ledger that quietly stops adding up.
 fn ledger_record(ledger: &Value) -> Option<crate::agent_runtime::tasks::ContextLedgerRecord> {
     let sections = ledger.get("sections")?;
-    let section = |name: &str| {
-        sections
-            .get(name)
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32
-    };
+    let section = |name: &str| sections.get(name).and_then(Value::as_u64).unwrap_or(0) as u32;
     let top = |name: &str| ledger.get(name).and_then(Value::as_i64).unwrap_or(0);
 
     Some(crate::agent_runtime::tasks::ContextLedgerRecord {
@@ -1735,7 +2092,9 @@ pub async fn agent_run_resumability(
     registry: State<'_, Arc<ModelRegistry>>,
 ) -> Result<crate::agent_runtime::events::Resumability, String> {
     let signed_in = require_session(&session)?;
-    Ok(assess_resumability(&app, &run_id, &signed_in, &events, &registry))
+    Ok(assess_resumability(
+        &app, &run_id, &signed_in, &events, &registry,
+    ))
 }
 
 /// Continues a stopped run as a new attempt at the same task.
@@ -1805,7 +2164,7 @@ pub async fn agent_resume_run(
         )
         .map_err(|error| {
             format!(
-                "This run was not resumed: the resumption could not be recorded ({error}), and                  continuing without a record of it would leave the work unattributable."
+                "This run was not resumed: the resumption could not be recorded ({error}), and continuing without a record of it would leave the work unattributable."
             )
         })?;
 
@@ -1873,15 +2232,12 @@ fn assess_resumability(
         prompt: &prompt,
         // Read back off the run rather than supplied: a caller that could name
         // the classification could name a lower one.
-        classification: snapshot
-            .classification
-            .as_deref()
-            .and_then(|label| {
-                crate::policy::Classification::ALL
-                    .iter()
-                    .copied()
-                    .find(|c| c.label() == label)
-            }),
+        classification: snapshot.classification.as_deref().and_then(|label| {
+            crate::policy::Classification::ALL
+                .iter()
+                .copied()
+                .find(|c| c.label() == label)
+        }),
         sovereignty_mode: &format!("{:?}", crate::sovereignty::global_broker().mode()),
         workspace_root: &workspace_root,
         model_available,
@@ -1891,4 +2247,122 @@ fn assess_resumability(
     };
 
     Resumability::of(checkpoint.as_ref(), &context.world())
+}
+
+#[cfg(test)]
+mod attachment_prompt_tests {
+    use super::{compose_prompt_with_attachments, describe_attachment_reads};
+    use crate::ai_engine::ocr_profile::OcrDetent;
+    use crate::commands::ocr::AttachmentRead;
+
+    /// A file read by the OCR model: an image goes to a vision model, one
+    /// page, and the read names which model and which stop.
+    fn read(name: &str, text: &str) -> AttachmentRead {
+        AttachmentRead {
+            name: name.into(),
+            sha256: "0".repeat(64),
+            text: text.into(),
+            kind: "image".into(),
+            pages: 1,
+            ocr_model_id: Some("unlimited-ocr-q6-k".into()),
+            ocr_detent: Some(OcrDetent::Detailed),
+        }
+    }
+
+    /// A file that carried its own text. No model touched it, and nothing
+    /// about it may claim one did.
+    fn extracted(name: &str, text: &str) -> AttachmentRead {
+        AttachmentRead {
+            name: name.into(),
+            sha256: "1".repeat(64),
+            text: text.into(),
+            kind: "xlsx".into(),
+            pages: 1,
+            ocr_model_id: None,
+            ocr_detent: None,
+        }
+    }
+
+    /// The defect this exists for: a turn that attached a scan was answered
+    /// by two models, and the reasons named only the second. Somebody
+    /// opening "Why?" saw a reasoning model with no account of where the
+    /// text it reasoned over came from.
+    #[test]
+    fn the_reasons_name_the_ocr_model_that_read_the_page() {
+        let reasons = describe_attachment_reads(&[read("scan.png", "TOTAL 44")]);
+        assert_eq!(reasons.len(), 1);
+        let line = &reasons[0];
+        assert!(line.contains("scan.png"), "{line}");
+        assert!(line.contains("unlimited-ocr-q6-k"), "{line}");
+        assert!(line.contains("Detailed"), "{line}");
+        assert!(line.contains("8 characters"), "{line}");
+    }
+
+    /// The other half of the same honesty: a spreadsheet was not read by a
+    /// vision model, and the explanation must not imply that it was.
+    #[test]
+    fn a_locally_extracted_file_does_not_claim_a_model_read_it() {
+        let reasons = describe_attachment_reads(&[extracted("rows.xlsx", "A1,B1")]);
+        let line = &reasons[0];
+        assert!(line.contains("already carried its text"), "{line}");
+        assert!(!line.contains("OCR"), "{line}");
+    }
+
+    /// The regression this change exists for: the composer used to keep only
+    /// `file.name`, so the bytes never left the picker and the model answered
+    /// "please provide the text". The prompt the runtime sees must contain
+    /// what was actually read.
+    #[test]
+    fn what_the_model_read_is_in_the_prompt_the_runtime_sees() {
+        let out = compose_prompt_with_attachments(
+            "Read this document and extract the text.",
+            &[read("field-report.png", "QUARTERLY FIELD REPORT")],
+        );
+        assert!(out.contains("QUARTERLY FIELD REPORT"), "got {out:?}");
+        assert!(
+            out.contains("field-report.png"),
+            "the file is named: {out:?}"
+        );
+        assert!(out.contains("Read this document"), "the question survives");
+    }
+
+    #[test]
+    fn the_document_precedes_the_question() {
+        let out =
+            compose_prompt_with_attachments("What is the total?", &[read("a.png", "TOTAL 44")]);
+        assert!(
+            out.find("TOTAL 44") < out.find("What is the total?"),
+            "the page must be read before the instruction: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_read_as_nothing_is_still_named() {
+        // Silently dropping it would let the model answer as though no
+        // document had been attached at all.
+        let out = compose_prompt_with_attachments("Read this.", &[read("blank.png", "")]);
+        assert!(out.contains("blank.png"), "got {out:?}");
+        assert!(out.contains("no text could be read"), "got {out:?}");
+    }
+
+    #[test]
+    fn several_attachments_are_all_present_and_separately_named() {
+        let out = compose_prompt_with_attachments(
+            "Compare these.",
+            &[read("one.png", "ALPHA"), read("two.png", "BETA")],
+        );
+        for needle in ["one.png", "ALPHA", "two.png", "BETA", "Compare these."] {
+            assert!(out.contains(needle), "missing {needle} in {out:?}");
+        }
+    }
+
+    /// Attachments belong to the request that carried them. A turn with none
+    /// must produce exactly its own prompt — this is what stops one message
+    /// answering about another's document.
+    #[test]
+    fn a_turn_with_no_attachments_is_left_exactly_as_written() {
+        let out = compose_prompt_with_attachments("Just a question.", &[]);
+        assert_eq!(out, "Just a question.");
+        assert!(!out.contains("<attachment"));
+    }
 }

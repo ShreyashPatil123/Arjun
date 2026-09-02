@@ -69,12 +69,49 @@ pub fn run() {
         .build();
 
     // Configure Log plugin
+    //
+    // Three things here are about how fast a chat turn feels, not about
+    // diagnostics.
+    //
+    // **The default level is `Trace`.** Left unset, every `hyper`, `reqwest`,
+    // `sqlx` and `h2` trace line was recorded: in a captured session log, 232
+    // of 291 lines were third-party noise, including a `connecting to
+    // 127.0.0.1` triple for every single HTTP request the app made.
+    //
+    // **`TargetKind::Webview` sends each of those lines to the front-end over
+    // IPC** — the same channel the token stream uses. During generation the two
+    // compete, and the tokens are the ones a person is watching. It is kept in
+    // debug builds, where a developer wants the console, and dropped from
+    // release.
+    //
+    // **The chatty crates are pinned to `Warn` regardless**, because raising
+    // the global level to `Info` still leaves `reqwest` free to log every
+    // connection at `Debug`.
+    let mut log_targets = vec![
+        Target::new(TargetKind::Stdout),
+        Target::new(TargetKind::LogDir { file_name: Some("sarathi".into()) }),
+    ];
+    if cfg!(debug_assertions) {
+        log_targets.push(Target::new(TargetKind::Webview));
+    }
+
     let log_plugin = tauri_plugin_log::Builder::new()
-        .targets([
-            Target::new(TargetKind::Stdout),
-            Target::new(TargetKind::LogDir { file_name: Some("sarathi".into()) }),
-            Target::new(TargetKind::Webview),
-        ])
+        .targets(log_targets)
+        .level(if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        // ARJUN's own modules keep their level; these are the ones whose
+        // per-request chatter drowned it.
+        .level_for("hyper", log::LevelFilter::Warn)
+        .level_for("hyper_util", log::LevelFilter::Warn)
+        .level_for("reqwest", log::LevelFilter::Warn)
+        .level_for("h2", log::LevelFilter::Warn)
+        .level_for("rustls", log::LevelFilter::Warn)
+        .level_for("sqlx", log::LevelFilter::Warn)
+        .level_for("tokio_util", log::LevelFilter::Warn)
+        .level_for("tower", log::LevelFilter::Warn)
         .build();
 
     // Build and run the app
@@ -245,6 +282,7 @@ pub fn run() {
             // Model servers ARJUN starts, so a llama-server is loaded once and
             // reused across runs rather than per prompt.
             app.manage(Arc::new(serving::ModelServers::new()));
+            app.manage(commands::ocr::ScanCancel::default());
             // One working directory per run, shared with the agent runtime so a
             // tool call can be resolved against the run that made it.
             app.manage(commands::agent::RunWorkspaces::default());
@@ -465,8 +503,10 @@ pub fn run() {
 
             // Bring the configured orchestrator onto the GPU during startup so
             // the agent loop and local gateway are ready without a manual model
-            // selection. Gemma 4 12B is the product default; a saved session is
-            // only a fallback when that package is not installed.
+            // selection. The orchestrator is whatever an administrator chose in
+            // Models — no model is compiled in as a default — and a saved
+            // session is the fallback when nothing is chosen or the chosen
+            // package is not installed.
             let ai_settings = config::ConfigManager::load(
                 &config::ConfigManager::get_config_path(app.handle()),
             )
@@ -483,11 +523,7 @@ pub fn run() {
             if ai_settings.auto_load_on_startup {
                 let inference = app.state::<Arc<InferenceManager>>().inner().clone();
                 let app_data = app.path().app_data_dir().ok();
-                let preferred = ai_engine::startup::StartupModelTarget {
-                    provider_id: ai_settings.orchestrator_provider_id,
-                    model_id: ai_settings.orchestrator_model_id,
-                    quantization: ai_settings.orchestrator_quantization,
-                };
+                let preferred = ai_engine::startup::StartupModelTarget::configured(&ai_settings);
                 let require_gpu = ai_settings.use_gpu;
 
                 tauri::async_runtime::spawn(async move {
@@ -515,18 +551,30 @@ pub fn run() {
                     let installed = model_manager::ModelManager::list_installed_models(&dir);
                     let target = ai_engine::startup::select_startup_model(
                         &installed,
-                        &preferred,
+                        preferred.as_ref(),
                         restore.as_ref(),
                     );
 
                     let Some(target) = target else {
-                        log::error!(
-                            "The configured orchestrator '{}' ({}) is not installed and \
-                             no unambiguous fallback is available. Install Gemma 4 12B Q4_0 from \
-                             Discover, or choose another installed orchestrator in Models.",
-                            preferred.model_id,
-                            preferred.quantization
-                        );
+                        // Two different situations, and telling them apart is
+                        // the whole value of the message: a choice that points
+                        // at something not installed is a broken setting, while
+                        // no choice at all is simply a step nobody has taken.
+                        match preferred.as_ref() {
+                            Some(preferred) => log::error!(
+                                "The configured orchestrator '{}' ({}) is not installed and no \
+                                 unambiguous fallback is available. Install it from Discover, or \
+                                 choose another installed model in Models.",
+                                preferred.model_id,
+                                preferred.quantization
+                            ),
+                            None => info!(
+                                "No orchestrator has been chosen and there is no single obvious \
+                                 model to load, so nothing was pre-loaded. Pick one in Models \
+                                 with 'Set as orchestrator'; until then each prompt is routed to \
+                                 the best installed model for it."
+                            ),
+                        }
                         return;
                     };
                     let provider = target.provider_id;
@@ -586,6 +634,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             // Config commands
+            commands::ocr::get_ocr_detents,
+            commands::ocr::preview_attachment_routing,
+            commands::ocr::get_page_image,
+            commands::ocr::scan_page,
+            commands::ocr::cancel_scan,
             commands::config::get_config,
             commands::config::set_config,
             commands::config::get_hf_token_status,
@@ -647,6 +700,10 @@ pub fn run() {
             // stop and observe it.
             commands::agent::agent_start_run,
             commands::agent::agent_abort_run,
+            commands::agent::agent_acknowledge_milestone,
+            commands::knowledge::knowledge_documents,
+            commands::knowledge::knowledge_search,
+            commands::knowledge::knowledge_health,
             commands::agent::agent_steer_run,
             commands::agent::agent_runtime_health,
             // What those runs left behind: the plan, the evidence, the working

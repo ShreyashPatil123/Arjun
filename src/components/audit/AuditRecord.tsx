@@ -5,6 +5,7 @@ import {
   AUDIT_KIND_LABELS,
   type AuditEntry,
   type ChainVerification,
+  type MerkleVerification,
 } from '../../services/governance.service';
 import styles from './AuditRecord.module.css';
 
@@ -25,6 +26,8 @@ export const AuditRecord = () => {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [verification, setVerification] = useState<ChainVerification | null>(null);
   const [verifying, setVerifying] = useState(false);
+  const [merkle, setMerkle] = useState<MerkleVerification | null>(null);
+  const [sealing, setSealing] = useState(false);
   /** Set when the signed-in user may not read the record — not an error. */
   const [denied, setDenied] = useState<string | null>(null);
 
@@ -53,6 +56,26 @@ export const AuditRecord = () => {
     }
   };
 
+  /**
+   * A different question from {@link verify}.
+   *
+   * Recomputing the chain proves each row still seals its own contents and
+   * position. It cannot prove nothing was *removed* — a chain re-sealed after a
+   * deletion is internally consistent. The Merkle root, taken at a point in
+   * time, is what catches that, so the two checks are offered separately rather
+   * than folded into one reassuring tick.
+   */
+  const checkSeal = async () => {
+    setSealing(true);
+    try {
+      setMerkle(await governanceService.verifyMerkle());
+    } catch (e) {
+      setDenied(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSealing(false);
+    }
+  };
+
   if (denied) {
     return (
       <section className={styles.section}>
@@ -75,18 +98,40 @@ export const AuditRecord = () => {
           <FileCheck2 size={15} />
           {verifying ? 'Checking…' : 'Verify the record'}
         </button>
+        <button className={styles.verifyBtn} onClick={checkSeal} disabled={sealing}>
+          <FileCheck2 size={15} />
+          {sealing ? 'Checking…' : 'Check the seal'}
+        </button>
       </div>
 
       <p className={styles.explainer}>
         Append-only in the database, and hash-chained, so each entry seals both its
         contents and its position. Verifying recomputes every seal from the first entry
-        onward and names the first one that disagrees.
+        onward and names the first one that disagrees. Checking the seal asks the other
+        question — whether anything has been removed since the log was last sealed, which
+        a re-hashed chain on its own cannot tell you.
       </p>
 
       {verification && (
         <div className={verification.intact ? styles.intact : styles.broken} role="status">
           {verification.intact ? <FileCheck2 size={18} /> : <FileWarning size={18} />}
           <span>{verification.detail}</span>
+        </div>
+      )}
+
+      {merkle && (
+        <div className={merkle.intact ? styles.intact : styles.broken} role="status">
+          {merkle.intact ? <FileCheck2 size={18} /> : <FileWarning size={18} />}
+          <span>
+            {merkle.detail}
+            {merkle.snapshot
+              ? ` Sealed at entry #${merkle.snapshot.upToSeq} on ${formatTime(
+                  merkle.snapshot.takenAt,
+                )}; ${merkle.eventsSinceSnapshot} entr${
+                  merkle.eventsSinceSnapshot === 1 ? 'y has' : 'ies have'
+                } been added since.`
+              : ' No seal has been taken yet, so there is nothing to compare against — this says the log is new, not that it is sound.'}
+          </span>
         </div>
       )}
 

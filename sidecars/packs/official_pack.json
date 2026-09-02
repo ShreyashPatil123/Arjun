@@ -34,15 +34,17 @@
         "restart_state_persistence": 100.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
         "signature": "sig_official_qwen2.5_3b_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Official Arjun Certified Base Model. Verified 32k context retention, clean ChatML stop tokens, and zero reasoning leakage."
+      "quirks_and_notes": "Official Arjun Certified Base Model. Verified 32k context retention, clean ChatML stop tokens, and zero reasoning leakage. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "google/gemma-2-2b::Q8_0::ollama",
@@ -72,15 +74,17 @@
         "restart_state_persistence": 99.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef12",
         "signature": "sig_official_gemma2_2b_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Official Arjun Certified Base Model. Ultra lightweight footprint (2.6 GB VRAM) and verified Gemma chat template."
+      "quirks_and_notes": "Official Arjun Certified Base Model. Ultra lightweight footprint (2.6 GB VRAM) and verified Gemma chat template. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "meta-llama/Llama-3.2-1B::Q8_0::ollama",
@@ -110,15 +114,17 @@
         "restart_state_persistence": 99.5
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef1234",
         "signature": "sig_official_llama3.2_1b_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Official Arjun Certified Base Model. Blazing fast 128k context retention with verified Llama3 chat template and stop tokens."
+      "quirks_and_notes": "Official Arjun Certified Base Model. Blazing fast 128k context retention with verified Llama3 chat template and stop tokens. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "meta-llama/Llama-3.2-3B::Q8_0::ollama",
@@ -148,15 +154,17 @@
         "restart_state_persistence": 100.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef12345",
         "signature": "sig_official_llama3.2_3b_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Official Arjun Certified Base Model. Exceptional balance of reasoning depth and fast generation."
+      "quirks_and_notes": "Official Arjun Certified Base Model. Exceptional balance of reasoning depth and fast generation. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "Qwen/Qwen2.5-7B-Instruct-GGUF::Q4_K_M::llama.cpp",
@@ -186,15 +194,17 @@
         "restart_state_persistence": 99.5
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
         "signature": "sig_official_qwen2.5_7b_q4km_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Primary recommended base model for Arjun. Excellent instruction following and zero control-token leaks."
+      "quirks_and_notes": "Primary recommended base model for Arjun. Excellent instruction following and zero control-token leaks. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "meta-llama/Llama-3.1-8B-Instruct-GGUF::Q4_K_M::llama.cpp",
@@ -224,15 +234,17 @@
         "restart_state_persistence": 99.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef12",
         "signature": "sig_official_llama3.1_8b_q4km_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Highly stable Llama 3.1 architecture with 128k native context support."
+      "quirks_and_notes": "Highly stable Llama 3.1 architecture with 128k native context support. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "google/gemma-2-9b-it-GGUF::Q4_K_M::llama.cpp",
@@ -262,15 +274,17 @@
         "restart_state_persistence": 95.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef1234",
         "signature": "sig_official_gemma2_9b_q4km_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "High performance model with head dimension 256. Requires slightly higher VRAM allocation for KV-cache."
+      "quirks_and_notes": "High performance model with head dimension 256. Requires slightly higher VRAM allocation for KV-cache. [UNVERIFIED SCORES]"
     },
     {
       "package_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B-GGUF::Q4_K_M::llama.cpp",
@@ -300,15 +314,19 @@
         "restart_state_persistence": 90.0
       },
       "provenance": {
-        "created_by": "Saarthi AI Research Lab",
-        "certified_by": "Saarthi Validation Pipeline v1.0",
-        "generated_with": "certification_runner.py",
+        "created_by": "hand-authored; not measured",
+        "certified_by": "UNVERIFIED - no benchmark run produced these figures",
+        "generated_with": "none (previously claimed certification_runner.py, which cannot produce these values)",
         "runner_version": "1.0.0",
         "profile_hash": "d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef12345",
         "signature": "sig_official_deepseek_r1_qwen7b_q4km_valid",
-        "generated_at": "2026-08-02T10:30:00Z"
+        "generated_at": "2026-08-02T10:30:00Z",
+        "verification_status": "unverified",
+        "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
       },
-      "quirks_and_notes": "Experimental reasoning model generating <think> tags. Saarthi stream parser automatically strips reasoning tags for clean UI display."
+      "quirks_and_notes": "Experimental reasoning model generating <think> tags. Saarthi stream parser automatically strips reasoning tags for clean UI display. [UNVERIFIED SCORES]"
     }
-  ]
+  ],
+  "verification_status": "unverified",
+  "note": "UNVERIFIED. These scores were not produced by a benchmark run. sidecars/certification_runner.py, which every entry names as its origin, has no benchmark implementation and never loaded a model; it emitted constants and now refuses outright. Treat tier and confidence_score as hand-authored editorial guidance about model suitability, not as measurements, and do not present them to anyone as benchmark results."
 }

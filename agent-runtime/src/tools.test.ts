@@ -111,6 +111,7 @@ describe("host tools", () => {
     expect(names.slice().sort()).toEqual([
       "agent.delegate_readonly",
       "artifact.create_approval_note",
+      "artifact.create_briefing_deck",
       "artifact.create_calculation_workbook",
       "artifact.verify_docx",
       "calculation.evaluate_with_units",

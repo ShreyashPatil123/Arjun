@@ -647,9 +647,29 @@ fn read_capped(path: &Path, cap: u64) -> Result<String, String> {
         .map_err(|error| format!("{} could not be read: {error}", path.display()))
 }
 
-/// SHA-256 of some text, lowercase hex.
+/// SHA-256 of some text, lowercase hex, line endings normalised first.
+///
+/// The normalisation is what makes this a hash of the *skill* rather than of
+/// the checkout it came from. Git is routinely configured to write CRLF into a
+/// Windows working copy and LF everywhere else, so hashing the bytes as they
+/// sit on disk gives one answer on a developer's machine and a different one
+/// in CI — for the same reviewed content, with no edit in between.
+///
+/// That is not hypothetical. The shipped trust list ended up with five skills
+/// hashed as LF and five as CRLF, and on a Windows checkout the LF five were
+/// quarantined with "its contents changed after it was trusted". Nothing had
+/// changed. Regenerating the list against the local bytes would only have
+/// moved the failure to the other five on the next Linux checkout.
+///
+/// A carriage return carries no meaning in a Markdown skill definition, so
+/// dropping it before hashing loses nothing an operator reviewed.
 pub fn sha256_of(text: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
+    for (index, line) in text.split("\r\n").enumerate() {
+        if index > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(line.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }

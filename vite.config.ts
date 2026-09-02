@@ -1,12 +1,19 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react()],
+  // Tailwind v4 is a Vite plugin rather than a PostCSS step, and it is
+  // additive here: the nineteen existing CSS Modules keep working untouched.
+  // Utilities are opt-in per component, and the design tokens in
+  // `src/index.css` remain the single source of colour and spacing —
+  // `@theme inline` republishes them as Tailwind scales so a utility and a
+  // module rule cannot drift to different values.
+  plugins: [react(), tailwindcss()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

@@ -435,6 +435,7 @@ mod tests {
             supports_structured_output: false,
             permitted_classifications: vec![crate::policy::Classification::Internal],
             path: std::path::PathBuf::from("models/qwen2.5-vl-3b-instruct.gguf"),
+            projector: None,
             load: None,
             serving: None,
             required_runtime_profile: None,

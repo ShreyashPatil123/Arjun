@@ -8,12 +8,75 @@ import { getHfTokenStatus, setHfToken, type HfTokenStatus } from '../services/co
 import { getModelProfile, updateModelProfile, refreshModelProfile } from '../services/intelligence.service';
 import type { ModelProfile, InferenceParameters } from '../types/intelligence';
 import type { LoadedModelInfo } from '../types/ai';
+import {
+  governanceService,
+  type ZeroTrustConfig,
+  type ZeroTrustMode,
+} from '../services/governance.service';
 import styles from './Settings.module.css';
+
+/**
+ * The gate's settings, in the order they narrow.
+ *
+ * Spelled out rather than derived from the enum so each one reads as what it
+ * costs an operator, not as a variant name.
+ */
+const ZERO_TRUST_MODES: { value: ZeroTrustMode; label: string }[] = [
+  { value: 'off', label: 'Off — role-based access only' },
+  {
+    value: 'approveEveryToolCall',
+    label: 'Approve every tool call',
+  },
+  {
+    value: 'approveEveryToolCallAndLogMemoryReads',
+    label: 'Approve every tool call, and log memory reads',
+  },
+  {
+    value: 'approveEveryToolCallAndLogMemoryReadsAndTightenReauth',
+    label: 'Approve, log memory reads, and tighten the re-auth window',
+  },
+];
 
 export const Settings: React.FC = () => {
   const { resolvedTheme, setTheme } = useTheme();
   const { config } = useConfig();
   const { addToast } = useToast();
+  const [zeroTrust, setZeroTrust] = useState<ZeroTrustConfig | null>(null);
+  const [zeroTrustBusy, setZeroTrustBusy] = useState(false);
+  const [zeroTrustError, setZeroTrustError] = useState<string | null>(null);
+
+  useEffect(() => {
+    governanceService
+      .readZeroTrustConfig()
+      .then(setZeroTrust)
+      // Reading the posture needs a signed-in session and the right role.
+      // Someone who may not read it sees why, rather than an empty panel that
+      // looks like the feature is missing.
+      .catch((error) => setZeroTrustError(String(error)));
+  }, []);
+
+  /** Writes the posture, and keeps the screen on whatever the gate reports back. */
+  const applyZeroTrust = async (mode: ZeroTrustMode, seconds: number) => {
+    setZeroTrustBusy(true);
+    setZeroTrustError(null);
+    try {
+      const next = await governanceService.setZeroTrustMode(
+        mode,
+        seconds,
+        'Changed from Settings.',
+      );
+      setZeroTrust(next);
+      addToast('success', 'Zero Trust posture updated');
+    } catch (error) {
+      setZeroTrustError(String(error));
+      // Re-read rather than keep the value the operator typed: the gate is the
+      // authority on what it is set to, and a refused change must not leave the
+      // screen claiming it took effect.
+      governanceService.readZeroTrustConfig().then(setZeroTrust).catch(() => {});
+    } finally {
+      setZeroTrustBusy(false);
+    }
+  };
 
   const [activeModel, setActiveModel] = useState<LoadedModelInfo | null>(null);
   const [profile, setProfile] = useState<ModelProfile | null>(null);
@@ -294,6 +357,60 @@ export const Settings: React.FC = () => {
           <code> HF_TOKEN</code> environment variable it replaces would be. Use a
           read-only token.
         </span>
+      </Card>
+
+      <Card>
+        <h2 className={styles.sectionTitle}>Zero Trust</h2>
+        <p className={styles.desc} style={{ marginTop: 0 }}>
+          What the gate requires beyond role-based access. Each setting is the one above it
+          plus one further requirement, so the posture only ever narrows. Every change is
+          recorded, with the reason you give beside it.
+        </p>
+        {zeroTrustError && <span className={styles.desc}>{zeroTrustError}</span>}
+        {zeroTrust && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <label className={styles.label} htmlFor="zt-mode">
+              Mode
+            </label>
+            <select
+              id="zt-mode"
+              value={zeroTrust.mode}
+              disabled={zeroTrustBusy}
+              onChange={(event) => {
+                void applyZeroTrust(
+                  event.target.value as ZeroTrustMode,
+                  zeroTrust.reauthWindowSeconds,
+                );
+              }}
+            >
+              {ZERO_TRUST_MODES.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+
+            <Input
+              label="Re-authentication window (seconds)"
+              type="number"
+              value={String(zeroTrust.reauthWindowSeconds)}
+              disabled={zeroTrustBusy || !zeroTrust.mode.endsWith('TightenReauth')}
+              onChange={(event) => {
+                const seconds = Number(event.target.value);
+                if (Number.isFinite(seconds)) {
+                  setZeroTrust({ ...zeroTrust, reauthWindowSeconds: seconds });
+                }
+              }}
+              onBlur={() => {
+                void applyZeroTrust(zeroTrust.mode, zeroTrust.reauthWindowSeconds);
+              }}
+            />
+            <span className={styles.desc}>
+              Only consulted in the strictest mode. Last changed by {zeroTrust.updatedBy}
+              {zeroTrust.reason ? ` — ${zeroTrust.reason}` : ''}.
+            </span>
+          </div>
+        )}
       </Card>
 
       <Card>

@@ -153,6 +153,76 @@ fn record_message_completion_marks_done_with_model() {
     assert_eq!(run.model_name.as_deref(), Some("gemma-3-12b-it"));
 }
 
+/// Two writers reach one message and neither knows everything.
+///
+/// The front-end completes on `message_end`, which is where the model's token
+/// usage arrives; the run completes again when `agent_run_prompt` resolves,
+/// which is where the routing decision arrives. The run wrote last, so
+/// assigning unconditionally meant the token counts were erased a moment after
+/// they were recorded and the chat's counter never had anything to show.
+#[test]
+fn a_second_completion_does_not_erase_what_the_first_recorded() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+    let conv = store
+        .create("Test".to_string(), "Welcome.".to_string(), OWNER)
+        .expect("create");
+    store
+        .append_user_turn(&conv.id, "Hello", "a-1", "run-1", OWNER)
+        .expect("append");
+
+    // The front-end, on `message_end`: token usage, no routing.
+    store
+        .record_message_completion(
+            &conv.id,
+            "a-1",
+            "run-1",
+            Some("the final answer"),
+            Some(1234),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(512),
+            Some(64),
+            OWNER,
+        )
+        .expect("complete")
+        .expect("found");
+
+    // The run, on resolve: routing, no token usage.
+    let updated = store
+        .record_message_completion(
+            &conv.id,
+            "a-1",
+            "run-1",
+            Some("the final answer"),
+            Some(1234),
+            Some("gemma-3-12b-it"),
+            Some("reasoning"),
+            Some(false),
+            None,
+            false,
+            None,
+            None,
+            OWNER,
+        )
+        .expect("complete")
+        .expect("found");
+
+    let assistant = updated
+        .messages
+        .iter()
+        .find(|m| m.id == "a-1")
+        .expect("assistant");
+    assert_eq!(assistant.tokens_in, Some(512), "token usage was erased");
+    assert_eq!(assistant.tokens_out, Some(64), "token usage was erased");
+    assert_eq!(assistant.model_name.as_deref(), Some("gemma-3-12b-it"));
+    assert_eq!(assistant.model_role.as_deref(), Some("reasoning"));
+    assert_eq!(assistant.status, MessageStatus::Done);
+}
+
 #[test]
 fn record_message_completion_can_mark_failed() {
     let dir = temp_dir();

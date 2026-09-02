@@ -17,7 +17,12 @@ pub enum AppStatus {
 }
 
 /// The state of the application
+/// Serialized camelCase like every other DTO that crosses the IPC boundary.
+/// Without it this struct sent `is_first_run` to a front-end reading
+/// `isFirstRun`, so the flag arrived `undefined` — a first run and a hundredth
+/// were indistinguishable, and neither was an error anyone saw.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppStateData {
     pub status: AppStatus,
     pub version: String,

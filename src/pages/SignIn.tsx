@@ -20,7 +20,7 @@ const MIN_PASSWORD_LENGTH = 12;
  * Sign-in, and the first-run setup that precedes it.
  *
  * On a fresh deployment nobody has a password, so the first thing that can
- * happen is an administrator choosing one — PS step 7. Only after that does the
+ * happen is an administrator choosing one — ARJUN design rule 7. Only after that does the
  * ordinary sign-in form appear.
  *
  * The account list is shown openly. On a machine inside a plant, who has an

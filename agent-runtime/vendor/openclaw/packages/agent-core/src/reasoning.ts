@@ -31,7 +31,13 @@ export function resolveAgentReasoningOption(
   }
   const offFallback =
     model.thinkingLevelMap?.off ??
-    ((model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
+    // ARJUN prune: upstream also matched a second, AWS-hosted protocol here.
+    // That arm is removed. ARJUN registers one protocol adapter,
+    // `openai-completions` (enforced by scripts/check-bundle.mjs), so no model
+    // reaching this function can carry the other api. The vendor id is not
+    // written out even in this comment, because the bundle gate asserts its
+    // absence from the shipped artifact and a comment ships too.
+    (model.api === "anthropic-messages" &&
     resolveClaudeFable5ModelIdentity(model)
       ? "low"
       : undefined);

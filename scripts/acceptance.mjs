@@ -29,7 +29,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -207,12 +207,19 @@ function criterionAgenticTask() {
 /**
  * 3. A coding task actually run in the sandbox.
  *
- * This one is honest about the machine it is on. ARJUN refuses to run
- * model-written code unless a real isolation boundary exists, and on a bare
- * Windows laptop with no container runtime there is none — ARJUN's broker stops
- * ARJUN, but it does not bind a child process. So the criterion reports BLOCKED
- * with the exact thing that would unblock it, rather than claiming a sandbox
- * that is not there.
+ * PS 26117's Expected Solution asks for *"A coding task run and verified in a
+ * sandbox"*. The verb is "run", so this criterion may only report PASS when code
+ * actually executed — not when the tests covering the *refusal* path pass, and
+ * not merely because a container runtime is installed.
+ *
+ * Those two are what an earlier version of this function checked, and together
+ * they produced a false PASS: the `orchestrator::sandbox` tests prove ARJUN
+ * declines correctly, `docker --version` answers from the CLI with the daemon
+ * stopped, and `LocalToolRunner::execute_code` returns "Running code is not
+ * implemented yet" on every machine. Three green signals, nothing executed.
+ *
+ * A criterion reporting PASS for a capability the product refuses to perform is
+ * worse than one reporting BLOCKED, because BLOCKED is true.
  */
 function criterionSandbox() {
   const result = cargoTests('orchestrator::sandbox');
@@ -223,20 +230,44 @@ function criterionSandbox() {
     return { status: FAIL, detail: `${result.failed} sandbox test(s) failed` };
   }
 
-  const podman = toolchainPresent('podman');
-  const docker = toolchainPresent('docker');
+  // Does the product execute code at all? Asked of the source rather than by
+  // running a task, so the answer does not depend on this machine's runtime.
+  const runner = join(ROOT, 'src-tauri', 'src', 'orchestrator', 'runner.rs');
+  const executionImplemented =
+    existsSync(runner)
+    && !readFileSync(runner, 'utf8').includes('Running code is not implemented yet');
+
+  if (!executionImplemented) {
+    return {
+      status: BLOCKED,
+      detail:
+        `${result.passed} sandbox checks pass — tier detection, the isolation each tier really `
+        + 'provides, and the refusal path. But `execute_code` is not implemented: it refuses on '
+        + 'every machine, including one with a working container runtime. No coding task has been '
+        + 'run in a sandbox, so this criterion does not pass on the strength of a runtime being '
+        + 'installed. Implement container execution in LocalToolRunner::execute_code to unblock it.',
+    };
+  }
+
+  // Only now does the runtime matter. `--version` is not enough: it answers from
+  // the CLI alone with the daemon stopped, which is a container tier that cannot
+  // start a container.
+  const podman = toolchainPresent('podman', ['info']);
+  const docker = toolchainPresent('docker', ['info']);
 
   if (!podman && !docker) {
     return {
       status: BLOCKED,
       detail:
-        'the refusal path is proven by tests, but no container runtime is installed, so code execution is refused rather than sandboxed. Install Podman to unblock this criterion.',
+        'code execution is implemented, but no container runtime is responding — a CLI may be '
+        + 'installed while its daemon is stopped. ARJUN refuses rather than running unisolated. '
+        + 'Start Podman or Docker Desktop to unblock this criterion.',
     };
   }
 
   return {
     status: PASS,
-    detail: `${result.passed} sandbox checks with ${podman ? 'Podman' : 'Docker'} present`,
+    detail: `${result.passed} sandbox checks, with a responding ${podman ? 'Podman' : 'Docker'} runtime`,
   };
 }
 
@@ -364,7 +395,7 @@ const blocked = results.filter((r) => r.status === BLOCKED);
 const unverified = results.filter((r) => r.status === UNVERIFIABLE);
 const passed = results.filter((r) => r.status === PASS);
 
-// The baseline record. PS step 15 asks that the scripted run be kept, so it is
+// The baseline record. ARJUN design rule 15 asks that the scripted run be kept, so it is
 // written every time rather than only when somebody remembers to.
 const record = {
   // Stamped by the caller's clock — the only clock this script has.
@@ -388,7 +419,7 @@ console.log(
 console.log(`  baseline written to ${recordPath}`);
 
 if (blocked.length > 0) {
-  console.log('\n  Blocked criteria need something provisioned, not something fixed:');
+  console.log('\n  Blocked criteria — each says what would unblock it:');
   for (const b of blocked) console.log(`    · ${b.name} — ${b.detail}`);
 }
 

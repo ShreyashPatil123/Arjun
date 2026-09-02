@@ -181,4 +181,78 @@ export const governanceService = {
   verifyChain(): Promise<ChainVerification> {
     return getBackendService().invoke<ChainVerification>('verify_audit_chain');
   },
+
+  /**
+   * Checks the log against its last sealed root.
+   *
+   * Distinct from {@link verifyChain}, which recomputes every row's own seal.
+   * This asks a different question: has anything been inserted, removed or
+   * altered *since the log was last sealed*. A chain can be internally
+   * consistent and still have had a row removed; the root is what catches that.
+   */
+  verifyMerkle(): Promise<MerkleVerification> {
+    return getBackendService().invoke<MerkleVerification>('verify_audit_merkle');
+  },
+
+  /** The zero-trust gate's current setting. */
+  readZeroTrustConfig(): Promise<ZeroTrustConfig> {
+    return getBackendService().invoke<ZeroTrustConfig>('read_zero_trust_config');
+  },
+
+  /**
+   * Changes what the gate requires. Administrator only.
+   *
+   * `reason` is carried into the audit row beside the change, so a reviewer
+   * reads why the posture moved next to the record that it moved.
+   */
+  setZeroTrustMode(
+    mode: ZeroTrustMode,
+    reauthWindowSeconds: number,
+    reason?: string,
+  ): Promise<ZeroTrustConfig> {
+    return getBackendService().invoke<ZeroTrustConfig>('set_zero_trust_mode', {
+      mode,
+      reauthWindowSeconds,
+      reason,
+    });
+  },
 };
+
+/**
+ * How much the zero-trust gate tightens beyond role-based access.
+ *
+ * Mirrors `sovereignty::zero_trust::ZeroTrustMode`. Each mode is the previous
+ * one plus one further requirement, so the list only ever narrows.
+ */
+export type ZeroTrustMode =
+  | 'off'
+  | 'approveEveryToolCall'
+  | 'approveEveryToolCallAndLogMemoryReads'
+  | 'approveEveryToolCallAndLogMemoryReadsAndTightenReauth';
+
+export interface ZeroTrustConfig {
+  mode: ZeroTrustMode;
+  /** Seconds since the last re-authentication within which a model switch is allowed. */
+  reauthWindowSeconds: number;
+  /** RFC 3339, UTC. */
+  updatedAt: string;
+  updatedBy: string;
+  reason?: string | null;
+}
+
+/** A point the audit log was sealed at. */
+export interface MerkleSnapshot {
+  upToSeq: number;
+  root: string;
+  takenAt: string;
+}
+
+/** Whether the log still reproduces its recorded root. */
+export interface MerkleVerification {
+  /** Absent when no snapshot has ever been taken — a freshly created log. */
+  snapshot: MerkleSnapshot | null;
+  /** True when nothing after the snapshot was inserted, removed or altered. */
+  intact: boolean;
+  eventsSinceSnapshot: number;
+  detail: string;
+}

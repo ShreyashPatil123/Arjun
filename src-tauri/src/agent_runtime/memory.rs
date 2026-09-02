@@ -900,7 +900,8 @@ pub struct RunMemory {
     /// approved last; the UI reads the same list to render the
     /// decision history alongside the run.
     ///
-    /// PS 26117 calls these "evidence-anchored decision points".
+    /// ARJUN calls these "evidence-anchored decision points"; the phrase is
+    /// ours, not the problem statement's.
     /// The model says "I think we are here" and a human signs off;
     /// that signature is the durable artefact, not the model's text.
     #[serde(default)]
@@ -926,6 +927,19 @@ pub struct MilestoneRecord {
     pub acknowledged_by: String,
     /// RFC 3339, UTC.
     pub at: String,
+    /// `approved` or `rejected`.
+    ///
+    /// Defaulted to `approved` so records written before a rejection could be
+    /// expressed still load as what they were: at that point the only decision
+    /// this list could hold was an approval, so reading them that way restates
+    /// the truth rather than assuming it.
+    #[serde(default = "approved_decision")]
+    pub decision: String,
+}
+
+/// The decision a `MilestoneRecord` written before the field existed carries.
+fn approved_decision() -> String {
+    "approved".to_string()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 //! The plan a run is given before it is allowed to start.
 //!
-//! PS step 19: *"The plan includes a maximum number of steps, maximum execution
+//! ARJUN design rule 19: *"The plan includes a maximum number of steps, maximum execution
 //! time, permitted tools, permitted files, model budget, and stop conditions.
 //! The model is not allowed to extend the plan indefinitely."*
 //!

@@ -82,6 +82,21 @@ const EXCLUDED_MARKERS = [
   ['code_execution', 'xAI-hosted code execution'],
   ['openshell', 'remote shell backend'],
   ['ClawHub', 'plugin installation'],
+  // Cloud model vendors. Upstream OpenClaw speaks to all of these; ARJUN speaks
+  // to two local inference servers over loopback and holds no cloud credential,
+  // so none of it should survive into the artifact. Each was present until the
+  // vendored tree was pruned, and these markers are what stops it coming back
+  // the next time the vendor drop is refreshed.
+  ['amazon-bedrock', 'AWS Bedrock credential discovery'],
+  ['bedrock-converse-stream', 'AWS Bedrock protocol adapter'],
+  ['openai.azure.com', 'Azure OpenAI endpoint'],
+  ['services.ai.azure.com', 'Azure AI Foundry endpoint'],
+  ['cognitiveservices.azure.com', 'Azure Cognitive Services endpoint'],
+  ['openrouter.ai', 'OpenRouter model broker'],
+  ['api.anthropic.com', 'Anthropic API'],
+  ['api.mistral.ai', 'Mistral API'],
+  ['huggingface.co', 'Hugging Face model downloads'],
+  ['generativelanguage.googleapis.com', 'Google Generative AI API'],
 ];
 
 /**

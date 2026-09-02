@@ -23,8 +23,37 @@ import { formatSize } from '../services/catalog.service';
 import {
   registryService,
   type OrchestratorModelSelection,
+  type OrchestratorSwapStep,
 } from '../services/registry.service';
 import styles from './Storage.module.css';
+
+/** A quantisation that names the container rather than the weights. */
+const isPlaceholderQuant = (quantization?: string | null) =>
+  !quantization?.trim() || quantization.trim().toLowerCase() === 'gguf';
+
+/**
+ * Whether the configured orchestrator is this installed model.
+ *
+ * The provider and model id are the package's identity and are compared
+ * strictly. Quantisation is compared only when both sides name a real one:
+ * what is saved is the registry's spelling, and a package whose file name
+ * declares no quantisation records the placeholder "GGUF" forever. Demanding
+ * they match exactly would drop the star off the model the chat is actually
+ * using, which is the confusion this whole area is being fixed for.
+ */
+const isSameModel = (
+  chosen: OrchestratorModelSelection | null,
+  installed: { providerId: string; modelId: string; quantization: string }
+) => {
+  if (!chosen) return false;
+  if (chosen.providerId !== installed.providerId || chosen.modelId !== installed.modelId) {
+    return false;
+  }
+  if (isPlaceholderQuant(chosen.quantization) || isPlaceholderQuant(installed.quantization)) {
+    return true;
+  }
+  return chosen.quantization.toLowerCase() === installed.quantization.toLowerCase();
+};
 
 /**
  * Storage — manage what is on disk.
@@ -42,6 +71,8 @@ export const Storage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  /** The stage the running swap is on, or null when none is running. */
+  const [swap, setSwap] = useState<OrchestratorSwapStep | null>(null);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -79,6 +110,28 @@ export const Storage: React.FC = () => {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Subscribed for the life of the screen rather than opened per swap: the
+  // first stage is emitted before `setOrchestratorModel` resolves, so a
+  // listener attached at click time would miss the release it exists to show.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void registryService
+      .subscribeOrchestratorSwap(step => setSwap(step))
+      .then(fn => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // No live channel. The swap still happens and the toast still
+        // reports it; only the running commentary is missing.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const handleDeleteModel = async (m: any) => {
     // Deleting frees gigabytes and cannot be undone, so it is confirmed and the
@@ -127,24 +180,48 @@ export const Storage: React.FC = () => {
     }
   };
 
+  // Choosing an orchestrator releases whatever is serving and loads the new
+  // model, which takes as long as reading several gigabytes off disk. The
+  // stages are shown as they arrive rather than behind one "Saving…" label:
+  // releasing and loading are the two halves of the wait, and which model each
+  // is about is the thing worth knowing while it happens.
   const handleSetOrchestrator = async (m: any) => {
     const busyKey = `orchestrator:${m.id}`;
     setBusy(busyKey);
+    setSwap({ phase: 'loading', modelId: m.modelId, modelName: m.modelName, detail: null });
     try {
-      const selected = await registryService.setOrchestratorModel({
+      const change = await registryService.setOrchestratorModel({
         providerId: m.providerId,
         modelId: m.modelId,
         quantization: m.quantization,
       });
-      setOrchestrator(selected);
-      addToast(
-        'success',
-        `${m.modelName} is the orchestrator and will auto-load on the GPU at startup`
-      );
+      setOrchestrator(change.selected);
+
+      const releasedNote = change.released.length
+        ? `, releasing ${change.released.join(' and ')}`
+        : '';
+      if (change.serving) {
+        addToast(
+          'success',
+          `${change.modelName} is the orchestrator and is now answering${releasedNote}`
+        );
+      } else {
+        // The choice was saved; the model just is not up. Reporting only
+        // "saved" would repeat the original bug in words — the setting looking
+        // like it took effect while another model does the talking.
+        addToast(
+          'error',
+          `${change.modelName} is saved as the orchestrator but did not start: ${
+            change.detail ?? 'the model server did not come up'
+          }`
+        );
+      }
+      await refresh();
     } catch (err) {
       addToast('error', String(err));
     } finally {
       setBusy(null);
+      setSwap(null);
     }
   };
 
@@ -227,12 +304,22 @@ export const Storage: React.FC = () => {
           </p>
         )}
 
+        {swap && (
+          <p className={styles.empty} role="status" aria-live="polite">
+            {swap.phase === 'releasing' && <>Releasing {swap.modelName} from memory…</>}
+            {swap.phase === 'loading' && <>Loading {swap.modelName} — this reads the weights off disk…</>}
+            {swap.phase === 'ready' && <>{swap.modelName} is loaded and answering.</>}
+            {swap.phase === 'failed' && (
+              <>
+                {swap.modelName} did not start: {swap.detail ?? 'no detail was reported'}
+              </>
+            )}
+          </p>
+        )}
+
         {models.map((m: any) => {
           const isLoaded = loadedModelId === m.modelId;
-          const isOrchestrator =
-            orchestrator?.providerId === m.providerId &&
-            orchestrator?.modelId === m.modelId &&
-            orchestrator?.quantization === m.quantization;
+          const isOrchestrator = isSameModel(orchestrator, m);
           return (
             <article key={`${m.modelId}-${m.quantization}`} className={styles.model}>
               <div className={styles.modelHead}>

@@ -27,27 +27,27 @@
     },
     {
       "name": "hazop-analyzer",
-      "sha256": "eeb965bea09d35c19046a55d7c33856da4452f00fa86735c4af5ea9a0cba00a2",
+      "sha256": "b2b02e1974d3a0b58c65a2418d414f5b424204eea5b4c6a4ae4b4f11b8ca5618",
       "note": "SIH 2026 industrial pack; HAZOP worksheet analyzer (IEC 61882)."
     },
     {
       "name": "pid-reader",
-      "sha256": "e5fa59bab5b7c888bf10e0d56956d0fc4bdb64568453790657b200cafa145b9f",
+      "sha256": "6df5561343879f6334cf4e5b82641717eae55e6985d1557da1db91bf806f09b3",
       "note": "SIH 2026 industrial pack; P&ID reader and line tracer."
     },
     {
       "name": "equipment-lookup",
-      "sha256": "2fdca1c82891844ca6ecfd5ace7eff3d05554976cd36a17e560c727831c1942b",
+      "sha256": "97ebcc0e31045f6e651ca660fdb57b0deef887f1a8bea8f5a4e7a5d86c07cca5",
       "note": "SIH 2026 industrial pack; equipment tag cross-reference."
     },
     {
       "name": "safety-compliance",
-      "sha256": "3feadefd549e0972289fa4568c0c8027789883b0437401ffc3f05a7bdd7924d3",
+      "sha256": "6f5dd4d3c04d8127b7fdaf5fab72dbe50374e8f69ba7dbdf494a562503b9f754",
       "note": "SIH 2026 industrial pack; IS 15656 / API 510 / OSHA clause checker."
     },
     {
       "name": "vendor-evaluator",
-      "sha256": "b1f42a4f4a41d57be35d5c24f84d52a6f8cfba009cac90e9fa06cb3153bbffe2",
+      "sha256": "0be871599d86fe76661cd7e0ac88ce9bbebc12c685abd077bf07a6ddbdebb578",
       "note": "SIH 2026 industrial pack; vendor quote comparison and 3-y TCO."
     }
   ]

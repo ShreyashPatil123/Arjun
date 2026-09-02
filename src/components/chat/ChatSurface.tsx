@@ -2,9 +2,28 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown } from 'lucide-react';
 import { useConversation } from '../run/useConversation';
 import { ChatComposer } from './ChatComposer';
+import {
+  listenAttachmentProgress,
+  describeAttachmentProgress,
+  describeAttachmentKind,
+  type AttachmentProgress,
+  type ComposerAttachment,
+} from '../../services/agent.service';
+import {
+  applyAttachmentOcrEvent,
+  listenAttachmentOcr,
+  type OcrPageRead,
+} from '../../services/ocr.service';
+import { OcrReadout } from './OcrReadout';
+import { useOcrPreference } from './useOcrPreference';
 import { AssistantMessageCell } from './AssistantMessageCell';
 import { RunView } from '../run/RunView';
-import { useAdoptedRun, useContextLedger, useTaskRecord } from '../run/runAdopt';
+import {
+  useAdoptedRun,
+  useContextLedger,
+  useConversationActivity,
+  useTaskRecord,
+} from '../run/runAdopt';
 import { ChatHeader } from './ChatHeader';
 import { TaskPanel } from './TaskPanel';
 import {
@@ -27,6 +46,15 @@ import styles from './ChatSurface.module.css';
  * shell, not in a sidebar inside this surface, so a chat is focused on
  * the current conversation.
  */
+/** How close to the bottom still counts as "following the stream". */
+const NEAR_BOTTOM_PX = 100;
+
+/** A turn waiting for the current run to finish, with its own attachments. */
+interface QueuedTurn {
+  text: string;
+  attachments: ComposerAttachment[];
+}
+
 export interface ChatSurfaceProps {
   /** Optional: a system prompt to prepend to every user message. */
   systemPrompt?: string;
@@ -46,12 +74,53 @@ export function ChatSurface({
     isStreaming,
     activeMessageId,
     activeRunId,
-    streamingContent,
+    streamingContents,
     send,
     replay,
   } = useConversation();
 
   const [inspectorRunId, setInspectorRunId] = useState<string | null>(null);
+
+  // Messages typed while a run is in flight. They are held here and
+  // sent one at a time, in order, as soon as the surface goes idle —
+  // the user never has to wait for a turn to finish before asking the
+  // next thing. `flushing` covers the gap between calling `send` and
+  // `isStreaming` catching up.
+  // A queued turn carries its own attachments. Holding only the text would
+  // let a turn be sent later with whatever was attached at flush time, which
+  // is how one message ends up answering about another's document.
+  const [queued, setQueued] = useState<QueuedTurn[]>([]);
+  // What the backend is doing with an attachment right now. Cleared when the
+  // run ends, so the line disappears rather than lingering as stale status.
+  const [reading, setReading] = useState<AttachmentProgress | null>(null);
+  // The OCR model's own output for this turn's attachments. Cleared when the
+  // next turn starts rather than when this one ends, so the evidence for the
+  // answer on screen stays on screen next to it.
+  const [ocrPages, setOcrPages] = useState<OcrPageRead[]>([]);
+  const ocrPreference = useOcrPreference();
+
+  useEffect(() => {
+    const sub = listenAttachmentProgress(p =>
+      setReading(p.phase === 'done' ? null : p),
+    );
+    return () => {
+      void sub.then(un => un());
+    };
+  }, []);
+
+  useEffect(() => {
+    const sub = listenAttachmentOcr(event =>
+      setOcrPages(prev => applyAttachmentOcrEvent(prev, event)),
+    );
+    return () => {
+      void sub.then(un => un());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isStreaming) setReading(null);
+  }, [isStreaming]);
+  const [flushing, setFlushing] = useState(false);
   const adopted = useAdoptedRun(inspectorRunId);
   const taskSummary = useTaskRecord(inspectorRunId);
 
@@ -89,6 +158,33 @@ export function ChatSurface({
     inspectorRunId ?? latestRunId,
   );
 
+  // Tool activity for the whole conversation. The live run streams;
+  // finished runs are read once from their snapshots.
+  const runIds = useMemo(
+    () => (conversation ? conversation.runs.map(r => r.runId) : []),
+    [conversation],
+  );
+  const liveRunId = useMemo(() => {
+    if (activeRunId) return activeRunId;
+    if (!conversation) return null;
+    for (const r of conversation.runs) {
+      if (r.live) return r.runId;
+    }
+    return null;
+  }, [activeRunId, conversation]);
+  const activityByRun = useConversationActivity(runIds, liveRunId);
+
+  // The newest assistant message is the only one that carries the orb.
+  // One avatar per screen reads as the assistant speaking; one per cell
+  // turned a long conversation into a column of spinning circles.
+  const orbMessageId = useMemo(() => {
+    const msgs = conversation?.messages ?? [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'assistant') return msgs[i].id;
+    }
+    return null;
+  }, [conversation]);
+
   // Auto-scroll to the bottom on new content, but only if the user has
   // not scrolled upward. The "↓ N new messages" pill lets them catch
   // up without losing their place.
@@ -107,13 +203,13 @@ export function ChatSurface({
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     });
-  }, [messages.length, streamingContent, stuckAtBottom]);
+  }, [messages.length, streamingContents, stuckAtBottom]);
 
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const atBottom = distance < 8;
+    const atBottom = distance < NEAR_BOTTOM_PX;
     setStuckAtBottom(atBottom);
     if (atBottom) setUnseenCount(0);
   };
@@ -127,11 +223,36 @@ export function ChatSurface({
   };
 
   const handleSubmit = useCallback(
-    async (text: string) => {
-      await send(text, classification);
+    async (text: string, attachments: ComposerAttachment[]) => {
+      if (isStreaming || flushing) {
+        setQueued(q => [...q, { text, attachments }]);
+        return;
+      }
+      // The previous turn's read belongs to the previous turn. Clearing it
+      // here rather than on completion is what keeps the evidence beside the
+      // answer it produced.
+      setOcrPages([]);
+      await send(text, classification, {
+        attachments,
+        ocrDetent: ocrPreference.detent,
+      });
     },
-    [send, classification],
+    [send, classification, isStreaming, flushing, ocrPreference.detent],
   );
+
+  // Drain the queue a message at a time. `setFlushing(false)` in the
+  // `finally` is what re-runs this effect for the next one.
+  useEffect(() => {
+    if (isStreaming || flushing || queued.length === 0) return;
+    const next = queued[0];
+    setFlushing(true);
+    setQueued(q => q.slice(1));
+    setOcrPages([]);
+    void send(next.text, classification, {
+      attachments: next.attachments,
+      ocrDetent: ocrPreference.detent,
+    }).finally(() => setFlushing(false));
+  }, [isStreaming, flushing, queued, send, classification, ocrPreference.detent]);
 
   // The task panel shows up only when the latest run had actual
   // orchestration (tools, multiple turns, plan). For a one-line
@@ -160,6 +281,7 @@ export function ChatSurface({
               : null
           }
         />
+        <div className={styles.chatScrollWrap}>
         <div
           className={styles.chatScroll}
           ref={scrollRef}
@@ -175,17 +297,15 @@ export function ChatSurface({
             <MessageRow
               key={m.id}
               message={m}
-              isLive={m.id === streamingMessageId}
+              isLive={m.status === 'streaming'}
               liveContent={
-                m.id === streamingMessageId ? streamingContent : undefined
-              }
-              runId={runsByMessageId.get(m.id) ?? null}
-              activity={
-                inspectorRunId &&
-                runsByMessageId.get(m.id) === inspectorRunId
-                  ? adopted?.activity
+                m.status === 'streaming'
+                  ? streamingContents.get(m.id) ?? ''
                   : undefined
               }
+              runId={runsByMessageId.get(m.id) ?? null}
+              activity={activityByRun.get(runsByMessageId.get(m.id) ?? '')}
+              showAvatar={m.id === orbMessageId}
               runSummary={
                 inspectorRunId && runsByMessageId.get(m.id) === inspectorRunId
                   ? taskSummary ?? null
@@ -213,25 +333,45 @@ export function ChatSurface({
           ))}
         </div>
 
-        {unseenCount > 0 && !stuckAtBottom && (
+        {!stuckAtBottom && messages.length > 0 && (
           <button
             type="button"
-            className={styles.unseenPill}
+            className={styles.scrollDownBtn}
             onClick={scrollToBottom}
-            aria-label={`${unseenCount} new messages`}
+            data-unseen={unseenCount > 0 || undefined}
+            aria-label={
+              unseenCount > 0
+                ? `Scroll to the newest message (${unseenCount} new)`
+                : 'Scroll to the newest message'
+            }
+            title="Scroll to the newest message"
           >
-            <ArrowDown size={13} />
-            <span>
-              {unseenCount} new message{unseenCount === 1 ? '' : 's'}
-            </span>
+            <ArrowDown size={16} />
           </button>
         )}
+        </div>
 
         <div className={styles.composerWrap}>
+          <OcrReadout pages={ocrPages} live={isStreaming || flushing} />
+          {reading && (
+            <div className={styles.readingStatus} role="status" aria-live="polite">
+              <span className={styles.readingPulse} aria-hidden="true" />
+              <span>{describeAttachmentProgress(reading)}</span>
+              <span className={styles.readingFile}>
+                {'\u{1F4C4}'} {reading.name}
+                {describeAttachmentKind(reading)
+                  ? ' · ' + describeAttachmentKind(reading)
+                  : ''}
+              </span>
+            </div>
+          )}
           <ChatComposer
-            streaming={isStreaming}
+            streaming={isStreaming || flushing}
             activeRunId={activeRunId}
+            queued={queued.map(q => q.text)}
+            onCancelQueued={i => setQueued(q => q.filter((_, j) => j !== i))}
             onSubmit={handleSubmit}
+            ocrPreference={ocrPreference}
           />
         </div>
       </div>
@@ -285,6 +425,8 @@ interface MessageRowProps {
   runId: string | null;
   activity?: Activity[];
   runSummary?: RunSummary | null;
+  /** Only the newest assistant cell draws the orb. */
+  showAvatar?: boolean;
   onOpenInspector: (runId: string) => void;
   onRetry: () => void;
   composerDisabled?: boolean;
@@ -297,6 +439,7 @@ function MessageRow({
   runId,
   activity,
   runSummary,
+  showAvatar,
   onOpenInspector,
   onRetry,
   composerDisabled,
@@ -324,6 +467,7 @@ function MessageRow({
       liveContent={liveContent}
       activity={runId ? activity : undefined}
       runSummary={runSummary ?? null}
+      showAvatar={showAvatar}
       onOpenInspector={runId ? () => onOpenInspector(runId) : undefined}
       onRetry={composerDisabled ? undefined : onRetry}
       composerDisabled={composerDisabled}

@@ -28,7 +28,7 @@ pub mod xlsx;
 pub mod verifier;
 
 pub use docx::{check_document, write_document, DocumentCheck, DocumentMetadata};
-pub use pptx::{check_deck, write_deck, DeckCheck, Slide};
+pub use pptx::{check_deck, write_deck, DeckCheck, Slide, BRIEFING_SECTIONS};
 pub use production::{produce, ContentSource, ProductionOutcome, Revision};
 pub use xlsx::{check_workbook, write_workbook, WorkbookCheck};
 pub use verifier::{verify, Evidence, Severity, Standing, VerificationReport};

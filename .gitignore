@@ -39,3 +39,9 @@ __pycache__/
 # Toolchain installers people download into the repo root while setting up.
 # They are multi-megabyte binaries that belong on the machine, not in history.
 rustup-init.exe
+
+# AI conversation logs. These are exports of assistant runs — they carry prompts,
+# model replies and operator names, and they are not source. 22 were committed
+# once, in b86b285; docs/purge-conversation-logs.md removes them from history.
+scratch/conversations-backup-*/
+scratch/*.db

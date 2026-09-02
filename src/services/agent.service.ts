@@ -1,5 +1,6 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getBackendService } from './api';
+import type { OcrDetent } from './ocr.service';
 
 /**
  * Starting, watching and stopping an agent run.
@@ -32,6 +33,94 @@ export type Classification =
  * letting the UI name one would make automatic selection optional, which is the
  * opposite of what the product is demonstrating.
  */
+/** A file the user attached in the composer, carried as bytes. */
+export interface ComposerAttachment {
+  name: string;
+  mime: string;
+  /** Base64 of the file itself, no data-URI prefix. */
+  dataBase64: string;
+}
+
+/**
+ * Reads a picked file into something that can cross the Tauri boundary.
+ *
+ * The backend cannot open a path the webview names — that would let the
+ * frontend nominate any file on the machine — so the bytes travel instead.
+ */
+export async function toComposerAttachment(file: File): Promise<ComposerAttachment> {
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`${file.name} could not be read.`));
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsDataURL(file);
+  });
+  const comma = dataUrl.indexOf(',');
+  if (comma === -1) throw new Error(`${file.name} could not be encoded.`);
+  return {
+    name: file.name,
+    // Browsers leave `type` empty for some picks; fall back to the extension
+    // so a PNG chosen from an odd source is still recognised as one.
+    mime: file.type || mimeFromName(file.name),
+    dataBase64: dataUrl.slice(comma + 1),
+  };
+}
+
+function mimeFromName(name: string): string {
+  const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  if (ext === 'png') return 'image/png';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'webp') return 'image/webp';
+  return 'application/octet-stream';
+}
+
+/**
+ * What the backend is doing with an attachment right now.
+ *
+ * Only facts. `page`/`pages` arrive once the extractor has counted them, so
+ * "Reading page 2 of 6" is never shown before those numbers are real.
+ */
+export interface AttachmentProgress {
+  name: string;
+  phase: 'reading' | 'preparing' | 'extracting' | 'understanding' | 'done';
+  page: number | null;
+  pages: number | null;
+  /** `image` | `pdf-text` | `pdf-scan` | `text` | `docx` | `xlsx` */
+  kind: string | null;
+}
+
+export async function listenAttachmentProgress(
+  callback: (payload: AttachmentProgress) => void
+) {
+  return listen<AttachmentProgress>('attachment:progress', (e) => callback(e.payload));
+}
+
+/** The line to show for a progress event. Real numbers only. */
+export function describeAttachmentProgress(p: AttachmentProgress): string {
+  if (p.phase === 'understanding' && p.page && p.pages && p.pages > 1) {
+    return `Reading page ${p.page} of ${p.pages}…`;
+  }
+  switch (p.phase) {
+    case 'reading':
+      return 'Reading document…';
+    case 'preparing':
+      return 'Preparing pages…';
+    case 'extracting':
+      return 'Extracting text…';
+    case 'understanding':
+      return 'Understanding document…';
+    default:
+      return 'Generating answer…';
+  }
+}
+
+/** The compact chip under the message: "6 pages · read locally". */
+export function describeAttachmentKind(p: AttachmentProgress): string | null {
+  if (!p.kind) return null;
+  const how = p.kind === 'pdf-scan' || p.kind === 'image' ? 'read on device' : 'read locally';
+  if (p.pages && p.pages > 1) return `${p.pages} pages · ${how}`;
+  return how;
+}
+
 export interface StartRunRequest {
   prompt: string;
   classification?: Classification;
@@ -53,6 +142,19 @@ export interface StartRunRequest {
    * fresh conversation for the first turn.
    */
   conversationId?: string;
+  /**
+   * Files attached to THIS turn. Nothing is remembered between runs, so one
+   * turn's attachment cannot reappear in another's.
+   */
+  attachments?: ComposerAttachment[];
+  /**
+   * Where the accuracy-to-speed slider was left when this turn was sent.
+   *
+   * It governs only how attachments are read; which model *answers* is still
+   * the backend router's decision and cannot be named from here. Omitted when
+   * the caller shows no slider, and the backend then uses its default stop.
+   */
+  ocrDetent?: OcrDetent;
   /**
    * The id the front-end reserved for the assistant message via
    * `agent_append_turn`. Required when `conversationId` is set.

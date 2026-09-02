@@ -1,37 +1,37 @@
 {
-  "at": "2026-08-26T11:50:36.180Z",
+  "at": "2026-09-01T16:45:21.313Z",
   "platform": "win32 x64",
   "results": [
     {
       "name": "1. Model auto-selection across task types",
       "status": "PASS",
-      "detail": "10 routing checks — different task types select different models, each with a recorded reason"
+      "detail": "23 routing checks — different task types select different models, each with a recorded reason"
     },
     {
       "name": "2. Agentic task, start to finish",
       "status": "PASS",
-      "detail": "180 checks — bounded plan, gated tools, grounded artifact that re-opens and verifies"
+      "detail": "264 checks — bounded plan, gated tools, grounded artifact that re-opens and verifies"
     },
     {
       "name": "3. Coding task run in the sandbox",
       "status": "BLOCKED",
-      "detail": "the refusal path is proven by tests, but no container runtime is installed, so code execution is refused rather than sandboxed. Install Podman to unblock this criterion."
+      "detail": "code execution is implemented, but no container runtime is responding — a CLI may be installed while its daemon is stopped. ARJUN refuses rather than running unisolated. Start Podman or Docker Desktop to unblock this criterion."
     },
     {
       "name": "4. Multimodal task",
-      "status": "BLOCKED",
-      "detail": "35 document-pipeline checks pass — routing, injection scanning, escalation and confidence flagging. But no vision model is provisioned (text weights are present; they cannot read pixels), so scans, handwriting and drawings cannot be read. Download a model with an mmproj projector in Provisioning mode to unblock this."
+      "status": "PASS",
+      "detail": "77 document-pipeline checks, with a vision model provisioned at C:\\Users\\lenovo\\AppData\\Roaming\\com.sarathi.app\\models"
     },
     {
       "name": "5. Zero egress in Work mode",
       "status": "PASS",
-      "detail": "source gate clean, build needs no network, 18 sovereignty checks — Work mode refuses, the canary fails, every decision is audited"
+      "detail": "source gate clean, build needs no network, 34 sovereignty checks — Work mode refuses, the canary fails, every decision is audited"
     }
   ],
   "summary": {
-    "passed": 3,
+    "passed": 4,
     "failed": 0,
-    "blocked": 2,
+    "blocked": 1,
     "unverified": 0
   }
 }

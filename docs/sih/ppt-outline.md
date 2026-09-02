@@ -134,17 +134,35 @@ calls, the audit row, the deliverable.
 
 ## Slide 10 — Performance
 
-**Title**: Honest numbers, on three hardware tiers
-**Bullets**:
-- Tier 1 (RTX 5060 4GB, our demo): 38 t/s on gemma-3-12b-it
-- Tier 2 (RTX 3060 12GB): 72 t/s
-- Tier 3 (CPU only, Ryzen 7): 8 t/s
-- TTFT: 220-450 ms (gemma-3-12b-it, 4-bit)
-- VRAM: 3.8 GB peak (gemma-3-12b-it at Q4_K_M)
-- Accuracy on demo tasks: 100% on tag ID, 92% on calculation, 88% on policy compliance
-**Visual**: bar chart of tokens/second by tier.
-**Speaker note**: The numbers are real, not marketing. Run
-`scripts/bench.py` and the rows above are what you get.
+> **This slide has no numbers on it yet, and must not get any until somebody
+> measures them.** Its previous version listed 38 / 72 / 8 tokens per second,
+> 220-450 ms TTFT, 3.8 GB VRAM and per-task accuracy of 100 / 92 / 88 percent,
+> under the speaker note *"The numbers are real, not marketing."* They were not
+> measured. `scripts/bench.py` returned a hardcoded constant whenever its
+> llama.cpp binding failed to import, and that constant is where 38 t/s came
+> from; the accuracy figures appear in no benchmark output at all. See
+> [`benchmarks.md`](benchmarks.md).
+>
+> The fallback is now removed — the script measures or exits non-zero. To fill
+> this slide in: `pip install llama-cpp-python`, then run
+> `python scripts/bench.py --model <path.gguf> --tier <label>` on the demo
+> machine and transcribe what comes back.
+
+**Title**: Runs on the machine in this room
+
+**Bullets** (until measured numbers exist, claim only what is visible):
+- Runs on a single workstation with a mid-range GPU — which is what the problem
+  statement asks for, and what the judges are watching it do
+- Model choice is automatic and the reason is recorded, per task
+- Larger models run on better hardware; a smaller open-weight model is used if
+  the venue machine cannot host a bigger one
+
+**Visual**: the live app, not a chart.
+
+**Speaker note**: We would rather show the workbench answering on this laptop
+than show a bar chart. If asked for throughput, say we have not published
+figures we have not measured on the hardware in question, and offer to run the
+benchmark on the spot.
 
 ## Slide 11 — Why ARJUN wins PS 26117
 
@@ -156,8 +174,10 @@ calls, the audit row, the deliverable.
 - Tamper-evident audit ✓ (hash chain + Merkle + HMAC provenance)
 - Human in the loop ✓ (approval queue + zero-trust mode)
 - Field-ready ✓ (push-to-talk voice + industrial dark UI)
-**Speaker note**: We mapped every PS 26117 requirement to a
-feature. The mapping is in the README.
+**Speaker note**: Split the claim. The requirements PS 26117 actually states
+are in Part 1 of `docs/sih/why-arjun-wins.md`; the audit ledger, approval queue
+and voice input are ours, not theirs, and go in Part 2. An MRPL judge knows
+which is which.
 
 ## Slide 12 — The team
 

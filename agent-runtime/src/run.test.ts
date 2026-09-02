@@ -196,7 +196,12 @@ describe("a run that uses a tool", () => {
     expect(methods).toEqual(["tool.authorize", "tool.execute"]);
 
     // The grant issued by the authorise step is the one spent executing.
-    expect(core.calls[1]!.params).toMatchObject({
+    // Found by method rather than by index: `calls` records every request,
+    // including the one-off `tool.catalogue` eligibility fetch at index 0, so
+    // `calls[1]` is the authorise call - which correctly carries no grant,
+    // because the grant is in its reply, not its request.
+    const executeCall = core.calls.find((call) => call.method === "tool.execute");
+    expect(executeCall?.params).toMatchObject({
       runId: "run-1",
       toolCallId: "call_1",
       tool: "knowledge.search_authorized",

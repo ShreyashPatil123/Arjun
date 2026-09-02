@@ -1,6 +1,7 @@
 //! Multimodal retrieval index: image regions, tables, document-type metadata.
 //!
-//! PS 26117's "multimodal engine" requirement lands hardest on the retrieval
+//! PS 26117's ask for *"a multimodal task involving image or scanned document
+//! understanding"* lands hardest on the retrieval
 //! side. A model that has to answer a question about a P&ID needs to be able
 //! to find a tag on the drawing; a model summarising a datasheet needs to
 //! find the row that says "design pressure: 14 bar" without scanning the

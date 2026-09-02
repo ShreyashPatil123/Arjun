@@ -6,7 +6,8 @@
 
 use crate::system_analyzer::process_utils::{create_hidden_command, run_command_with_timeout};
 use crate::system_analyzer::traits::GpuInfo;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -19,7 +20,54 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
 
+/// How long a cached hardware inventory is trusted.
+///
+/// Long enough that a burst of chat turns pays for one detection, short enough
+/// that plugging in an eGPU or updating a driver is picked up without a
+/// restart.
+const INVENTORY_TTL: Duration = Duration::from_secs(60);
+
+/// The installed GPUs, re-detected at most once per [`INVENTORY_TTL`].
+///
+/// Use this wherever the question is "what hardware is in this machine" —
+/// sizing a model, planning GPU offload, routing a run. Use [`detect_gpus`]
+/// only when live utilisation matters, which today is the health screen.
+///
+/// The distinction is worth the extra function. `detect_gpus` enumerates DXGI
+/// adapters, creates a D3D12 device per adapter, and — unconditionally, even
+/// on machines with no NVIDIA card — spawns `nvidia-smi` and waits up to 2.5
+/// seconds for it. Every chat message ran the whole thing before the router had
+/// picked a model, to arrive at a dedicated-VRAM figure that cannot change
+/// while the app is open.
+///
+/// `vram_free_bytes` on a cached entry is as old as the entry, which is exactly
+/// why the health screen does not use this.
+pub fn installed_gpus() -> Vec<GpuInfo> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<(Instant, Vec<GpuInfo>)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    // A poisoned lock means a previous detection panicked. Falling through to a
+    // fresh detection is better than propagating that panic into a chat turn.
+    if let Ok(guard) = cache.lock() {
+        if let Some((taken_at, gpus)) = guard.as_ref() {
+            if taken_at.elapsed() < INVENTORY_TTL {
+                return gpus.clone();
+            }
+        }
+    }
+
+    let gpus = detect_gpus();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), gpus.clone()));
+    }
+    gpus
+}
+
 /// Detects all installed GPU devices using native DXGI 1.4 and D3D12 hardware architecture APIs
+///
+/// Costs a subprocess and several driver calls. Prefer [`installed_gpus`]
+/// unless you need live VRAM utilisation.
 pub fn detect_gpus() -> Vec<GpuInfo> {
     log::info!("[SYSTEM ANALYZER DEBUG] 🚀 Universal GPU Collector Started (DXGI 1.4 + D3D12 UMA Primary)");
     let mut gpus = Vec::new();

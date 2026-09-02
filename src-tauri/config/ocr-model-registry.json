@@ -1,0 +1,57 @@
+{
+  "_comment": "Unlimited-OCR document-parsing registry entries. Merge into <app_data>/models/registry.json. Two entries, one per installed weight file, sharing a single F16 vision projector: the accuracy-to-speed slider moves between them. Both are cleared for NOTHING — permittedClassifications is deliberately empty, so the router will not send a document to either until an administrator reviews the model and grants classifications. That is the registry's safety property, not an oversight.",
+
+  "_projector": "mmproj-Unlimited-OCR-F16-patched.gguf is required by BOTH entries and is never quantized. It is the upstream mmproj-Unlimited-OCR-F16.gguf with two metadata keys added: clip.vision.preproc_max_tiles=32 and clip.vision.preproc_min_tiles=2. Without them llama.cpp throws \"Key not found\" while loading the projector, the exception is never caught, and the process dies with STATUS_STACK_BUFFER_OVERRUN (0xC0000409) before logging anything. The values are taken from sabafallah/Unlimited-OCR-GGUF, the conversion by the author of the llama.cpp DeepSeek-OCR PR. Only the KV block changed; all 476 tensors are byte-identical. sha256 d80b9f5157c716051e851047838f6b3be42c420fab17a23f563c05db463a1dc0.",
+
+  "_integrity": "The sha256 values are the upstream Hugging Face LFS oids for sahilchachra/Unlimited-OCR-GGUF, re-hashed on disk after download and matched exactly. registry::integrity::verify checks these before every load, so a swapped or truncated file fails loudly instead of producing quietly worse OCR.",
+
+  "_provenance": "Base model baidu/Unlimited-OCR (MIT). The GGUF is a third-party conversion whose architecture string was rewritten to DeepseekOCRForCausalLM to reach llama.cpp's DeepSeek-OCR path; the source config declares UnlimitedOCRForCausalLM. Whether that rewrite is behaviourally sound on long documents is unverified on this build — see the Phase 0 gate.",
+
+  "models": [
+    {
+      "_comment": "High tier. Slider stops 3-4 (Detailed, Maximum). The card recommends Q4_K_M as the default; independent llama.cpp testing found Q4_K_M loops on some prompts, so the accuracy tier sits above that line.",
+      "id": "unlimited-ocr-q6-k",
+      "name": "Unlimited-OCR (Q6_K)",
+      "version": "1",
+      "license": "mit",
+      "sha256": "a9994800e005190197a4cc5c0b54a88db5c6aba6f6dca48a27992ea2e1c0b3b3",
+      "runtime": "llamaCpp",
+      "roles": ["vision", "documentOcr"],
+      "modalities": ["text", "image"],
+      "quantization": "Q6_K",
+      "parametersB": 3.0,
+      "activeParametersB": 0.57,
+      "contextLength": 32768,
+      "weightsBytes": 2613275904,
+      "supportsStructuredOutput": false,
+      "permittedClassifications": [],
+      "path": "OCR/Unlimited-OCR/Unlimited-OCR-Q6_K.gguf",
+      "projector": "OCR/Unlimited-OCR/mmproj-Unlimited-OCR-F16-patched.gguf",
+      "serving": { "mode": "managed" },
+      "enabled": true,
+      "routing": { "preferred": true }
+    },
+    {
+      "_comment": "Fast tier. Slider stops 1-2 (Fastest, Fast). Only safe with the DRY sampler engaged, which ai_engine::ocr_profile attaches to every request — Baidu's reference implementation uses a no-repeat-ngram logit processor that llama.cpp does not have.",
+      "id": "unlimited-ocr-q4-k-m",
+      "name": "Unlimited-OCR (Q4_K_M)",
+      "version": "1",
+      "license": "mit",
+      "sha256": "c8461bded976eac709a33f6b26e1414efcd2124a203f2ee93ee984a4c9e9265b",
+      "runtime": "llamaCpp",
+      "roles": ["vision", "documentOcr"],
+      "modalities": ["text", "image"],
+      "quantization": "Q4_K_M",
+      "parametersB": 3.0,
+      "activeParametersB": 0.57,
+      "contextLength": 32768,
+      "weightsBytes": 1950326784,
+      "supportsStructuredOutput": false,
+      "permittedClassifications": [],
+      "path": "OCR/Unlimited-OCR/Unlimited-OCR-Q4_K_M.gguf",
+      "projector": "OCR/Unlimited-OCR/mmproj-Unlimited-OCR-F16-patched.gguf",
+      "serving": { "mode": "managed" },
+      "enabled": true
+    }
+  ]
+}

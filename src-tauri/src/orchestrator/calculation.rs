@@ -1,6 +1,6 @@
 //! Arithmetic that is actually correct, with the units checked.
 //!
-//! PS step 27: *"the orchestrator should use a deterministic calculator ... The
+//! ARJUN design rule 27: *"the orchestrator should use a deterministic calculator ... The
 //! model may explain the result, but the calculation engine should be the source
 //! of numerical truth."*
 //!
@@ -119,7 +119,7 @@ pub struct Step {
     pub result: String,
 }
 
-/// Everything PS step 27 asks a calculation to record.
+/// Everything ARJUN design rule 27 asks a calculation to record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalculationRecord {

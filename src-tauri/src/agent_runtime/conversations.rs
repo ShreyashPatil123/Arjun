@@ -578,13 +578,38 @@ impl ConversationStore {
                 MessageStatus::Done
             };
             msg.completed_at = Some(now.clone());
-            msg.elapsed_ms = elapsed_ms;
-            msg.model_name = model_name.map(str::to_string);
-            msg.model_role = model_role.map(str::to_string);
-            msg.used_fallback = used_fallback;
-            msg.error = error.map(str::to_string);
-            msg.tokens_in = tokens_in;
-            msg.tokens_out = tokens_out;
+            // Two writers reach this row and neither knows everything. The
+            // front-end writes on `message_end`, which is the only place the
+            // model's token usage appears; the run writes again when
+            // `agent_run_prompt` resolves, which is the only place the routing
+            // decision appears. Assigning unconditionally meant whichever
+            // wrote second erased the other's half — in practice the run
+            // wrote last and every message came back with no token counts.
+            // `None` here therefore means "I do not know this", not "clear it".
+            if elapsed_ms.is_some() {
+                msg.elapsed_ms = elapsed_ms;
+            }
+            if let Some(name) = model_name {
+                msg.model_name = Some(name.to_string());
+            }
+            if let Some(role) = model_role {
+                msg.model_role = Some(role.to_string());
+            }
+            if used_fallback.is_some() {
+                msg.used_fallback = used_fallback;
+            }
+            if tokens_in.is_some() {
+                msg.tokens_in = tokens_in;
+            }
+            if tokens_out.is_some() {
+                msg.tokens_out = tokens_out;
+            }
+            // The error is terminal state rather than metadata: a completion
+            // that reports no failure clears whatever an earlier writer left,
+            // but a failure with no message keeps the message already there.
+            if error.is_some() || !failed {
+                msg.error = error.map(str::to_string);
+            }
         }
         if let Some(run) = conversation.runs.iter_mut().find(|r| r.run_id == run_id) {
             run.finished_at = Some(now.clone());

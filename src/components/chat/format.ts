@@ -17,3 +17,16 @@ export function formatDuration(ms: number): string {
   const seconds = Math.round((ms % 60_000) / 1000);
   return `${minutes}m ${seconds}s`;
 }
+
+/**
+ * A token count at the size a status line has room for.
+ *
+ * Exact below a thousand, because the difference between 180 and 240 tokens
+ * is something an operator reads; abbreviated above it, because the
+ * difference between 12,400 and 12,600 is not, and the pill is narrow.
+ */
+export function formatTokens(tokens: number): string {
+  if (tokens < 1000) return `${Math.max(0, Math.round(tokens))}`;
+  const thousands = tokens / 1000;
+  return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
+}

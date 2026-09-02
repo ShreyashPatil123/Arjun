@@ -142,7 +142,15 @@ pub struct Split<'a> {
 /// splits and parses in one step is one that has already read every skill body
 /// into memory before deciding whether it needed to.
 pub fn split(source: &str) -> Result<Split<'_>, ParseError> {
-    let mut lines = source.lines();
+    // `split_inclusive` keeps each line's terminator, so the offsets below are
+    // real byte spans. An earlier version walked `lines()` and advanced by
+    // `line.len() + 1`, which assumes every line ends in a single `\n`. On a
+    // CRLF checkout — Git's default on Windows — each line is one byte longer
+    // than that, so the offset fell a byte behind per line and the frontmatter
+    // slice ended some twenty bytes short of its closing `---`. The parser
+    // then read the delimiter as content and reported "line 22: expected
+    // `key: value`", pointing at a line that is perfectly well formed.
+    let mut lines = source.split_inclusive('\n');
     let first = lines.next().ok_or_else(|| ParseError::at(1, "the file is empty"))?;
     if first.trim_end() != "---" {
         return Err(ParseError::at(
@@ -151,14 +159,16 @@ pub fn split(source: &str) -> Result<Split<'_>, ParseError> {
         ));
     }
 
-    // Byte offset just past the opening delimiter.
-    let mut offset = first.len() + 1;
+    // Byte offset just past the opening delimiter, which is also where the
+    // frontmatter itself starts.
+    let frontmatter_start = first.len();
+    let mut offset = frontmatter_start;
     let mut line_number = 1;
 
     for line in lines {
         line_number += 1;
         if line.trim_end() == "---" {
-            let frontmatter = &source[first.len() + 1..offset.min(source.len())];
+            let frontmatter = &source[frontmatter_start..offset.min(source.len())];
             if frontmatter.len() > MAX_FRONTMATTER_BYTES {
                 return Err(ParseError::at(
                     line_number,
@@ -168,15 +178,15 @@ pub fn split(source: &str) -> Result<Split<'_>, ParseError> {
                     ),
                 ));
             }
-            let body_start = (offset + line.len() + 1).min(source.len());
+            let body_start = (offset + line.len()).min(source.len());
             return Ok(Split {
                 frontmatter,
                 body: &source[body_start..],
                 body_line: line_number + 1,
             });
         }
-        offset += line.len() + 1;
-        if offset > MAX_FRONTMATTER_BYTES {
+        offset += line.len();
+        if offset - frontmatter_start > MAX_FRONTMATTER_BYTES {
             return Err(ParseError::at(
                 line_number,
                 "the frontmatter block is longer than the limit, or its closing `---` is missing",

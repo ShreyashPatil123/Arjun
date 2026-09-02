@@ -269,7 +269,7 @@ impl<'a> Executor<'a> {
     /// aggregated outcome as a single step.
     ///
     /// The plan counts this as **one** step regardless of how many calls
-    /// it contained. PS 26117 is explicit: a parallel fan-out is one
+    /// it contained. ARJUN design rule: a parallel fan-out is one
     /// step, because "sum of parallel calls counts as 1 step" is the
     /// budget's only honest reading. A task that asked for three searches
     /// and got them in one step has spent one step of its budget, and
@@ -425,7 +425,7 @@ impl<'a> Executor<'a> {
         }
 
         // One step for the whole batch. The budget counter sees one
-        // decrement, regardless of how many calls ran. PS 26117
+        // decrement, regardless of how many calls ran. ARJUN design rule
         // says: "sum of parallel calls counts as 1 step".
         let hit = run.record_step();
 
@@ -490,7 +490,7 @@ impl<'a> Executor<'a> {
         let Some(audit) = self.audit else { return };
 
         // The arguments are recorded, but never the tool's output: a document's
-        // text is exactly what PS step 14 says must not be copied into a log
+        // text is exactly what ARJUN design rule 14 says must not be copied into a log
         // that more people can read than could read the document.
         let _ = audit.record(
             &context.session.user.id,
@@ -855,7 +855,7 @@ mod tests {
         assert!(runner.ran().is_empty());
     }
 
-    /// PS 26117, Phase 2: a parallel fan-out counts as a single step.
+    /// ARJUN design rule: a parallel fan-out counts as a single step.
     /// Three read-only search calls run together and the budget only
     /// moves by one.
     #[test]
@@ -1004,7 +1004,7 @@ mod tests {
         assert!(runner.ran().is_empty());
     }
 
-    /// PS 26117, Phase 2: a step flagged as a milestone pauses the
+    /// ARJUN design rule: a step flagged as a milestone pauses the
     /// run for human approval before the next leg. The state carries
     /// the checkpoint id, ordinal and intent so the UI can render
     /// the gate without re-reading the plan.

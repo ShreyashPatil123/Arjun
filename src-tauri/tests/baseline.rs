@@ -1,6 +1,6 @@
 //! The scripted baseline — the demo, as a test.
 //!
-//! PS step 15 asks for a scripted baseline over five inputs: *"one scanned
+//! ARJUN design rule 15 asks for a scripted baseline over five inputs: *"one scanned
 //! inspection report, one SOP, one calculation, one code task and one image"*.
 //! This runs all five through the real modules against real fixture files, and
 //! then does the thing the criteria actually care about: it assembles them into

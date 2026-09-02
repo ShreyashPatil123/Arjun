@@ -19,7 +19,7 @@
 //! No password recovery. There is no email to send a reset to on an air-gapped
 //! machine, and a recovery question is just a weaker second password. An
 //! administrator resets another account; a lost administrator password is
-//! recovered through the local procedure PS step 7 asks the site to define,
+//! recovered through the local procedure ARJUN design rule 7 asks the site to define,
 //! which is an operational answer rather than a software one.
 
 use std::path::Path;

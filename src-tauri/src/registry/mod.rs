@@ -18,7 +18,7 @@
 //!
 //! ## What an entry has to declare
 //!
-//! Everything PS step 9 asks for: name, version, licence, hash, parameter class,
+//! Everything ARJUN design rule 9 asks for: name, version, licence, hash, parameter class,
 //! quantisation, modalities, context length, expected GPU memory, and the data
 //! classifications it may be used on. The last is the one people forget, and it
 //! is the one that stops a model that phones home — or simply one nobody has
@@ -185,6 +185,16 @@ pub struct ModelEntry {
     pub permitted_classifications: Vec<Classification>,
     /// Path to the weights, relative to the models directory.
     pub path: PathBuf,
+    /// The `mmproj-*.gguf` vision projector this model loads with, when it
+    /// has one.
+    ///
+    /// Separate from `path` because llama.cpp takes it as its own argument:
+    /// a vision model started without `--mmproj` loads and answers, but is
+    /// blind — it silently degrades to text-only rather than failing. The
+    /// scanner already pairs a GGUF with the projector beside it; this is
+    /// where that pairing survives into the launch.
+    #[serde(default)]
+    pub projector: Option<PathBuf>,
     /// What the runtime needs to actually load this.
     ///
     /// Separate from `path` because the llama.cpp loader addresses a model by
@@ -249,27 +259,49 @@ fn default_true() -> bool {
     true
 }
 
-fn is_default_orchestrator(entry: &ModelEntry) -> bool {
-    let configured = crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID;
-    if entry
-        .load
-        .as_ref()
-        .map(|load| normalized_identity(&load.model_id) == normalized_identity(configured))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    let identity = normalized_identity(&format!("{} {}", entry.id, entry.name));
-    identity.contains("gemma4") && identity.contains("12b")
-}
-
 fn normalized_identity(value: &str) -> String {
     value
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Whether this entry is the installed package an administrator selected.
+///
+/// Compared on the load coordinates rather than the display name, because the
+/// coordinates are what `set_orchestrator_model` persisted and what the runtime
+/// loads by; two quantizations of the same model share a name and are different
+/// files. Punctuation and case are ignored so a re-published package id still
+/// matches. An entry with no load spec cannot be matched — the runtime cannot
+/// load it either, so routing to it would fail later and more obscurely.
+fn entry_matches(
+    entry: &ModelEntry,
+    chosen: &crate::ai_engine::startup::StartupModelTarget,
+) -> bool {
+    entry
+        .load
+        .as_ref()
+        .map(|load| {
+            normalized_identity(&load.provider_id) == normalized_identity(&chosen.provider_id)
+                && normalized_identity(&load.model_id) == normalized_identity(&chosen.model_id)
+                // "GGUF" names the container, not the weights: it is what a
+                // package manifest records when the file name declares nothing
+                // it can parse. A choice carrying it picks the package and
+                // leaves the variant open, rather than matching nothing at all
+                // — which is what it used to do, and why an administrator could
+                // set an orchestrator and watch the chat ignore it.
+                && (is_placeholder_quantization(&chosen.quantization)
+                    || normalized_identity(&load.quantization)
+                        == normalized_identity(&chosen.quantization))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a stored quantisation names the container rather than the weights.
+fn is_placeholder_quantization(quantization: &str) -> bool {
+    let trimmed = quantization.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("gguf")
 }
 
 impl ModelEntry {
@@ -523,44 +555,98 @@ impl ModelRegistry {
             .collect()
     }
 
-    /// The model entry used by the orchestrator — the model that runs the chat.
-    /// An explicit `orchestrator.*` entry always wins. Without one, the product
-    /// default (Gemma 4 12B) is selected from its installed load coordinates or
-    /// recognizable identity.
+    /// Every registered entry that is the same installed package as `target`,
+    /// ignoring quantisation.
     ///
-    /// The marker is the first model whose `id` starts with
-    /// `"orchestrator"` (i.e. `"orchestrator"` itself, or
-    /// `"orchestrator.qwen3-4b"` etc.). A more elaborate
-    /// tagging scheme can replace this without breaking
-    /// callers.
-    pub fn orchestrator_entry(&self) -> Option<&ModelEntry> {
-        self.entries.iter().find(|e| {
-            e.id == "orchestrator" || e.id.starts_with("orchestrator.")
-        }).or_else(|| self.entries.iter().find(|e| is_default_orchestrator(e)))
+    /// Exists because the two halves of the product name a quantisation
+    /// differently. What is on disk is described by the package manifest, which
+    /// records what the file name declares; the registry is written by an
+    /// administrator, who writes the label the publisher used. Those agree
+    /// almost always and disagree exactly when the file name says something
+    /// this build cannot parse — and a disagreement there used to mean an
+    /// administrator's orchestrator choice matched no entry at all and was
+    /// silently ignored.
+    ///
+    /// The provider and model id are the package's identity and are compared
+    /// strictly. Quantisation is left to the caller, which knows whether it
+    /// holds a real label or a placeholder.
+    pub fn entries_for_package(&self, provider_id: &str, model_id: &str) -> Vec<&ModelEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .load
+                    .as_ref()
+                    .map(|load| {
+                        normalized_identity(&load.provider_id) == normalized_identity(provider_id)
+                            && normalized_identity(&load.model_id) == normalized_identity(model_id)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
-    /// The (family, quantisation) tuple the orchestrator
-    /// resolver should look for in the library scan. Falls
-    /// back to the standard Gemma 4 12B / Q4_0 if no orchestrator
-    /// is registered — the resolver then reports NotFound
-    /// rather than guessing.
-    pub fn orchestrator_identity(&self) -> Option<(String, String)> {
-        let entry = self.orchestrator_entry()?;
-        let family = if is_default_orchestrator(entry) {
-            "gemma-4-12b".to_string()
-        } else {
-            entry
-                .id
-                .strip_prefix("orchestrator")
-                .map(|s| s.trim_start_matches('.').to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| entry.name.clone())
-        };
+    /// The model entry used by the orchestrator — the model that runs the chat.
+    ///
+    /// Two ways an entry becomes the orchestrator, and no third:
+    ///
+    /// 1. An administrator chose it in Models → *Set as orchestrator*, which
+    ///    persists the exact provider / model / quantization coordinates. Pass
+    ///    them in as `chosen`; the first entry whose load spec matches wins.
+    /// 2. The manifest tags one, by giving it an `id` of `"orchestrator"` or
+    ///    one starting `"orchestrator."` (`"orchestrator.qwen3-4b"`). This is
+    ///    the escape hatch for a deployment that ships a fixed manifest, and it
+    ///    applies only when nobody has chosen: a tag written into the manifest
+    ///    at some point in the past must never outrank a person choosing today.
+    ///
+    /// There is deliberately no compiled-in third case. A product default named
+    /// in Rust is a model the machine may not even have installed, and guessing
+    /// one is exactly how a chat ends up answering from a model nobody picked.
+    pub fn orchestrator_entry_for(
+        &self,
+        chosen: Option<&crate::ai_engine::startup::StartupModelTarget>,
+    ) -> Option<&ModelEntry> {
+        match chosen {
+            Some(chosen) => self.entries.iter().find(|e| entry_matches(e, chosen)),
+            None => self
+                .entries
+                .iter()
+                .find(|e| e.id == "orchestrator" || e.id.starts_with("orchestrator.")),
+        }
+    }
+
+    /// The orchestrator tagged by the manifest, with no administrator choice
+    /// to consult. Callers that hold the configuration should prefer
+    /// [`Self::orchestrator_entry_for`].
+    pub fn orchestrator_entry(&self) -> Option<&ModelEntry> {
+        self.orchestrator_entry_for(None)
+    }
+
+    /// The (family, quantisation) tuple the orchestrator resolver should look
+    /// for in the library scan, derived from the orchestrator entry itself.
+    /// `None` when no orchestrator is registered — the resolver then reports
+    /// NotFound rather than guessing at a family name.
+    pub fn orchestrator_identity_for(
+        &self,
+        chosen: Option<&crate::ai_engine::startup::StartupModelTarget>,
+    ) -> Option<(String, String)> {
+        let entry = self.orchestrator_entry_for(chosen)?;
+        let family = entry
+            .id
+            .strip_prefix("orchestrator")
+            .map(|s| s.trim_start_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| entry.id.clone());
         let quant = entry
             .quantization
             .clone()
-            .unwrap_or_else(|| crate::config::DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string());
+            .or_else(|| entry.load.as_ref().map(|load| load.quantization.clone()))?;
         Some((family, quant))
+    }
+
+    /// [`Self::orchestrator_identity_for`] with no administrator choice.
+    pub fn orchestrator_identity(&self) -> Option<(String, String)> {
+        self.orchestrator_identity_for(None)
     }
 
     /// The root of the model library on disk. The orchestrator
@@ -646,6 +732,7 @@ impl ModelRegistry {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::ai_engine::startup::StartupModelTarget;
     use serde_json::Value;
 
     pub(crate) fn entry(id: &str, params: f32, roles: Vec<ModelRole>) -> ModelEntry {
@@ -666,6 +753,7 @@ pub(crate) mod tests {
             supports_structured_output: false,
             permitted_classifications: Classification::ALL.to_vec(),
             path: PathBuf::from(format!("{id}.gguf")),
+            projector: None,
             load: Some(LoadSpec {
                 provider_id: "huggingface".into(),
                 model_id: id.into(),
@@ -961,6 +1049,46 @@ pub(crate) mod tests {
     // Atomic manifest write tests (TODO 4 of the 7-step plan).
     // -----------------------------------------------------------------------
 
+    /// The shipped OCR registry is data, and data with a typo in an enum
+    /// variant fails at load time on an operator's machine rather than here.
+    /// Parsing it in the test suite moves that failure to the build.
+    #[test]
+    fn the_shipped_ocr_registry_parses_and_stays_cleared_for_nothing() {
+        #[derive(serde::Deserialize)]
+        struct Shipped {
+            models: Vec<ModelEntry>,
+        }
+        let raw = include_str!("../../config/ocr-model-registry.json");
+        let parsed: Shipped =
+            serde_json::from_str(raw).expect("ocr-model-registry.json must deserialise");
+        assert_eq!(parsed.models.len(), 2, "one entry per installed weight file");
+
+        for model in &parsed.models {
+            assert!(
+                model.projector.is_some(),
+                "{} would start blind without a projector",
+                model.id
+            );
+            assert!(
+                model.sha256.is_some(),
+                "{} is a third-party requant and must be hash-pinned",
+                model.id
+            );
+            assert!(
+                model.permitted_classifications.is_empty(),
+                "{} ships pre-cleared, which defeats the review gate",
+                model.id
+            );
+            assert!(model.roles.contains(&ModelRole::DocumentOcr));
+            assert!(model.modalities.contains(&Modality::Image));
+            assert!(
+                model.active_parameters_b.is_some(),
+                "{} is MoE; the VRAM planner needs its active parameter count",
+                model.id
+            );
+        }
+    }
+
     #[test]
     fn save_manifest_writes_a_valid_json_file() {
         // Build a registry with a known entry list, save it,
@@ -1072,48 +1200,79 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn chosen(provider_id: &str, model_id: &str, quantization: &str) -> StartupModelTarget {
+        StartupModelTarget {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            quantization: quantization.to_string(),
+        }
+    }
+
     #[test]
-    fn gemma_4_12b_is_the_implicit_orchestrator_when_no_entry_is_tagged() {
-        let mut gemma = entry(
-            "lmstudio-community_gemma-4-12B-it-QAT-GGUF_Q4_0",
-            12.0,
-            vec![ModelRole::Reasoning, ModelRole::Coding],
+    fn no_model_is_the_orchestrator_until_one_is_chosen_or_tagged() {
+        let registry = registry(vec![
+            entry("org/model-a-12b", 12.0, vec![ModelRole::Reasoning]),
+            entry("org/model-b-4b", 4.0, vec![ModelRole::Reasoning]),
+        ]);
+
+        assert!(
+            registry.orchestrator_entry().is_none(),
+            "an untagged registry with nothing configured must not elect an orchestrator"
         );
-        gemma.name = "Gemma 4 12B IT QAT".to_string();
-        gemma.quantization = Some("Q4_0".to_string());
-        gemma.load = Some(LoadSpec {
+        assert!(registry.orchestrator_identity().is_none());
+    }
+
+    #[test]
+    fn the_administrator_choice_selects_the_orchestrator_entry() {
+        let mut picked = entry("org_chosen-4b_Q4_K_M", 4.0, vec![ModelRole::Reasoning]);
+        picked.name = "Chosen 4B".to_string();
+        picked.quantization = Some("Q4_K_M".to_string());
+        picked.load = Some(LoadSpec {
             provider_id: "huggingface".to_string(),
-            model_id: crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID.to_string(),
-            quantization: "Q4_0".to_string(),
+            model_id: "org/chosen-4b".to_string(),
+            quantization: "Q4_K_M".to_string(),
         });
-        let registry = registry(vec![gemma]);
+        let other = entry("org/other-12b", 12.0, vec![ModelRole::Reasoning]);
+        let registry = registry(vec![other, picked]);
 
         let selected = registry
-            .orchestrator_entry()
-            .expect("the default Gemma package should run the orchestrator");
-        assert_eq!(
-            selected.load.as_ref().map(|load| load.model_id.as_str()),
-            Some(crate::config::DEFAULT_ORCHESTRATOR_MODEL_ID)
-        );
-        assert_eq!(
-            registry.orchestrator_identity(),
-            Some(("gemma-4-12b".to_string(), "Q4_0".to_string()))
+            .orchestrator_entry_for(Some(&chosen("huggingface", "org/chosen-4b", "Q4_K_M")))
+            .expect("the configured package should run the orchestrator");
+        assert_eq!(selected.name, "Chosen 4B");
+    }
+
+    #[test]
+    fn a_second_quantization_of_the_same_model_is_not_the_choice() {
+        let mut q6 = entry("org_chosen-4b_Q6_K", 4.0, vec![ModelRole::Reasoning]);
+        q6.load = Some(LoadSpec {
+            provider_id: "huggingface".to_string(),
+            model_id: "org/chosen-4b".to_string(),
+            quantization: "Q6_K".to_string(),
+        });
+        let registry = registry(vec![q6]);
+
+        assert!(
+            registry
+                .orchestrator_entry_for(Some(&chosen("huggingface", "org/chosen-4b", "Q4_K_M")))
+                .is_none(),
+            "two quantizations of one model are two different files on disk"
         );
     }
 
     #[test]
-    fn an_explicit_orchestrator_still_overrides_the_gemma_default() {
-        let gemma = entry("gemma-4-12b", 12.0, vec![ModelRole::Reasoning]);
-        let explicit = entry(
-            "orchestrator.custom-model",
-            14.0,
-            vec![ModelRole::Reasoning],
-        );
-        let registry = registry(vec![gemma, explicit]);
+    fn a_manifest_tag_is_the_orchestrator_when_nothing_is_configured() {
+        let plain = entry("org/model-a-12b", 12.0, vec![ModelRole::Reasoning]);
+        let mut explicit = entry("orchestrator.custom-model", 14.0, vec![ModelRole::Reasoning]);
+        explicit.quantization = Some("Q4_K_M".to_string());
+        let registry = registry(vec![plain, explicit]);
 
         assert_eq!(
             registry.orchestrator_entry().map(|model| model.id.as_str()),
             Some("orchestrator.custom-model")
+        );
+        assert_eq!(
+            registry.orchestrator_identity(),
+            Some(("custom-model".to_string(), "Q4_K_M".to_string()))
         );
     }
 }

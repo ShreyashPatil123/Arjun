@@ -1,6 +1,9 @@
 //! SIH Inspection-Report-to-Word-Approval-Note Workflow
 //!
-//! Implements the exact sequence required by SIH26117:
+//! Implements ARJUN's worked example of the end-to-end agentic task PS 26117
+//! names: *"reading a scanned inspection report, pulling out key findings and
+//! drafting an approval note as a Word file"*. The numbered sequence below is
+//! ARJUN's decomposition, not a sequence the problem statement specifies:
 //!
 //! 1. Upload scanned inspection report and optional photograph.
 //! 2. Validate type, size, classification and workspace scope.

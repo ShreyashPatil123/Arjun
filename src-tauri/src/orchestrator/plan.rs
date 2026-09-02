@@ -1,6 +1,6 @@
 //! A plan the model cannot extend, and a run that knows when to stop.
 //!
-//! PS step 19: *"The plan includes a maximum number of steps, maximum execution
+//! ARJUN design rule 19: *"The plan includes a maximum number of steps, maximum execution
 //! time, permitted tools, permitted files, model budget, and stop conditions.
 //! The model is not allowed to extend the plan indefinitely."*
 //!
@@ -115,9 +115,9 @@ pub struct PlanStep {
     /// If true, finishing this step is a checkpoint. The executor
     /// pauses the run and emits `TaskState::MilestoneReached` so the
     /// UI can ask a person to confirm before the next leg of work
-    /// starts. PS 26117 calls this "evidence-anchored decision
-    /// points" — the model says "I think we are here" and a human
-    /// signs off.
+    /// starts. ARJUN calls this an "evidence-anchored decision
+    /// point" — the model says "I think we are here" and a human
+    /// signs off. The term is ours; PS 26117 does not ask for this.
     #[serde(default)]
     pub milestone: bool,
     /// Stable identifier the parent plan wrote when the plan was
@@ -142,6 +142,18 @@ pub enum StopReason {
     Looping { tool: String, repeats: u32 },
     /// Waiting on a person. Not a failure; the run resumes when they answer.
     AwaitingApproval { tool: String },
+    /// A person was shown a milestone and declined to continue past it.
+    ///
+    /// Deliberately distinct from [`Self::Failed`]: nothing went wrong. Somebody
+    /// looked at the work so far and decided the next leg should not start, and
+    /// a record calling that a failure would report a working control as a
+    /// defect. Everything completed before the gate stands.
+    MilestoneRejected {
+        checkpoint_id: String,
+        /// The step's own words, copied in so the record says what was declined
+        /// without re-reading the plan.
+        intent: String,
+    },
     /// A step failed and the plan cannot continue past it.
     Failed { detail: String },
 }
@@ -185,6 +197,10 @@ impl StopReason {
             StopReason::AwaitingApproval { tool } => {
                 format!("Waiting for you to approve the request to {tool}.")
             }
+            StopReason::MilestoneRejected { intent, .. } => format!(
+                "Stopped at your decision not to continue past \"{intent}\". The work completed \
+                 before that point is below and has been kept."
+            ),
             StopReason::Failed { detail } => format!("Stopped: {detail}"),
         }
     }
@@ -403,6 +419,39 @@ impl PlanRun {
         if matches!(self.stopped, Some(StopReason::AwaitingApproval { .. })) {
             self.stopped = None;
         }
+    }
+
+    /// Ends the run because a person declined a milestone.
+    ///
+    /// The steps already marked done stay done: this is a decision to stop
+    /// here, not a reason to discard what the run had produced. Returns the
+    /// reason so the caller can record and emit the same value the plan now
+    /// holds, rather than reconstructing it.
+    ///
+    /// `None` when this plan has no step by that checkpoint id — a gate the
+    /// plan does not have is a request to refuse rather than to guess at.
+    pub fn reject_milestone(&mut self, checkpoint_id: &str) -> Option<StopReason> {
+        let step = self
+            .steps
+            .iter()
+            .find(|step| step.checkpoint_id.as_deref() == Some(checkpoint_id))?;
+        let reason = StopReason::MilestoneRejected {
+            checkpoint_id: checkpoint_id.to_string(),
+            intent: step.intent.clone(),
+        };
+        self.stopped = Some(reason.clone());
+        Some(reason)
+    }
+
+    /// The step carrying a checkpoint id, if the plan has one.
+    ///
+    /// Used by the acknowledgement path to attribute a decision to the step it
+    /// was actually about — the ordinal and the intent both go into the durable
+    /// record, and neither can be invented.
+    pub fn step_at_checkpoint(&self, checkpoint_id: &str) -> Option<&PlanStep> {
+        self.steps
+            .iter()
+            .find(|step| step.checkpoint_id.as_deref() == Some(checkpoint_id))
     }
 
     pub fn complete(&mut self) -> StopReason {
@@ -709,6 +758,73 @@ mod tests {
         assert_eq!(hit3.unwrap().checkpoint_id.as_deref(), Some("mtn-3"));
 
         assert_eq!(run.last_acknowledged_checkpoint(), Some("mtn-3"));
+    }
+
+    /// A person who declines a gate stops the run. What was already finished
+    /// stays finished: this is a decision to go no further, not a reason to
+    /// throw away the work that led to the decision.
+    #[test]
+    fn rejecting_a_milestone_stops_the_run_and_keeps_the_completed_work() {
+        let mut run = run();
+        run.mark_milestone(1, "mtn-1").unwrap();
+        run.record_step();
+
+        let reason = run.reject_milestone("mtn-1").expect("the plan has that gate");
+
+        assert!(matches!(
+            reason,
+            StopReason::MilestoneRejected { ref checkpoint_id, .. } if checkpoint_id == "mtn-1"
+        ));
+        assert!(matches!(
+            run.stopped(),
+            Some(StopReason::MilestoneRejected { .. })
+        ));
+        assert!(
+            run.steps.iter().any(|step| step.done),
+            "the step finished before the gate has to survive the rejection"
+        );
+        assert!(
+            !reason.is_success(),
+            "declining to continue is not a completed task"
+        );
+    }
+
+    /// Not a failure. A record that called a person's decision a defect would
+    /// misreport a working control.
+    #[test]
+    fn a_rejected_milestone_reads_as_a_decision_not_a_fault() {
+        let mut run = run();
+        run.mark_milestone(1, "mtn-1").unwrap();
+        run.record_step();
+        let reason = run.reject_milestone("mtn-1").unwrap();
+
+        let sentence = reason.explain();
+        assert!(sentence.ends_with('.'), "{sentence}");
+        assert!(
+            !sentence.to_lowercase().contains("failed"),
+            "a decision must not be reported as a failure: {sentence}"
+        );
+    }
+
+    /// A gate the plan does not have is refused rather than guessed at — the
+    /// ordinal and intent it would record cannot be invented.
+    #[test]
+    fn rejecting_a_checkpoint_the_plan_does_not_have_is_refused() {
+        let mut run = run();
+        run.mark_milestone(1, "mtn-1").unwrap();
+
+        assert!(run.reject_milestone("mtn-nope").is_none());
+        assert!(run.stopped().is_none(), "a refused request changes nothing");
+    }
+
+    #[test]
+    fn a_checkpoint_id_resolves_to_the_step_that_carries_it() {
+        let mut run = run();
+        run.mark_milestone(2, "mtn-2").unwrap();
+
+        let step = run.step_at_checkpoint("mtn-2").expect("registered");
+        assert_eq!(step.ordinal, 2);
+        assert!(run.step_at_checkpoint("mtn-1").is_none());
     }
 
     #[test]

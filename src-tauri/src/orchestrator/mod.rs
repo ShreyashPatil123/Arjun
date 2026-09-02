@@ -17,7 +17,8 @@
 //!   a model that is usually about right.
 //! - [`plan`]: budgets the model cannot widen, and a run that knows to stop.
 //! - [`grammar`]: constrains the emitting turn so a malformed call cannot occur.
-//! - [`sandbox`]: where model-written code runs, and what that actually guarantees.
+//! - [`sandbox`]: whether model-written code may run, and what that guarantees.
+//! - [`sandbox_exec`]: the container it actually runs in, when it may.
 //! - [`executor`]: the loop, one step at a time, pausing when a person is needed.
 //! - [`runner`]: the tools themselves, running only what the gateway permitted.
 
@@ -29,6 +30,7 @@ pub mod grammar;
 pub mod plan;
 pub mod runner;
 pub mod sandbox;
+pub mod sandbox_exec;
 pub mod tools;
 
 pub use calculation::{evaluate, CalculationRecord};

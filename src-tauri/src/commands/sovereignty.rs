@@ -108,7 +108,7 @@ pub async fn recent_egress_events(
     Ok(broker.recent_events())
 }
 
-/// Deliberately attempts an external connection that must fail (PS step 6).
+/// Deliberately attempts an external connection that must fail (ARJUN design rule 6).
 ///
 /// The returned event is the evidence: in Work mode it must come back refused,
 /// and it appears in the monitor alongside everything else.

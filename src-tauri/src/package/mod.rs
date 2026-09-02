@@ -1,6 +1,6 @@
 //! The task package — everything needed to check a piece of work, in one file.
 //!
-//! PS step 33 asks for an export carrying *"the artifact, the evidence map, the
+//! ARJUN design rule 33 asks for an export carrying *"the artifact, the evidence map, the
 //! calculation record, model metadata, the execution trace, the approval record
 //! and hashes"*. The reason it matters is narrower than it sounds, and worth
 //! stating plainly: an AI system that produces a document nobody can audit has
@@ -39,7 +39,7 @@ use crate::orchestrator::executor::StepOutcome;
 pub struct ModelUse {
     pub role: String,
     pub model_id: String,
-    /// The router's own words. PS step 20 asks that the reason be recorded, not
+    /// The router's own words. ARJUN design rule 20 asks that the reason be recorded, not
     /// just the choice.
     pub reason: String,
 }

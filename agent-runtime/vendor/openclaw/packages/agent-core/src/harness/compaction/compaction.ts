@@ -593,7 +593,8 @@ function createSummarizationOptions(
 ): SimpleStreamOptions {
   const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers };
   const fableReasoning =
-    (model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
+    // ARJUN prune: the AWS-hosted protocol arm is removed; see reasoning.ts.
+    model.api === "anthropic-messages" &&
     resolveClaudeFable5ModelIdentity(model) !== undefined;
   if ((model.reasoning || fableReasoning) && thinkingLevel) {
     options.reasoning = resolveAgentReasoningOption(model, thinkingLevel);

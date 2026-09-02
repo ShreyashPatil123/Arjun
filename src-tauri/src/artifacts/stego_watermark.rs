@@ -2,8 +2,8 @@
 //!
 //! ## Why this module exists
 //!
-//! PS 26117 originally proposed steganographic watermarking of generated
-//! artifacts. The function bodies below are placeholders that always return
+//! An early ARJUN design draft proposed steganographic watermarking of
+//! generated artifacts. PS 26117 does not mention watermarking of any kind. The function bodies below are placeholders that always return
 //! [`StegoNotImplemented`]. They are not stubs to be filled in later: they
 //! are a *refusal* of the feature, with the refusal written out so that a
 //! future contributor reading the call sites cannot accidentally re-introduce

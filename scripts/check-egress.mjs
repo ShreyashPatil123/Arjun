@@ -42,6 +42,12 @@ const LOOPBACK_CLIENT_FILES = new Map([
     'probes http://127.0.0.1:11434 to detect a local Ollama install',
   ],
   [
+    'src-tauri/src/commands/ocr.rs',
+    'streams one page to the llama-server ARJUN itself started; calls '
+      + 'serving::probe::check_loopback on the endpoint and refuses to send the '
+      + 'document at all if the base URL is not loopback',
+  ],
+  [
     'src-tauri/src/serving/probe.rs',
     'probes local inference servers (llama-server, vLLM, SGLang); refuses any URL '
       + 'whose host does not parse as a loopback address before the client is built',

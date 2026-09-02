@@ -1,6 +1,6 @@
 //! The tool gateway — where a model's request becomes an action, or does not.
 //!
-//! PS step 25: *"The tool gateway validates the call before execution. It checks
+//! ARJUN design rule 25: *"The tool gateway validates the call before execution. It checks
 //! the tool name, arguments, user permission, target paths, document ACLs, file
 //! size, time limit, resource quota, and whether human approval is needed. The
 //! model cannot directly access the operating system, arbitrary folders,
@@ -255,7 +255,7 @@ impl ToolGateway {
 
     /// What a person is shown before approving.
     ///
-    /// PS step 26 asks for the target, the arguments and the consequence. A
+    /// ARJUN design rule 26 asks for the target, the arguments and the consequence. A
     /// prompt that says only "allow this action?" trains people to say yes.
     fn approval_summary(tool: ToolName, path: &Option<PathBuf>, call: &ToolCall) -> String {
         let mut summary = format!("ARJUN wants to {}.", tool.describe());

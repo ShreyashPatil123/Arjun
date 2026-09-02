@@ -13,7 +13,7 @@
 //!
 //! ## Why redaction is here and not at the call sites
 //!
-//! PS step 14 says confidential contents must not be copied into a record more
+//! ARJUN design rule 14 says confidential contents must not be copied into a record more
 //! people can read than could read the original. A rule enforced at the call
 //! sites is a rule that holds until somebody adds a call site. So every payload
 //! goes through [`redact`] on its way into an [`EventDraft`], and the fields

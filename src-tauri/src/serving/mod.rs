@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "windows")]
@@ -104,6 +105,8 @@ pub enum ServingError {
     NeedsExternalEndpoint { model: String, runtime: &'static str },
     #[error("{model} has no weights at {path}. Import the model again.")]
     WeightsMissing { model: String, path: PathBuf },
+    #[error("{model} declares a vision projector at {path}, which is not there. Import the model again — a vision model started without its projector is blind, so ARJUN refuses rather than serving it text-only.")]
+    ProjectorMissing { model: String, path: PathBuf },
     #[error("llama-server could not be started: {0}. Set ARJUN_LLAMA_SERVER to its path, or put it on PATH.")]
     LaunchFailed(String),
     #[error("no free loopback port could be found: {0}")]
@@ -157,10 +160,11 @@ fn free_port() -> Result<u16, ServingError> {
 pub fn plan_launch(
     entry: &ModelEntry,
     weights: &Path,
+    projector: Option<&Path>,
     gpu: &GpuOffloadPlan,
     port: u16,
 ) -> LaunchPlan {
-    let args = vec![
+    let mut args = vec![
         "--model".to_string(),
         weights.display().to_string(),
         // Bound to loopback explicitly. A llama-server told to listen on
@@ -181,6 +185,16 @@ pub fn plan_launch(
         entry.id.clone(),
     ];
 
+    // Without this a vision model loads, answers, and cannot see: llama.cpp
+    // takes the projector as a separate argument and simply runs text-only
+    // when it is absent. The scanner pairs the projector with its model on
+    // disk; this is the last step where that pairing can be dropped, so it
+    // is appended here rather than left to the caller.
+    if let Some(projector) = projector {
+        args.push("--mmproj".to_string());
+        args.push(projector.display().to_string());
+    }
+
     LaunchPlan {
         program: llama_server_program(),
         args,
@@ -190,10 +204,24 @@ pub fn plan_launch(
     }
 }
 
+/// What [`ModelServers::spawn_managed`] resolved to, whether it had to start
+/// anything or found the server already running.
+struct Spawned {
+    endpoint: Endpoint,
+    base_url: String,
+    ready: Arc<AtomicBool>,
+}
+
 /// A server ARJUN started.
 struct Managed {
     child: Child,
     endpoint: Endpoint,
+    /// Whether this server has already answered a readiness probe.
+    ///
+    /// Set once, by the call that started it and waited. Every later run for
+    /// the same model reads it and skips the probe entirely — see
+    /// [`ModelServers::managed_endpoint`] for why that mattered.
+    ready: Arc<AtomicBool>,
 }
 
 /// The servers this session is using.
@@ -271,10 +299,38 @@ impl ModelServers {
         // guard never has to cross an `.await` — the future returned by this
         // async function must be `Send` (Tauri's command runtime requires
         // it), and a `std::sync::MutexGuard` is not `Send`.
-        let (endpoint, base_url) = self.spawn_managed(entry, models_dir, gpu)?;
+        let Spawned {
+            endpoint,
+            base_url,
+            ready,
+        } = self.spawn_managed(entry, models_dir, gpu)?;
+
+        // A server that has already answered a probe is not asked again.
+        //
+        // This used to run `wait_until_ready` unconditionally, including for a
+        // server this process started minutes ago and has been talking to
+        // since. `wait_until_ready` polls every 250 ms until the endpoint
+        // answers, so the cost was not one request but however many the loop
+        // took — measured at ~15 probes and four seconds, on *every* message,
+        // before the model was sent a single token. It is the largest fixed
+        // cost between pressing enter and the answer starting.
+        //
+        // Skipping is safe because the flag is only set after a probe
+        // succeeded, and it is dropped with the table entry: `stop` removes
+        // the `Managed`, so a restarted server gets a fresh flag and is waited
+        // for again. A server that dies on its own is caught where it matters
+        // — the run's own request fails with a transport error naming the
+        // endpoint, which is the same thing the probe would have told us, one
+        // round trip later.
+        if ready.load(Ordering::Acquire) {
+            return Ok(endpoint);
+        }
 
         match wait_until_ready(&base_url).await {
-            Ok(()) => Ok(endpoint),
+            Ok(()) => {
+                ready.store(true, Ordering::Release);
+                Ok(endpoint)
+            }
             Err(detail) => {
                 // Stopped rather than left running. A server that never became
                 // ready is holding VRAM for nothing, and the next attempt would
@@ -299,14 +355,18 @@ impl ModelServers {
         entry: &ModelEntry,
         models_dir: &Path,
         gpu: &GpuOffloadPlan,
-    ) -> Result<(Endpoint, String), ServingError> {
+    ) -> Result<Spawned, ServingError> {
         let mut table = self
             .managed
             .lock()
             .map_err(|_| ServingError::LaunchFailed("the server table is poisoned".into()))?;
 
         if let Some(existing) = table.get(&entry.id) {
-            return Ok((existing.endpoint.clone(), existing.endpoint.base_url.clone()));
+            return Ok(Spawned {
+                base_url: existing.endpoint.base_url.clone(),
+                endpoint: existing.endpoint.clone(),
+                ready: Arc::clone(&existing.ready),
+            });
         }
 
         let weights = models_dir.join(&entry.path);
@@ -331,7 +391,25 @@ impl ModelServers {
             })?;
         }
 
-        let plan = plan_launch(entry, &weights, gpu, free_port()?);
+        // Resolved exactly as the weights are: `join` returns an absolute
+        // path unchanged, so a scanned entry carrying an absolute projector
+        // and a manifest entry carrying one relative to the models directory
+        // both land in the right place.
+        let projector = match &entry.projector {
+            Some(relative) => {
+                let resolved = models_dir.join(relative);
+                if !resolved.exists() {
+                    return Err(ServingError::ProjectorMissing {
+                        model: entry.name.clone(),
+                        path: resolved,
+                    });
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+
+        let plan = plan_launch(entry, &weights, projector.as_deref(), gpu, free_port()?);
         let mut child_cmd = Command::new(&plan.program);
         child_cmd
             .args(&plan.args)
@@ -368,17 +446,23 @@ impl ModelServers {
             runtime: entry.runtime,
         };
 
+        let ready = Arc::new(AtomicBool::new(false));
         table.insert(
             entry.id.clone(),
             Managed {
                 child,
                 endpoint: endpoint.clone(),
+                ready: Arc::clone(&ready),
             },
         );
 
         // Lock guard goes out of scope at the end of this sync function —
         // there is no `.await` to hold it across.
-        Ok((endpoint, plan.base_url))
+        Ok(Spawned {
+            endpoint,
+            base_url: plan.base_url,
+            ready,
+        })
     }
 
     /// Stops one server. Idempotent.
@@ -412,6 +496,20 @@ impl ModelServers {
             .lock()
             .ok()
             .map(|table| table.values().map(|s| s.endpoint.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The registry ids of the servers now running.
+    ///
+    /// Distinct from [`Self::running_endpoints`], whose `served_model_id` is
+    /// the name the *server* answers to and is not always ARJUN's id. Only the
+    /// table key is accepted by [`Self::stop`], so a caller that has to stop
+    /// something needs this and not that.
+    pub fn running_model_ids(&self) -> Vec<String> {
+        self.managed
+            .lock()
+            .ok()
+            .map(|table| table.keys().cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -465,6 +563,7 @@ mod tests {
             supports_structured_output: false,
             permitted_classifications: vec![],
             path: PathBuf::from("qwen2.5-coder-7b-q4.gguf"),
+            projector: None,
             load: None,
             serving: None,
             required_runtime_profile: None,
@@ -494,7 +593,7 @@ mod tests {
 
     #[test]
     fn the_server_is_bound_to_loopback_and_never_to_every_interface() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
         let host = launch
             .args
             .windows(2)
@@ -506,7 +605,7 @@ mod tests {
 
     #[test]
     fn the_launch_carries_the_offload_the_router_planned() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
         let layers = launch
             .args
             .windows(2)
@@ -517,7 +616,7 @@ mod tests {
 
     #[test]
     fn a_cpu_only_plan_starts_the_server_with_no_gpu_layers() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), &plan(0), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(0), 8123);
         let layers = launch
             .args
             .windows(2)
@@ -530,7 +629,7 @@ mod tests {
     fn the_context_length_comes_from_the_registry_not_a_default() {
         let mut entry = gguf_entry();
         entry.context_length = 8_192;
-        let launch = plan_launch(&entry, Path::new("/models/m.gguf"), &plan(33), 8123);
+        let launch = plan_launch(&entry, Path::new("/models/m.gguf"), None, &plan(33), 8123);
         let ctx = launch
             .args
             .windows(2)
@@ -540,8 +639,37 @@ mod tests {
     }
 
     #[test]
+    fn a_vision_model_is_started_with_its_projector() {
+        let launch = plan_launch(
+            &gguf_entry(),
+            Path::new("/models/m.gguf"),
+            Some(Path::new("/models/mmproj-m-F16.gguf")),
+            &plan(33),
+            8123,
+        );
+        let mmproj = launch
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--mmproj")
+            .map(|pair| pair[1].clone());
+        assert_eq!(
+            mmproj.as_deref(),
+            Some(Path::new("/models/mmproj-m-F16.gguf").display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_projector_gets_no_mmproj_flag() {
+        // Not merely absent from the plan: a bare `--mmproj` with no value, or
+        // one pointing at nothing, makes llama-server fail to start. A
+        // text-only model has to produce a command line that never mentions it.
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        assert!(!launch.args.iter().any(|arg| arg == "--mmproj"));
+    }
+
+    #[test]
     fn the_server_advertises_arjuns_model_id_so_the_trace_matches() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
         let alias = launch
             .args
             .windows(2)
@@ -553,7 +681,7 @@ mod tests {
 
     #[test]
     fn the_base_url_is_loopback_and_carries_the_version_prefix() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
         assert_eq!(launch.base_url, "http://127.0.0.1:8123/v1");
         assert!(probe::check_loopback(&launch.base_url).is_ok());
     }

@@ -2,11 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_ORCHESTRATOR_MODEL_ID: &str =
-    "lmstudio-community/gemma-4-12B-it-QAT-GGUF";
-pub const DEFAULT_ORCHESTRATOR_PROVIDER_ID: &str = "huggingface";
-pub const DEFAULT_ORCHESTRATOR_QUANTIZATION: &str = "Q4_0";
-
 /// Main configuration for Sarathi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SarathiConfig {
@@ -38,12 +33,20 @@ pub struct AiSettings {
     pub gpu_layers: u32,
 
     /// Exact installed package coordinates selected by an administrator for
-    /// the agent orchestrator at startup.
-    #[serde(default = "default_orchestrator_provider_id")]
+    /// the agent orchestrator.
+    ///
+    /// **No model is compiled in as the product default.** Empty means "nobody
+    /// has chosen one yet", and that is the shipping state: what is installed
+    /// on a machine is discovered at runtime, so naming a model here would only
+    /// pin the product to a package the user may never have downloaded. An
+    /// administrator picks one in Models → *Set as orchestrator*; until then
+    /// startup restores the last session and the router picks per prompt from
+    /// whatever is actually installed.
+    #[serde(default)]
     pub orchestrator_provider_id: String,
-    #[serde(default = "default_orchestrator_model_id")]
+    #[serde(default)]
     pub orchestrator_model_id: String,
-    #[serde(default = "default_orchestrator_quantization")]
+    #[serde(default)]
     pub orchestrator_quantization: String,
 
     /// Whether startup may load a model without being asked.
@@ -54,16 +57,17 @@ pub struct AiSettings {
     pub auto_load_on_startup: bool,
 }
 
-fn default_orchestrator_model_id() -> String {
-    DEFAULT_ORCHESTRATOR_MODEL_ID.to_string()
-}
-
-fn default_orchestrator_provider_id() -> String {
-    DEFAULT_ORCHESTRATOR_PROVIDER_ID.to_string()
-}
-
-fn default_orchestrator_quantization() -> String {
-    DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string()
+impl AiSettings {
+    /// True when an administrator has chosen the orchestrator.
+    ///
+    /// All three coordinates are required: a provider and model without a
+    /// quantization names two different files on disk, and startup must never
+    /// guess between two variants of the same model.
+    pub fn has_configured_orchestrator(&self) -> bool {
+        !self.orchestrator_provider_id.trim().is_empty()
+            && !self.orchestrator_model_id.trim().is_empty()
+            && !self.orchestrator_quantization.trim().is_empty()
+    }
 }
 
 fn default_true() -> bool {
@@ -77,9 +81,9 @@ impl Default for AiSettings {
             default_temperature: 0.7,
             use_gpu: true,
             gpu_layers: 35,
-            orchestrator_provider_id: default_orchestrator_provider_id(),
-            orchestrator_model_id: default_orchestrator_model_id(),
-            orchestrator_quantization: default_orchestrator_quantization(),
+            orchestrator_provider_id: String::new(),
+            orchestrator_model_id: String::new(),
+            orchestrator_quantization: String::new(),
             auto_load_on_startup: true,
         }
     }
@@ -90,14 +94,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gemma_orchestrator_auto_loads_on_gpu_by_default() {
+    fn no_model_is_hardcoded_as_the_orchestrator() {
         let settings = AiSettings::default();
-        assert_eq!(settings.orchestrator_provider_id, DEFAULT_ORCHESTRATOR_PROVIDER_ID);
-        assert_eq!(settings.orchestrator_model_id, DEFAULT_ORCHESTRATOR_MODEL_ID);
-        assert_eq!(settings.orchestrator_quantization, DEFAULT_ORCHESTRATOR_QUANTIZATION);
+        assert!(settings.orchestrator_provider_id.is_empty());
+        assert!(settings.orchestrator_model_id.is_empty());
+        assert!(settings.orchestrator_quantization.is_empty());
+        assert!(!settings.has_configured_orchestrator());
+        // Auto-load stays on: with nothing configured it restores the last
+        // session rather than loading a model nobody asked for.
         assert!(settings.auto_load_on_startup);
         assert!(settings.use_gpu);
         assert!(settings.gpu_layers > 0);
+    }
+
+    #[test]
+    fn an_administrator_choice_is_a_complete_set_of_coordinates() {
+        let mut settings = AiSettings::default();
+        settings.orchestrator_provider_id = "huggingface".to_string();
+        settings.orchestrator_model_id = "nvidia/Nemotron3-Nano-4B".to_string();
+        assert!(
+            !settings.has_configured_orchestrator(),
+            "a model without a quantization names more than one file on disk"
+        );
+        settings.orchestrator_quantization = "Q4_K_M".to_string();
+        assert!(settings.has_configured_orchestrator());
     }
 
     #[test]
@@ -112,10 +132,27 @@ mod tests {
         )
         .expect("legacy AI settings should still deserialize");
 
-        assert_eq!(settings.orchestrator_model_id, DEFAULT_ORCHESTRATOR_MODEL_ID);
-        assert_eq!(settings.orchestrator_provider_id, DEFAULT_ORCHESTRATOR_PROVIDER_ID);
-        assert_eq!(settings.orchestrator_quantization, DEFAULT_ORCHESTRATOR_QUANTIZATION);
+        assert!(!settings.has_configured_orchestrator());
         assert!(settings.auto_load_on_startup);
+    }
+
+    #[test]
+    fn a_saved_orchestrator_choice_survives_a_round_trip() {
+        let settings: AiSettings = serde_json::from_str(
+            r#"{
+                "max_context_length": 4096,
+                "default_temperature": 0.7,
+                "use_gpu": true,
+                "gpu_layers": 35,
+                "orchestrator_provider_id": "huggingface",
+                "orchestrator_model_id": "nvidia/Nemotron3-Nano-4B",
+                "orchestrator_quantization": "Q4_K_M"
+            }"#,
+        )
+        .expect("a configured orchestrator should deserialize");
+
+        assert!(settings.has_configured_orchestrator());
+        assert_eq!(settings.orchestrator_model_id, "nvidia/Nemotron3-Nano-4B");
     }
 }
 

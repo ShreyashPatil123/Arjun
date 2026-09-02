@@ -302,7 +302,7 @@ reaches the backend.** There is no per-task document ingestion path.
 
 ### 4.4 Injection-defence layer 3 is dead code
 
-`knowledge/evidence.rs` implements the untrusted-data framing PS step 23 asks for
+`knowledge/evidence.rs` implements the untrusted-data framing ARJUN design rule 23 asks for
 — a long unguessable delimiter pair (`<<<ARJUN_EVIDENCE_BEGIN>>>`) and a preamble
 telling the model the block is data, not instructions.
 
@@ -323,7 +323,7 @@ BM25 keyword search only. No embedding model is provisioned.
 
 ### 4.6 Checkable task package — proven by test, unreachable from the UI
 
-`package/mod.rs` implements PS step 33 in full: a plain ZIP of JSON plus the
+`package/mod.rs` implements ARJUN design rule 33 in full: a plain ZIP of JSON plus the
 artifact, every entry SHA-256'd in `manifest.json`, the manifest's own hash
 returned for out-of-band recording, verifiable with `unzip` and `sha256sum`
 alone. **Its only callers are `src-tauri/tests/baseline.rs`.** No Tauri command

@@ -353,7 +353,14 @@ mod tests {
             Classification::ALL.to_vec(),
         );
 
-        let temp_path = std::env::temp_dir().join("arjun_test_fixture.txt");
+        // A paged fixture, because that is what this test is about. It used to
+        // write a `.txt`, which routes to `process_text_file` and truthfully
+        // reports one page — a plain text file has one — while the assertion
+        // below expects the five that were asked for. The adapter was right
+        // and the fixture was wrong: making a text file claim five pages would
+        // have it overstate what it read, which is the one thing the tests on
+        // either side of this exist to prevent.
+        let temp_path = std::env::temp_dir().join("arjun_test_fixture.pdf");
         fs::write(&temp_path, "test content").unwrap();
 
         let input = MediaInput {

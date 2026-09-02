@@ -1,6 +1,6 @@
 //! The health panel — and the one rule that makes it trustworthy.
 //!
-//! PS step 34 asks for a panel showing GPU memory, model status, index status,
+//! ARJUN design rule 34 asks for a panel showing GPU memory, model status, index status,
 //! queue depth, blocked network events and pending approvals, and then adds the
 //! constraint that actually shapes the design: *no health check may call
 //! anything external*.

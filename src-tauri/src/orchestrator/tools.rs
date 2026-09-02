@@ -7,7 +7,7 @@
 //!
 //! ## Every tool declares its own cost
 //!
-//! PS step 13 asks that each tool carry a schema, permitted inputs, permitted
+//! ARJUN design rule 13 asks that each tool carry a schema, permitted inputs, permitted
 //! directories, size and time limits, and whether a human has to approve it.
 //! Those live on the [`ToolSpec`] rather than in the code that runs the tool,
 //! so the limits can be read without reading an implementation — and so a new
@@ -141,6 +141,13 @@ pub enum ToolName {
     CreateDocx,
     /// Produce a spreadsheet from a template.
     CreateXlsx,
+    /// Produce a briefing deck from a template.
+    ///
+    /// PS 26117 names the deliverables as *"approval notes, PPT/Word/Excel
+    /// files, working code, calculations with steps shown"*. PPT is on that
+    /// list, and `artifacts::pptx` has been able to write one since it was
+    /// added — it simply had no tool through which a run could ask.
+    CreatePptx,
     /// Run code in the sandbox.
     ExecuteCode,
     /// Re-open a produced file and check it is sound.
@@ -168,6 +175,7 @@ impl ToolName {
         ToolName::RunCalculation,
         ToolName::CreateDocx,
         ToolName::CreateXlsx,
+        ToolName::CreatePptx,
         ToolName::ExecuteCode,
         ToolName::ValidateArtifact,
         ToolName::CapabilitySearch,
@@ -189,6 +197,7 @@ impl ToolName {
             ToolName::RunCalculation => "calculation.evaluate_with_units",
             ToolName::CreateDocx => "artifact.create_approval_note",
             ToolName::CreateXlsx => "artifact.create_calculation_workbook",
+            ToolName::CreatePptx => "artifact.create_briefing_deck",
             ToolName::ExecuteCode => "sandbox.run_code",
             ToolName::ValidateArtifact => "artifact.verify_docx",
             ToolName::CapabilitySearch => "capability.search",
@@ -214,6 +223,7 @@ impl ToolName {
             ToolName::RunCalculation => Some("run_calculation"),
             ToolName::CreateDocx => Some("create_docx"),
             ToolName::CreateXlsx => Some("create_xlsx"),
+            ToolName::CreatePptx => Some("create_pptx"),
             ToolName::ExecuteCode => Some("execute_code"),
             ToolName::ValidateArtifact => Some("validate_artifact"),
             // Introduced with the namespace. No older spelling exists, and
@@ -258,6 +268,7 @@ impl ToolName {
             | ToolName::WriteScopedFile
             | ToolName::CreateDocx
             | ToolName::CreateXlsx
+            | ToolName::CreatePptx
             | ToolName::ExecuteCode => false,
         }
     }
@@ -275,6 +286,7 @@ impl ToolName {
             ToolName::RunCalculation => "run a calculation",
             ToolName::CreateDocx => "produce a Word document",
             ToolName::CreateXlsx => "produce a spreadsheet",
+            ToolName::CreatePptx => "produce a briefing deck",
             ToolName::ExecuteCode => "run code in the sandbox",
             ToolName::ValidateArtifact => "check a produced file",
             ToolName::CapabilitySearch => "list the skills this task could load",
@@ -493,7 +505,7 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             timeout: Duration::from_secs(5),
             ..defaults(name)
         },
-        ToolName::CreateDocx | ToolName::CreateXlsx => ToolSpec {
+        ToolName::CreateDocx | ToolName::CreateXlsx | ToolName::CreatePptx => ToolSpec {
             permission: GenerateArtifact,
             arguments: &[
                 ArgumentSpec { name: "path", kind: Path },
@@ -772,6 +784,7 @@ mod tests {
             ToolName::WriteScopedFile,
             ToolName::CreateDocx,
             ToolName::CreateXlsx,
+            ToolName::CreatePptx,
             ToolName::ExecuteCode,
         ] {
             assert!(spec_for(tool).needs_approval, "{} should need approval", tool.as_str());

@@ -277,7 +277,7 @@ impl NetworkBroker {
     }
 
     /// Deliberately attempts a connection that must fail, demonstrating that the
-    /// controls are active rather than merely configured (PS step 6).
+    /// controls are active rather than merely configured (ARJUN design rule 6).
     ///
     /// Runs the real [`Self::evaluate`] path, so a bug that opened the door shows
     /// up here as a pass instead of being hidden behind a stub.

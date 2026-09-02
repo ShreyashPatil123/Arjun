@@ -1228,6 +1228,9 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
         ToolName::CreateXlsx => {
             artifacts::create_xlsx(resolved_path.as_deref(), &deps.calculations, &call.run_id)
         }
+        ToolName::CreatePptx => {
+            artifacts::create_pptx(&call, resolved_path.as_deref(), &tool_call)
+        }
         // Recorded as the run's evidence on the way past, and numbered once
         // across the whole run so a citation means one passage. See
         // [`retrieval`].
@@ -1342,7 +1345,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
 /// is all it *can* ask: it is built fresh per call and does not know the file
 /// was rendered from the `approval_note` template. This does, because the run
 /// remembered it — so `validate_artifact` on a document opens the package and
-/// checks the sections are really there, which is what PS step 30 asks for and
+/// checks the sections are really there, which is what ARJUN design rule 30 asks for and
 /// what the tool's own description promises the model.
 async fn validate(
     deps: &Arc<RuntimeDeps>,
@@ -1388,6 +1391,7 @@ fn remember_if_produced(
     let kind = match tool {
         ToolName::CreateDocx => artifacts::Kind::Document,
         ToolName::CreateXlsx => artifacts::Kind::Workbook,
+        ToolName::CreatePptx => artifacts::Kind::Deck,
         ToolName::WriteScopedFile => artifacts::Kind::Text,
         _ => return,
     };

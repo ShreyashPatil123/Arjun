@@ -1,3 +1,39 @@
+/* ------------------------------------------------------------------ *
+ * Tailwind v4.
+ *
+ * Imported here rather than in a file of its own so there is one
+ * stylesheet entry point, and placed FIRST so the tokens below and the
+ * nineteen CSS Modules both win over a utility of equal specificity —
+ * Tailwind's own layers sort beneath unlayered rules by definition.
+ *
+ * `@theme inline` republishes the design tokens as Tailwind scales. It is
+ * `inline` deliberately: the generated utilities then reference
+ * `var(--bg-primary)` rather than baking in a colour, so a utility follows
+ * the light/dark switch exactly as a module rule does. Without this a
+ * `bg-surface` would freeze whichever theme happened to be active when the
+ * CSS was generated.
+ * ------------------------------------------------------------------ */
+@import "tailwindcss";
+
+@theme inline {
+  --color-surface: var(--bg-primary);
+  --color-surface-raised: var(--bg-secondary);
+  --color-surface-sunken: var(--bg-tertiary);
+  --color-surface-hover: var(--bg-hover);
+  --color-ink: var(--text-primary);
+  --color-ink-muted: var(--text-secondary);
+  --color-ink-faint: var(--text-tertiary);
+  --color-line: var(--border-default);
+  --color-accent: var(--accent-primary);
+
+  /* Kimi's reasoning tree reads in blue; the rest of ARJUN is monochrome,
+   * so the accent is scoped to the tree rather than made global. */
+  --color-thinking: #4A90E2;
+  --color-thinking-bright: #5BA4F5;
+
+  --radius-node: 10px;
+}
+
 :root {
   --space-1: 4px;
   --space-2: 8px;
@@ -70,6 +106,12 @@
    * network call on every launch and would have shown up in the demo's own
    * network monitor. Replaced with the native system stack: nothing to fetch,
    * nothing to vendor, and Segoe UI Variable is the native Windows 11 face. */
+  /* One monospace stack, for code blocks and every tabular figure. Local
+   * faces only: ARJUN must render identically with the network off, so no
+   * webfont is fetched for JetBrains Mono or Fira Code. */
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo,
+    "DejaVu Sans Mono", ui-monospace, monospace;
+
   --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
     "Helvetica Neue", Arial, "Noto Sans", sans-serif;
 }

@@ -1,6 +1,6 @@
 //! The check between a draft and something somebody signs.
 //!
-//! PS step 31: *"the verifier checks whether every material claim has supporting
+//! ARJUN design rule 31: *"the verifier checks whether every material claim has supporting
 //! evidence, whether uncertain OCR/VLM fields are marked, whether the model
 //! invented a source, whether the output contains restricted content, and
 //! whether the task exceeded its permissions or resource budget. If the verifier
@@ -242,7 +242,7 @@ pub fn verify(draft: &str, evidence: &Evidence<'_>) -> VerificationReport {
     }
 
     // 3. Figures. A number in the document that does not match a recorded
-    //    calculation was produced by the model, and PS step 27 is explicit that
+    //    calculation was produced by the model, and ARJUN design rule 27 is explicit that
     //    the engine is the source of numerical truth.
     let figures = quoted_figures(draft);
     let mut checked = 0;
@@ -402,7 +402,7 @@ mod tests {
         assert!(report.findings.iter().any(|f| f.detail.contains("cites no sources at all")));
     }
 
-    /// PS step 27: the engine is the source of numerical truth, so a number
+    /// ARJUN design rule 27: the engine is the source of numerical truth, so a number
     /// nobody computed is a number the model produced.
     #[test]
     fn a_figure_that_matches_no_calculation_and_no_passage_is_blocked() {

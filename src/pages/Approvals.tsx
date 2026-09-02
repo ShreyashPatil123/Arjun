@@ -11,7 +11,7 @@ const formatTime = (iso: string) => {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 };
 
-/* The five things PS step 26 requires be shown before a risky action. Listed
+/* The five things ARJUN design rule 26 requires be shown before a risky action. Listed
  * here as data so the card cannot quietly stop rendering one of them. */
 const FACETS = [
   { key: 'target', label: 'Target' },

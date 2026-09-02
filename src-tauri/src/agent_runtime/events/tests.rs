@@ -774,7 +774,7 @@ fn a_settled_effect_cannot_be_rewritten_by_reconciliation() {
 
 #[test]
 fn document_text_never_reaches_the_event_log() {
-    // PS step 14: confidential contents must not be copied into a record more
+    // ARJUN design rule 14: confidential contents must not be copied into a record more
     // people can read than could read the original. Enforced on the way in, so
     // a future call site cannot opt out of it by forgetting.
     let secret = "The Kolkata plant seal is worn beyond the service limit.";

@@ -1,7 +1,8 @@
 //! Explainable fit score for model selection.
 //!
-//! PS 26117 asks that a router *explain* why it chose a model, and that an
-//! uncertain router fall back rather than picking badly. This module turns
+//! PS 26117 asks for *"model auto selection across at least two different task
+//! types"*. That a router should also **explain** its choice, and fall back
+//! rather than pick badly when uncertain, is ARJUN's own requirement. This module turns
 //! measured local certification data into a score with named components, so
 //! the decision is reproducible and auditable.
 //!
@@ -447,6 +448,7 @@ mod tests {
             supports_structured_output: true,
             permitted_classifications: Classification::ALL.to_vec(),
             path: PathBuf::from(format!("{id}.gguf")),
+            projector: None,
             load: Some(LoadSpec {
                 provider_id: "huggingface".into(),
                 model_id: id.into(),

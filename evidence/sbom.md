@@ -5,16 +5,16 @@ the day after it is written.
 
 | Ecosystem | Components |
 | --- | ---: |
-| cargo | 630 |
+| cargo | 629 |
 | npm | 291 |
 | vendored | 1 |
-| **total** | **922** |
+| **total** | **921** |
 
 ## What shipped
 
 Agent runtime bundle `agent-runtime/dist/arjun-agent-runtime.mjs`
 
-SHA-256 `a53025ada23b8a9672bc900ed8dfd5b70eea93f3a7203ebe9fc3d4ba68e40030`
+SHA-256 `96c6454ccdd6db8cac6a0164c6d6d3b4ced7ee6202afe4de4400bb6dd46036a8`
 
 ## Gaps, stated rather than hidden
 

@@ -25,7 +25,7 @@ export interface HealthSnapshot {
   items: HealthItem[];
   /**
    * Always 0. Carried on the response so the constraint is visible on the panel
-   * itself rather than only in the code — PS step 34 requires that no health
+   * itself rather than only in the code — ARJUN design rule 34 requires that no health
    * check call anything external.
    */
   externalCallsMade: number;

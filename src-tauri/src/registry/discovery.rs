@@ -164,6 +164,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 // Cleared for nothing. See the module note above.
                 permitted_classifications: Vec::new(),
                 path: installed.file_path.clone().into(),
+                projector: None,
                 // Discovery knows exactly how this model was installed, so the
                 // load coordinates are recorded rather than inferred later.
                 load: Some(LoadSpec {
@@ -246,6 +247,7 @@ mod tests {
             supports_structured_output: false,
             permitted_classifications: Vec::new(),
             path: "mystery.gguf".into(),
+            projector: None,
             load: None,
             serving: None,
             required_runtime_profile: None,
@@ -319,6 +321,7 @@ mod tests {
             supports_structured_output: false,
             permitted_classifications: Vec::new(),
             path: "x.gguf".into(),
+            projector: None,
             load: None,
             serving: None,
             required_runtime_profile: None,

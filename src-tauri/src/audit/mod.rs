@@ -1,6 +1,8 @@
 //! The audit record — what happened, in an order nobody can quietly revise.
 //!
-//! PS 26117 asks the system to prove what it did. A log that can be edited after
+//! PS 26117 asks the system to prove, "through logs or a visible network
+//! monitor", that no external calls are made. ARJUN goes further and records
+//! what it did as well. A log that can be edited after
 //! the fact proves nothing, so this one is built so that tampering is *detectable*
 //! rather than merely discouraged:
 //!
@@ -95,7 +97,7 @@ pub struct AuditEntry {
     pub kind: AuditKind,
     /// One line, written for a person reading the log.
     pub summary: String,
-    /// Structured context. Deliberately *not* the document text: PS step 14 is
+    /// Structured context. Deliberately *not* the document text: ARJUN design rule 14 is
     /// explicit that sensitive contents must not be copied into a log that more
     /// people can read than could read the original.
     pub detail: Option<serde_json::Value>,

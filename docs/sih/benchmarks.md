@@ -1,84 +1,55 @@
-# ARJUN Performance Benchmarks
+# ARJUN performance benchmarks
 
-This document is the SIH 2026 performance slide's source of truth.
-The numbers are reproduced from `scripts/bench.py` output. Run the
-script on each hardware tier to populate the table for the pitch.
+**Status: not yet measured. There are no numbers on this page, and none should
+be quoted in the pitch until this file carries some.**
 
-## Test methodology
+## Why this file is empty
 
-- **Model**: gemma-3-12b-it, Q4_K_M, 7.2 GB on disk
-- **Prompt suite**: 3 tasks — tag identification on a sample P&ID,
-  unit conversion, policy compliance clause lookup
-- **Reply length**: capped at 64 tokens
-- **TTFT**: wall clock from prompt to first token
-- **Tokens/second**: total reply tokens / total wall clock
-- **VRAM peak**: `nvidia-smi --query-gpu=memory.used` at the
-  end of the run
-- **Accuracy**: hand-graded, 100% if the expected substring is in
-  the response, 0% otherwise. The hand-grade is in
-  `scripts/bench.py::hand_grade`.
+An earlier version of this page published a three-tier table — 38 tok/s and
+220 ms TTFT on "RTX 5060 4GB", 72 tok/s on RTX 3060, 8 tok/s on CPU, and 100%
+accuracy in all nine cells — under the heading *"These numbers are measured on
+the listed hardware."*
 
-## Results
+They were not measured. `scripts/bench.py::run_prompt` caught every exception
+and returned `(max_tokens / 38.0, 0.22)` — a hardcoded constant. 64 tokens at
+that constant is 1.684 s, which is the 1700 ms and 37.6 tok/s the Tier 1 row
+reported. Its own docstring said it "returns a synthetic row that the SIH pitch
+quotes."
 
-### Tier 1 — RTX 5060 4GB (demo laptop)
+The 100% accuracy was an artifact of the same path: `hand_grade` looks for an
+expected substring in the response, and the synthetic response was
+`"[synthetic] " + prompt`, so anything drawn from the prompt matched.
 
-| Task | Tokens | TTFT (ms) | Total (ms) | Tok/s | VRAM (MiB) | Accuracy |
-|---|---|---|---|---|---|---|
-| tag-identification | 64 | 220 | 1700 | 37.6 | 3800 | 100% |
-| calculation-correctness | 64 | 240 | 1660 | 38.6 | 3800 | 100% |
-| policy-compliance | 64 | 230 | 1690 | 37.9 | 3800 | 100% |
+The fallback has been removed. `bench.py` now measures or exits non-zero.
 
-Source: `scripts/bench.py --model F:/Models/Reasoning/gemma-3-12b-it/gemma-3-12b-it.Q4_K_M.gguf --tier tier-1-rtx-5060-4gb`
+## How to populate this page
 
-### Tier 2 — RTX 3060 12GB
+Install a binding and run the script once per hardware tier:
 
-| Task | Tokens | TTFT (ms) | Total (ms) | Tok/s | VRAM (MiB) | Accuracy |
-|---|---|---|---|---|---|---|
-| tag-identification | 64 | 110 | 880 | 72.7 | 7800 | 100% |
-| calculation-correctness | 64 | 105 | 870 | 73.6 | 7800 | 100% |
-| policy-compliance | 64 | 115 | 900 | 71.1 | 7800 | 100% |
+```bash
+pip install llama-cpp-python
+```
 
-Source: `scripts/bench.py --model F:/Models/Reasoning/gemma-3-12b-it/gemma-3-12b-it.Q4_K_M.gguf --tier tier-2-rtx-3060-12gb`
+```bash
+python scripts/bench.py --model <path-to.gguf> --tier tier-1-<gpu>
+```
 
-### Tier 3 — CPU only, Ryzen 7 250
+It appends to `docs/sih/benchmarks.csv`. Transcribe the rows here, and record
+alongside each: the exact GGUF file and quantisation, the llama.cpp build
+(CPU / CUDA / Vulkan), the GPU and its driver version, and whether anything
+else was loaded on the machine at the time.
 
-| Task | Tokens | TTFT (ms) | Total (ms) | Tok/s | VRAM (MiB) | Accuracy |
-|---|---|---|---|---|---|---|
-| tag-identification | 64 | 1100 | 8400 | 7.6 | 0 | 100% |
-| calculation-correctness | 64 | 1050 | 8200 | 7.8 | 0 | 100% |
-| policy-compliance | 64 | 1080 | 8350 | 7.7 | 0 | 100% |
+## What to check before quoting a number
 
-Source: `scripts/bench.py --model F:/Models/Reasoning/gemma-3-12b-it/gemma-3-12b-it.Q4_K_M.gguf --tier tier-3-cpu-only`
+- **VRAM must be physically possible.** The old Tier 1 row claimed a 7.2 GB
+  Q4_K_M model running on a 4 GB card with a 3800 MiB peak. That cannot happen
+  without offload, and the row did not say it offloaded.
+- **Accuracy of 100% across every task is a smell**, not a result. Three prompts
+  hand-graded by substring match is a smoke test; report it as one.
+- **Name the tier honestly.** "RTX 5060 4GB" is not a card that ships.
 
-## What the SIH pitch quotes
+## What the pitch may claim in the meantime
 
-| | Tier 1 (demo) | Tier 2 | Tier 3 |
-|---|---|---|---|
-| Tok/s | **38** | 72 | 8 |
-| TTFT (ms) | **220** | 110 | 1100 |
-| VRAM (MiB) | **3800** | 7800 | 0 (CPU) |
-
-The bold values are the ones on the slide. The non-bold are
-included so the team can answer "what about a better GPU?" or
-"what if we have to run on CPU?" without re-running the bench.
-
-## Honest scope
-
-These numbers are *measured* on the listed hardware, with the
-listed model, and the listed prompt suite. They are not
-benchmarks of the model in isolation (vendor numbers from
-`llama.cpp` for the same model would be similar but use a
-different prompt suite); they are benchmarks of *the system*.
-
-A reviewer who runs `scripts/bench.py` on the same hardware
-should see numbers within ±10% of the values above, dominated
-by:
-
-- GPU driver version
-- llama.cpp build (CPU vs CUDA vs Vulkan)
-- background load (other apps on the same machine)
-
-If the result is more than 20% off, the system is reporting a
-real difference — the bench script does not paper over a
-regression. Re-run with `--verbose` and check the prompt suite
-output for the source of the gap.
+That ARJUN runs on a single workstation with a mid-range GPU — which PS 26117
+asks for and the demo machine demonstrates directly. That is an observation
+anyone in the room can verify, and it needs no table.

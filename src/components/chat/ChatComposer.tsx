@@ -1,8 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Plus, Square, X } from 'lucide-react';
+import { AlertTriangle, ArrowUp, Plus, ScanText, Square, X } from 'lucide-react';
 import { sovereigntyService } from '../../services/sovereignty.service';
+import { toComposerAttachment, type ComposerAttachment } from '../../services/agent.service';
 import { agentService } from '../../services/agent.service';
+import {
+  previewAttachmentRouting,
+  type AttachmentPlan,
+} from '../../services/ocr.service';
 import { RoutingPreview } from '../routing/RoutingPreview';
+import { OcrQualitySlider } from './OcrQualitySlider';
+import type { OcrPreference } from './useOcrPreference';
 import { ContextChip } from './ContextChip';
 import { useConversation } from '../run/useConversation';
 import styles from './ChatSurface.module.css';
@@ -36,18 +43,36 @@ export interface ChatComposerProps {
   activeRunId?: string | null;
   /** Optional placeholder override. */
   placeholder?: string;
-  onSubmit: (prompt: string, attachmentNames: string[]) => Promise<void> | void;
+  /** Messages already typed and waiting for the current run to finish. */
+  queued?: string[];
+  /** Drop a queued message before it is sent. */
+  onCancelQueued?: (index: number) => void;
+  onSubmit: (prompt: string, attachments: ComposerAttachment[]) => Promise<void> | void;
+  /**
+   * The accuracy-to-speed setting for reading attachments.
+   *
+   * Owned by the surface because the turn is sent from there, rendered here
+   * because this is where the person is looking when they attach a file.
+   */
+  ocrPreference?: OcrPreference;
 }
 
 export function ChatComposer({
   streaming,
   activeRunId,
   placeholder,
+  queued = [],
+  onCancelQueued,
   onSubmit,
+  ocrPreference,
 }: ChatComposerProps) {
   const { conversation } = useConversation();
   const [prompt, setPrompt] = useState('');
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  // What the backend says it will do with the attached files. Asked for
+  // rather than worked out here: the composer guessing at the routing is how
+  // a hint that says "OCR" ends up above a run that used none.
+  const [plans, setPlans] = useState<AttachmentPlan[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -72,8 +97,31 @@ export function ChatComposer({
     return () => window.clearTimeout(t);
   }, [conversation?.messages.length, resize]);
 
+  useEffect(() => {
+    if (attachments.length === 0) {
+      setPlans([]);
+      return;
+    }
+    let live = true;
+    void previewAttachmentRouting(
+      attachments.map(a => ({ name: a.name, mime: a.mime })),
+    )
+      .then(next => {
+        if (live) setPlans(next);
+      })
+      .catch(() => {
+        // No hint is better than a wrong one. The run itself makes the same
+        // decision from the same code, so nothing is lost but the preview.
+        if (live) setPlans([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [attachments]);
+
   const hasContent = prompt.trim().length > 0 || attachments.length > 0;
-  const canSubmit = !streaming && hasContent;
+  const canSubmit = hasContent;
+  const ocrPlans = plans.filter(p => p.needsOcr);
 
   const submit = useCallback(async () => {
     if (!canSubmit) return;
@@ -81,6 +129,7 @@ export function ChatComposer({
     const atts = [...attachments];
     setPrompt('');
     setAttachments([]);
+    setPlans([]);
     setRefusal(null);
     try {
       await onSubmit(text, atts);
@@ -104,15 +153,16 @@ export function ChatComposer({
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (streaming) return; // never queue a second run while one is in flight
+      // Mid-run this queues instead of starting a second run; the
+      // surface sends it when the one in flight finishes.
       void submit();
     }
   };
 
   const onFilesPicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const picked = Array.from(e.target.files ?? []).map(f => f.name);
+    const files = Array.from(e.target.files ?? []);
     e.target.value = '';
-    if (!picked.length) return;
+    if (!files.length) return;
     try {
       await sovereigntyService.assertConfidentialAllowed('attaching a document');
     } catch (err) {
@@ -120,7 +170,16 @@ export function ChatComposer({
       return;
     }
     setRefusal(null);
-    setAttachments(prev => [...prev, ...picked]);
+    // Read here, at the moment of picking. The File handle is only valid
+    // while the input holds it, and the backend cannot open a path the
+    // webview names — so the bytes have to be carried, and this is the only
+    // place they exist.
+    try {
+      const read = await Promise.all(files.map(toComposerAttachment));
+      setAttachments(prev => [...prev, ...read]);
+    } catch (err) {
+      setRefusal(err instanceof Error ? err.message : String(err));
+    }
   };
 
   return (
@@ -129,17 +188,62 @@ export function ChatComposer({
         <RoutingPreview prompt={prompt} />
       </div>
 
+      {/* What the attached files will be routed to, before anything is sent.
+        * The reasoning model named above answers the question; these lines
+        * name the model that has to read the page first. Showing only the
+        * second one is what made an attached scan look like it was being
+        * handled by a text model that had never seen it. */}
+      {plans.length > 0 && (
+        <ul className={styles.attachmentPlans}>
+          {plans.map((plan, i) => (
+            <li
+              key={`${plan.name}-${i}`}
+              className={styles.attachmentPlan}
+              data-route={plan.route}
+            >
+              {plan.refusal ? (
+                <AlertTriangle size={13} aria-hidden="true" />
+              ) : (
+                <ScanText size={13} aria-hidden="true" />
+              )}
+              <span>{plan.explanation}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
       <div className={styles.composerWrap}>
         <div className={styles.composer} data-streaming={streaming || undefined}>
+          {queued.length > 0 && (
+            <ul className={styles.queuedList}>
+              {queued.map((text, i) => (
+                <li key={`${i}-${text.slice(0, 24)}`} className={styles.queuedChip}>
+                  <span className={styles.queuedBadge}>Queued</span>
+                  <span className={styles.queuedText}>{text}</span>
+                  {onCancelQueued && (
+                    <button
+                      type="button"
+                      className={styles.attachmentRemove}
+                      aria-label={`Remove queued message ${i + 1}`}
+                      onClick={() => onCancelQueued(i)}
+                    >
+                      <X size={12} />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
           {attachments.length > 0 && (
             <ul className={styles.attachmentList}>
-              {attachments.map((name, i) => (
-                <li key={`${name}-${i}`} className={styles.attachmentChip}>
-                  <span className={styles.attachmentName}>{name}</span>
+              {attachments.map((att, i) => (
+                <li key={`${att.name}-${i}`} className={styles.attachmentChip}>
+                  <span className={styles.attachmentName}>{att.name}</span>
                   <button
                     type="button"
                     className={styles.attachmentRemove}
-                    aria-label={`Remove ${name}`}
+                    aria-label={`Remove ${att.name}`}
                     onClick={() =>
                       setAttachments(prev => prev.filter((_, j) => j !== i))
                     }
@@ -157,7 +261,7 @@ export function ChatComposer({
             placeholder={
               placeholder ??
               (streaming
-                ? 'Type your follow-up — it will send when the run finishes…'
+                ? 'Keep asking, messages will be queued…'
                 : 'Ask Arjun — text, images, tables')
             }
             value={prompt}
@@ -179,13 +283,18 @@ export function ChatComposer({
             <input
               ref={fileInputRef}
               type="file"
+              accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md,.markdown,.csv,.json,.log,.tsv,.docx,.xlsx"
               multiple
               hidden
               onChange={onFilesPicked}
             />
             <div className={styles.composerRight}>
               <ContextChip />
-              {streaming ? (
+              {/* Mid-run the button is a stop — until the user types, at
+                * which point it becomes the way to queue what they wrote.
+                * Without this, a queued message would be reachable only by
+                * pressing Enter. */}
+              {streaming && !hasContent ? (
                 <button
                   type="button"
                   className={styles.stopBtn}
@@ -203,8 +312,8 @@ export function ChatComposer({
                   className={styles.sendBtn}
                   onClick={() => void submit()}
                   disabled={!canSubmit}
-                  aria-label="Send"
-                  title="Send (Enter)"
+                  aria-label={streaming ? 'Queue this message' : 'Send'}
+                  title={streaming ? 'Queue this message (Enter)' : 'Send (Enter)'}
                 >
                   <ArrowUp size={16} />
                 </button>
@@ -218,6 +327,14 @@ export function ChatComposer({
             </p>
           )}
         </div>
+
+        {ocrPreference && (
+          <OcrQualitySlider
+            preference={ocrPreference}
+            disabled={streaming}
+            engaged={ocrPlans.length > 0}
+          />
+        )}
       </div>
     </div>
   );

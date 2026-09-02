@@ -1,6 +1,6 @@
 //! Producing a Word document that opens, from a template nobody can improvise.
 //!
-//! PS step 29: *"The artifact service should use deterministic templates wherever
+//! ARJUN design rule 29: *"The artifact service should use deterministic templates wherever
 //! possible. The language model supplies content, but the template engine
 //! controls document structure, formatting, calculations, and required fields."*
 //!
@@ -265,7 +265,7 @@ impl DocumentCheck {
 
 /// Re-opens a produced document and checks it is what it claims to be.
 ///
-/// PS step 30 asks that the application open the generated file locally and
+/// ARJUN design rule 30 asks that the application open the generated file locally and
 /// confirm it is not corrupt and that required sections exist. Checking the
 /// file rather than the code that wrote it is the point: a bug between the
 /// template and the ZIP would pass every test of the template and still produce

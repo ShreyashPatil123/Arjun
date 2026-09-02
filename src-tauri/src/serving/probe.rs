@@ -34,6 +34,32 @@ use serde::{Deserialize, Serialize};
 /// take a moment to answer its first request.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long an unused probe connection is kept before it is dropped.
+///
+/// Short, because the thing on the other end is a model server that an operator
+/// may stop at any time, and a pooled connection to a dead server costs one
+/// failed request to discover.
+const PROBE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The one client every probe uses. See [`probe`] for why it is shared.
+fn shared_client() -> Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(PROBE_TIMEOUT)
+                .pool_idle_timeout(PROBE_IDLE_TIMEOUT)
+                // A local server has no proxy, and honouring an inherited proxy
+                // variable would turn a loopback probe into a request that
+                // leaves the machine.
+                .no_proxy()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+}
+
 /// What a probe found.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "state")]
@@ -135,17 +161,21 @@ pub async fn probe(base_url: &str) -> ProbeOutcome {
         return refusal;
     }
 
-    // Constructed per probe rather than shared. A probe happens once per run
-    // start and once per health check, so pooling buys nothing, and a
-    // short-lived client cannot accumulate connections to a server that has
-    // since been replaced.
-    let client = match reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        // A local server has no proxy, and honouring an inherited proxy variable
-        // would turn a loopback probe into a request that leaves the machine.
-        .no_proxy()
-        .build()
-    {
+    // Shared, not built per call.
+    //
+    // This was constructed per probe on the reasoning that a probe happens once
+    // per run and pooling buys nothing. It happens far more often than that:
+    // `wait_until_ready` probes in a loop, and the health screen probes every
+    // endpoint. Each fresh client brought its own empty connection pool, so
+    // every probe paid a full TCP handshake and then threw the connection away
+    // — visible in the log as `starting new connection` on consecutive lines to
+    // the same port.
+    //
+    // Sharing does not weaken the isolation the old comment wanted. The pool is
+    // keyed by host and port, an idle connection to a server that has gone away
+    // fails the next request and is evicted, and `pool_idle_timeout` bounds how
+    // long a stale one can sit there at all.
+    let client = match shared_client() {
         Ok(client) => client,
         Err(error) => {
             return ProbeOutcome::InvalidResponse {
@@ -224,8 +254,64 @@ mod tests {
             "127.0.0.1.evil.com",
             "0x7f000001",
             "",
+            // Cloud instance metadata. Not reachable from a refinery
+            // workstation, but it is the single most valuable address to an
+            // attacker who gets a URL past this check, so it is pinned.
+            "169.254.169.254",
+            // The unspecified address. Binds every interface rather than the
+            // local one, so it is not "this machine" in the sense meant here.
+            "0.0.0.0",
+            "[::]",
+            // Legacy IPv4 literals that many C resolvers still accept. Rust's
+            // parser rejects them outright, which is the behaviour wanted: an
+            // address a human cannot read at a glance should not be waved
+            // through by a check a human is trusting.
+            "2130706433",
+            "127.1",
+            "017700000001",
         ] {
             assert!(!is_loopback_host(host), "{host} should not be loopback");
+        }
+    }
+
+    /// Every rejection this check makes is in the safe direction.
+    ///
+    /// Written because OpenClaw's `net-policy` package offers a far richer set
+    /// of IP predicates - private ranges, carrier-grade NAT, cloud metadata,
+    /// NAT64, IPv4-mapped IPv6 - and whether ARJUN should adopt them deserved
+    /// an answer rather than an opinion.
+    ///
+    /// It should not. Those helpers exist to power a **denylist**: permit the
+    /// internet, refuse the dangerous parts of it. `is_loopback_host` is an
+    /// **allowlist** - refuse everything not demonstrably this machine - and an
+    /// allowlist does not need to enumerate what it keeps out. A form this
+    /// parser does not understand is refused *because* it was not understood,
+    /// which is the outcome a denylist has to work to achieve.
+    ///
+    /// The cost is the opposite error: a genuine loopback address written in a
+    /// form Rust will not parse is refused, and an operator sees "not loopback"
+    /// for their own machine. That is a legible annoyance, not a way out.
+    #[test]
+    fn an_unparseable_address_is_refused_rather_than_guessed_at() {
+        for host in [
+            // IPv4-mapped IPv6. Loopback in effect; Rust's `is_loopback` says
+            // false, so ARJUN refuses it. Recorded as the known false negative
+            // rather than left for somebody to rediscover.
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+            // Malformed, oversized and injection-shaped inputs.
+            "127.0.0.256",
+            "127.0.0.1:8080:8080",
+            "127.0.0.1 ",
+            " 127.0.0.1",
+            "127.0.0.1/../evil",
+            "localhost.evil.com",
+        ] {
+            assert!(
+                !is_loopback_host(host),
+                "{host:?} parsed as loopback; an address this check cannot read \
+                 must be refused, never assumed local"
+            );
         }
     }
 

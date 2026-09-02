@@ -9,11 +9,11 @@
 //!
 //! Not accuracy — *honesty about accuracy*. A scanned page put through a parser
 //! that cannot read scans comes back empty, and an empty page is
-//! indistinguishable from a blank one unless something says which it was. PS
-//! 26117 names this directly: the system must not treat a document as understood
-//! merely because a parser finished.
+//! indistinguishable from a blank one unless something says which it was. ARJUN
+//! design rule 12 names this directly: the system must not treat a document as
+//! understood merely because a parser finished.
 //!
-//! [`store`] holds both halves PS step 12 asks for: the original bytes, which
+//! [`store`] holds both halves ARJUN design rule 12 asks for: the original bytes, which
 //! are the evidence a citation points at, and the derived extraction, which is
 //! the working copy and is regenerable when a better engine arrives.
 //!

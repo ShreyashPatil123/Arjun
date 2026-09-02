@@ -1,12 +1,17 @@
 //! Resolves the orchestrator GGUF to a real on-disk path.
 //!
-//! The orchestrator — the model that runs the chat — has a
-//! canonical id in the product contract: a specific path that
-//! the product assumes the user has the file at. In practice the
-//! file may not be at that exact path; the user might have
-//! installed it elsewhere on the SSD, or moved it to an external
-//! drive. The resolver tries the contract path first, and falls
-//! back to a sha256-verified scan of the model library.
+//! The orchestrator — the model that runs the chat — is whatever
+//! an administrator chose in Models. That choice is a set of
+//! package coordinates, and the registry entry for it declares
+//! the path the model was installed at. The resolver tries that
+//! declared path first, and falls back to a sha256-verified scan
+//! of the model library when the file is not there: the user may
+//! have moved it to another drive since it was installed.
+//!
+//! There is deliberately no hard-coded path here. A path compiled
+//! into the binary names a drive letter and a model that exist on
+//! one developer machine; on every other machine it is a file that
+//! is never found.
 //!
 //! ## Why this is a separate module
 //!
@@ -29,17 +34,34 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::ai_engine::startup::StartupModelTarget;
 use crate::registry::ModelRegistry;
 
-/// The orchestrator's contract path. The product assumes the
-/// orchestrator is here. The resolver tries this first and only
-/// scans the library when the file is missing.
-pub const ORCHESTRATOR_CONTRACT_PATH: &str =
-    r"D:\models\Gemma\gemma-4-12B-it-QAT-GGUF\gemma-4-12B-it-QAT-Q4_0.gguf";
+/// Where the registry says the chosen orchestrator was installed.
+///
+/// A relative path in the manifest is resolved against the model
+/// library, so an entry recorded as `huggingface/org/model.gguf`
+/// and one recorded as an absolute path both work.
+pub fn declared_path(
+    registry: &ModelRegistry,
+    app_data_dir: &Path,
+    chosen: Option<&StartupModelTarget>,
+) -> Option<PathBuf> {
+    let entry = registry.orchestrator_entry_for(chosen)?;
+    if entry.path.as_os_str().is_empty() {
+        return None;
+    }
+    if entry.path.is_absolute() {
+        Some(entry.path.clone())
+    } else {
+        Some(registry.library_root(app_data_dir).join(&entry.path))
+    }
+}
 
 /// What the resolver found. The `path` is the file to load.
-/// `resolved_via_contract` is true when the contract path was
-/// used, false when the library scan produced the answer.
+/// `resolved_via_contract` is true when the path the registry
+/// declared was used, false when the library scan produced the
+/// answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedOrchestrator {
     pub path: PathBuf,
@@ -54,17 +76,24 @@ pub struct ResolvedOrchestrator {
 /// unblock it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrchestratorPathError {
-    /// The contract path does not exist *and* the library scan
+    /// No orchestrator has been chosen and none is tagged in the
+    /// manifest, so there is nothing to resolve. Distinct from
+    /// `NotFound`: nothing is broken, a choice simply has not been
+    /// made.
+    NotChosen,
+    /// The declared path does not exist *and* the library scan
     /// did not find a model with the right family and
     /// quantisation.
     NotFound {
-        contract_path: PathBuf,
+        /// Where the registry said the model was installed, when
+        /// it said anything at all.
+        declared_path: Option<PathBuf>,
         /// The names of the family / quantisation the resolver
         /// was looking for.
         wanted_family: String,
         wanted_quant: String,
     },
-    /// The contract path exists but its sha256 does not match
+    /// The declared path exists but its sha256 does not match
     /// the value in the registry. The file is either corrupt or
     /// was replaced; the resolver refuses to load it.
     Sha256Mismatch {
@@ -82,16 +111,27 @@ pub enum OrchestratorPathError {
 impl OrchestratorPathError {
     pub fn message(&self) -> String {
         match self {
+            OrchestratorPathError::NotChosen => "No orchestrator has been chosen. Pick an \
+                 installed model in Models with 'Set as orchestrator'."
+                .to_string(),
             OrchestratorPathError::NotFound {
-                contract_path,
+                declared_path,
                 wanted_family,
                 wanted_quant,
-            } => format!(
-                "The orchestrator could not be located. The contract path {contract_path:?} \
-                 does not exist, and the model library does not contain a {wanted_family} \
-                 ({wanted_quant}) model. Install the orchestrator at the contract path, or \
-                 point the model library at the file's actual location."
-            ),
+            } => match declared_path {
+                Some(declared_path) => format!(
+                    "The orchestrator could not be located. The registry says it is at \
+                     {declared_path:?}, that file does not exist, and the model library does not \
+                     contain a {wanted_family} ({wanted_quant}) model. Re-install it, or point \
+                     the model library at the file's actual location."
+                ),
+                None => format!(
+                    "The orchestrator could not be located. The registry declares no path for \
+                     it, and the model library does not contain a {wanted_family} \
+                     ({wanted_quant}) model. Re-install it, or point the model library at the \
+                     file's actual location."
+                ),
+            },
             OrchestratorPathError::Sha256Mismatch {
                 path,
                 expected,
@@ -108,29 +148,40 @@ impl OrchestratorPathError {
     }
 }
 
-/// Resolves the orchestrator to a real on-disk path. Pure
-/// function over `&Path`s and `&ModelRegistry`; no I/O beyond
-/// `metadata()` and `read()`.
+/// Resolves the orchestrator to a real on-disk path.
+///
+/// `chosen` is the administrator's selection from `ai_settings`,
+/// or `None` when nobody has chosen and only a manifest tag can
+/// name the orchestrator. Pure function over `&Path`s and
+/// `&ModelRegistry`; no I/O beyond `metadata()` and `read()`.
 pub fn resolve_orchestrator_path(
     registry: &ModelRegistry,
     app_data_dir: &Path,
+    chosen: Option<&StartupModelTarget>,
 ) -> Result<ResolvedOrchestrator, OrchestratorPathError> {
-    let contract = PathBuf::from(ORCHESTRATOR_CONTRACT_PATH);
+    // What the registry says about the model that was chosen. No
+    // orchestrator at all is its own answer: there is no file to
+    // go looking for, and scanning the library for one would be
+    // guessing at the very thing the administrator gets to decide.
+    let (wanted_family, wanted_quant) = registry
+        .orchestrator_identity_for(chosen)
+        .ok_or(OrchestratorPathError::NotChosen)?;
+    let declared = declared_path(registry, app_data_dir, chosen);
 
-    // 1. The contract path. If the file is here and its hash
-    //    matches, this is the answer.
-    if contract.is_file() {
-        if let Some(entry) = registry.orchestrator_entry() {
+    // 1. The path the registry declared. If the file is there and
+    //    its hash matches, this is the answer.
+    if let Some(declared) = declared.as_ref().filter(|path| path.is_file()) {
+        if let Some(entry) = registry.orchestrator_entry_for(chosen) {
             if let Some(expected) = entry.sha256() {
-                let actual = sha256_of(&contract).map_err(|message| {
+                let actual = sha256_of(declared).map_err(|message| {
                     OrchestratorPathError::Io {
-                        path: contract.clone(),
+                        path: declared.clone(),
                         message,
                     }
                 })?;
                 if !constant_time_eq(actual.as_str(), expected) {
                     return Err(OrchestratorPathError::Sha256Mismatch {
-                        path: contract,
+                        path: declared.clone(),
                         expected: expected.to_string(),
                         actual,
                     });
@@ -138,7 +189,7 @@ pub fn resolve_orchestrator_path(
             }
         }
         return Ok(ResolvedOrchestrator {
-            path: contract,
+            path: declared.clone(),
             resolved_via_contract: true,
             from_library_scan: false,
         });
@@ -147,12 +198,6 @@ pub fn resolve_orchestrator_path(
     // 2. Library scan. We look for the orchestrator family in
     //    the model library, with the same quantisation, and
     //    sha256-verify the first hit.
-    let (wanted_family, wanted_quant) = registry
-        .orchestrator_identity()
-        .unwrap_or_else(|| (
-            "gemma-4-12b".to_string(),
-            crate::config::DEFAULT_ORCHESTRATOR_QUANTIZATION.to_string(),
-        ));
 
     let library_root = registry.library_root(app_data_dir);
     if let Some(hit) = scan_library_for(&library_root, &wanted_family, &wanted_quant) {
@@ -182,7 +227,7 @@ pub fn resolve_orchestrator_path(
     }
 
     Err(OrchestratorPathError::NotFound {
-        contract_path: contract,
+        declared_path: declared,
         wanted_family,
         wanted_quant,
     })
@@ -353,9 +398,20 @@ mod tests {
     }
 
     #[test]
-    fn the_contract_names_gemma_4_12b_q4() {
-        let normalized = ORCHESTRATOR_CONTRACT_PATH.to_ascii_lowercase();
-        assert!(normalized.contains("gemma-4-12b"));
-        assert!(normalized.contains("q4_0"));
+    fn an_empty_registry_has_no_orchestrator_to_resolve() {
+        let registry = ModelRegistry::load(Path::new("./__absent__"))
+            .expect("an absent manifest loads as empty");
+        let dir = std::env::temp_dir().join("arjun-orchestrator-path-unchosen");
+
+        let error = resolve_orchestrator_path(&registry, &dir, None)
+            .expect_err("nothing is registered, so nothing can be resolved");
+        assert_eq!(
+            error,
+            OrchestratorPathError::NotChosen,
+            "an unmade choice must not be reported as a missing file"
+        );
+        // And the message says what to do about it rather than naming a path
+        // the user has never heard of.
+        assert!(error.message().contains("Set as orchestrator"));
     }
 }

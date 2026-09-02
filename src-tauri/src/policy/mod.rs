@@ -1,6 +1,6 @@
 //! The policy gateway — the only thing that decides whether an action may proceed.
 //!
-//! PS 26117 step 8: *"The model must never decide permissions. The policy gateway
+//! ARJUN design rule 8: *"The model must never decide permissions. The policy gateway
 //! checks the user, document classification, requested tool, target path, and
 //! approval state before allowing an action."*
 //!
