@@ -197,6 +197,11 @@ async fn each_routed_model_resolves_to_a_loopback_endpoint_on_its_own_runtime() 
     let launch = plan_launch(
         coding,
         &PathBuf::from("/models/qwen2.5-coder-7b-q4.gguf"),
+        // No multimodal projector: this is a text coding model. The argument
+        // was added to `plan_launch` and never here, so this whole integration
+        // test has not compiled since — which is why `npm run test:integration`
+        // could not be green on a clean checkout.
+        None,
         &coding_plan,
         18080,
     );

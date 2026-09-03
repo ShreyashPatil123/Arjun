@@ -66,6 +66,11 @@ pub const fn is_side_effecting(tool: ToolName) -> bool {
         ToolName::WriteScopedFile
             | ToolName::CreateDocx
             | ToolName::CreateXlsx
+            // A briefing deck is a file written to disk, exactly like the other
+            // two documents. It was missing from this list, so a run that
+            // produced one and was then interrupted had nothing recorded to
+            // stop the resumption producing a second.
+            | ToolName::CreatePptx
             | ToolName::ExecuteCode
     )
 }

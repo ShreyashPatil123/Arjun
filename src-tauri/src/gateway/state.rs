@@ -18,6 +18,15 @@ use crate::ai_engine::scheduler::GenerationScheduler;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
+    /// Whether the local HTTP gateway may listen at all.
+    ///
+    /// It was never read. `start_gateway` bound a socket regardless, so the
+    /// setting existed, appeared in the UI, and did nothing — every
+    /// installation served the model over HTTP whether or not anybody had
+    /// asked it to.
+    ///
+    /// Now checked before the socket is opened. See
+    /// [`super::server::start_gateway`].
     pub enabled: bool,
     pub port: u16,
     /// Apply intent routing and capability profiles to gateway traffic.
@@ -31,7 +40,15 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Off, deliberately.
+            //
+            // The gateway is a listening socket that serves this machine's
+            // model to any process that can reach loopback. That is a useful
+            // thing and it is not the default posture of a product whose whole
+            // thesis is that nothing happens on this machine without a
+            // reviewed decision. An operator turns it on; it does not turn
+            // itself on because the struct was constructed.
+            enabled: false,
             port: super::DEFAULT_PORT,
             apply_capabilities: false,
         }
@@ -98,6 +115,31 @@ impl GatewayState {
 
     pub fn port(&self) -> u16 {
         self.config.lock().map(|c| c.port).unwrap_or(super::DEFAULT_PORT)
+    }
+
+    /// Whether the gateway may listen.
+    ///
+    /// A poisoned lock reads as *disabled*. That is the fail-closed direction:
+    /// the alternative reading — a lock this side cannot take means "go ahead
+    /// and open a socket" — is how a panic becomes a listening port.
+    pub fn enabled(&self) -> bool {
+        self.config.lock().map(|c| c.enabled).unwrap_or(false)
+    }
+
+    /// Turns the gateway on or off. Returns the previous value.
+    ///
+    /// Changing this does not itself bind or unbind — the caller starts or
+    /// stops the server. It is the setting the next `start_gateway` reads, and
+    /// the one a running server's shutdown is decided by.
+    pub fn set_enabled(&self, enabled: bool) -> bool {
+        match self.config.lock() {
+            Ok(mut config) => {
+                let previous = config.enabled;
+                config.enabled = enabled;
+                previous
+            }
+            Err(_) => false,
+        }
     }
 
     /// Records the port the gateway actually bound.

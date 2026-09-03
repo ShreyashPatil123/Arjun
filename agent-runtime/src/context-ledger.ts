@@ -43,6 +43,12 @@
 
 import { estimateContextTokens, estimateTokens, type AgentMessage } from "@openclaw/agent-core";
 
+import {
+  type ContextEntity,
+  reconcileSections,
+  withRemainders,
+} from "./context-entities.js";
+
 /** The independently-growing parts of a context window. */
 export const CONTEXT_SECTIONS = [
   "system",
@@ -56,6 +62,24 @@ export const CONTEXT_SECTIONS = [
 ] as const;
 
 export type ContextSection = (typeof CONTEXT_SECTIONS)[number];
+
+/**
+ * What a section's un-itemised balance is called on screen.
+ *
+ * Phrased as the thing it is rather than as "other", because "other: 4,200
+ * tokens" tells a reader nothing they can act on, and "the conversation so far"
+ * tells them where to look.
+ */
+const SECTION_REMAINDERS: Record<ContextSection, string> = {
+  system: "System prompt",
+  skill: "Skill guidance",
+  toolSchema: "Tool definitions",
+  evidence: "Other retrieved passages",
+  notes: "Working notes",
+  transcript: "Conversation so far",
+  compaction: "Summary of earlier turns",
+  reserve: "Reserved for the reply",
+};
 
 /** Loose text as the estimator wants to see it. */
 function asTextMessage(text: string): AgentMessage {
@@ -77,6 +101,46 @@ export interface ContextLedgerSnapshot {
   headroom: number;
   /** Times this run has compacted so far. */
   compactions: number;
+  /**
+   * The itemisation under the sections, completed with remainder rows so that
+   * it always sums to them. See `context-entities.ts`.
+   */
+  entities: ContextEntity[];
+  /**
+   * Every model call this run has made, each with what was predicted and what
+   * was counted.
+   *
+   * Kept in full rather than reduced to a running average: the question a
+   * person asks of these is "when did the estimate start drifting", and a mean
+   * cannot answer it.
+   */
+  reconciliations: TurnReconciliation[];
+  /**
+   * Sections whose itemised rows disagree with their totals.
+   *
+   * Empty in normal operation. Non-empty means the breakdown below the bar is
+   * not an explanation of the bar, and the screen says so rather than drawing
+   * rows that do not add up.
+   */
+  itemisationErrors: { section: string; fromEntities: number; fromSection: number }[];
+}
+
+/** One model call's prediction measured against what it actually cost. */
+export interface TurnReconciliation {
+  /** Which call of this run, 1-based. */
+  turn: number;
+  at: string;
+  /** What the ledger predicted the input would come to. */
+  estimatedIn: number;
+  /**
+   * What the provider reported. `null` when it reported nothing — which is
+   * left as null rather than back-filled from the estimate, so that a screen
+   * can tell "we checked and it matched" from "nobody checked".
+   */
+  actualIn: number | null;
+  actualOut: number | null;
+  /** `actualIn / estimatedIn`, or `null` when there is nothing to divide. */
+  driftRatio: number | null;
 }
 
 /**
@@ -90,6 +154,10 @@ export class ContextLedger {
   readonly #sections: Record<ContextSection, number>;
   #window: number;
   #compactions = 0;
+  /** Keyed by entity id, so a document re-registered on a later turn updates
+   *  its row instead of adding a second one for the same file. */
+  readonly #entities = new Map<string, ContextEntity>();
+  readonly #reconciliations: TurnReconciliation[] = [];
 
   constructor(window = 0) {
     this.#window = Math.max(0, Math.floor(window));
@@ -165,6 +233,94 @@ export class ContextLedger {
     return this.#compactions;
   }
 
+  /**
+   * Registers or updates one itemised entity.
+   *
+   * Keyed by id, so the same document arriving on a second turn replaces its
+   * row rather than doubling it — the reason ids are content hashes for files.
+   * A pin already set by the person survives an update that does not mention
+   * one, because the update comes from the runtime and the pin came from a
+   * human, and the human's instruction is not the runtime's to discard.
+   */
+  upsertEntity(entity: ContextEntity): void {
+    const existing = this.#entities.get(entity.id);
+    this.#entities.set(entity.id, {
+      ...entity,
+      pinned: entity.pinned || (existing?.pinned ?? false),
+    });
+  }
+
+  /** Protects an entity from eviction, or releases it. */
+  setPinned(id: string, pinned: boolean): void {
+    const existing = this.#entities.get(id);
+    if (existing) this.#entities.set(id, { ...existing, pinned });
+  }
+
+  /**
+   * Records what one model call was predicted to cost and what it actually did.
+   *
+   * Called on every model turn — see `token_reconciliation.rs` for why that
+   * cadence and not a periodic one.
+   */
+  reconcile(input: {
+    estimatedIn: number;
+    actualIn: number | null;
+    actualOut: number | null;
+    at?: string;
+  }): TurnReconciliation {
+    const record: TurnReconciliation = {
+      turn: this.#reconciliations.length + 1,
+      at: input.at ?? new Date().toISOString(),
+      estimatedIn: input.estimatedIn,
+      actualIn: input.actualIn,
+      actualOut: input.actualOut,
+      driftRatio:
+        input.actualIn !== null && input.estimatedIn > 0
+          ? input.actualIn / input.estimatedIn
+          : null,
+    };
+    this.#reconciliations.push(record);
+    return record;
+  }
+
+  /**
+   * Corrects the transcript section to what the provider actually charged.
+   *
+   * ## Why the correction lands on `transcript` and nowhere else
+   *
+   * The provider reports one number for the whole input. It does not say how
+   * that number divides between the system prompt, the tool schemas and the
+   * conversation — so spreading the correction across sections would mean
+   * inventing a division nobody measured, and every section would end up
+   * slightly false rather than one being right.
+   *
+   * The sections that do not change during a run — system, tool schemas — were
+   * measured once from text this process holds, and are the ones least likely
+   * to be wrong. The transcript is the part that grows, the part the estimator
+   * has the least purchase on, and the only part whose size this side infers
+   * rather than reads. So the difference is booked there, which is both the
+   * likeliest home for it and the one place a reader can interpret.
+   *
+   * Applied only when the provider actually reported a figure. A `null` leaves
+   * every section exactly as estimated, and the snapshot's `reconciliations`
+   * still say that nothing was confirmed.
+   */
+  applyMeasuredInput(actualIn: number | null): void {
+    if (actualIn === null) return;
+    const fixed =
+      this.#sections.system +
+      this.#sections.skill +
+      this.#sections.toolSchema +
+      this.#sections.evidence +
+      this.#sections.notes +
+      this.#sections.compaction;
+    // Never negative: a provider total below the fixed sections means the
+    // sections are over-counted, and writing a negative transcript would make
+    // the ledger sum to something impossible. Zero is the floor, and the
+    // discrepancy stays visible as drift on the reconciliation record.
+    this.#sections.transcript = Math.max(0, actualIn - fixed);
+  }
+
   snapshot(): ContextLedgerSnapshot {
     const sections = { ...this.#sections };
     const occupied = CONTEXT_SECTIONS.filter((section) => section !== "reserve").reduce(
@@ -172,6 +328,17 @@ export class ContextLedger {
       0,
     );
     const committed = occupied + sections.reserve;
+    // Completed with remainders so the rows always sum to the sections above
+    // them. `reserve` is excluded from the itemisation: it is committed by
+    // policy rather than held by anything, so a row for it would invite an
+    // operator to reclaim the one thing that must not be reclaimed.
+    const itemisable = Object.fromEntries(
+      CONTEXT_SECTIONS.filter((section) => section !== "reserve").map((section) => [
+        section,
+        sections[section],
+      ]),
+    );
+    const entities = withRemainders([...this.#entities.values()], itemisable, SECTION_REMAINDERS);
     return {
       sections,
       occupied,
@@ -182,6 +349,9 @@ export class ContextLedger {
       // checks `window` before believing it.
       headroom: this.#window > 0 ? this.#window - committed : 0,
       compactions: this.#compactions,
+      entities,
+      reconciliations: [...this.#reconciliations],
+      itemisationErrors: reconcileSections(entities, itemisable),
     };
   }
 

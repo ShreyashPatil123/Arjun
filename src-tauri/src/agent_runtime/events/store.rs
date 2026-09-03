@@ -783,6 +783,7 @@ const TERMINAL_TYPES: &[TaskEventType] = &[
     TaskEventType::RunFailed,
     TaskEventType::RunCancelled,
     TaskEventType::RunStoppedByBudget,
+    TaskEventType::RunStoppedByLength,
     TaskEventType::RunStoppedByPolicy,
     TaskEventType::RunDegraded,
     // Schema 1 spellings. Still terminal when read back, so a run ended by an

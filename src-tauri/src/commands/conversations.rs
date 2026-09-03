@@ -17,7 +17,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::agent_runtime::conversations::{
-    Conversation, ConversationStore, Message, MessageStatus, RunToConversation,
+    Conversation, ConversationHealth, ConversationState, ConversationStore, Message,
+    MessageCompletion, MessageStatus, RunToConversation,
 };
 use crate::commands::governance::{require_session, CurrentSession};
 
@@ -27,15 +28,40 @@ pub struct ConversationsState(pub Arc<ConversationStore>);
 /// Tauri-managed wrapper around the run→conversation index.
 pub struct RunToConversationState(pub Arc<RunToConversation>);
 
+/// Whether this session's chats will still be here tomorrow.
+///
+/// Consulted before a *new* conversation is created. Reading what is already
+/// there is always allowed — it is the only way a person finds out what is
+/// wrong. See [`crate::agent_runtime::conversations::ConversationHealth`].
+pub struct ConversationHealthState(pub Arc<ConversationHealth>);
+
+/// What the surface is told about conversation storage.
+///
+/// A separate command rather than a field on every response: the answer is the
+/// same for the whole session, and a banner that has to wait for a conversation
+/// to load is one a person sees after they have already typed.
+#[tauri::command]
+pub fn agent_conversation_health(
+    health: State<'_, ConversationHealthState>,
+) -> ConversationState {
+    health.0.state().clone()
+}
+
 /// Create a new conversation with one system welcome message.
 #[tauri::command]
 pub fn agent_create_conversation(
     title: String,
     welcome: Option<String>,
     state: State<'_, ConversationsState>,
+    health: State<'_, ConversationHealthState>,
     session: State<'_, CurrentSession>,
 ) -> Result<Conversation, String> {
     let session = require_session(&session)?;
+    // A new thread the person will lose is worse than no new thread. Reading
+    // what is already there stays allowed, which is how they find out why.
+    if let Some(refusal) = health.0.refusal() {
+        return Err(refusal);
+    }
     let welcome = welcome.unwrap_or_else(|| {
         "Arjun is ready. Ask anything; nothing leaves this machine.".to_string()
     });
@@ -197,6 +223,13 @@ pub fn agent_complete_message(
     model_role: Option<String>,
     used_fallback: Option<bool>,
     error: Option<String>,
+    // `outcome` is how the run ended, as `RunOutcome::kind` spells it. Optional
+    // because the front-end learns it only when `agent_start_run` resolves; a
+    // `message_end` writer sends `None` and leaves whatever the run recorded.
+    outcome: Option<String>,
+    // `verification` is what the verifier concluded: `ready` or `needsReview`.
+    // Sent only by the run; a `message_end` writer omits it.
+    verification: Option<String>,
     failed: bool,
     tokens_in: Option<u64>,
     tokens_out: Option<u64>,
@@ -211,15 +244,19 @@ pub fn agent_complete_message(
             &conversation_id,
             &message_id,
             &run_id,
-            final_content.as_deref(),
-            elapsed_ms,
-            model_name.as_deref(),
-            model_role.as_deref(),
-            used_fallback,
-            error.as_deref(),
-            failed,
-            tokens_in,
-            tokens_out,
+            MessageCompletion {
+                final_content: final_content.as_deref(),
+                elapsed_ms,
+                model_name: model_name.as_deref(),
+                model_role: model_role.as_deref(),
+                used_fallback,
+                error: error.as_deref(),
+                outcome: outcome.as_deref(),
+                verification: verification.as_deref(),
+                failed,
+                tokens_in,
+                tokens_out,
+            },
             &session.user.id,
         )
         .map_err(|e| e.to_string())?;

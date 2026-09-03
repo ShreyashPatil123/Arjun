@@ -109,6 +109,12 @@ pub struct TaskSnapshot {
     /// Times a person picked this task up again.
     pub resumptions: u32,
     pub memory_reads: u32,
+    /// Skills whose instructions were loaded into this run's context.
+    #[serde(default)]
+    pub skills_loaded: u32,
+    /// Skills the run asked for and was refused.
+    #[serde(default)]
+    pub skills_refused: u32,
     /// Facts promoted into project memory under an approval.
     pub memory_promotions: u32,
     /// Memory operations refused. Non-zero is worth a look: it means the run
@@ -171,6 +177,8 @@ impl TaskSnapshot {
             checkpoint_failures: 0,
             resumptions: 0,
             memory_reads: 0,
+            skills_loaded: 0,
+            skills_refused: 0,
             memory_promotions: 0,
             memory_refusals: 0,
             hook_blocks: 0,
@@ -353,6 +361,11 @@ impl TaskSnapshot {
             // is a run whose resume point is behind where it actually got to.
             TaskEventType::CheckpointFailed => self.checkpoint_failures += 1,
             TaskEventType::RunResumed => self.resumptions += 1,
+            // Counted, so a trace can say a run's instructions were added to
+            // part-way through. A refusal is counted too: a skill asked for and
+            // denied is a thing the run tried to do.
+            TaskEventType::SkillLoaded => self.skills_loaded += 1,
+            TaskEventType::SkillRefused => self.skills_refused += 1,
             TaskEventType::MemoryRecalled => self.memory_reads += 1,
             TaskEventType::MemoryPromoted => self.memory_promotions += 1,
             TaskEventType::MemoryRefused => self.memory_refusals += 1,
@@ -398,6 +411,30 @@ impl TaskSnapshot {
                 if let Some(turns) = count("turns") {
                     self.turns = turns as u32;
                 }
+            }
+            // Both an answer and a caveat. A run cut off at the output cap
+            // produced real text worth keeping — and the one thing a reader
+            // must not be allowed to assume about it is that it is whole, so
+            // the fragment and the reason are recorded together.
+            TaskEventType::RunStoppedByLength => {
+                self.answer_hash = event
+                    .payload
+                    .get("answer")
+                    .and_then(|answer| answer.get("sha256"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.answer_chars = event
+                    .payload
+                    .get("answer")
+                    .and_then(|answer| answer.get("chars"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                if let Some(turns) = count("turns") {
+                    self.turns = turns as u32;
+                }
+                self.failure =
+                    Some(text("failure").unwrap_or_else(|| self.state.describe().to_string()));
+                self.strand_running_calls();
             }
             TaskEventType::RunFailed
             | TaskEventType::RunCancelled

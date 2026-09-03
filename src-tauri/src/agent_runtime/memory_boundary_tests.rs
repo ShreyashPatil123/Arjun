@@ -62,6 +62,22 @@ fn deps_in(department: Option<&str>) -> (Arc<RuntimeDeps>, tempfile::TempDir) {
         checkpoints: Arc::default(),
         emit: Arc::new(|_| {}),
         emit_durable: Arc::new(|_| {}),
+        // A manager with no profiles: these tests are about the gateway, and
+        // the subagent system has its own tests in `subagents::tests`. What
+        // matters here is that one is *present*, so a delegation refused for
+        // want of a manager cannot be mistaken for a policy decision.
+        subagents: Arc::new(crate::subagents::SubagentManager::new(
+            Vec::new(),
+            Arc::new(
+                crate::agent_runtime::events::TaskEventLog::in_memory().expect("an event log"),
+            ),
+        )),
+        multimodal: Arc::new(
+            crate::knowledge::MultimodalIndex::open(dir.path()).expect("a multimodal index"),
+        ),
+        // Durable by default: these tests are about the gateway, and a
+        // degraded installation has its own tests in `audit_health`.
+        audit_health: Arc::new(crate::agent_runtime::audit_health::AuditHealth::durable()),
     });
     (deps, dir)
 }
@@ -575,4 +591,142 @@ fn a_scope_that_holds_nothing_says_so_rather_than_returning_silence() {
         recall_authorized(json!({ "runId": "r", "scope": "run" }), &deps).expect("recalled");
     assert!(out["items"].as_array().expect("items").is_empty());
     assert!(out["note"].as_str().is_some());
+}
+
+// -- The legacy surface, and why it is gone -----------------------------------
+
+/// Two signed-in people cannot reach each other's memory.
+///
+/// ## The defect these replace
+///
+/// `memory_engine::api` exposed ten Tauri commands, every one written the same
+/// way: `require_session(&session)?` — proving that *somebody* is signed in —
+/// followed by a call taking no user id. The profile table, the project table,
+/// the memory nodes, the summaries and the active-project selection were all
+/// per-machine. So any signed-in user could list, search, update, switch and
+/// delete every other user's memory, and the comment above the health command
+/// claimed "the per-user scoping lives inside the manager", which was true of
+/// none of them.
+///
+/// That surface had no consumer — `src/services/memoryService.ts` wrapped all
+/// ten and was imported by nothing — so it was removed rather than retrofitted.
+/// What a run actually uses is `MemoryStore`, reached only through
+/// `memory_api`, which fills in identity and project on this side. These tests
+/// pin that it does what the old surface only claimed to.
+mod scoping_replaces_the_legacy_surface {
+    use super::*;
+
+    #[test]
+    fn one_persons_user_scope_is_not_another_persons() {
+        // The property the old commands did not have. Two *people*, two user
+        // scopes, and no argument either of them can send to reach the other's.
+        //
+        // `deps_in` varies the department rather than the person, so the
+        // session is built here: what is under test is identity, not project.
+        let (deps, _dir) = deps_in(Some("Technical Services"));
+
+        let priya = Session::open(User::new("priya", "Priya Sharma", vec![Role::Employee]));
+        let arun = Session::open(User::new("arun", "Arun Patel", vec![Role::Employee]));
+
+        let hers = deps.scope_for(RequestedScope::User, "r", &priya);
+        let his = deps.scope_for(RequestedScope::User, "r", &arun);
+
+        assert_ne!(
+            hers, his,
+            "two people resolved to the same user scope, which is the legacy defect"
+        );
+        // And run scope is keyed by the run, deliberately: a run is one piece
+        // of work, not one person, so both resolve to the same place there.
+        assert_eq!(
+            deps.scope_for(RequestedScope::Run, "r", &priya),
+            deps.scope_for(RequestedScope::Run, "r", &arun)
+        );
+    }
+
+    #[test]
+    fn a_recall_cannot_name_whose_memory_it_wants() {
+        // The whole defence. The old API took no user id and therefore returned
+        // everybody's; this one takes no user id *because it will not accept
+        // one* — identity is filled in from the session on this side.
+        //
+        // Anything the caller adds is ignored rather than honoured.
+        let (deps, _dir) = deps_in(Some("Technical Services"));
+        remember_run_fact(&deps, "revision", "Use the 2019 revision.");
+
+        let forged = recall_authorized(
+            json!({
+                "runId": "r",
+                "scope": "run",
+                // None of these exist in the contract. If any of them were
+                // read, this would be the way to read another person's memory.
+                "userId": "someone-else",
+                "user_id": "someone-else",
+                "project": "Finance",
+                "owner": "someone-else",
+            }),
+            &deps,
+        )
+        .expect("recalled");
+
+        let items = forged["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "a forged field changed what came back");
+        assert_eq!(items[0]["value"], "Use the 2019 revision.");
+    }
+
+    #[test]
+    fn a_person_cannot_read_another_departments_project_memory() {
+        // Written by one, asked for by the other. The scope the second person
+        // resolves to is not the scope the first person wrote into, and there
+        // is no argument that changes that.
+        let (a, _a_dir) = deps_in(Some("Technical Services"));
+        let (b, _b_dir) = deps_in(Some("Finance"));
+
+        let scope_a = a.scope_for(
+            RequestedScope::Workspace,
+            "r",
+            &a.session().expect("signed in"),
+        );
+        let scope_b = b.scope_for(
+            RequestedScope::Workspace,
+            "r",
+            &b.session().expect("signed in"),
+        );
+
+        assert_ne!(scope_a, scope_b);
+        assert_eq!(scope_a.project(), Some("Technical Services"));
+        assert_eq!(scope_b.project(), Some("Finance"));
+
+        // And the second person's recall comes back empty rather than
+        // borrowing the first person's project.
+        let theirs =
+            recall_authorized(json!({ "runId": "r", "scope": "workspace" }), &b).expect("recalled");
+        assert!(
+            theirs["items"].as_array().expect("items").is_empty(),
+            "one department read another's project memory"
+        );
+    }
+
+    #[test]
+    fn the_legacy_memory_commands_are_no_longer_registered() {
+        // The structural half. Every test above would still pass with the old
+        // commands sitting alongside, because they bypassed all of this.
+        let lib = std::fs::read_to_string("src/lib.rs").expect("lib.rs");
+        for command in [
+            "memory_engine::api::get_user_profile_memory",
+            "memory_engine::api::update_user_profile_fact",
+            "memory_engine::api::list_memory_projects",
+            "memory_engine::api::create_memory_project",
+            "memory_engine::api::switch_active_project",
+            "memory_engine::api::get_active_project",
+            "memory_engine::api::search_memory_nodes",
+            "memory_engine::api::delete_memory_node_by_id",
+            "memory_engine::api::get_memory_health_status",
+            "memory_engine::api::get_memory_diagnostics",
+        ] {
+            assert!(
+                !lib.contains(command),
+                "{command} is registered again; it reads and writes every user's memory"
+            );
+        }
+    }
 }

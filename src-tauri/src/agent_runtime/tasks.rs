@@ -382,6 +382,19 @@ pub struct TaskRecord {
     pub approvals: Vec<ApprovalRecord>,
     /// Set when the run ended badly, in the words shown to the person.
     pub failure: Option<String>,
+    /// How the run ended, typed.
+    ///
+    /// The authority for what happened, and the only field that separates a
+    /// finished answer from a fragment cut off at the output cap — the text of
+    /// the two is indistinguishable. `failure` carries the same information as
+    /// a sentence for display; this carries it as a value a screen can filter
+    /// and count on.
+    ///
+    /// Defaulted so records written before this existed still load. Those
+    /// records read as `None`, which is honestly "not recorded" rather than a
+    /// guess at which ending they had.
+    #[serde(default)]
+    pub outcome: Option<crate::agent_runtime::outcome::RunOutcome>,
     /// Every time the run's history was replaced by a summary, in order.
     ///
     /// Defaulted so records written before this existed still load. A run that
@@ -649,7 +662,7 @@ pub fn list(app_data_dir: &Path, owner_user_id: Option<&str>) -> Vec<TaskSummary
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agent_runtime::artifacts::Kind;
     use crate::artifacts::verifier::Finding;
@@ -658,7 +671,13 @@ mod tests {
     use crate::orchestrator::tools::ToolName;
     use crate::registry::{ModelRole, Runtime};
 
-    pub(super) fn record(run_id: &str, finished_at: &str) -> TaskRecord {
+    /// A whole, realistic task record.
+    ///
+    /// `pub(crate)` because the durability tests in `agent_runtime::tests` need
+    /// a real record to drive `save` against a disk that will not take it, and
+    /// rebuilding one there would mean maintaining a second fixture that drifts
+    /// from this one.
+    pub(crate) fn record(run_id: &str, finished_at: &str) -> TaskRecord {
         TaskRecord {
             run_id: run_id.to_string(),
             prompt: "draft an approval note".to_string(),
@@ -700,6 +719,7 @@ mod tests {
             tool_calls: Vec::new(),
             approvals: Vec::new(),
             failure: None,
+            outcome: Some(crate::agent_runtime::outcome::RunOutcome::Completed),
         }
     }
 
@@ -860,6 +880,7 @@ mod tests {
     fn a_task_whose_draft_needs_review_is_not_ready() {
         let mut written = record("run-1", "2026-08-27T10:00:42+00:00");
         written.verification = Some(VerificationReport {
+            coverage: Default::default(),
             standing: Standing::NeedsReview {
                 blocking: 1,
                 advisory: 0,

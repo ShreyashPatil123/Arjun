@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::ai_engine::ocr_profile::{
     to_page, CoordSpace, OcrDetent, OcrTier, PageBox, PageGeometry,
 };
+use crate::ai_engine::ocr_repetition::degenerate_tail_start;
 use crate::ai_engine::ocr_spans::{OcrEvent, RawBox};
 use crate::ai_engine::ocr_stream::stream_ocr;
 use crate::agent_runtime::stages::StageTag;
@@ -284,8 +285,13 @@ pub fn preview_attachment_routing(files: Vec<AttachmentDescriptor>) -> Vec<Attac
 }
 
 /// Extensions the local extractor can turn into text without any model.
+///
+/// `pptx` is here because a board presentation is one of the document kinds
+/// this product exists to handle, and it was the one Office format the
+/// extractor could not open — a deck attached to a chat was refused outright
+/// with a message listing every other format.
 const DOCUMENT_SUFFIXES: &[&str] = &[
-    "pdf", "txt", "md", "markdown", "csv", "json", "log", "tsv", "docx", "xlsx",
+    "pdf", "txt", "md", "markdown", "csv", "json", "log", "tsv", "docx", "xlsx", "pptx",
 ];
 
 /// Everything about an attachment that can be judged before touching disk.
@@ -309,7 +315,7 @@ fn validate_attachment(name: &str, mime: &str, len: usize) -> Result<AttachmentK
         AttachmentKind::Document(ext)
     } else {
         return Err(format!(
-            "{name} is a {mime} — ARJUN reads PDF, Word, Excel, text, Markdown, CSV, JSON and image files."
+            "{name} is a {mime} — ARJUN reads PDF, Word, Excel, PowerPoint, text, Markdown, CSV, JSON and image files."
         ));
     };
 
@@ -459,6 +465,14 @@ pub enum AttachmentOcrEvent {
         /// much as fitted", and a looping read produces the second while
         /// looking exactly like the first.
         hit_decode_cap: bool,
+        /// True when the read degenerated into repetition and was cut.
+        ///
+        /// Distinct from `hit_decode_cap`, and the more common of the two now
+        /// that the loop is stopped early: a page cut by the repetition guard
+        /// never reaches the decode cap, so reporting only the cap would make
+        /// every stopped loop look like a clean read. `characters` counts what
+        /// survived the cut, not what the model emitted.
+        looped: bool,
     },
 }
 
@@ -495,12 +509,13 @@ async fn ocr_one_image(
         .map(|gpu| gpu.dedicated_video_memory_bytes)
         .max()
         .unwrap_or(0);
-    let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
-        vram,
-        entry.weights_bytes,
-        entry.context_length,
-        None,
-    );
+    // Budgeted against free VRAM with the model's own layer count, and any
+    // other server released only if this one will not otherwise fit. See
+    // `serving::admission`.
+    let plan = crate::serving::admission::admit(&servers, &entry, registry.models_dir())
+        .await
+        .map_err(|error| error.to_string())?
+        .plan;
     let endpoint = servers
         .endpoint_for(&entry, registry.models_dir(), &plan)
         .await
@@ -557,7 +572,29 @@ async fn ocr_one_image(
     )
     .await
     .map_err(|e| format!("reading the page failed: {e:#}"))?;
-    let read = text.lock().map(|t| t.clone()).unwrap_or_default();
+    let raw = text.lock().map(|t| t.clone()).unwrap_or_default();
+    // Measured again over the assembled text rather than reusing the stream's
+    // offset. The two count different things: the guard inside `stream_ocr`
+    // watches the model's raw output, headers and boxes included, while this
+    // is what the span parser kept — so an offset from one does not address
+    // the other, and cutting at it would slice mid-word.
+    let looped_from = degenerate_tail_start(&raw);
+    let read = match looped_from {
+        Some(at) => raw.chars().take(at).collect::<String>(),
+        None => raw,
+    };
+    // Either signal is enough to call the read incomplete. The stream guard
+    // can fire on repetition that lives entirely in the region headers, which
+    // the parser strips before this text is assembled; the tail scan can fire
+    // on a page that ran to the decode cap before the guard was reached.
+    let looped = looped_from.is_some() || summary.looped_at.is_some();
+    if looped {
+        log::warn!(
+            "[OCR] {name} page {page} degenerated into repetition and was cut short; \
+             {} characters kept",
+            read.chars().count()
+        );
+    }
     // `hit_decode_cap` used to be dropped on the floor here, and dropping it
     // is how a page that filled its entire token budget with one repeated
     // character reached the answer looking like an ordinary read. A page that
@@ -574,6 +611,7 @@ async fn ocr_one_image(
             characters: read.chars().count(),
             elapsed_ms: started.elapsed().as_millis() as u64,
             hit_decode_cap: summary.hit_decode_cap,
+            looped,
         },
     );
     Ok(read)
@@ -900,12 +938,13 @@ pub async fn scan_page(
         .map(|gpu| gpu.dedicated_video_memory_bytes)
         .max()
         .unwrap_or(0);
-    let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
-        vram,
-        entry.weights_bytes,
-        entry.context_length,
-        None,
-    );
+    // Budgeted against free VRAM with the model's own layer count, and any
+    // other server released only if this one will not otherwise fit. See
+    // `serving::admission`.
+    let plan = crate::serving::admission::admit(&servers, &entry, registry.models_dir())
+        .await
+        .map_err(|error| error.to_string())?
+        .plan;
 
     let endpoint = servers
         .endpoint_for(&entry, registry.models_dir(), &plan)
@@ -984,7 +1023,23 @@ pub async fn scan_page(
                     },
                 },
             );
-            if summary.hit_decode_cap {
+            if let Some(at) = summary.looped_at {
+                // Said plainly, because the alternative is a page that looks
+                // read. The guard stopped the model here; everything after
+                // this point would have been repetition.
+                let _ = app.emit(
+                    "ocr:error",
+                    ErrorPayload {
+                        page,
+                        reason: format!(
+                            "The model began repeating itself after {at} characters, so \
+                             the read was stopped there. What is shown above is the part \
+                             of the page that was read; the rest was not. A sharper scan \
+                             of this page, or a stop further right, usually fixes it."
+                        ),
+                    },
+                );
+            } else if summary.hit_decode_cap {
                 // The page stopped because it ran out of budget. On the Fast
                 // tier that is the signature of the loop the DRY substitute
                 // is supposed to prevent, so it is surfaced, not hidden.
@@ -1199,6 +1254,29 @@ mod tests {
     /// The regression for the PDF refusal: a PDF used to be rejected because
     /// the only accepted types were the three the vision model reads. It must
     /// now route to the extractor, not to OCR.
+    /// A board presentation is one of the document kinds this product exists
+    /// for, and it was the one Office format the extractor could not open.
+    #[test]
+    fn a_presentation_is_read_locally_rather_than_refused() {
+        assert_eq!(
+            validate_attachment(
+                "capex-approval.pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                4096
+            )
+            .unwrap(),
+            AttachmentKind::Document("pptx")
+        );
+
+        let plan = plan_attachment("capex-approval.pptx", "");
+        assert_eq!(plan.route, "document");
+        assert!(
+            !plan.needs_ocr,
+            "a deck carries its own text; sending slides to a vision model would be              slower and lossier than reading the XML"
+        );
+        assert!(plan.refusal.is_none());
+    }
+
     #[test]
     fn a_pdf_routes_to_the_document_extractor_not_to_ocr() {
         assert_eq!(

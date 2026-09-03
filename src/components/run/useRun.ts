@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { labelForTool } from '../../services/toolNames';
 import {
   agentService,
   type AgentEvent,
   type Classification,
+  type ComposerAttachment,
   type DurableEvent,
   type RunSummary,
 } from '../../services/agent.service';
@@ -75,19 +77,15 @@ function lastRun(): string | null {
   }
 }
 
-/** How a tool name reads in the trace. Follows `ToolName::describe` in Rust. */
-const TOOL_LABELS: Record<string, string> = {
-  search_documents: 'Searching the documents',
-  read_scoped_file: 'Reading a file',
-  write_scoped_file: 'Writing a file',
-  run_calculation: 'Calculating',
-  create_docx: 'Producing a Word document',
-  create_xlsx: 'Producing a workbook',
-  execute_code: 'Running code',
-  validate_artifact: 'Checking a produced file',
-};
-
-export const labelFor = (tool: string) => TOOL_LABELS[tool] ?? tool;
+/**
+ * How a tool name reads in the trace.
+ *
+ * Re-exported rather than defined here. The table used to live in this file
+ * *and* in `AssistantMessageCell.tsx`, both keyed on the pre-namespace
+ * spelling, while live events carry the current one — so every row displayed
+ * the raw wire name. See `services/toolNames.ts`.
+ */
+export const labelFor = labelForTool;
 
 export function useRun() {
   const [state, setState] = useState<RunViewState>(IDLE);
@@ -286,8 +284,19 @@ export function useRun() {
         /** Caller-supplied correlation id. Used by the demo page so its
          *  events are not misattributed to another window's run. */
         correlationId?: string;
-        /** Override the default instructions. Scripted demonstrations only. */
-        systemPrompt?: string;
+        /**
+         * Extra framing for a scripted scenario, appended beneath ARJUN's own
+         * instructions rather than replacing them.
+         */
+        scenarioInstructions?: string;
+        /**
+         * Documents this run is given.
+         *
+         * The demonstrator's scenarios say their documents are "attached";
+         * until this existed nothing was, so a scenario asked the model to
+         * cross-reference a drawing it had never been given.
+         */
+        attachments?: ComposerAttachment[];
       },
     ) => {
       const correlationId = options?.correlationId ?? crypto.randomUUID();
@@ -299,11 +308,18 @@ export function useRun() {
       setState({ ...IDLE, phase: 'starting', prompt });
 
       try {
+        // No `conversationId` and no `messageId`: this caller has no chat cell
+        // to reserve. The backend settles both before the run starts and
+        // returns them on the summary — see `resolve_turn_identity`. Sending
+        // `messageId: null` used to reach the runtime as a malformed request,
+        // so every run started from here failed before a model was asked
+        // anything.
         const summary = await agentService.start({
           prompt,
           classification,
           correlationId,
-          systemPrompt: options?.systemPrompt,
+          scenarioInstructions: options?.scenarioInstructions,
+          attachments: options?.attachments,
         });
         // The summary is complete where the event stream is best-effort, so it
         // wins: the plan it carries is the one that was actually enforced.
@@ -357,7 +373,10 @@ export function useRun() {
     }
   }, []);
 
-  return { state, start, abort, steer, reset };
+  // `adopt` is returned so a provider can follow a run it did not start --
+  // the chat surface issues its own run id before the backend replies, and the
+  // dashboard has to be able to show that run rather than a different one.
+  return { state, start, abort, steer, reset, adopt };
 }
 
 /** Whether a run is still going, for disabling the composer. */

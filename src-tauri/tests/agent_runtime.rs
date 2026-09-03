@@ -56,10 +56,40 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             passages: Arc::default(),
             produced: Arc::default(),
             calls: Arc::default(),
-            // No plan registered: these tests are about the transport between
-            // the two processes, and a budget refusing a call would make a wire
-            // problem and a policy problem look the same.
-            plans: Arc::default(),
+            // A plan for each run these tests drive, permitting every tool.
+            //
+            // Registered rather than absent, because absent no longer means
+            // "no budget applies" — it means the run does not exist, and the
+            // catalogue, the gateway and the executor all refuse it. Leaving
+            // this empty would still pass, by testing the transport with a run
+            // that is offered no tools at all, which is not the shape these
+            // tests are meant to exercise.
+            plans: {
+                let table: Arc<
+                    std::sync::Mutex<
+                        std::collections::HashMap<
+                            String,
+                            sarathi_lib::orchestrator::plan::PlanRun,
+                        >,
+                    >,
+                > = Arc::default();
+                {
+                    let mut plans = table.lock().expect("fresh lock");
+                    for run_id in ["run-1", "r", "follow-up-1", "follow-up-2"] {
+                        plans.insert(
+                            run_id.to_string(),
+                            sarathi_lib::orchestrator::plan::PlanRun::new(
+                                run_id,
+                                vec!["do the work".to_string()],
+                                sarathi_lib::orchestrator::plan::Budget::standard(
+                                    sarathi_lib::orchestrator::tools::ToolName::ALL.to_vec(),
+                                ),
+                            ),
+                        );
+                    }
+                }
+                table
+            },
             // Written to the same directory the rest of the run's state lives
             // in, so a tool call replayed across these tests behaves as it
             // would in the application.
@@ -77,6 +107,23 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             checkpoints: Arc::default(),
             emit: Arc::new(|_| {}),
             emit_durable: Arc::new(|_| {}),
+            // Present, so a tool refused for want of a dependency cannot be
+            // mistaken for a wire problem. The subagent and multimodal
+            // systems have their own tests.
+            subagents: Arc::new(sarathi_lib::subagents::SubagentManager::new(
+                Vec::new(),
+                Arc::new(
+                    sarathi_lib::agent_runtime::events::TaskEventLog::in_memory()
+                        .expect("an event log"),
+                ),
+            )),
+            multimodal: Arc::new(
+                sarathi_lib::knowledge::MultimodalIndex::open(dir.path())
+                    .expect("a multimodal index"),
+            ),
+            // Durable: this test is about the wire between the two processes,
+            // and a degraded installation has its own tests in `audit_health`.
+            audit_health: Arc::new(sarathi_lib::agent_runtime::audit_health::AuditHealth::durable()),
         }),
         // Returned so the directory outlives the test; dropping it early would
         // delete the SQLite file out from under the runtime.

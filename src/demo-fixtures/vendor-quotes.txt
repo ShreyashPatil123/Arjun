@@ -1,0 +1,58 @@
+SYNTHETIC VENDOR QUOTATIONS — ARJUN DEMONSTRATION DATA
+======================================================
+
+Two quotations for the same duty, generated for the ARJUN demonstration. Both
+vendors are invented. No real vendor, price, person or contract appears here.
+The figures are chosen so that a comparison has something to find, not because
+they reflect any market.
+
+Enquiry:   DEMO-ENQ-0042, 75 kW centrifugal pump, unit 100 feed service
+Issued by: Demonstration Procurement (synthetic)
+
+------------------------------------------------------------------
+QUOTE A
+------------------------------------------------------------------
+Quote ref:       MRE-2026-0311
+Vendor:          Meridian Rotating Equipment (synthetic)
+Issued:          2026-02-03
+Valid until:     2026-03-05
+Equipment:       75 kW centrifugal pump, API 610 OH2
+Price (INR):     42,80,000
+Delivery:        22 weeks from order
+Warranty:        18 months from commissioning
+Payment terms:   30% with order, 60% on despatch, 10% on commissioning
+
+Commercial terms stated in Quote A
+  A1. Price is firm for the validity period only.
+  A2. Escalation of up to 8% applies to orders placed after the validity date.
+  A3. Liquidated damages capped at 2% of order value.
+  A4. Seller's liability capped at the order value.
+  A5. Spares list is indicative and priced separately.
+
+------------------------------------------------------------------
+QUOTE B
+------------------------------------------------------------------
+Quote ref:       KP-Q-8871
+Vendor:          Kestrel Pumps (synthetic)
+Issued:          2026-02-06
+Valid until:     2026-05-06
+Equipment:       75 kW centrifugal pump, API 610 OH2
+Price (INR):     46,15,000
+Delivery:        14 weeks from order
+Warranty:        24 months from commissioning
+Payment terms:   20% with order, 70% on despatch, 10% on commissioning
+
+Commercial terms stated in Quote B
+  B1. Price is firm to the validity date with no escalation clause.
+  B2. Liquidated damages capped at 5% of order value.
+  B3. Seller's liability capped at the order value.
+  B4. Two years of recommended spares included in the price.
+  B5. Commissioning support of 5 days included.
+
+------------------------------------------------------------------
+WHAT IS NOT IN EITHER QUOTE
+------------------------------------------------------------------
+Neither quotation states an energy-efficiency figure, a seal plan, a noise
+guarantee, or a lifetime maintenance cost. A comparison that reports any of
+those has invented them. They are omitted deliberately: the demonstration is
+partly about what the model does when a document does not answer the question.

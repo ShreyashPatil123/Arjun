@@ -15,6 +15,9 @@
 //!   concurrency — TODO 6 of the 7-step plan
 //! - `vision_bridge`: takes image paths + a query and produces a structured
 //!   description via a local VLM, in the OpenAI-compatible vision schema.
+//! - `token_reconciliation`: compares a token estimate against what the
+//!   tokenizer actually counted, and keeps the two apart in the record
+//! - `ocr_budget`: decides how much of an OCR'd document fits in the prompt
 
 pub mod traits;
 pub mod runtime;
@@ -32,7 +35,10 @@ pub mod gguf_meta;
 pub mod vision_bridge;
 pub mod ocr_spans;
 pub mod ocr_profile;
+pub mod ocr_repetition;
 pub mod ocr_stream;
+pub mod token_reconciliation;
+pub mod ocr_budget;
 
 pub use traits::*;
 pub use manager::InferenceManager;

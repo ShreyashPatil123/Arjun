@@ -1,0 +1,49 @@
+SYNTHETIC PIPING & INSTRUMENTATION DIAGRAM — TEXT RENDERING
+===========================================================
+
+This is a text rendering of a synthetic P&ID, generated for the ARJUN
+demonstration. It is not a drawing of any real plant. It is plain text rather
+than a scanned image so that a reviewer can read exactly what the model was
+given, and so the demonstration does not depend on OCR quality to show
+retrieval and citation working.
+
+TITLE BLOCK
+-----------
+Drawing:   A-101-001
+Revision:  6
+Unit:      Demonstration Unit 100 (synthetic)
+Issued:    2026-01-12
+Status:    Issued for demonstration
+
+EQUIPMENT SHOWN ON THIS SHEET
+-----------------------------
+V-101    Inlet separator, vertical, on level control
+P-101A   Feed pump, duty
+P-101B   Feed pump, standby
+E-101    Feed/effluent exchanger, shell and tube
+
+INSTRUMENTS SHOWN ON THIS SHEET
+-------------------------------
+LT-1011   V-101 level transmitter
+LV-1011   V-101 level control valve, fail closed
+LAHH-1011 V-101 level high-high alarm
+LALL-1011 V-101 level low-low alarm, set 8%
+PI-1021   P-101A/B common discharge pressure indicator
+ESD-0101  Unit emergency shutdown, initiated by LALL-1011
+
+LINE LIST
+---------
+101-PL-001  Feed inlet to V-101
+101-PL-002  V-101 liquid outlet to P-101A/B suction header
+101-PL-003  P-101A/B discharge header to E-101
+101-PL-004  E-101 outlet to battery limit
+101-VN-001  V-101 vapour outlet to flare header
+
+NOTES ON THE SHEET
+------------------
+1. P-101A and P-101B share a common suction and discharge header.
+2. LV-1011 fails closed on loss of instrument air.
+3. ESD-0101 is initiated by LALL-1011 and trips both feed pumps.
+4. This sheet does not show relief device set points; see the equipment
+   register. A reader asked for a set point from this sheet alone should say it
+   is not on the drawing rather than infer it.

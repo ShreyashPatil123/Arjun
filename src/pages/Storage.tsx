@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   Download,
   Star,
+  ScanSearch,
 } from 'lucide-react';
 import { Button, Spinner, DownloadBar } from '../components/ui';
 import { Can } from '../components/auth/Can';
@@ -22,6 +23,7 @@ import { getInferenceStatus, loadInstalledModel, unloadActiveModel } from '../se
 import { formatSize } from '../services/catalog.service';
 import {
   registryService,
+  type LibraryModel,
   type OrchestratorModelSelection,
   type OrchestratorSwapStep,
 } from '../services/registry.service';
@@ -65,6 +67,13 @@ const isSameModel = (
 export const Storage: React.FC = () => {
   const { addToast } = useToast();
   const [models, setModels] = useState<any[]>([]);
+  /**
+   * The manifest, which is not the same list as the installed packages
+   * above. A model can be registered and running without ever having been
+   * downloaded through this app, which is exactly how both Unlimited-OCR
+   * weights came to be missing from this screen.
+   */
+  const [library, setLibrary] = useState<LibraryModel[]>([]);
   const [summary, setSummary] = useState<any>(null);
   const [loadedModelId, setLoadedModelId] = useState<string | null>(null);
   const [orchestrator, setOrchestrator] = useState<OrchestratorModelSelection | null>(null);
@@ -77,13 +86,19 @@ export const Storage: React.FC = () => {
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [installed, sum, status, configuredOrchestrator] = await Promise.all([
-        getInstalledModels(),
-        getStorageSummary().catch(() => null),
-        getInferenceStatus().catch(() => null),
-        registryService.getOrchestratorModel().catch(() => null),
-      ]);
+      const [installed, sum, status, configuredOrchestrator, registered] =
+        await Promise.all([
+          getInstalledModels(),
+          getStorageSummary().catch(() => null),
+          getInferenceStatus().catch(() => null),
+          registryService.getOrchestratorModel().catch(() => null),
+          // Caught rather than thrown: a manifest this build cannot read is a
+          // reason to show an empty Registered list, not a reason to hide the
+          // packages that are plainly installed.
+          registryService.listLibraryModels().catch(() => []),
+        ]);
       setModels(installed ?? []);
+      setLibrary(registered ?? []);
       setSummary(sum);
       setLoadedModelId(status?.model?.modelId ?? null);
       setOrchestrator(configuredOrchestrator);
@@ -170,6 +185,38 @@ export const Storage: React.FC = () => {
     }
   };
 
+// Detection walks the disk and writes the manifest. It is deliberately a
+  // button rather than something that happens on load: it touches the file
+  // that decides what this machine will run, and an operator should be the one
+  // who asks for that.
+  const handleDetect = async () => {
+    setBusy('detect');
+    try {
+      const report = await registryService.detectSystemModels();
+      setLibrary(report.models);
+      if (report.added.length === 0) {
+        addToast(
+          'info',
+          `Nothing new — ${report.alreadyRegistered} of ${report.filesSeen} weight files in ` +
+            `${report.roots.length} folders were already registered`
+        );
+      } else {
+        const names = report.added.map((m) => m.name).join(', ');
+        addToast(
+          'success',
+          `Registered ${report.added.length} model${report.added.length === 1 ? '' : 's'}: ` +
+            `${names}. Each is cleared for no classification until you review it` +
+            (report.restartRequired ? ', and routing will use them after a restart' : '')
+        );
+      }
+      await refresh();
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const handleUnload = async () => {
     try {
       await unloadActiveModel();
@@ -240,12 +287,28 @@ export const Storage: React.FC = () => {
         <div>
           <h1 className={styles.title}>Storage</h1>
           <p className={styles.subtitle}>
-            Models on this computer. To find new ones, use Discover.
+            Models on this computer. <strong>Detect models</strong> searches the
+            disk for weight files that are installed but unregistered; to find
+            new ones to download, use Discover.
           </p>
         </div>
-        <Button variant="ghost" size="sm" onClick={refresh}>
-          <RefreshCw size={14} /> Refresh
-        </Button>
+        <div className={styles.headerActions}>
+          <Can permission="importModel">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleDetect}
+              disabled={busy !== null}
+              title="Search this computer for weight files and register the ones the manifest does not list"
+            >
+              <ScanSearch size={14} />{' '}
+              {busy === 'detect' ? 'Searching…' : 'Detect models'}
+            </Button>
+          </Can>
+          <Button variant="ghost" size="sm" onClick={refresh} disabled={busy !== null}>
+            <RefreshCw size={14} /> Refresh
+          </Button>
+        </div>
       </header>
 
       {error && (
@@ -389,6 +452,54 @@ export const Storage: React.FC = () => {
             </article>
           );
         })}
+      </section>
+
+      <section className={styles.section}>
+        <h2 className={styles.sectionTitle}>
+          <ScanSearch size={15} /> Registered
+          <span className={styles.count}>{library.length}</span>
+        </h2>
+
+        <p className={styles.empty}>
+          Every model the manifest lists, including ones put on disk by hand.
+          Detection adds what it finds here; it never edits or removes an entry
+          somebody wrote, and everything it adds is cleared for no
+          classification until an administrator reviews it.
+        </p>
+
+        {library.length === 0 && (
+          <p className={styles.empty}>
+            The manifest is empty. Press <strong>Detect models</strong> to search
+            this computer for weight files.
+          </p>
+        )}
+
+        {library.map((m) => (
+          <article key={m.id} className={styles.model}>
+            <div className={styles.modelHead}>
+              <div className={styles.modelInfo}>
+                <h3 className={styles.modelName}>
+                  {m.name}
+                  {m.quantization && <span className={styles.quant}>{m.quantization}</span>}
+                  {!m.present && (
+                    <span className={styles.missing} title={m.path}>
+                      file missing
+                    </span>
+                  )}
+                </h3>
+                <p className={styles.modelMeta}>
+                  {formatSize(m.bytesOnDisk ?? m.weightsBytes)} · {m.runtime}
+                  {m.roles.length > 0 && ` · ${m.roles.join(', ')}`}
+                  {m.projector && ' · vision projector paired'}
+                  {m.permittedClassifications.length === 0 && ' · cleared for nothing'}
+                </p>
+                <p className={styles.modelPath} title={m.path}>
+                  {m.path}
+                </p>
+              </div>
+            </div>
+          </article>
+        ))}
       </section>
     </div>
   );

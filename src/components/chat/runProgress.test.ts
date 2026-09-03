@@ -63,7 +63,7 @@ describe('applyProgress: only real work becomes a step', () => {
     expect(steps.map(s => s.kind)).not.toContain('loading');
   });
 
-  it('a cold model produces a loading step that settles with its real duration', () => {
+  it('a cold model produces a loading step that settles when the model is ready', () => {
     const steps = fold([
       { kind: 'submitted' },
       stage('accepted'),
@@ -72,8 +72,20 @@ describe('applyProgress: only real work becomes a step', () => {
     ]);
     const loading = steps.find(s => s.kind === 'loading');
     expect(loading?.label).toBe('Loaded the model');
-    expect(loading?.detail).toBe('41.2s');
     expect(loading?.endedAt).toBeDefined();
+    // The duration is NOT repeated into the detail: the panel times every row
+    // itself and prints that on the right, so putting it here too showed the
+    // same number twice on one line.
+    expect(loading?.detail).toBeUndefined();
+  });
+
+  it('keeps a detail the loading step already had rather than clearing it', () => {
+    const steps = fold([
+      { kind: 'submitted' },
+      stage('loadingModel', { modelName: 'gemma-4-E4B-it', fullyOnGpu: false }),
+      stage('modelReady', { warm: false, tookMs: 12_000 }),
+    ]);
+    expect(steps.find(s => s.kind === 'loading')?.detail).toBe('partly on the CPU');
   });
 });
 
@@ -202,7 +214,7 @@ describe('applyProgress: the thinking row carries no reasoning', () => {
     ]);
     const thinking = steps[steps.length - 1];
     expect(thinking.label).toBe('Thinking');
-    expect(thinking.detail).toBe('9.0s · 1,240 characters so far');
+    expect(thinking.detail).toBe('1,240 characters so far');
   });
 
   it('cannot render text even if a caller tried to smuggle it through', () => {
@@ -218,7 +230,7 @@ describe('applyProgress: the thinking row carries no reasoning', () => {
     expect(rendered).not.toContain('reasoning that');
   });
 
-  it('the finished row says how long it thought for', () => {
+  it('the finished row reports the size it produced, timed by the panel', () => {
     const steps = fold([
       { kind: 'submitted' },
       { kind: 'thinking', state: 'start', characters: 10, elapsedMs: 0 },
@@ -226,7 +238,8 @@ describe('applyProgress: the thinking row carries no reasoning', () => {
     ]);
     const thinking = steps.find(s => s.kind === 'thinking');
     expect(thinking?.label).toBe('Thought it through');
-    expect(thinking?.detail).toBe('1m 32s · 3,200 characters of private reasoning');
+    expect(thinking?.detail).toBe('3,200 characters of private reasoning');
+    expect(thinking?.endedAt).toBeDefined();
   });
 });
 

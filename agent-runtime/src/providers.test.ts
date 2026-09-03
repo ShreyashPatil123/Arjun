@@ -128,3 +128,32 @@ describe("provider identity", () => {
     }
   });
 });
+
+describe("applyThinkingPolicy: the capability comes from the model, not its name", () => {
+  const payload = { messages: [] };
+
+  it("honours an explicit capability for a model no pattern recognises", () => {
+    // The case the name match cannot answer: a model nobody has added to the
+    // regex, whose own chat template branches on `enable_thinking`.
+    const out = applyThinkingPolicy(payload, "some-new-reasoner-8b", true, true) as {
+      chat_template_kwargs?: Record<string, unknown>;
+    };
+    expect(out.chat_template_kwargs?.enable_thinking).toBe(true);
+  });
+
+  it("leaves a model alone when it says it has no reasoning switch", () => {
+    // The other direction, and the one that matters for correctness: a
+    // fine-tune whose id still matches the pattern but whose template no
+    // longer has the variable must not be sent the kwarg.
+    const out = applyThinkingPolicy(payload, "qwen3-something-distilled", true, false);
+    expect(out).toEqual(payload);
+  });
+
+  it("falls back to the name match when the capability is not supplied", () => {
+    const known = applyThinkingPolicy(payload, "qwen3-9b", true) as {
+      chat_template_kwargs?: Record<string, unknown>;
+    };
+    expect(known.chat_template_kwargs?.enable_thinking).toBe(true);
+    expect(applyThinkingPolicy(payload, "gemma-3-12b-it", true)).toEqual(payload);
+  });
+});

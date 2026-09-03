@@ -31,11 +31,13 @@
 
 pub mod approval;
 pub mod artifacts;
+pub mod audit_health;
 pub mod conversations;
 pub mod events;
 pub mod grants;
 pub mod memory;
 pub mod memory_api;
+pub mod outcome;
 pub mod planning;
 pub mod protocol;
 pub mod recording;
@@ -68,6 +70,7 @@ use crate::orchestrator::calculation::CalculationRecord;
 use crate::orchestrator::gateway::{GatewayVerdict, TaskContext, ToolGateway};
 use crate::orchestrator::plan::Continuation;
 use crate::orchestrator::runner::LocalToolRunner;
+use crate::subagents::InheritedPolicy;
 use crate::orchestrator::executor::ToolRunner;
 use crate::orchestrator::tools::{ToolCall, ToolName};
 use crate::policy::ApprovalState;
@@ -192,6 +195,30 @@ pub struct RuntimeDeps {
     /// message on this one names a row that exists, and carries the sequence
     /// number a client reconciles against.
     pub emit_durable: Arc<dyn Fn(Value) + Send + Sync>,
+    /// The workers a run may delegate a read-only sub-task to.
+    ///
+    /// `agent.delegate_readonly` is the model-facing surface, and it used to
+    /// answer "Subagents are not available on this machine" for every call:
+    /// the runner was constructed with `subagents: None` on the agent path, so
+    /// the manager the application had built was never handed to it.
+    pub subagents: Arc<crate::subagents::SubagentManager>,
+    /// The page-region and table half of the knowledge index.
+    ///
+    /// Backs `knowledge.multimodal_retrieve`. Never constructed outside tests
+    /// before, so that tool was in the catalogue and in the plan with nothing
+    /// behind it.
+    pub multimodal: Arc<crate::knowledge::MultimodalIndex>,
+    /// Whether this installation can still record what it does.
+    ///
+    /// Consulted before a tool with a side effect is authorised. A read is
+    /// still allowed when the record is broken — nothing it does needs writing
+    /// down beyond the event that names it — but a write to disk, a produced
+    /// file or a sandboxed command must not happen where there is nowhere to
+    /// record that it happened. That is the whole of ARJUN's claim: an effect
+    /// with no provenance is worse than no effect.
+    ///
+    /// See [`audit_health`].
+    pub audit_health: Arc<audit_health::AuditHealth>,
 }
 
 impl RuntimeDeps {
@@ -476,7 +503,19 @@ async fn dispatch(
                     .unwrap_or("");
                 if matches!(
                     event_type,
-                    "message_start" | "message_update" | "message_end" | "model_thinking"
+                    "message_start"
+                        | "message_update"
+                        | "message_end"
+                        | "model_thinking"
+                        // `context_ledger` is a reading of where the window
+                        // stands, emitted every turn so the meter a person
+                        // watches describes this run rather than the last one.
+                        // Live-only for the same reason as `model_thinking`: a
+                        // durable row per turn would put the whole itemisation
+                        // on disk dozens of times to preserve a figure the next
+                        // turn supersedes — and the reading that outlives the
+                        // run is already kept, once, on the task record.
+                        | "context_ledger"
                 ) {
                     // Live channel only. Drop on slow consumer.
                     //
@@ -509,6 +548,7 @@ async fn handle(
         "tool.execute" => execute(params, deps).await,
         "tool.catalogue" => tool_catalogue(params, deps),
         "capability.search" => capability_search(params, deps),
+        "skill.load" => skill_load(params, deps),
         // The whole of a model's reach into memory. Both fill in identity,
         // project, classification and approval on this side; neither takes them
         // from the caller. See [`memory_api`].
@@ -519,6 +559,40 @@ async fn handle(
             format!("no handler for {other}"),
         )),
     }
+}
+
+/// The tools a registered plan permits, or `None` when there is no such plan.
+///
+/// A poisoned table reads as no plan. That is the fail-closed reading and the
+/// correct one: the budget could not be consulted, so nothing may be authorised
+/// against it.
+fn registered_plan_tools(deps: &Arc<RuntimeDeps>, run_id: &str) -> Option<Vec<ToolName>> {
+    deps.plans
+        .lock()
+        .ok()?
+        .get(run_id)
+        .map(|plan| plan.budget.permitted_tools.clone())
+}
+
+/// Whether this run has a plan registered on this side.
+fn has_registered_plan(deps: &Arc<RuntimeDeps>, run_id: &str) -> bool {
+    deps.plans
+        .lock()
+        .map(|plans| plans.contains_key(run_id))
+        .unwrap_or(false)
+}
+
+/// The wire error for a call that names a run this side does not know.
+///
+/// Deliberately says nothing about which runs *do* exist. A caller probing ids
+/// learns only that this one is not one of them.
+fn no_plan_error(run_id: &str) -> WireError {
+    WireError::new(
+        code::REFUSED,
+        format!(
+            "There is no plan registered for run {run_id}, so nothing may be done under it. A              run id this side has not issued, or one whose run has already ended, has no              authority to catalogue, authorise or execute any tool."
+        ),
+    )
 }
 
 /// Which tools this run may be offered, as metadata rather than as schemas.
@@ -536,12 +610,20 @@ async fn handle(
 /// before the model is told anything, so this cannot be widened by anything the
 /// model does afterwards.
 ///
-/// ## Why a run with no plan gets the read-only set
+/// ## Why a run with no plan gets nothing
 ///
-/// The runtime's health probe belongs to no run and has no plan. Returning
-/// everything would make the probe the widest surface in the product; returning
-/// nothing would make it fail. The read-only tools are the honest middle: enough
-/// to prove the wire works, and nothing that can leave a trace.
+/// The plan is the authority for what a run may do, so a run id this side has
+/// never heard of has no authority at all. It used to get the read-only set,
+/// justified by the runtime's health probe — which does not ask for a
+/// catalogue. `health` is its own RPC, served in `agent-runtime/src/main.ts`
+/// and answered without touching a tool, so the exception protected nothing and
+/// cost a great deal: any string in the `runId` field returned a working
+/// catalogue of every read-only tool in the product, and a search runs against
+/// the organisation's own documents.
+///
+/// So it fails closed. If some future probe genuinely needs tools, the answer
+/// is a dedicated probe context with a plan of its own — a signed, bounded,
+/// auditable thing — not a hole that any unrecognised id falls through.
 fn tool_catalogue(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
     use crate::orchestrator::tools::spec_for;
 
@@ -550,23 +632,33 @@ fn tool_catalogue(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireE
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let planned: Option<Vec<ToolName>> = deps
-        .plans
-        .lock()
-        .ok()
-        .and_then(|plans| plans.get(run_id).map(|plan| plan.budget.permitted_tools.clone()));
+    let Some(planned) = registered_plan_tools(deps, run_id) else {
+        return Err(no_plan_error(run_id));
+    };
 
     let mode = crate::sovereignty::global_broker().mode();
 
-    let eligible: Vec<ToolName> = match planned {
-        Some(permitted) => permitted,
-        None => ToolName::ALL
-            .iter()
-            .copied()
-            .filter(|tool| tool.is_read_only())
-            .collect(),
-    }
-    .into_iter()
+    // Whether any declared subagent role can actually be performed here.
+    //
+    // A profile is a declaration and a worker is what performs it, and a build
+    // with profiles but no workers refuses every delegation with "the role is
+    // declared but this build has no worker for it". Offering the tool anyway
+    // is not neutral: the model reads five role names in the tool description,
+    // delegates, is refused, and has spent a turn out of a budget the plan
+    // fixed before it started. On a multi-step task it does that repeatedly and
+    // the run ends having done nothing but ask.
+    //
+    // So the tool is withheld when nothing behind it can run. A tool a model is
+    // never shown is one it cannot spend a turn being refused for asking about
+    // — the same reasoning the mode filter below is written on.
+    let delegation_possible = deps
+        .subagents
+        .profiles()
+        .any(|profile| deps.subagents.has_worker(&profile.name));
+
+    let eligible: Vec<ToolName> = planned
+        .into_iter()
+        .filter(|tool| *tool != ToolName::AgentDelegateReadonly || delegation_possible)
     // Applied again here even though the plan was already filtered when it was
     // made. The two are not the same check: a plan is fixed at the start of a
     // run, and this is asked whenever the runtime starts a loop — including
@@ -626,18 +718,15 @@ fn capability_search(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wi
         .unwrap_or_default();
 
     // The run's own tool list, so a card can be read against what this task can
-    // actually do. A run with no plan registered permits nothing, which is the
-    // correct answer rather than an error: the health probe belongs to no run.
-    let permits: Vec<ToolName> = deps
-        .plans
-        .lock()
-        .ok()
-        .and_then(|plans| {
-            plans
-                .get(run_id)
-                .map(|plan| plan.budget.permitted_tools.clone())
-        })
-        .unwrap_or_default();
+    // actually do.
+    //
+    // A run with no plan is refused rather than answered with an empty permit
+    // list. Skill *descriptions* are not secret, but they name what this
+    // deployment can do and who it is for, and a surface that answers to any id
+    // at all is a surface worth probing. The same rule the catalogue follows.
+    let Some(permits) = registered_plan_tools(deps, run_id) else {
+        return Err(no_plan_error(run_id));
+    };
 
     let context = crate::skills::SkillContext {
         session: &session,
@@ -654,6 +743,156 @@ fn capability_search(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wi
         // Said explicitly so a caller does not have to infer it from the shape.
         "note": "Metadata only. Ask for a skill by name to read its instructions.",
     }))
+}
+
+/// Loads one skill's instructions into a run, by name.
+///
+/// ## Why this exists
+///
+/// `capability.search` returns *cards* — a name, a description, a version, a
+/// tool list — and never a skill's instructions. That split is deliberate: it
+/// is what stops every skill on the machine reaching every prompt. Loading the
+/// body is the separate, deliberate second step.
+///
+/// `SkillRegistry::load` has always performed every check that step needs:
+/// registry identity, the trust list's hash against the bytes on disk *now*,
+/// the ARJUN version requirement, the required binaries, the signed-in
+/// person's clearance, and the sovereignty mode. Nothing called it. The
+/// checking was complete and the capability did not exist, so a skill could be
+/// listed and never used.
+///
+/// ## What loading a skill can and cannot do
+///
+/// It can narrow. [`crate::skills::narrowing::narrow`] builds the resulting
+/// tool set by *filtering the run's own list*, so a tool the run does not hold
+/// cannot enter it by any path — whatever the skill's manifest asked for. The
+/// refused list is returned so the model is told what it did not get rather
+/// than discovering it one refusal at a time.
+///
+/// It cannot widen anything: not the tool set, not the classification, not the
+/// approval class. A skill is guidance, not permission.
+fn skill_load(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+    let session = deps.session()?;
+    let run_id = params
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+
+    if name.is_empty() {
+        return Err(WireError::new(
+            code::BAD_PARAMS,
+            "skill.load needs the name of a skill",
+        ));
+    }
+
+    // Fail closed on a run this side does not know, the same as every other
+    // method that acts under a run's authority. A skill body is instructions
+    // put in front of a model; an unrecognised run has no authority to ask for
+    // any.
+    let Some(permits) = registered_plan_tools(deps, run_id) else {
+        return Err(no_plan_error(run_id));
+    };
+
+    let context = crate::skills::SkillContext {
+        session: &session,
+        // Read now rather than when the run started: switching the workbench
+        // into provisioning mode must change which skills may be loaded, not
+        // only which ones could have been.
+        mode: crate::sovereignty::global_broker().mode(),
+        run_permits: &permits,
+    };
+
+    let loaded = match deps.skills.load(name, &context) {
+        Ok(loaded) => loaded,
+        Err(refusal) => {
+            let reason = refusal.explain();
+            deps.remember(
+                run_id,
+                events::TaskEventType::SkillRefused,
+                json!({ "skill": name, "reason": reason }),
+            );
+            return Err(WireError::new(code::REFUSED, reason));
+        }
+    };
+
+    // Bounded before it goes anywhere near a context window. A skill body is
+    // capped at read time by `MAX_SKILL_BYTES`, and this is the second cap: the
+    // one that keeps a large-but-legal skill from displacing the task's own
+    // instructions. Truncation is reported rather than silent — a model acting
+    // on half a procedure should know it has half.
+    let (body, truncated) = bound_skill_body(&loaded.body);
+
+    deps.remember(
+        run_id,
+        events::TaskEventType::SkillLoaded,
+        json!({
+            "skill": loaded.manifest.name,
+            "version": loaded.manifest.version,
+            // The hash the bytes were checked against, so the record says which
+            // revision of the instructions this run was given.
+            "sha256": loaded.manifest.sha256,
+            "bodyChars": body.chars().count(),
+            "truncated": truncated,
+            "toolsAllowed": loaded
+                .narrowed
+                .tools
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>(),
+            "toolsRefused": loaded
+                .narrowed
+                .refused
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(json!({
+        "name": loaded.manifest.name,
+        "version": loaded.manifest.version,
+        "sha256": loaded.manifest.sha256,
+        // The instructions themselves. The only place in the product that
+        // returns them, and only after every check above passed.
+        "body": body,
+        "truncated": truncated,
+        // What the run may use from here. Never wider than it already was.
+        "tools": loaded
+            .narrowed
+            .tools
+            .iter()
+            .map(|tool| tool.as_str())
+            .collect::<Vec<_>>(),
+        "refused": loaded
+            .narrowed
+            .refused
+            .iter()
+            .map(|tool| tool.as_str())
+            .collect::<Vec<_>>(),
+        "note": "These instructions are guidance. They do not grant any tool this run did not                  already hold, and every call is still put to the gateway.",
+    }))
+}
+
+/// Caps a skill body at what may reasonably enter a context window.
+///
+/// Separate from the read cap, which is about not loading a huge file at all.
+/// This is about not letting a large-but-legal skill displace the task's own
+/// instructions. Cut on a character boundary and reported.
+fn bound_skill_body(body: &str) -> (String, bool) {
+    /// Roughly four thousand tokens of guidance — long enough for a real
+    /// procedure, short enough to leave the window to the work.
+    const MAX_BODY_CHARS: usize = 16_000;
+
+    if body.chars().count() <= MAX_BODY_CHARS {
+        return (body.to_string(), false);
+    }
+    let cut: String = body.chars().take(MAX_BODY_CHARS).collect();
+    (cut, true)
 }
 
 /// Fields both tool methods need off the wire.
@@ -728,6 +967,39 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         return Ok(refused(deps, &call, reason));
     }
 
+    // A run this side has no plan for has no authority to do anything.
+    //
+    // Asked first, before the ending check even, because the two answer
+    // different questions: "this run finished" presumes the run existed. An
+    // invented id belongs to no run at all, and the honest answer to it is not
+    // a refusal message about a task — it is that there is no task.
+    //
+    // Before this, `plan_refusal` returned `None` for a missing plan (an early
+    // `?` on the table lookup), which the caller read as "no objection". The
+    // call then went to the gateway, which grants on the signed-in person's
+    // permissions alone — so any string in `runId` could authorise a search of
+    // the organisation's documents, outside every budget, with no step counted
+    // and no plan to hold it to.
+    if !has_registered_plan(deps, &call.run_id) {
+        return Err(no_plan_error(&call.run_id));
+    }
+
+    // Nothing with a side effect happens that cannot be written down.
+    //
+    // A read is still allowed: nothing it does needs recording beyond the event
+    // naming it, and refusing reads would leave a degraded installation unable
+    // even to explain itself. A write, a produced file or a sandboxed command
+    // is different — an effect on this machine with no provenance is worse than
+    // no effect, and provenance is exactly what is not working.
+    //
+    // Checked here rather than only at `agent_start_run` because storage can
+    // stop working *during* a run: the run that was already in flight when the
+    // disk filled is the one that would otherwise write a document nobody can
+    // account for.
+    if let Some(reason) = durability_refusal(&call, deps) {
+        return Ok(refused(deps, &call, reason));
+    }
+
     // The plan is consulted before the gateway. A task that is out of time
     // should not be asking about permissions, and "you have run out of steps"
     // is a more useful thing to tell a model than "that path is fine, but
@@ -745,7 +1017,16 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         return Ok(refused(deps, &call, reason));
     }
 
-    let verdict = decide(&call, deps, ApprovalState::NotRequested)?;
+    // The reservation is live from here, so a failure that leaves by `?` has to
+    // give it back explicitly — `refused` covers the paths that produce a
+    // verdict, and these do not.
+    let verdict = match decide(&call, deps, ApprovalState::NotRequested) {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(error);
+        }
+    };
 
     let (tool, resolved_path) = match verdict {
         GatewayVerdict::Allow {
@@ -758,7 +1039,13 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
             summary,
             resolved_path,
         } => {
-            let session = deps.session()?;
+            let session = match deps.session() {
+                Ok(session) => session,
+                Err(error) => {
+                    release_reservation(deps, &call.run_id, &call.tool_call_id);
+                    return Err(error);
+                }
+            };
             let target = resolved_path
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -802,10 +1089,13 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
         }
     };
 
-    let grant = ledger()
-        .lock()
-        .map_err(|_| WireError::new(code::INTERNAL, "grant ledger is poisoned"))?
-        .issue(&call.run_id, &call.tool_call_id, &call.tool, &call.args);
+    let grant = match ledger().lock() {
+        Ok(mut ledger) => ledger.issue(&call.run_id, &call.tool_call_id, &call.tool, &call.args),
+        Err(_) => {
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(WireError::new(code::INTERNAL, "grant ledger is poisoned"));
+        }
+    };
 
     deps.remember(
         &call.run_id,
@@ -905,6 +1195,28 @@ fn hook_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
     report.refusal()
 }
 
+/// Refuses a side-effecting call while this installation cannot record it.
+///
+/// Read-only calls pass. The distinction is the one the whole product rests on:
+/// a search that is not written down costs a line in a trace, and a document
+/// written to disk that is not written down is an artefact with no provenance —
+/// which is the thing an engineer would be asked to sign, and the thing nobody
+/// could then stand behind.
+fn durability_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
+    // An unknown tool is not this check's business; `decide` refuses it by
+    // name. Treating it as side-effecting here would produce a misleading
+    // reason for a call that was never going to run.
+    let tool = ToolName::from_str(&call.tool)?;
+    if tool.is_read_only() {
+        return None;
+    }
+    let refusal = deps.audit_health.refusal()?;
+    Some(format!(
+        "{} needs to be recorded before it can be done, and this installation cannot record it. {refusal}",
+        call.tool
+    ))
+}
+
 fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
     let stopped = {
         // A poisoned table is a panic that happened while the budget was being
@@ -918,9 +1230,11 @@ fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
                     .to_string(),
             );
         };
-        // No plan at all is different, and is allowed: the runtime's own health
-        // probe belongs to no run, and refusing it would break the check rather
-        // than enforce anything.
+        // A missing plan is not reachable here: `authorize` refuses a run it has
+        // no plan for before this is called, and `execute` does the same. The
+        // `?` is what remains of the old health-probe exception, which used to
+        // read a missing plan as "no objection" — kept only so a table that
+        // changed under this call cannot panic, and no longer a way in.
         let plan = plans.get_mut(&call.run_id)?;
 
         // Checked before `may_call`, which halts the whole plan on an
@@ -943,7 +1257,19 @@ fn plan_refusal(call: &CallParams, deps: &Arc<RuntimeDeps>) -> Option<String> {
             ));
         }
 
-        match plan.may_call(&ToolCall::new(call.tool.clone(), call.args.clone())) {
+        // Reserved, not merely checked.
+        //
+        // The slot is taken here, under the lock that just decided there was
+        // one, and before any grant is issued. The runtime runs read-only tools
+        // in parallel, so four searches in a turn arrive here as four
+        // concurrent authorisations; when this only *asked* whether there was
+        // room, all four read the same unchanged figure and all four were let
+        // through. Everything downstream now either settles this lease or gives
+        // it back — see `release_reservation`.
+        match plan.reserve(
+            &call.tool_call_id,
+            &ToolCall::new(call.tool.clone(), call.args.clone()),
+        ) {
             Continuation::Proceed => return None,
             Continuation::Stop(reason) => reason,
         }
@@ -1076,6 +1402,18 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
         .and_then(Value::as_str)
         .ok_or_else(|| WireError::new(code::REFUSED, "no authorisation grant was presented"))?;
 
+    // Asked again here, and not only in `authorize`.
+    //
+    // A grant is single-use and bound to its call, so in the ordinary course
+    // nothing reaches this without having passed the same check a moment ago.
+    // But the two are separated in time, and what changes in between is exactly
+    // what matters: a run that ended between authorisation and execution has
+    // had its plan released, and a call redeemed against a plan that is no
+    // longer registered is an action outside every budget this side can name.
+    if !has_registered_plan(deps, &call.run_id) {
+        return Err(no_plan_error(&call.run_id));
+    }
+
     ledger()
         .lock()
         .map_err(|_| WireError::new(code::INTERNAL, "grant ledger is poisoned"))?
@@ -1095,19 +1433,41 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
     // `Granted` because the grant is itself the evidence a person already said
     // yes: re-deciding as `NotRequested` would put the same request in front of
     // the same approver a second time, for an action they have just approved.
-    let verdict = decide(&call, deps, ApprovalState::Granted)?;
+    //
+    // A refusal here is a call that will not run, so its reservation goes back:
+    // the slot was taken when the gateway said yes a moment ago, and the state
+    // it decides against has changed since. Charging the run for a step the
+    // policy then stopped would let a rule the model kept running into exhaust
+    // a run that had done nothing.
+    let verdict = match decide(&call, deps, ApprovalState::Granted) {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(error);
+        }
+    };
     let (tool, resolved_path) = match verdict {
         GatewayVerdict::Allow {
             tool,
             resolved_path,
         } => (tool, resolved_path),
         GatewayVerdict::NeedsApproval { summary, .. } => {
-            return Err(WireError::new(code::REFUSED, summary))
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(WireError::new(code::REFUSED, summary));
         }
-        GatewayVerdict::Refuse { reason } => return Err(WireError::new(code::REFUSED, reason)),
+        GatewayVerdict::Refuse { reason } => {
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(WireError::new(code::REFUSED, reason));
+        }
     };
 
-    let session = deps.session()?;
+    let session = match deps.session() {
+        Ok(session) => session,
+        Err(error) => {
+            release_reservation(deps, &call.run_id, &call.tool_call_id);
+            return Err(error);
+        }
+    };
     // Anchored the same way the gateway saw it, so the tool acts on exactly the
     // path that was judged rather than on the raw argument.
     let tool_call = anchor_path(
@@ -1181,7 +1541,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
                 // Counted like any other call. A replay still costs a turn and
                 // a slice of the context window, and a budget that did not
                 // count it is one a model repeating itself never reaches.
-                record_step(deps, &call.run_id, tool);
+                record_step(deps, &call.run_id, &call.tool_call_id, tool);
                 return match outcome {
                     // Cut and sanitised exactly as a fresh result is. A replay
                     // that came back longer than the same call did the first
@@ -1207,6 +1567,8 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
                     recorded.tool, recorded.target
                 );
                 remember_refusal(deps, &call, &reason);
+                // Not started, so not charged.
+                release_reservation(deps, &call.run_id, &call.tool_call_id);
                 return Err(WireError::new(code::REFUSED, reason));
             }
 
@@ -1217,12 +1579,16 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
             events::EffectLookup::Unknown(recorded) => {
                 let reason = recorded.unknown_refusal();
                 remember_refusal(deps, &call, &reason);
+                // Not started, so not charged.
+                release_reservation(deps, &call.run_id, &call.tool_call_id);
                 return Err(WireError::new(code::REFUSED, reason));
             }
 
             events::EffectLookup::Conflict(conflict) => {
                 let reason = conflict.to_string();
                 remember_refusal(deps, &call, &reason);
+                // Not started, so not charged.
+                release_reservation(deps, &call.run_id, &call.tool_call_id);
                 return Err(WireError::new(code::REFUSED, reason));
             }
         }
@@ -1287,11 +1653,42 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
         )
         .map(|value| render_memory(&value))
         .map_err(|error| error.message),
+        // Served through the same handler the RPC uses, for exactly the reason
+        // memory is: two paths with two implementations are two places for the
+        // plan and session filtering to drift.
+        //
+        // It used to fall through to `LocalToolRunner`, which refuses it —
+        // "served on the agent path, not by this runner" — so a model that
+        // called `capability.search` got an error saying the tool was
+        // available somewhere else. It was in the catalogue, it was in the
+        // plan, and it could not be called.
+        ToolName::CapabilitySearch => capability_search(
+            json!({
+                "runId": call.run_id,
+                "query": tool_call.text("query").unwrap_or_default(),
+            }),
+            deps,
+        )
+        .map(|value| render_capabilities(&value))
+        .map_err(|error| error.message),
         ToolName::ValidateArtifact => {
             validate(deps, &call.run_id, resolved_path.as_deref(), &session, &tool_call).await
         }
         _ => {
-            let runner = LocalToolRunner::new(deps.index.as_ref(), &session);
+            // Built with everything the run has, rather than with the index
+            // alone.
+            //
+            // The agent path used to construct this with `LocalToolRunner::new`,
+            // leaving `multimodal`, `subagents`, `inherited` and `run_workspace`
+            // all `None`. Three tools in the catalogue were therefore
+            // unreachable: `knowledge.multimodal_retrieve` had no index,
+            // `agent.delegate_readonly` answered "subagents are not available
+            // on this machine", and any worker that had started would have had
+            // no workspace to be confined to.
+            let workspace = deps.root_for(&call.run_id);
+            let inherited =
+                inherited_policy_for(deps, &session, &call.run_id, workspace.as_deref());
+            let runner = runner_for(deps, &session, inherited.as_ref(), workspace.as_deref());
             let result = runner.run(tool, &tool_call, resolved_path.as_deref()).await;
             // A successful calculation is kept, so the workbook can show the
             // working rather than the model's memory of it.
@@ -1327,7 +1724,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
     // Counted whatever the tool returned. A failed call cost the same wall
     // clock and the same context window as a successful one, and a budget that
     // only counts successes is one a model going in circles never reaches.
-    record_step(deps, &call.run_id, tool);
+    record_step(deps, &call.run_id, &call.tool_call_id, tool);
 
     match outcome {
         // Cut to the tool's own ceiling on the way out, in one place. Doing it
@@ -1460,7 +1857,22 @@ fn record_call(
 }
 
 /// Marks a step spent and publishes how far through the plan the run is.
-fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
+/// Gives back a slot reserved for a call that will not run.
+///
+/// Called from every path that refuses *after* the plan admitted the call: the
+/// durability check, a deployment hook, the gateway itself, a declined
+/// approval, a grant that was never redeemed. None of those spent anything, and
+/// a budget that charged for them would let a policy the model kept running
+/// into exhaust a run that had done no work.
+fn release_reservation(deps: &Arc<RuntimeDeps>, run_id: &str, tool_call_id: &str) {
+    if let Ok(mut plans) = deps.plans.lock() {
+        if let Some(plan) = plans.get_mut(run_id) {
+            plan.release(tool_call_id);
+        }
+    }
+}
+
+fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool_call_id: &str, tool: ToolName) {
     // Built inside the lock, published outside it: the handler is arbitrary
     // code, and holding the plan table across a slow listener would stall every
     // other run's authorisation.
@@ -1471,16 +1883,32 @@ fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
         let Some(plan) = plans.get_mut(run_id) else {
             return;
         };
-        // `record_call`, not `record_step`: one planned step can take several
-        // tool calls, and ticking a step off per call would report a document
-        // as produced and checked after four searches.
-        plan.record_call();
+        // Settles the slot this call reserved when it was authorised, rather
+        // than incrementing a counter. Two things follow from that and neither
+        // is true of a bare increment: a call cannot be charged twice, because
+        // the second settlement finds no lease; and a call that never reserved
+        // one -- which should not happen, and would mean a grant issued outside
+        // the plan -- is not silently charged to a budget it never entered.
+        //
+        // A step, not a checklist tick: one planned step can take several tool
+        // calls, and ticking a step off per call would report a document as
+        // produced and checked after four searches.
+        if !plan.settle(tool_call_id) {
+            log::warn!(
+                "[tasks] run {run_id}: {} settled without holding a reservation; the budget was                  not charged for it",
+                tool.as_str()
+            );
+            return;
+        }
         json!({
             "type": "plan_step",
             "tool": tool.as_str(),
             "stepsTaken": plan.steps_taken(),
             "maxSteps": plan.budget.max_steps,
             "stepsPlanned": plan.steps.len(),
+            // What else is in flight. A person watching a parallel batch sees
+            // the counter jump and wants to know which calls did it.
+            "inFlight": plan.leases_outstanding(),
         })
     };
     deps.publish(run_id, progress.clone());
@@ -1495,6 +1923,108 @@ fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool: ToolName) {
             "maxSteps": progress.get("maxSteps").cloned().unwrap_or(Value::Null),
         }),
     );
+}
+
+/// Builds the tool runner with everything this run carries.
+///
+/// The inherited policy is derived here rather than stored, because it is a
+/// function of things that can change during a run: who is signed in, what the
+/// plan still permits, and where the run is writing. A policy captured at start
+/// would be one a narrowing mid-run could not tighten.
+///
+/// Every field narrows a child and none widens it — `InheritedPolicy::of_run`
+/// takes the run's *permitted tools*, so a worker cannot be handed a tool its
+/// parent does not hold, and takes the run's workspace, so it cannot reach a
+/// file outside it.
+fn runner_for<'a>(
+    deps: &'a Arc<RuntimeDeps>,
+    session: &'a Session,
+    inherited: Option<&'a InheritedPolicy>,
+    workspace: Option<&'a std::path::Path>,
+) -> LocalToolRunner<'a> {
+    let mut runner = LocalToolRunner::with_multimodal(
+        deps.index.as_ref(),
+        deps.multimodal.as_ref(),
+        session,
+    );
+    runner.subagents = Some(deps.subagents.as_ref());
+    runner.inherited = inherited;
+    runner.run_workspace = workspace;
+    runner
+}
+
+/// The policy a child of this run would inherit.
+///
+/// Derived per call rather than stored, because it is a function of things that
+/// can change during a run: who is signed in, what the plan still permits, and
+/// where the run is writing. A policy captured at start-up would be one that a
+/// narrowing mid-run could not tighten.
+///
+/// `None` when the run has no plan — a run this side does not know has no
+/// permitted tools to pass on, and a child inheriting an empty set could do
+/// nothing anyway. Returning `None` makes the delegation refuse with the
+/// reason rather than start a worker that can do nothing.
+fn inherited_policy_for(
+    deps: &Arc<RuntimeDeps>,
+    session: &Session,
+    run_id: &str,
+    workspace: Option<&std::path::Path>,
+) -> Option<InheritedPolicy> {
+    let permitted = registered_plan_tools(deps, run_id)?;
+    let root = workspace?;
+    Some(InheritedPolicy::of_run(
+        session,
+        // The ceiling a child may not exceed. Taken as the most restrictive
+        // this deployment recognises rather than the parent's own, because a
+        // read-only worker has no business seeing more than it must.
+        crate::policy::Classification::Internal,
+        root,
+        &permitted,
+    ))
+}
+
+/// Turns the skill cards into the prose the model reads.
+///
+/// Metadata only, and said so: a card carries a name, a description, a version
+/// and a tool list, never a skill's instructions. Loading those is the separate
+/// `skill.load` step, and a model told the difference here does not have to
+/// infer it.
+fn render_capabilities(value: &Value) -> String {
+    let cards = value.get("skills").and_then(Value::as_array);
+    let Some(cards) = cards.filter(|cards| !cards.is_empty()) else {
+        // Said plainly. A model told nothing came back asks a different next
+        // question from one told the search failed.
+        return "No installed skill matches that, so nothing was loaded. Carry on with the \
+                tools this task already has."
+            .to_string();
+    };
+
+    let mut out = String::from(
+        "These installed skills match. This is their description only; ask for one by name to \
+         read its instructions.\n\n",
+    );
+    for card in cards {
+        let name = card.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+        let description = card
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("no description");
+        let version = card.get("version").and_then(Value::as_str).unwrap_or("?");
+        out.push_str(&format!("- {name} (v{version}): {description}"));
+        // Whether it can actually be used right now. A card for a quarantined
+        // skill is still worth showing -- a model that cannot see it will keep
+        // looking for it -- but presenting it as usable would waste a step.
+        if card.get("available").and_then(Value::as_bool) == Some(false) {
+            let why = card
+                .get("unavailableBecause")
+                .and_then(Value::as_str)
+                .unwrap_or("it is not available");
+            out.push_str(&format!(" — not usable: {why}"));
+        }
+        out.push_str("
+");
+    }
+    out
 }
 
 /// Turns a memory result into the prose the model reads.

@@ -791,6 +791,7 @@ impl LlamaCppRuntime {
                     text: String::new(),
                     is_final: true,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: Some("cancelled".to_string()),
                 });
                 break;
@@ -803,6 +804,7 @@ impl LlamaCppRuntime {
                     text: String::new(),
                     is_final: true,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: Some("length".to_string()),
                 });
                 break;
@@ -815,6 +817,7 @@ impl LlamaCppRuntime {
                     text: String::new(),
                     is_final: true,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: Some("context_length".to_string()),
                 });
                 break;
@@ -833,6 +836,7 @@ impl LlamaCppRuntime {
                     text: String::new(),
                     is_final: true,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: Some("stop".to_string()),
                 });
                 break;
@@ -862,6 +866,7 @@ impl LlamaCppRuntime {
                     text: String::new(),
                     is_final: true,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: Some("stop".to_string()),
                 });
                 break;
@@ -886,6 +891,7 @@ impl LlamaCppRuntime {
                     text: emit_text,
                     is_final: false,
                     tokens_generated: Some(n_generated),
+                    prompt_tokens: Some(n_prompt_tokens as u32),
                     finish_reason: None,
                 });
             }

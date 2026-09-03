@@ -75,6 +75,19 @@ async fn bind_with_retry(
 }
 
 pub async fn start_gateway(state: Arc<GatewayState>) -> anyhow::Result<GatewayHandle> {
+    // Checked before a socket is opened.
+    //
+    // `GatewayConfig::enabled` existed, appeared in the UI, and was never read:
+    // this function bound regardless. Every installation therefore served the
+    // model over HTTP to anything that could reach loopback, whether or not
+    // anybody had turned it on — and turning it *off* in the UI changed
+    // nothing at all.
+    if !state.enabled() {
+        anyhow::bail!(
+            "The local gateway is turned off, so nothing is listening. Turn it on in settings              to let other tools on this machine use this model."
+        );
+    }
+
     let requested_port = state.port();
     let app = router(state.clone());
 
@@ -244,16 +257,26 @@ fn submit(
 }
 
 /// Drains the whole answer for non-streaming requests.
-async fn collect(handle: &mut GenerationHandle) -> (String, String, u32) {
+///
+/// Returns the text, the finish reason, the generated-token count, and the
+/// prompt-token count the runtime's tokenizer reported — `None` when no chunk
+/// carried one, which is the case a caller must pass on rather than paper over.
+async fn collect(handle: &mut GenerationHandle) -> (String, String, u32, Option<u32>) {
     let mut text = String::new();
     let mut finish = "stop".to_string();
     let mut tokens = 0u32;
+    let mut prompt_tokens = None;
 
     while let Some(chunk) = handle.chunks.recv().await {
         text.push_str(&chunk.text);
         if let Some(n) = chunk.tokens_generated {
             tokens = n;
         }
+        // Every chunk of one generation carries the same prompt count, so the
+        // first that has it settles the matter. Taken with `or` rather than by
+        // assignment so a terminal chunk built on an error path — which counted
+        // nothing and reports `None` — cannot erase a figure already measured.
+        prompt_tokens = prompt_tokens.or(chunk.prompt_tokens);
         if chunk.is_final {
             if let Some(reason) = chunk.finish_reason {
                 finish = reason;
@@ -261,7 +284,7 @@ async fn collect(handle: &mut GenerationHandle) -> (String, String, u32) {
             break;
         }
     }
-    (text, finish, tokens)
+    (text, finish, tokens, prompt_tokens)
 }
 
 /// How a generation ended, shared between the body and tail of a stream.
@@ -312,9 +335,12 @@ async fn openai_chat(
     let created = now_secs();
 
     if !req.stream {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let (text, finish, tokens, prompt_tokens) = collect(&mut handle).await;
         state.finish_request();
-        return Json(ChatCompletionResponse::new(id, created, model, text, &finish, tokens)).into_response();
+        return Json(ChatCompletionResponse::new(
+            id, created, model, text, &finish, tokens, prompt_tokens,
+        ))
+        .into_response();
     }
 
     Sse::new(openai_stream(state.clone(), handle, id, created, model))
@@ -403,10 +429,11 @@ async fn anthropic_messages(
     let id = short_id("msg_");
 
     if !req.stream {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let (text, finish, tokens, prompt_tokens) = collect(&mut handle).await;
         state.finish_request();
         let stop = anthropic::map_stop_reason(&finish);
-        return Json(MessagesResponse::new(id, model, text, stop, tokens)).into_response();
+        return Json(MessagesResponse::new(id, model, text, stop, tokens, prompt_tokens))
+            .into_response();
     }
 
     Sse::new(anthropic_stream(state.clone(), handle, id, model))
@@ -569,6 +596,102 @@ mod server_tests {
                 .await
                 .is_ok(),
             "the fallback port must be live"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    //! Whether the gateway listens at all.
+    //!
+    //! ## The defect
+    //!
+    //! `GatewayConfig::enabled` existed, appeared in the UI, defaulted to
+    //! `true`, and was never read. `start_gateway` bound a socket regardless,
+    //! so every installation served this machine's model over HTTP to anything
+    //! that could reach loopback — and turning the setting *off* changed
+    //! nothing at all.
+    //!
+    //! A listening socket that serves the model is a useful thing and it is not
+    //! the default posture of a product whose thesis is that nothing happens on
+    //! this machine without a reviewed decision.
+
+    use super::*;
+    use crate::ai_engine::scheduler::GenerationScheduler;
+    use crate::gateway::state::GatewayConfig;
+
+    fn state_with(enabled: bool) -> Arc<GatewayState> {
+        let inference = Arc::new(crate::ai_engine::manager::InferenceManager::new());
+        let scheduler = Arc::new(GenerationScheduler::start(inference.clone()));
+        Arc::new(GatewayState::new(
+            scheduler,
+            inference,
+            GatewayConfig {
+                enabled,
+                // Port 0 so a test that *does* bind takes whatever is free.
+                port: 0,
+                apply_capabilities: false,
+            },
+        ))
+    }
+
+    #[test]
+    fn the_gateway_is_off_by_default() {
+        // The security posture, as a value rather than as a comment.
+        assert!(
+            !GatewayConfig::default().enabled,
+            "a listening socket serving the model must be opted into"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_gateway_does_not_bind() {
+        let state = state_with(false);
+        let error = start_gateway(state)
+            .await
+            .expect_err("a disabled gateway must not open a socket");
+        let message = error.to_string();
+        // The refusal says what to do about it, because a person who wanted
+        // the gateway needs to know why nothing is listening.
+        assert!(message.contains("turned off"), "{message}");
+        assert!(message.contains("settings"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_enabled_gateway_binds_loopback_only() {
+        // The other half: turning it on works, and what it binds is loopback.
+        // Never 0.0.0.0 — that would put the model on the network.
+        let state = state_with(true);
+        let handle = start_gateway(state.clone())
+            .await
+            .expect("an enabled gateway binds");
+        assert!(handle.port > 0);
+        assert_eq!(
+            state.port(),
+            handle.port,
+            "the bound port must be published so tools are handed the real one"
+        );
+    }
+
+    #[test]
+    fn the_setting_can_be_toggled_at_runtime_and_reports_the_previous_value() {
+        let state = state_with(false);
+        assert!(!state.enabled());
+        assert!(!state.set_enabled(true), "the previous value was off");
+        assert!(state.enabled());
+        assert!(state.set_enabled(false), "the previous value was on");
+        assert!(!state.enabled());
+    }
+
+    #[tokio::test]
+    async fn toggling_it_off_stops_the_next_start() {
+        // The runtime toggle has to reach the thing that binds, not only the
+        // thing that displays.
+        let state = state_with(true);
+        state.set_enabled(false);
+        assert!(
+            start_gateway(state).await.is_err(),
+            "a gateway turned off at runtime must not bind on the next start"
         );
     }
 }

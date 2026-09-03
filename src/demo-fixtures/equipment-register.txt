@@ -1,0 +1,28 @@
+SYNTHETIC EQUIPMENT REGISTER — ARJUN DEMONSTRATION DATA
+=======================================================
+
+This file is generated for the ARJUN demonstration. No real plant, vendor or
+person appears in it. Every tag, figure and date below is invented.
+
+Facility:      Demonstration Unit 100 (synthetic)
+Register rev:  4
+Issued:        2026-01-12
+
+Tag      | Service                  | Design pressure (bar) | Design temp (C) | Last inspection | Next due
+---------|--------------------------|-----------------------|-----------------|-----------------|----------
+V-101    | Inlet separator          | 12.0                  | 90              | 2025-11-14      | 2026-11-14
+V-102    | Flash drum               | 8.5                   | 120             | 2025-06-02      | 2026-06-02
+P-101A   | Feed pump (duty)         | 16.0                  | 80              | 2025-09-30      | 2026-09-30
+P-101B   | Feed pump (standby)      | 16.0                  | 80              | 2025-09-30      | 2026-09-30
+E-101    | Feed/effluent exchanger  | 14.0                  | 150             | 2025-03-18      | 2027-03-18
+LV-1011  | V-101 level control      | 12.0                  | 90              | 2025-11-14      | 2026-11-14
+
+Notes
+-----
+1. V-101 operates on level control LV-1011 with low-low alarm LAHH-1011 at 8%.
+2. P-101A/B share a common discharge header. Design discharge pressure is
+   12.0 bar; the relief device is set at 13.2 bar.
+3. E-101 was re-rated in 2024. The register carries the re-rated figure.
+4. No entry in this register has been verified against a real asset, because
+   there is no real asset. It exists so a demonstration can show retrieval and
+   citation working against a document that is genuinely on disk.

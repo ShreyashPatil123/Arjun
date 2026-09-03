@@ -76,6 +76,17 @@ pub struct StreamChunk {
     /// Reason generation finished (e.g., "stop", "length", "cancelled")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// How many tokens the prompt occupied, as the model's own tokenizer
+    /// counted them.
+    ///
+    /// `None` means nobody counted — a transport that never saw a tokenizer, or
+    /// a stub. It does **not** mean zero, and no reader may substitute one. The
+    /// whole reason this field exists is that a prompt-token figure was being
+    /// published where no count had been taken: [`crate::gateway::openai`] sent
+    /// a hardcoded `0`, and `send_chat_message` recorded a word count times
+    /// 1.3. Both read as measurements. Neither was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
 }
 
 // ─── Generation Parameters ───────────────────────────────────────────────────

@@ -136,7 +136,20 @@ export interface StartRunRequest {
   prompt: string;
   classification?: Classification;
   /** Overrides the default instructions. Scripted demonstrations only. */
-  systemPrompt?: string;
+  /**
+   * Extra context for a scripted scenario, appended *beneath* ARJUN's own
+   * instructions.
+   *
+   * It used to be `systemPrompt` and it *replaced* them, so a demo scenario
+   * could remove the retrieval rule, the citation rule and the instruction to
+   * say plainly when a search found nothing — and the run would look normal
+   * while answering from the model's weights. It is additive and bounded now:
+   * see `compose_system_prompt` in `src-tauri/src/commands/agent.rs`.
+   *
+   * It grants nothing. Tools come from the plan and the gateway; the
+   * classification comes from the request and the policy.
+   */
+  scenarioInstructions?: string;
   /**
    * Echoed back on the run's first event.
    *
@@ -364,10 +377,226 @@ export type ArtifactPreview =
   | { kind: 'image'; mime: string; dataUrl: string; truncated: boolean }
   | { kind: 'unsupported'; mime: string; reason: string };
 
+/**
+ * How a run ended.
+ *
+ * Mirrors `RunOutcome` in `src-tauri/src/agent_runtime/outcome.rs`, which is
+ * the source of truth. Read this rather than inferring success from the fact
+ * that the command returned: `text` is present for a run cut off at the output
+ * cap too, and that fragment reads exactly like a short answer.
+ *
+ * - `completed` — the loop finished and the model stopped of its own accord.
+ * - `failed` — the provider or the loop errored.
+ * - `aborted` — a person, or the app shutting down, stopped it.
+ * - `lengthLimited` — the model hit the output cap; the answer is a fragment.
+ * - `budgetStopped` — it ran past the time or the steps its plan allowed.
+ * - `policyStopped` — it needed to do something it is not permitted to do.
+ */
+export type RunOutcomeKind =
+  | 'completed'
+  | 'failed'
+  | 'aborted'
+  | 'lengthLimited'
+  | 'budgetStopped'
+  | 'policyStopped';
+
+/** The typed ending of a run, with the one sentence a person is shown. */
+export type RunOutcome =
+  | { kind: 'completed' }
+  | { kind: Exclude<RunOutcomeKind, 'completed'>; detail: string };
+
+/** Whether an outcome means the run finished the work it set out to do. */
+export function runSucceeded(outcome: RunOutcome | undefined | null): boolean {
+  return outcome?.kind === 'completed';
+}
+
+/** The sentence to show for an outcome, or null when there is nothing to say. */
+export function outcomeDetail(outcome: RunOutcome | undefined | null): string | null {
+  if (!outcome || outcome.kind === 'completed') return null;
+  return outcome.detail;
+}
+
+/**
+ * How a finished or in-flight assistant turn should be described.
+ *
+ * ## The defect
+ *
+ * The chat cell derived its status as `isFailed ? 'failed' : isDone ?
+ * 'verified' : ...`. "Not streaming and not failed" was rendered as
+ * **Verified**, with a green tick — for every turn, including ones where the
+ * verifier had never run, had found blocking problems, or where the run had
+ * been stopped by a person part way through. The word on screen was the
+ * strongest claim the product can make, and nothing had checked it.
+ *
+ * These are the states a person can act on, and each means one thing:
+ *
+ * - `thinking` / `usingTool` / `composing` — still going.
+ * - `verified` — the verifier ran and every claim resolved.
+ * - `needsReview` — the verifier ran and found something.
+ * - `unverified` — there is an answer and nothing checked it.
+ * - `completed` — the run finished and produced nothing to check.
+ * - `stopped` — a person, a budget or a policy ended it early.
+ * - `failed` — it did not finish.
+ */
+export type MessageStatusKind =
+  | 'thinking'
+  | 'usingTool'
+  | 'composing'
+  | 'verified'
+  | 'needsReview'
+  | 'unverified'
+  | 'completed'
+  | 'stopped'
+  | 'failed';
+
+/** What the surface knows about one assistant turn. */
+export interface MessageStatusInput {
+  /** Whether tokens are still arriving for this cell. */
+  isStreaming: boolean;
+  /** How much visible text has arrived. */
+  contentLength: number;
+  /** Tool calls currently running, for the live states. */
+  runningTools: number;
+  /**
+   * How the run ended, when it is known.
+   *
+   * `undefined` for a turn from before the typed ending existed, or one whose
+   * summary never arrived. Absence is not success — see below.
+   */
+  outcome?: RunOutcomeKind | null;
+  /**
+   * What the verifier concluded, when it ran.
+   *
+   * `null` means it did not run — there was nothing to check, or the run ended
+   * before it got that far. That is *not* the same as passing, and this is the
+   * distinction the old derivation could not make.
+   */
+  verification?: 'ready' | 'needsReview' | null;
+}
+
+/**
+ * The status to show for one assistant turn.
+ *
+ * Nothing here infers a verdict from silence. A turn that stopped streaming has
+ * stopped streaming; whether it is trustworthy is a separate question with a
+ * separate answer, and if nobody answered it the status says so.
+ */
+export function messageStatus(input: MessageStatusInput): MessageStatusKind {
+  if (input.isStreaming) {
+    if (input.contentLength > 0) return 'composing';
+    if (input.runningTools > 0) return 'usingTool';
+    return 'thinking';
+  }
+
+  // How the run ended comes first: a stopped run's partial answer should not
+  // be labelled by how well its fragment verifies.
+  switch (input.outcome) {
+    case 'failed':
+      return 'failed';
+    case 'aborted':
+    case 'budgetStopped':
+    case 'policyStopped':
+    case 'lengthLimited':
+      return 'stopped';
+    default:
+      break;
+  }
+
+  if (input.verification === 'ready') return 'verified';
+  if (input.verification === 'needsReview') return 'needsReview';
+
+  // Finished, and nothing checked it. An answer in this state is the one the
+  // old derivation called "Verified".
+  return input.contentLength > 0 ? 'unverified' : 'completed';
+}
+
+/** The words shown on the status pill. */
+export const MESSAGE_STATUS_LABELS: Readonly<Record<MessageStatusKind, string>> = {
+  thinking: 'Thinking',
+  usingTool: 'Using a tool…',
+  composing: 'Composing…',
+  verified: 'Verified',
+  needsReview: 'Needs review',
+  unverified: 'Unverified',
+  completed: 'Completed',
+  stopped: 'Stopped',
+  failed: 'Failed',
+};
+
+/**
+ * What a `message_end` alone can honestly say about how the run ended.
+ *
+ * Narrower than the run's own ending, on purpose. This writer sees one thing:
+ * the finish reason of the model's last turn. Two of those are conclusive on
+ * their own — the output cap was hit, or the turn errored — and neither
+ * depends on anything the backend decided afterwards. The rest are not: a turn
+ * that stopped cleanly says nothing about whether the *run* was then stopped
+ * by its budget or by policy, so no `outcome` is returned for them and the
+ * field is left for the run's own write, which is the authority and lands
+ * afterwards.
+ *
+ * Returning no `outcome` rather than `'completed'` is the whole point.
+ * Claiming completion from a clean finish reason is the same class of mistake
+ * as claiming it from a resolved request.
+ */
+export function endingFromFinishReason(
+  finishReason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error',
+): { outcome?: RunOutcomeKind; failed: boolean } {
+  if (finishReason === 'length') return { outcome: 'lengthLimited', failed: true };
+  if (finishReason === 'error') return { outcome: 'failed', failed: true };
+  return { failed: false };
+}
+
+/**
+ * Whether this installation can still record what it does.
+ *
+ * Mirrors `AuditState` in `src-tauri/src/agent_runtime/audit_health.rs`.
+ *
+ * ARJUN's claim is that every run leaves a checkable record. When the store
+ * that holds it cannot be written, the desktop stays usable read-only — past
+ * runs open, settings open — and no run starts. A surface that showed nothing
+ * would leave a person wondering why their prompt did nothing at all.
+ */
+export type AuditState =
+  | { state: 'durable' }
+  | {
+      state: 'degraded';
+      /** What went wrong, in the sentence to show. */
+      because: string;
+      /** True when the store never opened; false when a write failed later. */
+      atStartup: boolean;
+    };
+
+/**
+ * Whether this session's chats will still be here tomorrow.
+ *
+ * Mirrors `ConversationState` in
+ * `src-tauri/src/agent_runtime/conversations.rs`.
+ *
+ * The store's failure path used to be a fixed temp directory opened silently,
+ * so the chat behaved exactly as normal while the person's real conversations
+ * were somewhere else — and the next session found the previous one's threads
+ * sitting there looking like history. A session writing to scratch now says so.
+ */
+export type ConversationStorageState =
+  | { state: 'durable' }
+  | {
+      state: 'ephemeral';
+      /** What went wrong, in the sentence to show. */
+      because: string;
+      /** Where this session's chats are going, so an operator can find them. */
+      directory: string;
+    };
+
 export interface RunSummary {
   runId: string;
   text: string;
   turns: number;
+  /**
+   * How this run ended. Never inferred from the command resolving — see
+   * {@link RunOutcome}.
+   */
+  outcome: RunOutcome;
   routing: RoutingDecision;
   endpoint: Endpoint;
   plan: PlanRecord;
@@ -385,6 +614,17 @@ export interface RunSummary {
    * uses it to correlate `message_end` with the right `Message` cell.
    */
   messageId?: string;
+  /**
+   * Set when the run happened but could not be fully written down.
+   *
+   * The answer is real and the work was done; what is missing is the record of
+   * it. Worth showing because it changes what the answer can be used for — an
+   * approval note nobody can produce the provenance for is not one anybody
+   * should sign.
+   */
+  recordFailure?: string | null;
+  /** How the audit stores were doing when this run finished. */
+  audit: AuditState;
 }
 
 /** One passage the run stood on, as its `[E3]` marker refers to it. */
@@ -482,6 +722,13 @@ export interface TaskRecord {
   approvals: ApprovalRecord[];
   /** Set when the run ended badly, in the words shown to the person. */
   failure: string | null;
+  /**
+   * How the run ended, typed.
+   *
+   * Absent on records written before this existed, which reads as "not
+   * recorded" rather than as a guess at which ending they had.
+   */
+  outcome?: RunOutcome | null;
 }
 
 /** A row on the Tasks screen. */
@@ -634,6 +881,99 @@ export interface ContextLedgerRecord {
   window: number;
   /** `window - committed`. Negative means the next turn does not fit. */
   headroom: number;
+  /**
+   * The itemised rows under the sections.
+   *
+   * Optional so a record written before the itemisation existed still parses,
+   * and absent is treated as "not itemised" rather than "nothing in it" — the
+   * screen falls back to section rows instead of drawing an empty breakdown
+   * under a full bar.
+   */
+  entities?: ContextEntity[];
+  /** Every model call this run made, estimate against measurement. */
+  reconciliations?: TurnReconciliation[];
+  /** Sections whose rows do not add up to them. Empty in normal operation. */
+  itemisationErrors?: { section: string; fromEntities: number; fromSection: number }[];
+}
+
+/** The eight sections, as the ledger names them. */
+export type LedgerSectionName =
+  | 'system'
+  | 'skill'
+  | 'toolSchema'
+  | 'evidence'
+  | 'notes'
+  | 'transcript'
+  | 'compaction'
+  | 'reserve';
+
+/** How an entity's token figure was arrived at. Never inferred. */
+export type ContextMeasurement = 'exact' | 'provider' | 'estimated';
+
+/**
+ * Where one entity stands.
+ *
+ * `pending` is a document still being read. It reports no tokens, because
+ * nothing has counted it yet — see the runtime's `context-entities.ts`.
+ */
+export type ContextEntityStatus = 'active' | 'pending' | 'summarised' | 'dropped';
+
+/** One addressable thing occupying the context window. */
+export interface ContextEntity {
+  id: string;
+  section: LedgerSectionName;
+  label: string;
+  tokens: number;
+  measurement: ContextMeasurement;
+  status: ContextEntityStatus;
+  /** Protected from eviction by the person, and honoured by the compactor. */
+  pinned: boolean;
+  sequence: number;
+  detail?: Record<string, string | number | boolean | null>;
+}
+
+/**
+ * One model call's prediction measured against what it actually cost.
+ *
+ * `actualIn` is `null` when the server reported no usage. Left null rather than
+ * back-filled from the estimate, so a screen can tell "checked, and it matched"
+ * from "nobody checked" — the distinction the whole reconciliation exists for.
+ */
+export interface TurnReconciliation {
+  turn: number;
+  at: string;
+  estimatedIn: number;
+  actualIn: number | null;
+  actualOut: number | null;
+  /** `actualIn / estimatedIn`, or null when there is nothing to divide. */
+  driftRatio: number | null;
+}
+
+/**
+ * What one attachment cost and how much of it reached the model.
+ *
+ * Emitted on `attachment:context` by `agent_start_run` at the moment the
+ * injection decision is taken. Mirrors `AttachmentContextEvent` in
+ * `commands::agent`.
+ */
+export interface AttachmentContextEvent {
+  name: string;
+  /** Content address — the stable row id for this file in the meter. */
+  sha256: string;
+  pages: number;
+  documentTokens: number;
+  /** Equal to `documentTokens` only when the whole document went in. */
+  injectedTokens: number;
+  strategy: 'full' | 'chunked' | 'referenceOnly';
+  /** Shown verbatim: how much of the document the answer rests on. */
+  explanation: string;
+}
+
+/** Subscribes to per-attachment context costs. */
+export async function listenAttachmentContext(
+  callback: (payload: AttachmentContextEvent) => void,
+) {
+  return listen<AttachmentContextEvent>('attachment:context', (e) => callback(e.payload));
 }
 
 /** One time a run's older history was replaced by a summary. */
@@ -842,6 +1182,21 @@ export type AgentEvent =
       messagesSummarised: number;
     }
   | {
+      /**
+       * Where the context window stands, right now.
+       *
+       * Emitted every model turn and after every compaction, which is what
+       * makes the meter live. Before this existed the surface could only learn
+       * the ledger when the run finished, so the number a person watched while
+       * deciding whether to attach one more file was always describing the
+       * previous run.
+       */
+      type: 'context_ledger';
+      /** `turn` or `compaction` — why this reading was taken. */
+      reason: string;
+      ledger: ContextLedgerRecord;
+    }
+  | {
       type: 'tool_execution_end';
       toolCallId: string;
       toolName: string;
@@ -958,19 +1313,28 @@ export type AgentEvent =
     }
   | {
       /**
-       * The model is reasoning privately, or has stopped.
+       * The model is reasoning, or has stopped.
        *
-       * **Carries no reasoning.** `characters` is the size of what the model
-       * produced and `elapsedMs` is how long it has been at it; neither can
-       * be turned back into a token of the thought. See the translator in
-       * `agent-runtime/src/run.ts`, which is the only place the reasoning
-       * stream is read and the only place this is produced.
+       * `characters` is the running size of the block, `elapsedMs` how long
+       * it has been going, and `delta` the reasoning itself since the last
+       * frame — absent on a frame carrying only the counter.
+       *
+       * **Live only.** The reasoning is shown while it happens and is not
+       * kept: it is held in a buffer separate from the answer, is never
+       * written to `Message.content`, never sent as `finalContent`, and never
+       * reaches the verifier or the audit record. Reopening a conversation
+       * shows the answer and no thought, which is correct — the thought was
+       * never anywhere to be re-read from.
+       *
+       * See the translator in `agent-runtime/src/run.ts`, the only place the
+       * reasoning stream is read and the only place this is produced.
        */
       type: 'model_thinking';
       messageId: string;
       state: 'start' | 'active' | 'end';
       characters: number;
       elapsedMs: number;
+      delta?: string;
     };
 
 /** One event, tagged with the run it belongs to. */
@@ -1309,6 +1673,13 @@ export const agentService = {
     modelRole?: string;
     usedFallback?: boolean;
     error?: string;
+    /**
+     * How the run ended. Sent only by a caller that knows — the run itself.
+     * A `message_end` writer omits it and leaves whatever the run recorded.
+     */
+    outcome?: RunOutcomeKind;
+    /** What the verifier concluded. Sent only by the run. */
+    verification?: 'ready' | 'needsReview';
     failed: boolean;
     tokensIn?: number;
     tokensOut?: number;
@@ -1323,6 +1694,8 @@ export const agentService = {
       modelRole: args.modelRole ?? null,
       usedFallback: args.usedFallback ?? null,
       error: args.error ?? null,
+      outcome: args.outcome ?? null,
+      verification: args.verification ?? null,
       failed: args.failed,
       tokensIn: args.tokensIn ?? null,
       tokensOut: args.tokensOut ?? null,
@@ -1338,6 +1711,17 @@ export const agentService = {
    * remount, the chat surface rebuilds the index by reading the
    * conversation's `runs[]` from disk.
    */
+  /**
+   * Whether this session's chats will persist.
+   *
+   * Asked once and shown as a banner. A person who has just been refused a new
+   * conversation needs to know why, and one who has not yet tried needs to know
+   * before they type.
+   */
+  conversationHealth(): Promise<ConversationStorageState> {
+    return getBackendService().invoke<ConversationStorageState>('agent_conversation_health');
+  },
+
   runConversation(runId: string): Promise<string | null> {
     return getBackendService().invoke<string | null>('agent_run_conversation', { runId });
   },
@@ -1385,6 +1769,24 @@ export interface ChatMessage {
   /** Token counts from the model (assistant messages only). */
   tokensIn?: number | null;
   tokensOut?: number | null;
+  /**
+   * How the run that produced this message ended.
+   *
+   * Persisted per message so the surface can say what happened to a turn it is
+   * rendering from disk, long after the run's events have gone. `null` on
+   * messages written before this field existed, and on user and system
+   * messages, which no run produced.
+   */
+  outcome?: RunOutcomeKind | null;
+  /**
+   * What the verifier concluded about this answer, when it ran.
+   *
+   * Persisted alongside the outcome for the same reason: a cell rendered from
+   * disk has no run events to consult, and "not streaming" is not a verdict.
+   * `null` means the verifier did not run — there was nothing to check, or the
+   * run ended before it got that far.
+   */
+  verification?: 'ready' | 'needsReview' | null;
 }
 
 /** A run that produced an assistant message in a conversation. */

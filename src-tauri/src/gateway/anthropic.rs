@@ -147,7 +147,13 @@ pub struct MessagesResponse {
     pub content: Vec<TextBlock>,
     pub stop_reason: String,
     pub stop_sequence: Option<String>,
-    pub usage: Usage,
+    /// Omitted when the prompt was never counted. See the same field on
+    /// [`crate::gateway::openai::ChatCompletionResponse`]: this reported
+    /// `input_tokens: 0` for every response, which a client reads as a
+    /// measured empty prompt. Absence says "not counted"; zero says something
+    /// false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,7 +170,19 @@ pub struct Usage {
 }
 
 impl MessagesResponse {
-    pub fn new(id: String, model: String, text: String, stop_reason: &str, output_tokens: u32) -> Self {
+    /// Builds a finished message.
+    ///
+    /// `input_tokens` is the model tokenizer's own count, or `None` when the
+    /// generation reported none — in which case the usage object is left out
+    /// rather than filled with a zero.
+    pub fn new(
+        id: String,
+        model: String,
+        text: String,
+        stop_reason: &str,
+        output_tokens: u32,
+        input_tokens: Option<u32>,
+    ) -> Self {
         Self {
             id,
             kind: "message",
@@ -173,7 +191,7 @@ impl MessagesResponse {
             content: vec![TextBlock { kind: "text", text }],
             stop_reason: stop_reason.to_string(),
             stop_sequence: None,
-            usage: Usage { input_tokens: 0, output_tokens },
+            usage: input_tokens.map(|input_tokens| Usage { input_tokens, output_tokens }),
         }
     }
 }

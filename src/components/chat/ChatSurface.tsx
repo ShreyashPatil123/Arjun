@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown } from 'lucide-react';
 import { useConversation } from '../run/useConversation';
+import { useActiveRun } from '../../contexts/ActiveRunContext';
 import { ChatComposer } from './ChatComposer';
 import {
   listenAttachmentProgress,
@@ -18,6 +19,7 @@ import { OcrReadout } from './OcrReadout';
 import { useOcrPreference } from './useOcrPreference';
 import { AssistantMessageCell } from './AssistantMessageCell';
 import type { ProgressStep } from './runProgress';
+import type { LiveReasoning } from '../../contexts/ConversationContext';
 import { RunView } from '../run/RunView';
 import {
   useAdoptedRun,
@@ -58,12 +60,36 @@ interface QueuedTurn {
 
 export interface ChatSurfaceProps {
   /** Optional: a system prompt to prepend to every user message. */
-  systemPrompt?: string;
+  scenarioInstructions?: string;
   /** Optional: a custom classification to apply to every user message. */
   classification?: Classification;
   /** Whether to show the conversation sidebar. Reserved for future
    *  layouts; the current UI does not render a sidebar. */
   showSidebar?: boolean;
+}
+
+/**
+ * Publishes the chat's run to the one active-run source.
+ *
+ * The chat issues its own run id — it has to, because it reserves the assistant
+ * cell before the backend replies — so the shared provider does not learn about
+ * a chat-launched run on its own. Handing it over here is what makes the SIH
+ * dashboard's routing, plan, activity, verification and security panes follow
+ * the run the person is actually watching, rather than sitting idle for the
+ * whole of it.
+ */
+function useShareActiveRun(activeRunId: string | null): void {
+  const { follow } = useActiveRun();
+  const shared = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeRunId || shared.current === activeRunId) return;
+    shared.current = activeRunId;
+    void follow(activeRunId).catch(() => {
+      // The run may not have a durable record yet -- it was started a moment
+      // ago. The dashboard shows what it has; it does not invent the rest.
+      shared.current = null;
+    });
+  }, [activeRunId, follow]);
 }
 
 export function ChatSurface({
@@ -77,9 +103,13 @@ export function ChatSurface({
     activeRunId,
     streamingContents,
     progressByMessage,
+    reasoningByMessage,
     send,
     replay,
   } = useConversation();
+
+  // Every surface follows the run the chat started, not one of its own.
+  useShareActiveRun(activeRunId);
 
   const [inspectorRunId, setInspectorRunId] = useState<string | null>(null);
 
@@ -314,6 +344,7 @@ export function ChatSurface({
               runId={runsByMessageId.get(m.id) ?? null}
               activity={activityByRun.get(runsByMessageId.get(m.id) ?? '')}
               progress={progressByMessage.get(m.id)}
+              reasoning={reasoningByMessage.get(m.id)}
               showAvatar={m.id === orbMessageId}
               runSummary={
                 inspectorRunId && runsByMessageId.get(m.id) === inspectorRunId
@@ -433,6 +464,8 @@ interface MessageRowProps {
   liveContent?: string;
   /** This turn's own step list, found by message id and never by position. */
   progress?: ProgressStep[];
+  /** This turn's reasoning so far. Live only; absent once the run ends. */
+  reasoning?: LiveReasoning;
   runId: string | null;
   activity?: Activity[];
   runSummary?: RunSummary | null;
@@ -448,6 +481,7 @@ function MessageRow({
   isLive,
   liveContent,
   progress,
+  reasoning,
   runId,
   activity,
   runSummary,
@@ -478,6 +512,7 @@ function MessageRow({
       isLive={isLive}
       liveContent={liveContent}
       progress={progress}
+      reasoning={reasoning}
       activity={runId ? activity : undefined}
       runSummary={runSummary ?? null}
       showAvatar={showAvatar}

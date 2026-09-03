@@ -6,7 +6,7 @@ import styles from './ChatSurface.module.css';
 
 /**
  * The accuracy-to-speed control for reading attachments, docked under the
- * composer.
+ * composer and mounted only while an attachment is on the turn.
  *
  * ## Why a slider and not a model picker
  *
@@ -28,11 +28,13 @@ export interface OcrQualitySliderProps {
   /** True while a run is in flight; the stops are fixed for that turn. */
   disabled?: boolean;
   /**
-   * True when the turn being composed actually carries a file.
+   * True when the turn being composed carries a file that needs reading.
    *
-   * The control is always present — a person should be able to set this
-   * before picking a document, the way a camera's quality setting exists
-   * before the shot — but it is quiet until it governs something.
+   * The control is only mounted once an attachment is present (see
+   * `ChatComposer`), so this is not "shown or hidden" — it is the difference
+   * between a scanned PDF, which this setting governs, and a .txt attached
+   * alongside it, which it does not. Styling goes quiet in the second case
+   * rather than the control vanishing mid-compose.
    */
   engaged?: boolean;
 }

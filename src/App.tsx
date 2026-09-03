@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { AppStateProvider } from './contexts/AppStateContext';
 import { ConfigProvider } from './contexts/ConfigContext';
 import { ConversationProvider } from './contexts/ConversationContext';
+import { ActiveRunProvider } from './contexts/ActiveRunContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
 import { PermissionsProvider, usePermissions } from './contexts/PermissionsContext';
@@ -12,7 +13,6 @@ import { Workbench } from './pages/Workbench';
 import { DocumentScan } from './pages/DocumentScan';
 import { Tasks } from './pages/Tasks';
 import { Conversations } from './pages/Conversations';
-import { Placeholder } from './pages/Placeholder';
 import { Knowledge } from './pages/Knowledge';
 import { AuditNetwork } from './pages/AuditNetwork';
 import { SignIn } from './pages/SignIn';
@@ -76,6 +76,7 @@ function App() {
           <ToastProvider>
             <PermissionsProvider>
               <ConversationProvider>
+                <ActiveRunProvider>
                 <BrowserRouter>
                 <Routes>
                   <Route path="/" element={<AppShell />}>
@@ -153,6 +154,7 @@ function App() {
                   </Route>
                 </Routes>
               </BrowserRouter>
+                </ActiveRunProvider>
             </ConversationProvider>
           </PermissionsProvider>
           </ToastProvider>

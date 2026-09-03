@@ -33,27 +33,40 @@ impl Extractor {
     pub async fn process_user_input(&self, message: &str, project_id: &str, session_id: Option<&str>) -> Result<usize> {
         log::info!("[EXTRACTOR] Processing input: \"{}\" (project={})", &message[..message.len().min(80)], project_id);
 
-        // Try primary provider first, fallback to MockProvider on deserialization errors
-        let facts = match self.provider.extract_facts(message, None).await {
-            Ok(f) => {
-                log::info!("[EXTRACTOR] Provider '{}' extracted {} fact(s)", self.provider.provider_id(), f.len());
-                f
-            }
-            Err(e) => {
-                log::warn!("[EXTRACTOR] Provider '{}' failed: {:?}. Falling back to MockProvider.", self.provider.provider_id(), e);
-                let mock = MockProvider::new();
-                match mock.extract_facts(message, None).await {
-                    Ok(f) => {
-                        log::info!("[EXTRACTOR] MockProvider fallback extracted {} fact(s)", f.len());
-                        f
-                    }
-                    Err(e2) => {
-                        log::error!("[EXTRACTOR] MockProvider fallback also failed: {:?}", e2);
-                        return Err(e2);
-                    }
-                }
-            }
-        };
+        // The real provider, or nothing.
+        //
+        // This used to fall back to `MockProvider` whenever the configured
+        // provider failed. `MockProvider` is a keyword matcher — it looks for
+        // "my name is" and similar phrases — and it reports its own health as
+        // `"healthy"`. So a deployment whose extraction model was unreachable
+        // went on writing *facts* into the user's long-term memory, derived by
+        // string matching, and stored them in exactly the same shape as facts a
+        // model had actually extracted. Nothing downstream could tell them
+        // apart, and the health endpoint said everything was fine.
+        //
+        // A memory that cannot be written is a degradation the caller handles —
+        // and `send_chat_message` already treats extraction failure as
+        // non-fatal. A memory written by a substitute nobody chose is a
+        // corruption nobody can find afterwards.
+        let facts = self
+            .provider
+            .extract_facts(message, None)
+            .await
+            .inspect(|facts| {
+                log::info!(
+                    "[EXTRACTOR] Provider '{}' extracted {} fact(s)",
+                    self.provider.provider_id(),
+                    facts.len()
+                );
+            })
+            .map_err(|error| {
+                log::warn!(
+                    "[EXTRACTOR] Provider '{}' failed, so nothing was remembered from this \
+                     turn: {error:?}",
+                    self.provider.provider_id()
+                );
+                error
+            })?;
 
         let now_ts = chrono::Utc::now().timestamp();
         let now_str = chrono::Utc::now().to_rfc3339();

@@ -13,7 +13,8 @@
 use std::env;
 
 use crate::agent_runtime::conversations::{
-    Conversation, ConversationStore, MessageRole, MessageStatus, LEGACY_OWNER_ID,
+    Conversation, ConversationStore, MessageCompletion, MessageRole, MessageStatus,
+    LEGACY_OWNER_ID,
 };
 
 const OWNER: &str = "engineer";
@@ -125,15 +126,15 @@ fn record_message_completion_marks_done_with_model() {
             &conv.id,
             "a-1",
             "run-1",
-            Some("the final answer"),
-            Some(1234),
-            Some("gemma-3-12b-it"),
-            Some("vision"),
-            Some(false),
-            None,
-            false,
-            None,
-            None,
+            MessageCompletion {
+                final_content: Some("the final answer"),
+                elapsed_ms: Some(1234),
+                model_name: Some("gemma-3-12b-it"),
+                model_role: Some("vision"),
+                used_fallback: Some(false),
+                outcome: Some("completed"),
+                ..MessageCompletion::default()
+            },
             OWNER,
         )
         .expect("complete")
@@ -177,15 +178,13 @@ fn a_second_completion_does_not_erase_what_the_first_recorded() {
             &conv.id,
             "a-1",
             "run-1",
-            Some("the final answer"),
-            Some(1234),
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some(512),
-            Some(64),
+            MessageCompletion {
+                final_content: Some("the final answer"),
+                elapsed_ms: Some(1234),
+                tokens_in: Some(512),
+                tokens_out: Some(64),
+                ..MessageCompletion::default()
+            },
             OWNER,
         )
         .expect("complete")
@@ -197,15 +196,15 @@ fn a_second_completion_does_not_erase_what_the_first_recorded() {
             &conv.id,
             "a-1",
             "run-1",
-            Some("the final answer"),
-            Some(1234),
-            Some("gemma-3-12b-it"),
-            Some("reasoning"),
-            Some(false),
-            None,
-            false,
-            None,
-            None,
+            MessageCompletion {
+                final_content: Some("the final answer"),
+                elapsed_ms: Some(1234),
+                model_name: Some("gemma-3-12b-it"),
+                model_role: Some("reasoning"),
+                used_fallback: Some(false),
+                outcome: Some("completed"),
+                ..MessageCompletion::default()
+            },
             OWNER,
         )
         .expect("complete")
@@ -223,6 +222,108 @@ fn a_second_completion_does_not_erase_what_the_first_recorded() {
     assert_eq!(assistant.status, MessageStatus::Done);
 }
 
+/// A run cut off at the output cap keeps its fragment *and* its caveat.
+///
+/// The two halves have to survive together. The text alone reads exactly like
+/// a short answer, and the caveat alone loses the only thing the run produced.
+#[test]
+fn a_length_limited_run_keeps_both_the_fragment_and_the_reason() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+    let conv = store
+        .create("Test".to_string(), "Welcome.".to_string(), OWNER)
+        .expect("create");
+    store
+        .append_user_turn(&conv.id, "Specify the seal", "a-1", "run-1", OWNER)
+        .expect("append");
+    let updated = store
+        .record_message_completion(
+            &conv.id,
+            "a-1",
+            "run-1",
+            MessageCompletion {
+                final_content: Some("The seal specification is "),
+                elapsed_ms: Some(900),
+                error: Some("Stopped: the answer reached the output limit for one turn."),
+                outcome: Some("lengthLimited"),
+                failed: true,
+                ..MessageCompletion::default()
+            },
+            OWNER,
+        )
+        .expect("complete")
+        .expect("found");
+    let assistant = updated
+        .messages
+        .iter()
+        .find(|m| m.id == "a-1")
+        .expect("assistant");
+    assert_eq!(assistant.content, "The seal specification is ");
+    assert_eq!(assistant.outcome.as_deref(), Some("lengthLimited"));
+    assert_eq!(assistant.status, MessageStatus::Failed);
+    assert!(assistant.error.is_some());
+}
+
+/// The two writers reach this row in either order and neither may erase the
+/// other's half. The front-end knows the token usage; only the run knows how
+/// the run ended.
+#[test]
+fn a_message_end_writer_does_not_erase_the_runs_recorded_ending() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+    let conv = store
+        .create("Test".to_string(), "Welcome.".to_string(), OWNER)
+        .expect("create");
+    store
+        .append_user_turn(&conv.id, "Hello", "a-1", "run-1", OWNER)
+        .expect("append");
+
+    // The run, on resolve: it was stopped by policy.
+    store
+        .record_message_completion(
+            &conv.id,
+            "a-1",
+            "run-1",
+            MessageCompletion {
+                error: Some("Stopped: it needed to do something it is not permitted to do."),
+                outcome: Some("policyStopped"),
+                failed: true,
+                ..MessageCompletion::default()
+            },
+            OWNER,
+        )
+        .expect("complete");
+
+    // The front-end, afterwards, with token usage and no idea how it ended.
+    let updated = store
+        .record_message_completion(
+            &conv.id,
+            "a-1",
+            "run-1",
+            MessageCompletion {
+                tokens_in: Some(400),
+                tokens_out: Some(12),
+                failed: true,
+                ..MessageCompletion::default()
+            },
+            OWNER,
+        )
+        .expect("complete")
+        .expect("found");
+
+    let assistant = updated
+        .messages
+        .iter()
+        .find(|m| m.id == "a-1")
+        .expect("assistant");
+    assert_eq!(assistant.tokens_in, Some(400));
+    assert_eq!(
+        assistant.outcome.as_deref(),
+        Some("policyStopped"),
+        "the ending was erased by a writer that did not know it"
+    );
+}
+
 #[test]
 fn record_message_completion_can_mark_failed() {
     let dir = temp_dir();
@@ -238,15 +339,13 @@ fn record_message_completion_can_mark_failed() {
             &conv.id,
             "a-1",
             "run-1",
-            None,
-            Some(500),
-            None,
-            None,
-            None,
-            Some("budget exhausted"),
-            true,
-            None,
-            None,
+            MessageCompletion {
+                elapsed_ms: Some(500),
+                error: Some("budget exhausted"),
+                outcome: Some("budgetStopped"),
+                failed: true,
+                ..MessageCompletion::default()
+            },
             OWNER,
         )
         .expect("complete")
@@ -306,15 +405,15 @@ fn round_trip_preserves_all_fields() {
             &conv.id,
             "a-1",
             "run-1",
-            Some("final"),
-            Some(2000),
-            Some("model-x"),
-            Some("reasoning"),
-            Some(false),
-            None,
-            false,
-            None,
-            None,
+            MessageCompletion {
+                final_content: Some("final"),
+                elapsed_ms: Some(2000),
+                model_name: Some("model-x"),
+                model_role: Some("reasoning"),
+                used_fallback: Some(false),
+                outcome: Some("completed"),
+                ..MessageCompletion::default()
+            },
             OWNER,
         )
         .expect("complete");
@@ -470,15 +569,14 @@ fn record_message_completion_for_a_non_owner_is_a_no_op() {
             &conv.id,
             "a-1",
             "run-1",
-            Some("forged final"),
-            Some(1),
-            Some("forged-model"),
-            Some("forged"),
-            Some(false),
-            None,
-            false,
-            None,
-            None,
+            MessageCompletion {
+                final_content: Some("forged final"),
+                elapsed_ms: Some(1),
+                model_name: Some("forged-model"),
+                model_role: Some("forged"),
+                used_fallback: Some(false),
+                ..MessageCompletion::default()
+            },
             OTHER,
         )
         .expect("complete");
@@ -541,4 +639,123 @@ fn legacy_v1_files_migrate_to_the_administrator_owner() {
     let envelope: serde_json::Value = serde_json::from_str(&raw).expect("parse");
     assert_eq!(envelope["schemaVersion"], 2);
     assert_eq!(envelope["conversation"]["ownerUserId"], LEGACY_OWNER_ID);
+}
+
+/// What happens when the conversation store cannot be opened.
+///
+/// ## The defect
+///
+/// The failure path opened a *fixed* temp directory,
+/// `arjun-conversations-fallback`, silently. Three things were wrong with that:
+/// it is shared between sessions and users; it is stale, so a recovered session
+/// found the previous degraded session's threads looking like history; and
+/// nothing said so, so the chat behaved exactly as normal while the person's
+/// real conversations were somewhere else.
+mod degraded_storage {
+    use super::OWNER;
+    use crate::agent_runtime::conversations::{
+        ConversationHealth, ConversationState, ConversationStore,
+    };
+
+    /// A path that cannot be a directory, because it is a file.
+    fn blocked() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("conversations");
+        std::fs::write(&path, b"not a directory").expect("blocking file");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_opened_reports_it() {
+        let (_dir, path) = blocked();
+        assert!(
+            ConversationStore::open(&path).is_err(),
+            "the store must not open where a regular file already is"
+        );
+    }
+
+    #[test]
+    fn a_healthy_session_refuses_nothing() {
+        let health = ConversationHealth::durable();
+        assert!(health.is_durable());
+        assert_eq!(health.refusal(), None);
+        assert_eq!(health.state(), &ConversationState::Durable);
+    }
+
+    #[test]
+    fn an_ephemeral_session_refuses_new_conversations_and_says_where_they_would_go() {
+        let health = ConversationHealth::ephemeral(
+            "The conversation store could not be opened: access denied.",
+            std::path::Path::new("/tmp/arjun-conversations-ephemeral-1234-5678"),
+        );
+        assert!(!health.is_durable());
+        let refusal = health.refusal().expect("a reason");
+        // What is wrong, where the writing goes, and what still works.
+        assert!(refusal.contains("access denied"), "{refusal}");
+        assert!(refusal.contains("arjun-conversations-ephemeral"), "{refusal}");
+        assert!(refusal.contains("not be there after a restart"), "{refusal}");
+        assert!(refusal.contains("can still be read"), "{refusal}");
+    }
+
+    #[test]
+    fn the_ephemeral_directory_is_unique_per_session() {
+        // The stale-reuse defect. Two sessions must not share a directory, or
+        // one finds the other's threads and shows them as its own history.
+        //
+        // The uniqueness comes from the process id and a nanosecond timestamp,
+        // which is what `lib.rs` composes. Asserted here on the shape rather
+        // than by starting two applications.
+        let first = format!("arjun-conversations-ephemeral-{}-{}", 1234, 1_000_000_001u64);
+        let second = format!("arjun-conversations-ephemeral-{}-{}", 1234, 1_000_000_002u64);
+        assert_ne!(first, second);
+        assert!(!first.ends_with("fallback"), "a fixed name is a shared name");
+    }
+
+    #[test]
+    fn two_ephemeral_stores_do_not_see_each_others_conversations() {
+        // The property the unique directory buys, driven for real: a session
+        // that writes into its own scratch directory leaves nothing for the
+        // next one to find.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = ConversationStore::open(&dir.path().join("session-1")).expect("open");
+        first
+            .create("Yesterday".to_string(), "W.".to_string(), OWNER)
+            .expect("create");
+        assert_eq!(first.list(Some(OWNER)).expect("list").len(), 1);
+
+        let second = ConversationStore::open(&dir.path().join("session-2")).expect("open");
+        assert!(
+            second.list(Some(OWNER)).expect("list").is_empty(),
+            "a new session inherited the previous one's ephemeral conversations"
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_session_can_still_read_what_is_already_there() {
+        // Refusing to *create* is the design; refusing to open would leave a
+        // person unable to find out what is wrong. A store opened at a scratch
+        // path still reads and writes normally — the refusal is a policy above
+        // it, not a broken store.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ConversationStore::open(dir.path()).expect("open");
+        let conversation = store
+            .create("Readable".to_string(), "W.".to_string(), OWNER)
+            .expect("create");
+        assert!(store.get(&conversation.id, Some(OWNER)).expect("read").is_some());
+    }
+
+    #[test]
+    fn the_state_serialises_for_the_ui() {
+        let durable = serde_json::to_value(ConversationState::Durable).expect("serialises");
+        assert_eq!(durable["state"], "durable");
+
+        let ephemeral = serde_json::to_value(ConversationState::Ephemeral {
+            because: "no disk".to_string(),
+            directory: "/tmp/x".to_string(),
+        })
+        .expect("serialises");
+        assert_eq!(ephemeral["state"], "ephemeral");
+        assert_eq!(ephemeral["because"], "no disk");
+        assert_eq!(ephemeral["directory"], "/tmp/x");
+    }
 }

@@ -477,3 +477,73 @@ fn query_cim_videocontroller() -> Result<Vec<GpuInfo>, String> {
 
     Ok(gpus)
 }
+
+/// How long a free-VRAM reading is reused.
+///
+/// Free VRAM is the one GPU figure that changes while the app runs, so it
+/// cannot come from [`installed_gpus`], whose whole point is that its answer
+/// does not. Two seconds is shorter than any model load and longer than a
+/// burst of routing decisions, so a chat turn that plans, releases and
+/// re-plans pays for at most one subprocess.
+const FREE_VRAM_TTL: Duration = Duration::from_millis(2000);
+
+/// VRAM actually free on the largest GPU, right now.
+///
+/// ## Why this exists
+///
+/// Routing and offload planning read `dedicated_video_memory_bytes` — what the
+/// card *has*. Nothing read what was *left*. On a machine where another
+/// process held most of the card, the planner budgeted the full 8 GB, computed
+/// a layer count that could not be placed, and llama.cpp either failed to
+/// allocate or spilled across PCIe into host memory. The arithmetic was right
+/// and the answer was unusable: measured at 5 tok/s for a 9B model nominally
+/// at 97% offload.
+///
+/// Deliberately measures the whole card rather than tracking ARJUN's own
+/// servers. The competing consumer is often not ARJUN — another llama-server,
+/// an Ollama daemon, the desktop compositor, a second copy of the app — and a
+/// budget derived from bookkeeping we control would be blind to every one of
+/// them. Asking the driver is blind to none.
+///
+/// Returns `None` when no GPU reports a free figure, which the caller must
+/// treat as "unknown", not as zero: a machine with an AMD card and no
+/// `nvidia-smi` still has VRAM, and refusing to route there would be worse
+/// than planning against the installed total as before.
+pub fn free_vram_bytes() -> Option<u64> {
+    let cache = free_vram_cache();
+
+    if let Ok(guard) = cache.lock() {
+        if let Some((taken_at, value)) = guard.as_ref() {
+            if taken_at.elapsed() < FREE_VRAM_TTL {
+                return *value;
+            }
+        }
+    }
+
+    let free = query_nvidia_smi()
+        .ok()
+        .and_then(|metrics| metrics.into_iter().map(|m| m.vram_free_bytes).max())
+        .filter(|bytes| *bytes > 0);
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), free));
+    }
+    free
+}
+
+/// Drops the cached reading so the next call measures again.
+///
+/// Called after a server has been stopped and awaited. The point of the stop
+/// was to return VRAM, and answering the next fit question from a reading
+/// taken before it came back would defeat the release entirely.
+pub fn invalidate_free_vram_cache() {
+    if let Ok(mut guard) = free_vram_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn free_vram_cache() -> &'static Mutex<Option<(Instant, Option<u64>)>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<(Instant, Option<u64>)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}

@@ -68,6 +68,32 @@ pub struct GgufMetadata {
     pub value_length: u32,
     /// From `general.parameter_count`, which not every converter writes.
     pub parameter_count: Option<u64>,
+    /// Training context length, from `<arch>.context_length`.
+    ///
+    /// `None` when the converter did not write the key. Read because the
+    /// registry otherwise recorded a flat 8192 for every model it found on
+    /// disk, whatever the model was — which is the number the context meter
+    /// showed and the number the agent loop compacted against. A model trained
+    /// for 128k was being compacted at 8k, and one trained for 4k was told it
+    /// had twice the room it has.
+    pub context_length: Option<u32>,
+    /// Whether this model's own chat template exposes a reasoning switch.
+    ///
+    /// Read from `tokenizer.chat_template` by looking for the `enable_thinking`
+    /// variable the template branches on. That is the model telling us, in its
+    /// own words, that it emits a separable reasoning block and will honour a
+    /// request to turn it off.
+    ///
+    /// Derived rather than matched against a list of families. The previous
+    /// answer to "does this model reason?" was a regular expression over the
+    /// model id (`qwen-?3`, `nemotron-3`), which is wrong twice over: it says
+    /// nothing about a model nobody has added to the list, and it keeps saying
+    /// yes about a fine-tune whose template no longer has the switch.
+    ///
+    /// `false` for a model whose template does not mention it, which covers
+    /// both a model that never reasons and one that always does. Neither wants
+    /// the kwarg sent.
+    pub supports_toggled_reasoning: bool,
 }
 
 impl GgufMetadata {
@@ -213,11 +239,22 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
     let expert_count = get("expert_count").unwrap_or(0);
     let expert_used_count = get("expert_used_count").unwrap_or(0);
     let expert_ff_length = get("expert_feed_forward_length").unwrap_or(0);
+    let context_length = get("context_length");
+
+    // Substring rather than a template parse. The question is only whether the
+    // template branches on the variable at all; rendering it would mean
+    // shipping a Jinja engine to answer a yes-or-no.
+    let supports_toggled_reasoning = kv
+        .get("tokenizer.chat_template")
+        .and_then(Scalar::as_str)
+        .map(|template| template.contains("enable_thinking"))
+        .unwrap_or(false);
 
     // Every `get` is done, so the closure's borrow of `architecture` has ended
     // and it can be moved into the result.
     Ok(GgufMetadata {
         architecture,
+        supports_toggled_reasoning,
         block_count,
         embedding_length,
         expert_count,
@@ -227,6 +264,10 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
         key_length,
         value_length,
         parameter_count: kv.get("general.parameter_count").and_then(Scalar::as_u64),
+        // Deliberately not defaulted here. A caller that needs a number when the
+        // key is missing has to choose one and say why; a default invented in
+        // the parser would be indistinguishable from a value the file stated.
+        context_length,
     })
 }
 
@@ -408,6 +449,52 @@ mod tests {
         out
     }
 
+    /// A reasoning switch is the model's own statement, not a guess from its
+    /// name.
+    ///
+    /// The previous answer to "does this model reason?" was a regular
+    /// expression over the model id. It said nothing about a model nobody had
+    /// added to the pattern, and it kept saying yes about a fine-tune whose
+    /// template no longer had the switch. The template is the model telling us
+    /// directly.
+    #[test]
+    fn a_template_that_branches_on_enable_thinking_reports_the_switch() {
+        let mut reader = header(vec![
+            kv_str("general.architecture", "llama"),
+            kv_u32("llama.block_count", 32),
+            kv_str(
+                "tokenizer.chat_template",
+                "{% if enable_thinking %}<think>{% endif %}",
+            ),
+        ]);
+        let meta = parse_gguf_metadata(&mut reader).expect("parses");
+        assert!(meta.supports_toggled_reasoning);
+    }
+
+    #[test]
+    fn a_template_without_the_switch_reports_none() {
+        let mut reader = header(vec![
+            kv_str("general.architecture", "gemma3"),
+            kv_u32("gemma3.block_count", 48),
+            kv_str("tokenizer.chat_template", "{{ messages[0].content }}"),
+        ]);
+        let meta = parse_gguf_metadata(&mut reader).expect("parses");
+        assert!(!meta.supports_toggled_reasoning);
+    }
+
+    /// A header with no template at all is not a reasoning model. Absent has
+    /// to read as "no", or every model whose header this cannot parse would be
+    /// asked for a reasoning block it will never send.
+    #[test]
+    fn a_header_with_no_template_reports_no_switch() {
+        let mut reader = header(vec![
+            kv_str("general.architecture", "llama"),
+            kv_u32("llama.block_count", 32),
+        ]);
+        let meta = parse_gguf_metadata(&mut reader).expect("parses");
+        assert!(!meta.supports_toggled_reasoning);
+    }
+
     fn header(entries: Vec<Vec<u8>>) -> Cursor<Vec<u8>> {
         let mut out = GGUF_MAGIC.to_vec();
         out.extend_from_slice(&3u32.to_le_bytes());
@@ -459,6 +546,37 @@ mod tests {
         // At the working context this is a few hundred MB, not the ~2 GB the
         // banded estimate would charge a 4 GB card.
         assert!(meta.kv_bytes_per_token() * 8192 < 512 * 1024 * 1024);
+    }
+
+    /// The window is read from the file, and its absence is reported as absence.
+    ///
+    /// The registry recorded a flat 8192 for every model on disk before this key
+    /// was parsed, which is the window the context meter showed and the window
+    /// the agent loop compacted against. Returning `None` rather than a default
+    /// keeps the choice of fallback at the call site, where it can be explained.
+    #[test]
+    fn the_trained_context_length_is_read_and_its_absence_is_not_invented() {
+        let stated = parse_gguf_metadata(&mut header(vec![
+            kv_str("general.architecture", "llama"),
+            kv_u32("llama.block_count", 32),
+            kv_u32("llama.embedding_length", 4096),
+            kv_u32("llama.attention.head_count", 32),
+            kv_u32("llama.context_length", 131_072),
+        ]))
+        .unwrap();
+        assert_eq!(stated.context_length, Some(131_072));
+
+        let silent = parse_gguf_metadata(&mut header(vec![
+            kv_str("general.architecture", "llama"),
+            kv_u32("llama.block_count", 32),
+            kv_u32("llama.embedding_length", 4096),
+            kv_u32("llama.attention.head_count", 32),
+        ]))
+        .unwrap();
+        assert_eq!(
+            silent.context_length, None,
+            "a converter that wrote no key must not be reported as having stated one"
+        );
     }
 
     #[test]

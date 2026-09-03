@@ -15,8 +15,20 @@ import {
 } from 'lucide-react';
 import { useToast } from '../hooks/useToast';
 import { demoService, type DemoScenario } from '../services/demo.service';
-import { sovereigntyService, type EgressEvent } from '../services/sovereignty.service';
-import { useRun, isBusy, hasSummary } from '../components/run/useRun';
+import {
+  sovereigntyService,
+  type EgressEvent,
+  type OperatingMode,
+} from '../services/sovereignty.service';
+import { governanceService, type ChainVerification } from '../services/governance.service';
+import {
+  auditChainClaim,
+  egressClaim,
+  sovereigntyClaim,
+  type SecurityClaim,
+} from '../services/securityClaims';
+import { isBusy, hasSummary } from '../components/run/useRun';
+import { useActiveRun } from '../contexts/ActiveRunContext';
 import { ChatSurface } from '../components/chat/ChatSurface';
 import type { RunViewState } from '../components/run/recovery';
 import type { RoutingDecision } from '../services/agent.service';
@@ -51,31 +63,41 @@ const PALETTE = {
  * are honest about being finished.
  */
 export const SIHDashboard = () => {
-  const { state } = useRun();
+  // The same run every other surface shows. This page used to call
+  // `useRun()` for itself, which gave it a private instance that never
+  // started a run and therefore filtered every event away: routing, plan,
+  // activity, verification and security all sat idle for the whole of a run
+  // launched from the chat two panes over.
+  const { state } = useActiveRun();
   const { addToast } = useToast();
   const scenarios = useMemo<DemoScenario[]>(() => demoService.list(), []);
 
   // Live egress events from the broker — replaces the SAMPLE_SECURITY list.
-  const [egress, setEgress] = useState<EgressEvent[]>([]);
+  // `undefined` means "not back yet"; `null` means "asked and could not be
+  // told". The badges render those differently, because a spinner that never
+  // resolves and a probe that failed are different things to a person.
+  const [egress, setEgress] = useState<EgressEvent[] | null | undefined>(undefined);
+  const [mode, setMode] = useState<OperatingMode | null | undefined>(undefined);
+  const [chain, setChain] = useState<ChainVerification | null | undefined>(undefined);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      try {
-        const initial = await sovereigntyService.recentEvents();
-        if (!cancelled) setEgress(initial);
-      } catch {
-        // The broker may be unavailable in offline / dev builds. Show an
-        // empty list rather than failing the whole dashboard.
-      }
+      // Three measured facts, each allowed to fail on its own. A badge whose
+      // probe failed says so; it does not borrow another badge's confidence.
+      const [events, operating, verification] = await Promise.all([
+        sovereigntyService.recentEvents().catch(() => null),
+        sovereigntyService.getMode().catch(() => null),
+        governanceService.verifyChain().catch(() => null),
+      ]);
+      if (cancelled) return;
+      setEgress(events);
+      setMode(operating);
+      setChain(verification);
     })();
     const interval = window.setInterval(() => {
       void (async () => {
-        try {
-          const latest = await sovereigntyService.recentEvents();
-          if (!cancelled) setEgress(latest);
-        } catch {
-          // Ignored — see above.
-        }
+        const latest = await sovereigntyService.recentEvents().catch(() => null);
+        if (!cancelled) setEgress(latest);
       })();
     }, 4000);
     return () => {
@@ -90,16 +112,35 @@ export const SIHDashboard = () => {
   // assistant cell in its own conversation.
   const onDemo = useCallback(
     (scenario: DemoScenario) => {
-      addToast('info', `Starting: ${scenario.title}`);
-      window.dispatchEvent(
-        new CustomEvent('arjun:trigger-send', {
-          detail: {
-            prompt: scenario.prompt,
-            title: scenario.title,
-            systemPrompt: scenario.systemPrompt,
-          },
-        }),
-      );
+      void (async () => {
+        // The documents are read first, and a scenario whose documents cannot
+        // be read does not start. Its prompt says "attached"; a run begun
+        // without them would be answering about a drawing it never saw.
+        let launch;
+        try {
+          launch = await demoService.launch(scenario.id);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          addToast('error', message);
+          return;
+        }
+        addToast(
+          'info',
+          `Starting: ${scenario.title} (${launch.attachments.length} document(s))`,
+        );
+        window.dispatchEvent(
+          new CustomEvent('arjun:trigger-send', {
+            detail: {
+              prompt: launch.prompt,
+              title: scenario.title,
+              classification: launch.classification,
+              scenarioInstructions: launch.scenarioInstructions,
+              skillId: launch.skillId,
+              attachments: launch.attachments,
+            },
+          }),
+        );
+      })();
     },
     [addToast],
   );
@@ -112,12 +153,8 @@ export const SIHDashboard = () => {
           <span className={styles.topbarTag}>SIH 2026 · PS 26117</span>
         </div>
         <div className={styles.topbarRight}>
-          <span className={styles.topbarBadge} style={{ background: PALETTE.amber }}>
-            Sovereign
-          </span>
-          <span className={styles.topbarBadge} style={{ background: PALETTE.green }}>
-            Audit intact
-          </span>
+          <ClaimBadge claim={sovereigntyClaim(mode)} className={styles.topbarBadge} />
+          <ClaimBadge claim={auditChainClaim(chain)} className={styles.topbarBadge} />
           {isBusy(state.phase) && (
             <span
               className={styles.topbarBadge}
@@ -176,7 +213,7 @@ export const SIHDashboard = () => {
 
         {/* RIGHT: security monitor + activity */}
         <section className={`${styles.pane} ${styles.paneRight}`}>
-          <SecurityPanel events={egress} />
+          <SecurityPanel events={egress} mode={mode} chain={chain} />
           <ActivityPanel state={state} />
         </section>
       </div>
@@ -267,31 +304,85 @@ const RoutingPanel = ({
 /* ------------------------------------------------------------------ *
  * Security panel — now fed by the live egress log, not a SAMPLE list.
  * ------------------------------------------------------------------ */
-const SecurityPanel = ({ events }: { events: EgressEvent[] }) => (
+/**
+ * How far back the egress claim looks.
+ *
+ * The broker keeps a bounded recent-events list; this is the window the badge
+ * states. "Zero egress" without a denominator is unfalsifiable — equally true
+ * of a machine that blocked a thousand attempts and one whose broker is not
+ * running.
+ */
+const EGRESS_WINDOW_MINUTES = 60;
+
+/**
+ * One security badge, coloured by how much is actually known.
+ *
+ * Green is reserved for `verified` — a claim with measured state behind it.
+ * Everything else is visibly not green, which is the whole point: these badges
+ * used to be hard-coded strings that read the same on a machine with a broken
+ * audit chain as on one with an intact chain.
+ */
+const CLAIM_COLOURS: Record<SecurityClaim['level'], string> = {
+  loading: PALETTE.steel,
+  unknown: PALETTE.steel,
+  verified: PALETTE.green,
+  degraded: PALETTE.amber,
+  failed: PALETTE.red,
+};
+
+const ClaimBadge = ({
+  claim,
+  className,
+}: {
+  claim: SecurityClaim;
+  className: string;
+}) => (
+  <span
+    className={className}
+    style={{ background: CLAIM_COLOURS[claim.level] }}
+    title={claim.detail}
+    data-claim-level={claim.level}
+  >
+    {claim.level === 'verified' ? (
+      <ShieldCheck size={12} />
+    ) : claim.level === 'failed' ? (
+      <ShieldAlert size={12} />
+    ) : claim.level === 'loading' ? (
+      <Loader2 size={12} className={styles.spin} />
+    ) : (
+      <ShieldAlert size={12} />
+    )}{' '}
+    {claim.label}
+  </span>
+);
+
+const SecurityPanel = ({
+  events,
+  mode,
+  chain,
+}: {
+  events: EgressEvent[] | null | undefined;
+  mode: OperatingMode | null | undefined;
+  chain: ChainVerification | null | undefined;
+}) => (
   <div className={styles.securityPanel}>
     <header>
       <ShieldCheck size={16} />
       <h3>Security Monitor</h3>
     </header>
     <div className={styles.securityMode}>
-      <span className={styles.securityBadge} style={{ background: PALETTE.green }}>
-        <ShieldCheck size={12} /> Work mode
-      </span>
-      <span className={styles.securityBadge} style={{ background: PALETTE.steel }}>
-        <ShieldAlert size={12} /> Zero egress
-      </span>
-      <span className={styles.securityBadge} style={{ background: PALETTE.amber }}>
-        Audit chain: intact
-      </span>
+      <ClaimBadge claim={sovereigntyClaim(mode)} className={styles.securityBadge} />
+      <ClaimBadge claim={egressClaim(events, EGRESS_WINDOW_MINUTES)} className={styles.securityBadge} />
+      <ClaimBadge claim={auditChainClaim(chain)} className={styles.securityBadge} />
     </div>
-    {events.length === 0 ? (
+    {!events || events.length === 0 ? (
       <p className={styles.securityEmpty}>
         No egress events recorded yet. The broker is watching; nothing has been
         attempted.
       </p>
     ) : (
       <ul className={styles.securityList}>
-        {events.slice(0, 12).map((e, i) => (
+        {(events ?? []).slice(0, 12).map((e, i) => (
           <li key={i} className={styles.securityItem}>
             <span className={styles.securityTime}>
               {new Date(e.at).toLocaleTimeString()}

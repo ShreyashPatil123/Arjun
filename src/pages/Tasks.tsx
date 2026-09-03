@@ -26,7 +26,8 @@ import {
   ledgerRows,
 } from '../components/run/context-ledger';
 import { useToast } from '../hooks/useToast';
-import { useRun, isBusy } from '../components/run/useRun';
+import { isBusy } from '../components/run/useRun';
+import { useActiveRun } from '../contexts/ActiveRunContext';
 import styles from './Tasks.module.css';
 
 /**
@@ -590,7 +591,8 @@ function TaskRowActions({
   task: TaskSummary;
   onOpen: (runId: string) => void;
 }) {
-  const { state, start } = useRun();
+  // Shared, so a replayed task is the run every other surface follows.
+  const { state, start } = useActiveRun();
   const { addToast } = useToast();
   const busy = isBusy(state.phase);
   const disabled = busy || task.live;

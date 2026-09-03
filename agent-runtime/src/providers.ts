@@ -87,8 +87,16 @@ export function applyThinkingPolicy(
   payload: unknown,
   modelId: string,
   reasoningWanted: boolean,
+  supportsToggle?: boolean,
 ): unknown {
-  if (!isRecord(payload) || !hasSeparableReasoning(modelId)) {
+  // `supportsToggle` is the model's own answer, read from its chat template on
+  // the Rust side. The name match below is the fallback for a caller that does
+  // not supply one, and it is a fallback rather than the rule for the obvious
+  // reason: it says nothing about a model nobody has added to the pattern, and
+  // it keeps saying yes about a fine-tune whose template no longer branches on
+  // the variable.
+  const separable = supportsToggle ?? hasSeparableReasoning(modelId);
+  if (!isRecord(payload) || !separable) {
     return payload;
   }
 
@@ -118,6 +126,8 @@ export function applyThinkingPolicy(
  */
 export function payloadPolicy(
   reasoningWanted: boolean,
+  supportsToggle?: boolean,
 ): (payload: unknown, model: { id: string }) => unknown {
-  return (payload, model) => applyThinkingPolicy(payload, model.id, reasoningWanted);
+  return (payload, model) =>
+    applyThinkingPolicy(payload, model.id, reasoningWanted, supportsToggle);
 }

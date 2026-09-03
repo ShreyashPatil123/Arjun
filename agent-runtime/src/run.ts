@@ -48,7 +48,24 @@ export interface RunRequest {
     contextWindow?: number;
     maxTokens?: number;
     input?: ("text" | "image")[];
+    /** Whether reasoning is wanted for this run. */
     reasoning?: boolean;
+    /**
+     * Whether this model can be asked for reasoning at all.
+     *
+     * Read on the Rust side from the model's own chat template — the presence
+     * of the `enable_thinking` variable it branches on — rather than matched
+     * against a list of model families. A model with no switch must not be
+     * sent the kwarg in either direction: telling a model that never reasons
+     * not to reason is noise, and telling one that always reasons to stop is a
+     * template variable it will ignore while the operator waits for a panel
+     * that never fills.
+     *
+     * Absent means unknown, and the runtime falls back to recognising the two
+     * families it knows by name — the behaviour that shipped before this
+     * existed.
+     */
+    supportsReasoning?: boolean;
   };
   /**
    * When this run must stop, as epoch milliseconds.
@@ -79,11 +96,56 @@ export interface RunRequest {
   preserved?: PreservedState;
 }
 
+/**
+ * How a run ended.
+ *
+ * A run has exactly one of these, and it is derived from what the loop actually
+ * did rather than from whether this side managed to reply. The distinction is
+ * the whole point: a JSON-RPC request that resolves says the *transport* worked,
+ * and before this existed the core read that as "the task succeeded" -- so a run
+ * an operator stopped, a run that hit the model's output cap mid-sentence, and a
+ * run that answered were recorded, listed and shown as the same thing.
+ *
+ * - `completed` -- the loop finished and the model stopped of its own accord.
+ * - `failed` -- the provider or the loop errored. `detail` is the sentence.
+ * - `aborted` -- a person, or the core, stopped it.
+ * - `lengthLimited` -- the model hit the output cap. The answer is a fragment,
+ *   and calling that complete is the failure mode this product cannot have.
+ * - `budgetStopped` -- it ran past the time or the steps its plan allowed.
+ * - `policyStopped` -- it needed to do something it is not permitted to do.
+ */
+export type RunOutcomeKind =
+  | "completed"
+  | "failed"
+  | "aborted"
+  | "lengthLimited"
+  | "budgetStopped"
+  | "policyStopped";
+
+/** The typed ending of a run, with the one sentence a person is shown. */
+export interface RunTermination {
+  kind: RunOutcomeKind;
+  /**
+   * Why, in a sentence. Absent only for `completed`, which needs no excuse.
+   *
+   * Bounded and safe to display: it is the loop's own wording for the ending,
+   * never a tool result and never model output.
+   */
+  detail?: string;
+}
+
 export interface RunOutcome {
   runId: string;
   /** Assistant text of the final turn, for callers that want just the answer. */
   text: string;
   turns: number;
+  /**
+   * How this run ended, typed.
+   *
+   * The core maps this onto the run's terminal event. It does **not** infer the
+   * ending from the fact that this request resolved.
+   */
+  outcome: RunTermination;
   stopReason?: string;
   /**
    * The run's notes as they finished.
@@ -242,11 +304,16 @@ export async function startRun(
       unresolvedIssues: preserved.unresolvedIssues ?? notes.state.openQuestions,
       recentFiles: preserved.recentFiles ?? notes.state.artifactIds,
     }),
-    onCompacted: (event) =>
+    onCompacted: (event) => {
       peer.notify("run.event", {
         runId,
         event: { type: "context_compacted", ...event },
-      }),
+      });
+      // The ledger moved, and the meter should show it moving. Emitted after
+      // the compaction frame so a consumer folding both in order ends on the
+      // post-compaction reading rather than the one that triggered it.
+      publishLedger("compaction");
+    },
   });
 
   const agent = new Agent({
@@ -318,7 +385,7 @@ export async function startRun(
      * remember to set, and forgetting produces an approval note that opens with
      * the model thinking out loud.
      */
-    onPayload: payloadPolicy(request.model.reasoning ?? false),
+    onPayload: payloadPolicy(request.model.reasoning ?? false, request.model.supportsReasoning),
   });
 
   /**
@@ -330,6 +397,23 @@ export async function startRun(
    * it had. A deadline that killed the process instead would leave a tool call
    * in flight and nobody able to say whether it took effect.
    */
+  /**
+   * Why this run was stopped, when something stopped it.
+   *
+   * The loop reports an abort as `stopReason: "aborted"` and says nothing about
+   * who asked. A deadline and an operator's stop button are the same event to
+   * agent-core and different endings to a person reading the run afterwards, so
+   * the cause is recorded at the point it is known -- here -- rather than
+   * guessed from the wording of a message later.
+   *
+   * First writer wins: the run stops once, and the first thing to ask for it is
+   * the reason it stopped.
+   */
+  let abortCause: RunTermination | null = null;
+  const causedBy = (cause: RunTermination) => {
+    if (abortCause === null) abortCause = cause;
+  };
+
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   if (typeof request.deadlineMs === "number") {
     const remaining = request.deadlineMs - Date.now();
@@ -342,6 +426,10 @@ export async function startRun(
       );
     }
     deadlineTimer = setTimeout(() => {
+      causedBy({
+        kind: "budgetStopped",
+        detail: "Stopped: it ran past the time its plan allowed.",
+      });
       agent.abort("the task reached the time limit its plan allowed");
     }, remaining);
     // Never hold the process open on its own account: if everything else has
@@ -356,8 +444,50 @@ export async function startRun(
   // tracks which (run, content block) has been sent and only emits a
   // `message_update` for genuinely new text.
   const translator = new MessageTranslator(request.messageId);
+
+  /**
+   * Publishes the ledger as it stands.
+   *
+   * Sent on its own frame rather than folded into `context_compacted`, because
+   * the two answer different questions. A compaction event says history was
+   * lost; this says where the window stands *right now*, including on the great
+   * majority of turns where nothing was lost at all. Before this existed the
+   * surface could only learn the ledger when the run finished, so the meter a
+   * person watches while deciding whether to attach one more file was always
+   * describing the previous run.
+   */
+  const publishLedger = (reason: string) => {
+    peer.notify("run.event", {
+      runId,
+      event: { type: "context_ledger", reason, ledger: contextLedger.snapshot() },
+    });
+  };
+
   agent.subscribe((event: AgentEvent) => {
     if (event.type === "turn_end") turns += 1;
+
+    // Reconciliation, on every model call rather than periodically.
+    //
+    // `message_end` is the moment the provider's usage is in hand, and it is
+    // the only moment it is: the numbers are on the finished assistant message
+    // and nowhere else. Doing this per turn is what keeps the running total a
+    // measurement for the whole life of the run instead of only at the end.
+    if (event.type === "message_end") {
+      const message = event.message;
+      const usage = message.role === "assistant" ? message.usage : undefined;
+      // `estimatedIn` is read before the correction is applied, or the drift
+      // would be computed against a figure that had already been corrected and
+      // would read as zero on every turn.
+      const estimatedIn = contextLedger.snapshot().occupied;
+      const actualIn = usage?.input ?? null;
+      contextLedger.reconcile({
+        estimatedIn,
+        actualIn,
+        actualOut: usage?.output ?? null,
+      });
+      contextLedger.applyMeasuredInput(actualIn);
+      publishLedger("turn");
+    }
     // Best-effort by design: a dropped event costs the operator a progress line,
     // whereas awaiting delivery would let a slow UI stall the run.
     //
@@ -368,17 +498,34 @@ export async function startRun(
     // arguments. Both lists are merged so the chat sees a single ordered
     // stream of `run.event` frames.
     const translated = translator.translate(event);
-    if (translated.length > 0) {
-      for (const wire of translated) {
-        peer.notify("run.event", { runId, event: wire });
-      }
-    } else {
+    for (const wire of translated) {
+      peer.notify("run.event", { runId, event: wire });
+    }
+    // The message stream belongs to the translator, exclusively.
+    //
+    // Forwarding the raw event when the translator produced nothing is what
+    // put the loop's own `message_start` / `message_end` frames -- which carry
+    // the *whole* `AgentMessage`, prompt text and tool output included -- onto
+    // the chat channel for every user and tool-result message. The consumer
+    // ignored them because they carry no `messageId`, so the only thing they
+    // ever did was send document text down a second path. A translator that
+    // declines to translate a message event has decided it is not part of the
+    // chat cell; that decision is the answer, not a reason to fall back.
+    if (!isMessageStreamEvent(event) && translated.length === 0) {
       peer.notify("run.event", { runId, event: redactEvent(event) });
     }
   });
 
   register({
-    abort: (reason) => agent.abort(reason),
+    abort: (reason) => {
+      causedBy({
+        kind: "aborted",
+        detail: typeof reason === "string" && reason.trim().length > 0
+          ? `Stopped: ${reason}`
+          : "Stopped by request.",
+      });
+      agent.abort(reason);
+    },
     steer: (text) =>
       agent.steer({
         role: "user",
@@ -396,6 +543,16 @@ export async function startRun(
     await agent.prompt(request.prompt);
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
+    // Exactly one terminal event per run, on every path out.
+    //
+    // `agent_end` covers the ordinary exits and has already closed the cell by
+    // the time control reaches here; this covers the ones where the loop threw
+    // before it could emit anything. `finalize` is idempotent, so the common
+    // case costs nothing and the uncommon one no longer leaves a chat cell
+    // streaming forever.
+    for (const wire of translator.finalize(agent.state.messages)) {
+      peer.notify("run.event", { runId, event: wire });
+    }
     // A run that ends holding grants means authorisation outlived its call. That
     // is a defect, but clearing is the safe half of handling it either way.
     ledger.clear();
@@ -411,14 +568,79 @@ export async function startRun(
           .join("\n")
       : "";
 
+  const outcome = terminationOf({
+    finalAssistant: [...messages].reverse().find((message) => isAssistantMessage(message)),
+    errorMessage: agent.state.errorMessage,
+    abortCause,
+  });
+
   return {
     runId,
     text,
     turns,
+    outcome,
     stopReason: agent.state.errorMessage ? "error" : undefined,
     notes: notes.state,
     ledger: contextLedger.snapshot(),
   };
+}
+
+/**
+ * Reads the run's ending off what the loop actually did.
+ *
+ * Deliberately not "the request resolved, so it worked". A loop that was
+ * stopped, that errored, or that ran into the model's output cap all return
+ * normally from `agent.prompt` -- they are ordinary endings of an agent loop,
+ * not transport faults -- and treating a resolved promise as success is what
+ * made every one of them indistinguishable from an answer.
+ */
+export function terminationOf(state: {
+  finalAssistant?: { stopReason?: unknown; errorMessage?: unknown };
+  errorMessage?: string;
+  abortCause?: RunTermination | null;
+}): RunTermination {
+  const stopReason = state.finalAssistant?.stopReason;
+
+  if (stopReason === "aborted") {
+    // Who asked is knowable only where the abort was requested, so it is
+    // recorded there. Without a recorded cause the honest answer is the
+    // general one: something stopped it.
+    return state.abortCause ?? { kind: "aborted", detail: "Stopped before it finished." };
+  }
+
+  if (stopReason === "error") {
+    const detail =
+      firstString(state.finalAssistant?.errorMessage, state.errorMessage) ??
+      "The model call failed.";
+    return { kind: "failed", detail };
+  }
+
+  if (stopReason === "length") {
+    return {
+      kind: "lengthLimited",
+      detail:
+        "Stopped: the answer reached the output limit for one turn, so it is cut off mid-way.",
+    };
+  }
+
+  // An error the loop recorded without it reaching the final message -- a
+  // provider that failed after the last assistant turn, say. Still a failure.
+  if (typeof state.errorMessage === "string" && state.errorMessage.trim().length > 0) {
+    return { kind: "failed", detail: state.errorMessage };
+  }
+
+  // `stop` and `toolUse` both land here. A loop that stopped on `toolUse`
+  // exhausted its turns rather than its model, and the core -- which owns the
+  // budget -- is the side that can say so.
+  return { kind: "completed" };
+}
+
+/** The first of these that is a non-empty string. */
+function firstString(...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate;
+  }
+  return undefined;
 }
 
 /**
@@ -443,6 +665,20 @@ function applyNotes(notes: WorkingNotes, update: Partial<WorkingNotesState>): vo
   for (const effect of update.completed ?? []) {
     notes.didEffect(effect.tool, effect.target, effect.at);
   }
+}
+
+/**
+ * Whether an event belongs to the chat message stream.
+ *
+ * These three are the translator's alone. Everything else is forwarded to the
+ * surface as-is, redacted.
+ */
+function isMessageStreamEvent(event: AgentEvent): boolean {
+  return (
+    event.type === "message_start" ||
+    event.type === "message_update" ||
+    event.type === "message_end"
+  );
 }
 
 /**
@@ -479,24 +715,38 @@ type WireEvent =
   | { type: "message_update"; messageId: string; delta: string }
   | {
       /**
-       * The model is reasoning privately, or has stopped.
+       * The model is reasoning, or has stopped.
        *
-       * Carries no reasoning. `characters` is the *size* of what the model
-       * produced, which is a progress signal in the same way a byte count is,
-       * and `elapsedMs` is how long it has been at it. Neither can be turned
-       * back into a single token of the thought.
+       * `characters` is the running size of the block and `elapsedMs` is how
+       * long it has been going. `delta` is the reasoning itself, since the
+       * last frame.
        *
-       * This exists because dropping the thinking stream entirely — which is
-       * the right thing to do with its *content* — also dropped the only
-       * evidence that anything was happening. A reasoning model that thinks
-       * for ninety seconds before its first word left the chat surface with
-       * nothing to show for a minute and a half.
+       * ## Why `delta` exists, having deliberately not existed
+       *
+       * This event was built to carry a size and never the text: a byte
+       * counter, so a reasoning pass was visibly happening without any of it
+       * leaving the runtime. That held the wrong line. A model that reasons
+       * for two and a half minutes before its first visible word — measured,
+       * on Qwen3.5-9B at 3 tok/s — left the surface with a static label for
+       * the whole run, and the person watching could not tell a long thought
+       * from a hang.
+       *
+       * The text is **live only**, and that part has not changed. It is
+       * forwarded on the streaming channel, held in a buffer separate from
+       * the answer, and never written to `Message.content`, never sent as
+       * `finalContent`, never resolved against by the verifier, and never
+       * recorded. What survives the run is the answer and the counts; the
+       * thought is shown while it happens and then it is gone.
+       *
+       * Absent on a frame that carries only the counter — a provider that
+       * signals reasoning without sending any, or a tick between flushes.
        */
       type: "model_thinking";
       messageId: string;
       state: "start" | "active" | "end";
       characters: number;
       elapsedMs: number;
+      delta?: string;
     }
   | {
       type: "message_end";
@@ -530,17 +780,45 @@ type WireEvent =
  *    sub-events, so the translator yields zero or more wire events per input.
  */
 export class MessageTranslator {
-  private sentTextStart = new Set<number>();
-  private sentTextEnd = new Set<number>();
+  /**
+   * Characters of each block already forwarded as `message_update`.
+   *
+   * Replaces three boolean sets that tried to answer "has this block been
+   * sent?" and could not, because the question has a length rather than a
+   * yes or no. See the streaming contract below.
+   */
+  private forwarded = new Map<number, number>();
+  /** Blocks that have produced at least one `text_delta`. */
   private sawTextDelta = new Set<number>();
-  private seenStart = false;
-  private seenEnd = false;
+  /**
+   * Whether the assistant chat cell has been opened.
+   *
+   * One cell per run, opened by the first *assistant* `message_start` and by
+   * nothing else. The loop emits `message_start` and `message_end` for user and
+   * tool-result messages too, and before this was role-aware the very first one
+   * -- the user's own prompt -- opened the cell and the very first `message_end`
+   * -- the same user message -- closed it again, terminating the stream before
+   * the model had produced a token.
+   */
+  private cellOpen = false;
+  /** Whether the single terminal `message_end` has gone out. */
+  private cellClosed = false;
   /** When the current run of private reasoning began, or null if none is open. */
   private thinkingSince: number | null = null;
-  /** How many characters of reasoning this block has produced. Never the text. */
+  /** How many characters of reasoning this block has produced. */
   private thinkingChars = 0;
   /** When the last `active` tick went out, so the channel is not flooded. */
   private thinkingTickedAt = 0;
+  /**
+   * Reasoning produced since the last frame went out.
+   *
+   * Buffered rather than forwarded per delta: a reasoning model emits one
+   * delta per token, and one stdio frame per token is thousands a second to
+   * move text a person reads at reading speed. The buffer is emptied onto
+   * every frame that leaves, the closing one included, so no reasoning is
+   * dropped at the end of a block.
+   */
+  private thinkingBuffer = "";
   /**
    * How many of each inner event type the loop delivered.
    *
@@ -558,41 +836,51 @@ export class MessageTranslator {
   ) {}
 
   /**
-   * Opens or advances the private-reasoning signal.
+   * Opens or advances the reasoning signal.
    *
-   * `size` is the length of the delta, and it is the only thing taken from
-   * it. The delta itself is not read, not stored, and not passed on.
+   * Ticked on two clocks, because the frame carries two things now. Reasoning
+   * text goes out at [`THINKING_TEXT_TICK_MS`], fast enough to read as typing
+   * and slow enough that a decode at hundreds of tokens a second still costs
+   * a dozen frames. The counter goes out on its own at [`THINKING_TICK_MS`]
+   * regardless, so a provider that signals reasoning without sending any text
+   * still moves the elapsed figure rather than looking stalled.
    */
-  private thinking(size: number): WireEvent[] {
+  private thinking(delta: string): WireEvent[] {
     const at = this.now();
-    this.thinkingChars += size;
+    this.thinkingChars += delta.length;
+    this.thinkingBuffer += delta;
+
     if (this.thinkingSince === null) {
       this.thinkingSince = at;
       this.thinkingTickedAt = at;
-      return [
-        {
-          type: "model_thinking",
-          messageId: this.messageId,
-          state: "start",
-          characters: this.thinkingChars,
-          elapsedMs: 0,
-        },
-      ];
+      return [this.thinkingFrame("start", at)];
     }
-    // A reasoning model emits deltas as fast as it can decode. Forwarding one
-    // event per delta would put thousands of frames through the stdio channel
-    // to move a number the person reads once a second. Ticked instead.
-    if (at - this.thinkingTickedAt < THINKING_TICK_MS) return [];
+
+    const sinceLast = at - this.thinkingTickedAt;
+    const dueForText = this.thinkingBuffer.length > 0 && sinceLast >= THINKING_TEXT_TICK_MS;
+    if (!dueForText && sinceLast < THINKING_TICK_MS) return [];
     this.thinkingTickedAt = at;
-    return [
-      {
-        type: "model_thinking",
-        messageId: this.messageId,
-        state: "active",
-        characters: this.thinkingChars,
-        elapsedMs: at - this.thinkingSince,
-      },
-    ];
+    return [this.thinkingFrame("active", at)];
+  }
+
+  /**
+   * One reasoning frame, emptying the text buffer onto it.
+   *
+   * `delta` is omitted rather than sent empty, so a consumer can tell a frame
+   * carrying reasoning from one carrying only the counter without inspecting
+   * a string's length.
+   */
+  private thinkingFrame(state: "start" | "active", at: number): WireEvent {
+    const delta = this.thinkingBuffer;
+    this.thinkingBuffer = "";
+    const frame = {
+      type: "model_thinking" as const,
+      messageId: this.messageId,
+      state,
+      characters: this.thinkingChars,
+      elapsedMs: this.thinkingSince === null ? 0 : at - this.thinkingSince,
+    };
+    return delta.length > 0 ? { ...frame, delta } : frame;
   }
 
   /**
@@ -607,33 +895,114 @@ export class MessageTranslator {
     if (this.thinkingSince === null) return [];
     const elapsed = this.now() - this.thinkingSince;
     const characters = this.thinkingChars;
+    // Whatever had not reached a tick yet. Without this the last fraction of
+    // a second of reasoning — the sentence the model was in the middle of
+    // when it started answering — is thrown away, and the panel stops
+    // mid-word on every single run.
+    const delta = this.thinkingBuffer;
     this.thinkingSince = null;
     this.thinkingChars = 0;
+    this.thinkingBuffer = "";
+    const frame = {
+      type: "model_thinking" as const,
+      messageId: this.messageId,
+      state: "end" as const,
+      characters,
+      elapsedMs: elapsed,
+    };
+    return [delta.length > 0 ? { ...frame, delta } : frame];
+  }
+
+  /**
+   * Resets the per-turn block bookkeeping.
+   *
+   * The dedupe sets are keyed by `contentIndex`, which restarts at zero on
+   * every assistant message. Carrying turn one's set into turn two would make
+   * the loop's second answer look like an echo of the first and drop it.
+   */
+  private beginAssistantTurn(): void {
+    this.forwarded.clear();
+    this.sawTextDelta.clear();
+    this.thinkingSince = null;
+    this.thinkingChars = 0;
+    this.thinkingBuffer = "";
+  }
+
+  /**
+   * Emits the run's one terminal event, if it has not been emitted already.
+   *
+   * Every path out of a run funnels through here, which is what makes "exactly
+   * one `message_end` per run" a property of the translator rather than a thing
+   * each call site has to remember.
+   */
+  private closeCell(
+    stopReason: unknown,
+    usage: { input?: number; output?: number } | undefined,
+  ): WireEvent[] {
+    if (this.cellClosed) return [];
+    this.cellClosed = true;
+    const shape = [...this.shape.entries()]
+      .map(([type, count]) => `${type}=${count}`)
+      .sort()
+      .join(" ");
+    process.stderr.write(`[agent-runtime:log] [stream] messageId=${this.messageId} ${shape}
+`);
     return [
       {
-        type: "model_thinking",
+        type: "message_end",
         messageId: this.messageId,
-        state: "end",
-        characters,
-        elapsedMs: elapsed,
+        finishReason: mapStopReason(stopReason),
+        tokensIn: usage?.input,
+        tokensOut: usage?.output,
       },
     ];
   }
 
+  /**
+   * Closes the cell from the run's final state, whatever path the loop took out.
+   *
+   * Called on `agent_end` and again by `startRun` in its `finally`, because a
+   * loop that throws never reaches `agent_end` and a chat cell whose stream
+   * simply stops arriving spins forever. Idempotent: the second call returns
+   * nothing.
+   *
+   * A run that never opened a cell -- no assistant turn ever started -- closes
+   * nothing. There is no cell on the surface to terminate, and inventing a
+   * terminal event for one would tell the chat an answer finished that was
+   * never begun.
+   */
+  finalize(messages: readonly unknown[] = []): WireEvent[] {
+    if (!this.cellOpen || this.cellClosed) return [];
+    const last = [...messages]
+      .reverse()
+      .find((message) => isAssistantMessage(message)) as
+      | { stopReason?: unknown; usage?: { input?: number; output?: number } }
+      | undefined;
+    const closed = this.endThinking();
+    // No final assistant message behind an open cell means the loop stopped
+    // before it produced one. `error` is the honest reading; `stop` would tell
+    // the surface an answer completed.
+    return [...closed, ...this.closeCell(last ? last.stopReason : "error", last?.usage)];
+  }
+
   translate(event: AgentEvent): WireEvent[] {
     if (event.type === "message_start") {
-      if (this.seenStart) return [];
-      this.seenStart = true;
-      this.seenEnd = false;
-      this.sentTextStart.clear();
-      this.sentTextEnd.clear();
-      this.sawTextDelta.clear();
-      this.thinkingSince = null;
-      this.thinkingChars = 0;
+      // Role-aware. The loop emits `message_start` for user and tool-result
+      // messages as well, and neither is the assistant's answer: a user
+      // message opening the cell is what previously made the chat show an
+      // empty assistant bubble the moment the prompt was submitted.
+      if (!isAssistantMessage(event.message)) return [];
+      this.beginAssistantTurn();
+      // Turn two and later continue the cell turn one opened. Re-emitting
+      // `message_start` would tell the consumer to clear the buffer, which is
+      // how everything the model said before its first tool call disappeared.
+      if (this.cellOpen) return [];
+      this.cellOpen = true;
       return [{ type: "message_start", messageId: this.messageId, role: "assistant" }];
     }
 
     if (event.type === "message_update") {
+      if (!isAssistantMessage(event.message)) return [];
       const inner = event.assistantMessageEvent;
       this.shape.set(inner.type, (this.shape.get(inner.type) ?? 0) + 1);
 
@@ -645,59 +1014,64 @@ export class MessageTranslator {
         // Visible text means the reasoning pass is over, whether or not the
         // model bothered to say so.
         const closed = this.endThinking();
-        // Once we've sent the full block via text_start or text_end, ignore
-        // further deltas for that block — the wire contract is "delta = new
-        // text", and the deltas are echoes of the text_start/text_end payload.
-        if (this.sentTextStart.has(contentIndex)) return closed;
-        if (this.sentTextEnd.has(contentIndex)) return closed;
+        // Always forwarded. A delta is new text by definition, and the
+        // previous code suppressed it whenever a `text_start` payload had
+        // been sent for the block — which, under the race described in the
+        // streaming contract above, was every run whose first network chunk
+        // carried more than one frame. Everything the model said after that
+        // chunk was dropped on the floor.
+        this.forwarded.set(contentIndex, (this.forwarded.get(contentIndex) ?? 0) + delta.length);
         return [...closed, { type: "message_update", messageId: this.messageId, delta }];
       }
 
       if (inner.type === "text_start" || inner.type === "text_end") {
-        const partial = (inner as { partial?: { content?: Array<{ type: string; text?: string }> } })
-          .partial;
-        const block = partial?.content?.[0];
-        if (!block || block.type !== "text" || typeof block.text !== "string" || block.text.length === 0) {
-          return [];
-        }
         const contentIndex = (inner as { contentIndex?: number }).contentIndex ?? 0;
 
-        if (inner.type === "text_start") {
-          // If deltas already arrived for this block, suppress the text_start
-          // payload: the consumer has the text already.
-          if (this.sawTextDelta.has(contentIndex)) {
-            this.sentTextStart.add(contentIndex);
-            return [];
-          }
-          if (this.sentTextStart.has(contentIndex)) return [];
-          this.sentTextStart.add(contentIndex);
-          return [{ type: "message_update", messageId: this.messageId, delta: block.text }];
-        }
+        // A block opening carries no text worth forwarding. It used to, and
+        // that is precisely what broke: its `partial` is a live reference to
+        // the message the producer is still writing into, so by the time this
+        // ran it held everything that had arrived in the chunk — which was
+        // then emitted as one lump and used to suppress every real delta.
+        // The block is opened by the deltas that follow it.
+        if (inner.type === "text_start") return [];
 
-        // text_end: emit a final delta only if we have not streamed the
-        // text via deltas, and we have not already emitted a text_start
-        // for the same block (which would itself be a duplicate).
-        if (this.sawTextDelta.has(contentIndex)) {
-          this.sentTextEnd.add(contentIndex);
+        const partial = (inner as { partial?: { content?: Array<{ type: string; text?: string }> } })
+          .partial;
+        // Indexed by the block this event names, not by zero. A reasoning
+        // block ahead of the text one put the thinking at index 0, and
+        // reading it here compared the wrong block against the wrong length.
+        const block = partial?.content?.[contentIndex] ?? partial?.content?.[0];
+        if (!block || block.type !== "text" || typeof block.text !== "string") {
           return [];
         }
-        if (this.sentTextEnd.has(contentIndex)) return [];
-        this.sentTextEnd.add(contentIndex);
-        return [{ type: "message_update", messageId: this.messageId, delta: block.text }];
+
+        // The close is a reconciliation, not a repeat: forward only the part
+        // of the finished block that the deltas did not already carry.
+        //
+        // For a server that streams, that suffix is empty and nothing is
+        // sent. For one that returns the whole message at once — no
+        // `text_delta` at all — it is the entire answer, which is the case
+        // this branch exists for. For one that streams and then pads, it is
+        // the padding. None of the three can duplicate or drop text, which is
+        // what the three booleans this replaced could not guarantee.
+        const already = this.forwarded.get(contentIndex) ?? 0;
+        if (block.text.length <= already) return [];
+        const delta = block.text.slice(already);
+        this.forwarded.set(contentIndex, block.text.length);
+        return [{ type: "message_update", messageId: this.messageId, delta }];
       }
 
-      // Private reasoning. The *content* never leaves this function: no
-      // branch below reads `delta`, `content`, or `partial` for anything but
-      // its length, and none of them produces a `message_update`. What does
-      // go out is that the model is reasoning, how long for, and how much it
-      // has produced — the same class of fact as a byte counter, and the only
-      // thing that keeps the surface honest during a long reasoning pass.
+      // Reasoning. Forwarded on `model_thinking`, buffered and ticked, and
+      // never on `message_update` — which is the line that matters, because
+      // `message_update` is what becomes the answer, what is persisted, and
+      // what the verifier resolves citations against. A thought that reached
+      // that buffer would be signed as part of the deliverable.
       if (inner.type === "thinking_start") {
-        return this.thinking(0);
+        return this.thinking("");
       }
       if (inner.type === "thinking_delta") {
         const delta = (inner as { delta?: unknown }).delta;
-        return this.thinking(typeof delta === "string" ? delta.length : 0);
+        return this.thinking(typeof delta === "string" ? delta : "");
       }
       if (inner.type === "thinking_end") {
         return this.endThinking();
@@ -710,31 +1084,30 @@ export class MessageTranslator {
     }
 
     if (event.type === "message_end") {
-      if (this.seenEnd) return [];
-      this.seenEnd = true;
-      const shape = [...this.shape.entries()]
-        .map(([type, count]) => `${type}=${count}`)
-        .sort()
-        .join(" ");
-      process.stderr.write(`[agent-runtime:log] [stream] messageId=${this.messageId} ${shape}
-`);
+      // A user message ending is not the answer ending, and a tool result
+      // arriving is not the answer ending either. Only an assistant turn can
+      // close the cell -- and only one that is not handing off to a tool.
+      if (!isAssistantMessage(event.message)) return [];
+      const message = event.message;
       // A model that reasoned and then stopped without answering still has an
       // open thinking block. Closing it here is what stops the surface
       // spinning on a run that is already over.
       const closed = this.endThinking();
-      const message = event.message;
-      const stopReason = message.role === "assistant" ? message.stopReason : undefined;
-      const usage = message.role === "assistant" ? message.usage : undefined;
-      return [
-        ...closed,
-        {
-          type: "message_end",
-          messageId: this.messageId,
-          finishReason: mapStopReason(stopReason),
-          tokensIn: usage?.input,
-          tokensOut: usage?.output,
-        },
-      ];
+      if (message.stopReason === "toolUse") {
+        // A tool-use transition, not an outcome. The loop will run the tools
+        // and come back with another assistant turn into the same cell;
+        // terminating here truncated every tool-using run at its first call.
+        return closed;
+      }
+      return [...closed, ...this.closeCell(message.stopReason, message.usage)];
+    }
+
+    // The loop is done. This is the backstop that guarantees a terminal event
+    // for a run whose last assistant turn ended on `toolUse` -- a run stopped
+    // by its step budget, its deadline, or an operator -- where no assistant
+    // `message_end` will ever carry a final outcome.
+    if (event.type === "agent_end") {
+      return this.finalize(event.messages);
     }
 
     return [];
@@ -742,13 +1115,43 @@ export class MessageTranslator {
 }
 
 /**
- * How often an in-progress reasoning pass reports its size.
+ * Whether a loop message is the assistant's own.
+ *
+ * `AgentMessage` spans user, tool-result and several harness-internal roles
+ * (`custom`, `compactionSummary`, `branchSummary`, `bashExecution`). Only the
+ * assistant's turns belong in the chat cell; the rest are the machinery around
+ * them and are not the model speaking.
+ */
+function isAssistantMessage(
+  message: unknown,
+): message is { role: "assistant"; stopReason?: unknown; usage?: { input?: number; output?: number } } {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    (message as { role?: unknown }).role === "assistant"
+  );
+}
+
+/**
+ * How often a reasoning pass reports its size when it has no text to send.
  *
  * A second is slower than the model produces and faster than a person reads,
- * which is the whole requirement. Lower would spend frames on a number nobody
- * looked at; higher would make a long pause look like a stall again.
+ * which is the whole requirement for a counter. Lower would spend frames on a
+ * number nobody looked at; higher would make a long pause look like a stall
+ * again.
  */
 const THINKING_TICK_MS = 1000;
+
+/**
+ * How often buffered reasoning text is flushed.
+ *
+ * Twelve frames a second: fast enough that the panel reads as typing rather
+ * than as paragraphs appearing, slow enough that a model decoding at three
+ * hundred tokens a second costs twelve stdio frames rather than three
+ * hundred. A reading-speed choice, not a throughput one — the text arrives
+ * whole either way.
+ */
+const THINKING_TEXT_TICK_MS = 80;
 
 /**
  * Backwards-compatible stateless wrapper. Used by the unit tests; the

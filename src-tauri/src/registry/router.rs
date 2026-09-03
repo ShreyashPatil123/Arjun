@@ -371,23 +371,69 @@ impl ModelRouter {
                 })
         });
 
+        // The administrator's choice is answered before the size search, not
+        // inside it.
+        //
+        // It used to be sorted to the front of `candidates` and then left to
+        // the same `full_offload` filter as everything else, which quietly
+        // undid it: an orchestrator too large to fit entirely in VRAM failed
+        // the `if`, the loop moved on, and the first smaller model that did fit
+        // answered instead. The Models screen kept the star beside the chosen
+        // model while a different one did the talking — and the reason line
+        // said "the largest cleared model that fits in VRAM", which was true
+        // and was not the question.
+        //
+        // A choice that reaches this point has already cleared every hard gate
+        // — role, floor, classification, modality, licence — because those are
+        // what `candidates` filters on. Fitting in VRAM is not one of them; it
+        // is a question of how fast the model will be, and that is the
+        // administrator's trade to make. Step 5's own comment already said so.
+        if let Some(entry) = candidates
+            .iter()
+            .find(|entry| is_orchestrator(entry, orchestrator))
+            .copied()
+        {
+            let plan = plan_gpu_offload(
+                vram_total_bytes,
+                entry.weights_bytes,
+                entry.context_length,
+                None,
+            );
+            reasons.push(if plan.full_offload {
+                format!(
+                    "{} is configured as the orchestrator and fits in VRAM.",
+                    entry.name
+                )
+            } else {
+                // Named rather than silently accepted: a partly-offloaded model
+                // is markedly slower, and an administrator watching a slow
+                // answer should be able to read why it is this model.
+                format!(
+                    "{} is configured as the orchestrator. It does not fit                      entirely in this machine's VRAM, so it runs partly on the                      CPU rather than being replaced by a smaller model. It will                      be slower.",
+                    entry.name
+                )
+            });
+            reasons.push(plan.reason.clone());
+            let degraded = !plan.full_offload;
+            return Ok(Self::decide(
+                entry,
+                role,
+                intent_label,
+                confidence,
+                plan,
+                degraded,
+                reasons,
+            ));
+        }
+
         for entry in &candidates {
             let plan = plan_gpu_offload(vram_total_bytes, entry.weights_bytes, entry.context_length, None);
             if plan.full_offload {
-                let is_orch = is_orchestrator(entry, orchestrator);
-                let reason_msg = if is_orch {
-                    format!(
-                        "{} is configured as the orchestrator and fits in VRAM.",
-                        entry.name,
-                    )
-                } else {
-                    format!(
-                        "{} is the largest cleared {} model that fits in VRAM.",
-                        entry.name,
-                        role.label()
-                    )
-                };
-                reasons.push(reason_msg);
+                reasons.push(format!(
+                    "{} is the largest cleared {} model that fits in VRAM.",
+                    entry.name,
+                    role.label()
+                ));
                 reasons.push(plan.reason.clone());
                 return Ok(Self::decide(entry, role, intent_label, confidence, plan, false, reasons));
             }
@@ -890,6 +936,89 @@ mod tests {
         assert_eq!(decision.model_id, "qwen-32b");
         assert!(decision.used_fallback, "it does not fit, and the trace must say so");
         assert!(!decision.fully_on_gpu);
+    }
+
+    /// The gap between "the orchestrator fits" and "nothing fits".
+    ///
+    /// Both of those already had tests and both already passed. The case
+    /// between them did not: an orchestrator too large for VRAM, on a machine
+    /// where a *smaller* candidate fits entirely. The full-offload search ran
+    /// first, the choice failed its `if`, and the smaller model answered — so
+    /// the Models screen showed the star beside one model while another did the
+    /// talking, with a reason line that said "the largest cleared model that
+    /// fits in VRAM" and never mentioned that a choice had been overruled.
+    ///
+    /// 20 GB holds the 8B (≈4.8 GB of weights) with room to spare and cannot
+    /// hold the 32B (≈19.2 GB) once the KV cache for 32k tokens is charged.
+    #[test]
+    fn the_choice_wins_even_when_a_smaller_model_would_have_fitted_and_it_does_not() {
+        let registry = stocked();
+
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            20 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&chose("qwen-32b")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision.model_id, "qwen-32b",
+            "the administrator's choice lost to a model that merely fitted better"
+        );
+        assert!(
+            !decision.fully_on_gpu,
+            "this test is only meaningful while the choice does not fully fit"
+        );
+        assert!(
+            decision.used_fallback,
+            "running partly on the CPU is a degraded answer and the trace must say so"
+        );
+        // Confirm the smaller model really was available, or the test would
+        // pass for the wrong reason on a future change to the VRAM heuristic.
+        let smaller = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            20 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(smaller.model_id, "qwen-8b");
+        assert!(smaller.fully_on_gpu);
+    }
+
+    /// A choice that fails a *hard* gate is still overruled. The fix above
+    /// makes VRAM fit a preference; it does not make the choice a bypass.
+    #[test]
+    fn a_choice_that_fails_a_hard_gate_still_loses_when_it_does_not_fit() {
+        let registry = stocked();
+
+        // `surya` serves document OCR only, so it is not a reasoning candidate
+        // at any VRAM size and cannot win a reasoning prompt.
+        let decision = ModelRouter::route_with_orchestrator(
+            &registry,
+            "Explain the trade-offs here",
+            None,
+            20 * GB,
+            None,
+            false,
+            &[],
+            &[],
+            Some(&chose("surya")),
+        )
+        .unwrap();
+
+        assert_eq!(decision.model_id, "qwen-8b");
     }
 
     /// With nobody having chosen, the router is back to judging on capability

@@ -125,13 +125,24 @@ function thinkingDelta(delta: string): AgentEvent {
   } as AgentEvent;
 }
 
-describe("translateForWire: private reasoning is signalled but never disclosed", () => {
+describe("translateForWire: reasoning streams on its own channel", () => {
+  /**
+   * The guarantee that survived the change, and the only one that was ever
+   * load-bearing.
+   *
+   * Reasoning is now shown to the person watching — that was asked for, and
+   * these tests were rewritten rather than deleted so the change is on the
+   * record. What must not happen is reasoning reaching `message_update`: that
+   * stream becomes `Message.content`, is persisted, is sent as `finalContent`,
+   * and is what the verifier resolves citations against. A thought that leaked
+   * into it would be signed as part of the deliverable.
+   */
   it("never produces a message_update from a thinking_delta", () => {
     const out = translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID);
     expect(out.every((e) => e.type !== "message_update")).toBe(true);
   });
 
-  it("emits a content-free model_thinking signal instead of silence", () => {
+  it("carries the reasoning on model_thinking, and only there", () => {
     const out = translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID);
     expect(out).toEqual([
       {
@@ -140,35 +151,78 @@ describe("translateForWire: private reasoning is signalled but never disclosed",
         state: "start",
         characters: SECRET.length,
         elapsedMs: 0,
+        delta: SECRET,
+      },
+    ]);
+    // Serialised rather than field-checked, so a future field carrying the
+    // text somewhere it does not belong fails here too.
+    const wire = JSON.stringify(out.filter((e) => e.type !== "model_thinking"));
+    expect(wire).not.toContain(SECRET);
+  });
+
+  it("buffers between flushes rather than sending a frame per token", () => {
+    let clock = 1_000;
+    const translator = new MessageTranslator(MESSAGE_ID, () => clock);
+    expect(translator.translate(thinkingDelta("abcde"))).toEqual([
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "start",
+        characters: 5,
+        elapsedMs: 0,
+        delta: "abcde",
+      },
+    ]);
+
+    // Inside the text window: buffered, not sent. A reasoning model emits one
+    // delta per token, and a frame each would be thousands a second.
+    clock = 1_020;
+    expect(translator.translate(thinkingDelta("fghij"))).toEqual([]);
+
+    // Past it: one frame carrying everything buffered since the last.
+    clock = 1_120;
+    expect(translator.translate(thinkingDelta("klm"))).toEqual([
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "active",
+        characters: 13,
+        elapsedMs: 120,
+        delta: "fghijklm",
       },
     ]);
   });
 
-  it("carries no fragment of the reasoning anywhere in the serialised event", () => {
-    // Serialised rather than field-checked: a future field that accidentally
-    // carried the text would pass a per-field assertion and fail this one.
-    const wire = JSON.stringify(translateForWire(thinkingDelta(SECRET), RUN_ID, MESSAGE_ID));
-    expect(wire).not.toContain(SECRET);
-    expect(wire).not.toContain("chain-of-thought");
-    for (const word of SECRET.split(" ")) {
-      expect(wire).not.toContain(word);
-    }
+  it("still ticks the counter when a provider sends no reasoning text", () => {
+    // Some providers signal that reasoning is under way without streaming any
+    // of it. The elapsed figure has to keep moving, or a long silent pass
+    // looks like a stall again — the failure the counter was added for.
+    let clock = 0;
+    const translator = new MessageTranslator(MESSAGE_ID, () => clock);
+    translator.translate(thinkingDelta(""));
+    clock = 500;
+    expect(translator.translate(thinkingDelta(""))).toEqual([]);
+    clock = 1_100;
+    expect(translator.translate(thinkingDelta(""))).toEqual([
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "active",
+        characters: 0,
+        elapsedMs: 1_100,
+      },
+    ]);
   });
 
-  it("reports size and duration without the text, and closes on thinking_end", () => {
+  it("flushes the unsent tail on thinking_end rather than dropping it", () => {
+    // The tail is the sentence the model was in the middle of when it stopped
+    // reasoning. Without this the panel stops mid-word on every run.
     let clock = 1_000;
     const translator = new MessageTranslator(MESSAGE_ID, () => clock);
-    expect(translator.translate(thinkingDelta("abcde"))).toEqual([
-      { type: "model_thinking", messageId: MESSAGE_ID, state: "start", characters: 5, elapsedMs: 0 },
-    ]);
-    // Inside the tick window: counted, not sent.
-    clock = 1_500;
-    expect(translator.translate(thinkingDelta("fghij"))).toEqual([]);
-    // Past it: one tick carrying the running total.
-    clock = 2_600;
-    expect(translator.translate(thinkingDelta("klm"))).toEqual([
-      { type: "model_thinking", messageId: MESSAGE_ID, state: "active", characters: 13, elapsedMs: 1_600 },
-    ]);
+    translator.translate(thinkingDelta("abcde"));
+    clock = 1_010;
+    expect(translator.translate(thinkingDelta("tail"))).toEqual([]);
+
     clock = 4_000;
     const ends: AgentEvent = {
       type: "message_update",
@@ -181,7 +235,14 @@ describe("translateForWire: private reasoning is signalled but never disclosed",
       },
     } as AgentEvent;
     expect(translator.translate(ends)).toEqual([
-      { type: "model_thinking", messageId: MESSAGE_ID, state: "end", characters: 13, elapsedMs: 3_000 },
+      {
+        type: "model_thinking",
+        messageId: MESSAGE_ID,
+        state: "end",
+        characters: 9,
+        elapsedMs: 3_000,
+        delta: "tail",
+      },
     ]);
   });
 
@@ -202,6 +263,10 @@ describe("translateForWire: private reasoning is signalled but never disclosed",
         state: "end",
         characters: SECRET.length,
         elapsedMs: 900,
+        // The opening frame already took the reasoning that had arrived by
+        // then, so this one closes the block and carries no text. `delta` is
+        // absent rather than an empty string, which is what lets a consumer
+        // tell "no reasoning in this frame" from "reasoning that was blank".
       },
       { type: "message_update", messageId: MESSAGE_ID, delta: "Hello" },
     ]);
@@ -228,7 +293,23 @@ describe("translateForWire: private reasoning is signalled but never disclosed",
 });
 
 describe("translateForWire: text_start / text_end carry the visible text", () => {
-  it("text_start emits a single message_update with the whole text block", () => {
+  /**
+   * Reversed deliberately, and this is the assertion the streaming bug lived
+   * behind.
+   *
+   * It used to require `text_start` to emit its whole payload. That payload is
+   * `partial` — a live reference to the message the transport is still writing
+   * into — so whenever one network chunk carried the block open plus its first
+   * deltas, this fired with the text already accumulated, emitted it as one
+   * lump, and marked the block as sent. Every later delta was then discarded,
+   * and an answer spanning more than one chunk lost everything after the
+   * first. See "the text_start / text_delta race" below, which reproduces that
+   * interleaving against the real queue.
+   *
+   * A block opening carries no text worth forwarding. The text arrives as
+   * deltas, and `text_end` reconciles whatever the deltas did not carry.
+   */
+  it("text_start emits nothing, because a block opening is not text", () => {
     const event: AgentEvent = {
       type: "message_update",
       message: assistantMessage("stop"),
@@ -238,8 +319,7 @@ describe("translateForWire: text_start / text_end carry the visible text", () =>
         partial: assistantMessageWithText("Hello, world."),
       },
     };
-    const out = translateForWire(event, RUN_ID, MESSAGE_ID);
-    expect(out).toEqual([{ type: "message_update", messageId: MESSAGE_ID, delta: "Hello, world." }]);
+    expect(translateForWire(event, RUN_ID, MESSAGE_ID)).toEqual([]);
   });
 
   it("text_end emits a single message_update with the whole text block", () => {
@@ -318,10 +398,9 @@ describe("translateForWire: message_end", () => {
     expect(wire.tokensOut).toBe(12);
   });
 
-  it("maps length, toolUse, error, and aborted to the chat surface's union", () => {
-    const cases: Array<{ input: StopReason; expected: "length" | "tool_calls" | "error" }> = [
+  it("maps length, error, and aborted to the chat surface's union", () => {
+    const cases: Array<{ input: StopReason; expected: "length" | "error" }> = [
       { input: "length", expected: "length" },
-      { input: "toolUse", expected: "tool_calls" },
       { input: "error", expected: "error" },
       { input: "aborted", expected: "error" },
     ];
@@ -335,6 +414,14 @@ describe("translateForWire: message_end", () => {
       expect(wire.messageId).toBe(MESSAGE_ID);
       expect(wire.finishReason).toBe(expected);
     }
+  });
+
+  it("does not terminate the cell when an assistant turn stops to call a tool", () => {
+    // `toolUse` is a hand-off, not an outcome: the loop runs the tools and
+    // comes back with another assistant turn into the same cell. Emitting a
+    // terminal event here truncated every tool-using run at its first call.
+    const event: AgentEvent = { type: "message_end", message: assistantMessage("toolUse") };
+    expect(translateForWire(event, RUN_ID, MESSAGE_ID)).toEqual([]);
   });
 });
 
@@ -466,5 +553,334 @@ describe("MessageTranslator: deduplication", () => {
     };
     expect(t.translate(ev)).toHaveLength(1);
     expect(t.translate(ev)).toHaveLength(0);
+  });
+});
+
+/**
+ * The full shape of one tool-using turn, as the loop actually emits it.
+ *
+ * This is the sequence that used to break the chat surface. `agent-core`
+ * emits `message_start` and `message_end` for *every* message -- the user's
+ * prompt and each tool result included -- and the translator treated the
+ * first of each as the assistant's. The user's prompt opened the cell and
+ * the user's own `message_end` closed it, so the terminal event went out
+ * before the model had produced a token and every assistant turn after it
+ * was dropped as a duplicate.
+ *
+ * The contract these tests pin:
+ *   - exactly one `message_start`, from the first *assistant* turn;
+ *   - exactly one `message_end`, from the *final* assistant outcome;
+ *   - every assistant turn's text, in order, in between;
+ *   - nothing at all from user or tool-result messages.
+ */
+describe("MessageTranslator: user -> assistant toolUse -> tool result -> final assistant", () => {
+  /** The user's own prompt message, as the loop emits it. */
+  function userMessage(text: string) {
+    return { role: "user" as const, content: [{ type: "text" as const, text }], timestamp: 0 };
+  }
+
+  /** A tool-result message, as the loop emits it after executing a call. */
+  function toolResultMessage(text: string) {
+    return {
+      role: "toolResult" as const,
+      toolCallId: "tc-1",
+      toolName: "knowledge.search_authorized",
+      content: [{ type: "text" as const, text }],
+      isError: false,
+      timestamp: 0,
+    };
+  }
+
+  function textDelta(message: AssistantMessage, delta: string, contentIndex = 0): AgentEvent {
+    return {
+      type: "message_update",
+      message,
+      assistantMessageEvent: { type: "text_delta", contentIndex, delta },
+    } as AgentEvent;
+  }
+
+  /** The whole run, in emission order. */
+  function lifecycle(): AgentEvent[] {
+    const firstTurn = assistantMessageWithText("Let me look that up.", "toolUse");
+    const finalTurn = assistantMessageWithText("The valve is rated to 40 bar.", "stop", {
+      input: 120,
+      output: 34,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 154,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+    return [
+      { type: "agent_start" } as AgentEvent,
+      { type: "turn_start" } as AgentEvent,
+      // 1. The user's prompt. Must not open the cell, must not close it.
+      { type: "message_start", message: userMessage("What is the valve rating?") } as AgentEvent,
+      { type: "message_end", message: userMessage("What is the valve rating?") } as AgentEvent,
+      // 2. The first assistant turn, which stops to call a tool.
+      { type: "message_start", message: firstTurn } as AgentEvent,
+      textDelta(firstTurn, "Let me look "),
+      textDelta(firstTurn, "that up."),
+      { type: "message_end", message: firstTurn } as AgentEvent,
+      // 3. The tool runs and returns. Must not touch the cell either.
+      {
+        type: "tool_execution_start",
+        toolCallId: "tc-1",
+        toolName: "knowledge.search_authorized",
+        args: { query: "valve rating" },
+      } as AgentEvent,
+      { type: "message_start", message: toolResultMessage("P-101 valve: 40 bar") } as AgentEvent,
+      { type: "message_end", message: toolResultMessage("P-101 valve: 40 bar") } as AgentEvent,
+      { type: "turn_end", message: firstTurn, toolResults: [] } as AgentEvent,
+      // 4. The second assistant turn: the answer, into the same cell.
+      { type: "turn_start" } as AgentEvent,
+      { type: "message_start", message: finalTurn } as AgentEvent,
+      textDelta(finalTurn, "The valve is "),
+      textDelta(finalTurn, "rated to 40 bar."),
+      { type: "message_end", message: finalTurn } as AgentEvent,
+      { type: "turn_end", message: finalTurn, toolResults: [] } as AgentEvent,
+      { type: "agent_end", messages: [finalTurn] } as AgentEvent,
+    ];
+  }
+
+  function run(): Array<{ type: string }> {
+    const t = new MessageTranslator("msg-lifecycle");
+    return lifecycle().flatMap((event) => t.translate(event));
+  }
+
+  it("opens the cell exactly once, and from the assistant turn", () => {
+    const starts = run().filter((w) => w.type === "message_start");
+    expect(starts).toEqual([
+      { type: "message_start", messageId: "msg-lifecycle", role: "assistant" },
+    ]);
+  });
+
+  it("emits exactly one terminal event, from the final assistant outcome", () => {
+    const ends = run().filter((w) => w.type === "message_end");
+    expect(ends).toEqual([
+      {
+        type: "message_end",
+        messageId: "msg-lifecycle",
+        finishReason: "stop",
+        tokensIn: 120,
+        tokensOut: 34,
+      },
+    ]);
+  });
+
+  it("preserves both assistant turns' text, in order", () => {
+    const deltas = run()
+      .filter(
+        (w): w is { type: "message_update"; messageId: string; delta: string } =>
+          w.type === "message_update",
+      )
+      .map((w) => w.delta);
+    expect(deltas).toEqual(["Let me look ", "that up.", "The valve is ", "rated to 40 bar."]);
+  });
+
+  it("orders the stream: start, all text, then the single end", () => {
+    const kinds = run().map((w) => w.type);
+    expect(kinds).toEqual([
+      "message_start",
+      "message_update",
+      "message_update",
+      "message_update",
+      "message_update",
+      "message_end",
+    ]);
+  });
+
+  it("emits nothing for the user prompt or the tool result on their own", () => {
+    const t = new MessageTranslator("msg-solo");
+    expect(t.translate({ type: "message_start", message: userMessage("hi") } as AgentEvent)).toEqual(
+      [],
+    );
+    expect(t.translate({ type: "message_end", message: userMessage("hi") } as AgentEvent)).toEqual(
+      [],
+    );
+    expect(
+      t.translate({ type: "message_start", message: toolResultMessage("result") } as AgentEvent),
+    ).toEqual([]);
+    expect(
+      t.translate({ type: "message_end", message: toolResultMessage("result") } as AgentEvent),
+    ).toEqual([]);
+  });
+});
+
+describe("MessageTranslator: the terminal event is emitted exactly once, on every path", () => {
+  it("closes a cell left open by a toolUse turn when the loop ends", () => {
+    // A run stopped by its step budget, its deadline, or an operator: the last
+    // assistant turn ended on `toolUse` and no further assistant message will
+    // arrive. Without the `agent_end` backstop the chat cell streams forever.
+    const stalled = assistantMessageWithText("Calling one more tool.", "toolUse");
+    const t = new MessageTranslator("msg-stalled");
+    t.translate({ type: "message_start", message: stalled } as AgentEvent);
+    expect(t.translate({ type: "message_end", message: stalled } as AgentEvent)).toEqual([]);
+    const out = t.translate({ type: "agent_end", messages: [stalled] } as AgentEvent);
+    expect(out).toEqual([
+      {
+        type: "message_end",
+        messageId: "msg-stalled",
+        finishReason: "tool_calls",
+        tokensIn: 0,
+        tokensOut: 0,
+      },
+    ]);
+  });
+
+  it("does not emit a second terminal event on agent_end after a normal finish", () => {
+    const done = assistantMessageWithText("Done.", "stop");
+    const t = new MessageTranslator("msg-once");
+    t.translate({ type: "message_start", message: done } as AgentEvent);
+    expect(t.translate({ type: "message_end", message: done } as AgentEvent)).toHaveLength(1);
+    expect(t.translate({ type: "agent_end", messages: [done] } as AgentEvent)).toEqual([]);
+    expect(t.finalize([done])).toEqual([]);
+  });
+
+  it("finalize() closes a cell whose loop threw before agent_end", () => {
+    const partial = assistantMessageWithText("I was saying", "error");
+    const t = new MessageTranslator("msg-thrown");
+    t.translate({ type: "message_start", message: partial } as AgentEvent);
+    const out = t.finalize([partial]);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.type === "message_end" && out[0].finishReason).toBe("error");
+    // Idempotent: the caller in `startRun` runs it in a `finally` that also
+    // fires on the paths where `agent_end` already closed the cell.
+    expect(t.finalize([partial])).toEqual([]);
+  });
+
+  it("finalize() closes nothing when no assistant turn ever opened a cell", () => {
+    // Nothing on the surface to terminate. A terminal event here would tell
+    // the chat an answer finished that was never begun.
+    const t = new MessageTranslator("msg-never");
+    expect(t.finalize([])).toEqual([]);
+    expect(t.translate({ type: "agent_end", messages: [] } as AgentEvent)).toEqual([]);
+  });
+});
+
+/**
+ * The streaming race, reproduced against the real queue.
+ *
+ * ## What is being reproduced
+ *
+ * `EventStream.push` (llm-core/utils/event-stream.ts) enqueues an event
+ * whenever no consumer is currently parked in `waiting`. The SSE producer in
+ * `openai-completions-stream.ts` parses a whole network chunk synchronously:
+ * for one chunk carrying several frames it pushes `text_start` and then every
+ * `text_delta` back to back, with no `await` between them, so the consumer
+ * does not run until all of them are queued.
+ *
+ * The `text_start` frame carries `partial: output` — a **live reference** to
+ * the message the producer is still mutating. By the time the consumer drains
+ * it, `output.content[0].text` already holds everything that arrived in that
+ * chunk.
+ *
+ * These tests build that interleaving by hand rather than mocking the
+ * translator's inputs, because the ordering *is* the bug: a test that fed
+ * `text_start` with an empty payload would pass against the broken code.
+ */
+describe("MessageTranslator: the text_start / text_delta race", () => {
+  /** A block of text as the transport accumulates it, with a live partial. */
+  function producer() {
+    const output = { content: [{ type: "text", text: "" }] as Array<{ type: string; text: string }> };
+    const queued: AgentEvent[] = [];
+    return {
+      /** What the transport does when it opens the block. */
+      start() {
+        queued.push({
+          type: "message_update",
+          message: assistantMessage("stop"),
+          assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: output },
+        } as unknown as AgentEvent);
+      },
+      /** Mutate first, then queue — the order `appendTextDeltaInternal` uses. */
+      delta(text: string) {
+        const block = output.content[0];
+        if (block) block.text += text;
+        queued.push({
+          type: "message_update",
+          message: assistantMessage("stop"),
+          assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text },
+        } as unknown as AgentEvent);
+      },
+      end() {
+        queued.push({
+          type: "message_update",
+          message: assistantMessage("stop"),
+          assistantMessageEvent: { type: "text_end", contentIndex: 0, partial: output },
+        } as unknown as AgentEvent);
+      },
+      /** Drain everything the producer queued, in order, through one translator. */
+      drain(translator: MessageTranslator) {
+        return queued.splice(0).flatMap((event) => translator.translate(event));
+      },
+      output,
+    };
+  }
+
+  function deltasOf(events: Array<{ type: string; delta?: string }>): string[] {
+    return events.filter((e) => e.type === "message_update").map((e) => e.delta ?? "");
+  }
+
+  it("streams every delta when the consumer keeps up with the producer", () => {
+    const translator = new MessageTranslator(MESSAGE_ID);
+    const p = producer();
+
+    // One event per drain: the consumer is never behind, so `text_start`
+    // carries an empty block and is correctly ignored.
+    p.start();
+    const started = p.drain(translator);
+    p.delta("Hello");
+    const first = p.drain(translator);
+    p.delta(" world");
+    const second = p.drain(translator);
+
+    expect(deltasOf(started)).toEqual([]);
+    expect(deltasOf(first)).toEqual(["Hello"]);
+    expect(deltasOf(second)).toEqual([" world"]);
+  });
+
+  it("still streams every delta when one chunk carries the open and several deltas", () => {
+    const translator = new MessageTranslator(MESSAGE_ID);
+    const p = producer();
+
+    // The real case: the producer runs to completion for this chunk before the
+    // consumer sees any of it, so `text_start`'s live partial already reads
+    // "Hello world".
+    p.start();
+    p.delta("Hello");
+    p.delta(" world");
+    expect(p.output.content[0]?.text).toBe("Hello world");
+
+    const out = deltasOf(p.drain(translator));
+    expect(out.join("")).toBe("Hello world");
+    expect(
+      out.length,
+      "one lump instead of two deltas means the surface cannot render progressively",
+    ).toBeGreaterThan(1);
+  });
+
+  it("loses no text when the answer spans more than one network chunk", () => {
+    const translator = new MessageTranslator(MESSAGE_ID);
+    const p = producer();
+
+    // Chunk one.
+    p.start();
+    p.delta("Hello");
+    p.delta(" world");
+    const chunkOne = deltasOf(p.drain(translator));
+
+    // Chunk two: deltas only, no second `text_start`.
+    p.delta(" and");
+    p.delta(" goodbye");
+    const chunkTwo = deltasOf(p.drain(translator));
+
+    // The close.
+    p.end();
+    const closing = deltasOf(p.drain(translator));
+
+    expect(
+      [...chunkOne, ...chunkTwo, ...closing].join(""),
+      "text produced after the first chunk must reach the surface",
+    ).toBe("Hello world and goodbye");
   });
 });

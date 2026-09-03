@@ -92,6 +92,13 @@ pub struct VerificationReport {
     pub citations_resolved: usize,
     /// Figures in the draft matched against a calculation record.
     pub figures_checked: usize,
+    /// How much of the answer rests on something. See [`Coverage`].
+    ///
+    /// Defaulted so a report written before this existed still loads; those
+    /// read as all-zero, which is honestly "not recorded" rather than a claim
+    /// that nothing was cited.
+    #[serde(default)]
+    pub coverage: Coverage,
 }
 
 impl VerificationReport {
@@ -100,8 +107,81 @@ impl VerificationReport {
     }
 }
 
+/// What kind of answer this is, and therefore what it must rest on.
+///
+/// ## Why the verifier needs to be told
+///
+/// The check that catches an ungrounded answer used to be written:
+///
+/// ```text
+/// if cited.is_empty() && !evidence.passages.is_empty() && draft.len() > 200
+/// ```
+///
+/// Every clause is a guard against a false positive, and together they left the
+/// worst case unguarded. An answer about the organisation's own record that
+/// retrieved **nothing** has `passages.is_empty()`, so the condition is false,
+/// so no finding is raised, so the report comes back `Ready`. The one answer
+/// this product exists to catch — the model answering from its weights about
+/// documents it never opened — was the one answer it certified.
+///
+/// The clause cannot simply be dropped: an answer to "what does ASME B16.5
+/// say about flange classes" is general knowledge, cites nothing, and is
+/// perfectly good. The two cases are indistinguishable from the draft alone.
+/// So the caller, which knows what the task was, says which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Grounding {
+    /// The answer is about the organisation's own record, so it must rest on
+    /// passages retrieved from it. An answer with no evidence behind it needs a
+    /// person to look before it is used.
+    OrganisationRecord,
+    /// General knowledge — a standard, a method, a definition. Citations are
+    /// welcome and are not required, and demanding them would make the product
+    /// refuse to answer ordinary questions.
+    GeneralKnowledge,
+}
+
+impl Grounding {
+    /// Whether an answer of this kind has to point at something.
+    pub const fn requires_evidence(self) -> bool {
+        matches!(self, Grounding::OrganisationRecord)
+    }
+}
+
+/// How much of the answer rests on something, in figures rather than prose.
+///
+/// Kept explicitly rather than inferred from the findings list, because "no
+/// findings" and "nothing to check" produce the same empty list and mean
+/// opposite things. A reader deciding whether to trust a draft needs to know
+/// which of the two they are looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Coverage {
+    /// Passages the run actually retrieved, and could therefore cite.
+    pub passages_available: usize,
+    /// Distinct `[En]` markers the draft used.
+    pub citations_made: usize,
+    /// Of those, how many point at a passage that exists.
+    pub citations_resolved: usize,
+    /// Whether this answer was required to rest on retrieved evidence.
+    pub required_evidence: bool,
+}
+
+impl Coverage {
+    /// Whether the answer cited everything it could have.
+    ///
+    /// Not a quality judgement — an answer that needed one passage and cited
+    /// one is fully covered. It says only that no retrieved passage went
+    /// unused while claims were being made.
+    pub const fn is_fully_cited(&self) -> bool {
+        self.passages_available > 0 && self.citations_resolved >= self.passages_available
+    }
+}
+
 /// What a draft is checked against.
 pub struct Evidence<'a> {
+    /// What kind of answer this is. See [`Grounding`].
+    pub grounding: Grounding,
     /// Passages actually retrieved during the task. A citation to anything else
     /// did not come from the knowledge base.
     pub passages: &'a [SearchResult],
@@ -230,15 +310,41 @@ pub fn verify(draft: &str, evidence: &Evidence<'_>) -> VerificationReport {
         }
     }
 
-    // 2. A document that asserts things and cites nothing at all.
-    if cited.is_empty() && !evidence.passages.is_empty() && draft.trim().len() > 200 {
-        findings.push(Finding {
-            severity: Severity::Blocking,
-            detail: "The draft cites no sources at all, although passages were retrieved for \
-                     this task. Every material claim should point at the passage it came from."
-                .to_string(),
-            excerpt: None,
-        });
+    // 2. An answer that asserts things without resting on anything.
+    //
+    // Two failures, and this used to be one condition that caught only the
+    // milder of them. Every clause guarded against a false positive, and
+    // together they left the worst case unguarded: an answer about the
+    // organisation's own record that retrieved *nothing* has
+    // `passages.is_empty()`, so the condition was false, so no finding was
+    // raised, so the report came back `Ready`. The one answer this product
+    // exists to catch was the one answer it certified.
+    if evidence.grounding.requires_evidence() && !draft.trim().is_empty() {
+        if evidence.passages.is_empty() {
+            // Not refused outright, because the answer may be a truthful "I
+            // could not find anything" — which is exactly what the system
+            // prompt asks for and must not be punished. It is marked as
+            // needing a person, which is the honest reading of an answer with
+            // nothing behind it.
+            findings.push(Finding {
+                severity: Severity::Blocking,
+                detail: "This answer is about the organisation's own record, and nothing was \
+                         retrieved from it. Whatever it says therefore came from the model \
+                         rather than from a document. A person must check it before it is \
+                         relied on."
+                    .to_string(),
+                excerpt: None,
+            });
+        } else if cited.is_empty() && draft.trim().len() > 200 {
+            findings.push(Finding {
+                severity: Severity::Blocking,
+                detail: "The draft cites no sources at all, although passages were retrieved for \
+                         this task. Every material claim should point at the passage it came \
+                         from."
+                    .to_string(),
+                excerpt: None,
+            });
+        }
     }
 
     // 3. Figures. A number in the document that does not match a recorded
@@ -323,6 +429,12 @@ pub fn verify(draft: &str, evidence: &Evidence<'_>) -> VerificationReport {
         findings,
         citations_resolved: resolved,
         figures_checked: checked,
+        coverage: Coverage {
+            passages_available: available,
+            citations_made: cited.len(),
+            citations_resolved: resolved,
+            required_evidence: evidence.grounding.requires_evidence(),
+        },
     }
 }
 
@@ -356,9 +468,220 @@ mod tests {
         calculations: &'a [CalculationRecord],
     ) -> Evidence<'a> {
         Evidence {
+            grounding: Grounding::OrganisationRecord,
             passages,
             calculations,
             unread_pages: &[],
+        }
+    }
+
+    /// The same evidence, for a question the record does not have to answer.
+    fn general_knowledge<'a>(
+        passages: &'a [SearchResult],
+        calculations: &'a [CalculationRecord],
+    ) -> Evidence<'a> {
+        Evidence {
+            grounding: Grounding::GeneralKnowledge,
+            passages,
+            calculations,
+            unread_pages: &[],
+        }
+    }
+
+    /// What an answer had to rest on, and whether it did.
+    ///
+    /// ## The defect
+    ///
+    /// The check for an unsupported answer was written:
+    ///
+    /// ```text
+    /// if cited.is_empty() && !evidence.passages.is_empty() && draft.len() > 200
+    /// ```
+    ///
+    /// Every clause guards against a false positive, and together they left the
+    /// worst case unguarded. An answer about the organisation's own record that
+    /// retrieved **nothing** has `passages.is_empty()`, so the condition was
+    /// false, so no finding was raised, so the report came back `Ready`. The
+    /// one answer this product exists to catch — the model answering from its
+    /// weights about documents it never opened — was the one answer it
+    /// certified as fully supported.
+    mod grounding {
+        use super::*;
+
+        #[test]
+        fn an_organisation_record_answer_with_no_evidence_needs_review() {
+            // The whole defect, in one assertion.
+            let report = verify(
+                "Pump P-101 was last overhauled in March and its seal was replaced then.",
+                &evidence(&[], &[]),
+            );
+            assert!(
+                !report.is_ready(),
+                "an answer about the record, produced without opening any of it, was certified"
+            );
+            let Standing::NeedsReview { blocking, .. } = report.standing else {
+                panic!("expected NeedsReview, got {:?}", report.standing);
+            };
+            assert!(blocking >= 1);
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.detail.contains("came from the model")),
+                "the reason must say what is wrong: {:?}",
+                report.findings
+            );
+        }
+
+        #[test]
+        fn a_general_knowledge_answer_with_no_evidence_is_ready() {
+            // The reason the clause could not simply be dropped. "What does
+            // the flange standard say about pressure classes" cites nothing
+            // and is a perfectly good answer; demanding evidence would make
+            // the product refuse to answer ordinary questions.
+            //
+            // Deliberately free of numerals: the figure check is a separate
+            // rule with its own tests, and a standard's number in the prose
+            // would fail this test for an unrelated reason.
+            let report = verify(
+                "The flange standard defines pressure ratings by material group and class.",
+                &general_knowledge(&[], &[]),
+            );
+            assert!(report.is_ready(), "{:?}", report.findings);
+            assert!(!report.coverage.required_evidence);
+        }
+
+        #[test]
+        fn an_empty_answer_is_not_faulted_for_having_no_evidence() {
+            // Nothing was claimed, so nothing is unsupported. A finding here
+            // would report a run that produced no answer as a run that
+            // produced a bad one.
+            let report = verify("   \n  ", &evidence(&[], &[]));
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|f| !f.detail.contains("came from the model")),
+                "{:?}",
+                report.findings
+            );
+        }
+
+        #[test]
+        fn a_truthful_nothing_found_answer_still_needs_a_person() {
+            // The system prompt asks the model to say when it found nothing,
+            // and that answer is the right one. It is still an answer about
+            // the record with nothing behind it, so it is marked for review
+            // rather than refused — the distinction between "wrong" and
+            // "unverifiable" is the one the banner has to carry.
+            let report = verify(
+                "I searched the maintenance records and found nothing about pump P-101.",
+                &evidence(&[], &[]),
+            );
+            assert!(!report.is_ready());
+            assert_eq!(report.coverage.passages_available, 0);
+            assert_eq!(report.coverage.citations_made, 0);
+        }
+
+        #[test]
+        fn a_grounded_answer_that_cites_nothing_still_blocks() {
+            // The case the original clause did catch, kept working: passages
+            // were retrieved and the draft ignored all of them.
+            let passages = [
+                passage("Minimum acceptable wall thickness is 9.0 mm."),
+                passage("The seal was replaced in March."),
+            ];
+            let draft = "The vessel is serviceable and the seal is in good condition. ".repeat(6);
+            let report = verify(&draft, &evidence(&passages, &[]));
+            assert!(!report.is_ready());
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.detail.contains("cites no sources")),
+                "{:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// The figures behind the verdict.
+    ///
+    /// Kept explicitly because "no findings" and "nothing to check" produce the
+    /// same empty list and mean opposite things. A reader deciding whether to
+    /// trust a draft needs to know which of the two they are looking at.
+    mod coverage {
+        use super::*;
+
+        #[test]
+        fn a_partially_cited_answer_reports_how_much_it_used() {
+            let passages = [
+                passage("Minimum acceptable wall thickness is 9.0 mm."),
+                passage("The seal was replaced in March."),
+                passage("The pump is rated to 40 bar."),
+            ];
+            let report = verify(
+                "The minimum wall thickness is 9.0 mm [E1].",
+                &evidence(&passages, &[]),
+            );
+            assert_eq!(report.coverage.passages_available, 3);
+            assert_eq!(report.coverage.citations_made, 1);
+            assert_eq!(report.coverage.citations_resolved, 1);
+            assert!(
+                !report.coverage.is_fully_cited(),
+                "one of three passages used is not full coverage"
+            );
+        }
+
+        #[test]
+        fn a_fully_cited_answer_reports_full_coverage() {
+            let passages = [
+                passage("Minimum acceptable wall thickness is 9.0 mm."),
+                passage("The seal was replaced in March."),
+            ];
+            let report = verify(
+                "Wall thickness is 9.0 mm [E1] and the seal was replaced in March [E2].",
+                &evidence(&passages, &[]),
+            );
+            assert!(report.is_ready(), "{:?}", report.findings);
+            assert_eq!(report.coverage.citations_resolved, 2);
+            assert!(report.coverage.is_fully_cited());
+        }
+
+        #[test]
+        fn a_citation_that_resolves_to_nothing_is_counted_as_made_but_not_resolved() {
+            // The distinction that matters: the draft claimed a source, and
+            // the source does not exist. Counting it as resolved would make
+            // coverage read as evidence of grounding.
+            let passages = [passage("Minimum acceptable wall thickness is 9.0 mm.")];
+            let report = verify(
+                "The vessel is due for replacement [E4].",
+                &evidence(&passages, &[]),
+            );
+            assert_eq!(report.coverage.citations_made, 1);
+            assert_eq!(report.coverage.citations_resolved, 0);
+            assert!(!report.coverage.is_fully_cited());
+        }
+
+        #[test]
+        fn coverage_says_whether_evidence_was_required_at_all() {
+            // Two reports with identical zero counts and opposite meanings.
+            let required = verify("Some answer about the record.", &evidence(&[], &[]));
+            let optional = verify("Some general answer.", &general_knowledge(&[], &[]));
+            assert_eq!(required.coverage.citations_resolved, 0);
+            assert_eq!(optional.coverage.citations_resolved, 0);
+            assert!(required.coverage.required_evidence);
+            assert!(!optional.coverage.required_evidence);
+            assert!(!required.is_ready());
+            assert!(optional.is_ready());
+        }
+
+        #[test]
+        fn an_answer_with_nothing_available_is_never_fully_cited() {
+            // Zero of zero is not completeness. Reporting it as such is how a
+            // run that retrieved nothing would look best-in-class.
+            let report = verify("Some general answer.", &general_knowledge(&[], &[]));
+            assert!(!report.coverage.is_fully_cited());
         }
     }
 
@@ -494,6 +817,7 @@ mod tests {
         let report = verify(
             "The vessel meets requirements [E1].",
             &Evidence {
+                grounding: Grounding::OrganisationRecord,
                 passages: &passages,
                 calculations: &[],
                 unread_pages: &[3, 4],
@@ -525,6 +849,7 @@ mod tests {
         let report = verify(
             "The vessel is fine [E9].",
             &Evidence {
+                grounding: Grounding::OrganisationRecord,
                 passages: &passages,
                 calculations: &[],
                 unread_pages: &[2],

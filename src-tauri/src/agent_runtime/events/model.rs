@@ -121,6 +121,16 @@ pub enum TaskEventType {
     MemoryRecalled,
     /// A memory operation was refused, with the fixed reason it was refused for.
     MemoryRefused,
+    /// A skill's instructions were loaded into a run's context.
+    ///
+    /// Written when the body actually reaches the model, not when a skill is
+    /// merely listed. The payload names the skill, its version and the hash the
+    /// bytes were checked against, plus what the load did to the run's tool
+    /// set — a skill can only ever narrow it, and the record says by how much.
+    SkillLoaded,
+    /// A skill was asked for and refused, with the fixed reason.
+    SkillRefused,
+
     /// A run-scope fact was promoted into a project's memory under an approval.
     /// Carries the binding's hashes so the decision stays checkable.
     MemoryPromoted,
@@ -156,6 +166,14 @@ pub enum TaskEventType {
     RunCancelled,
     /// It reached the limit the plan set — steps, time, or going in circles.
     RunStoppedByBudget,
+    /// The model ran into the output cap for one turn, so the answer stops
+    /// mid-way.
+    ///
+    /// Its own ending rather than a completion or a failure. The model did
+    /// what it was asked and the deployment's cap stopped it — and the
+    /// difference is invisible in the text, because a cut-off answer reads
+    /// exactly like a short one.
+    RunStoppedByLength,
     /// It needed to do something it is not permitted to do.
     RunStoppedByPolicy,
     /// It was still going when the process went away, and the next start found
@@ -199,6 +217,8 @@ impl TaskEventType {
             TaskEventType::CheckpointTaken => "checkpoint_taken",
             TaskEventType::CheckpointFailed => "checkpoint_failed",
             TaskEventType::RunResumed => "run_resumed",
+            TaskEventType::SkillLoaded => "skill_loaded",
+            TaskEventType::SkillRefused => "skill_refused",
             TaskEventType::MemoryRecalled => "memory_recalled",
             TaskEventType::MemoryRefused => "memory_refused",
             TaskEventType::MemoryPromoted => "memory_promoted",
@@ -211,6 +231,7 @@ impl TaskEventType {
             TaskEventType::RunFailed => "run_failed",
             TaskEventType::RunCancelled => "run_cancelled",
             TaskEventType::RunStoppedByBudget => "run_stopped_by_budget",
+            TaskEventType::RunStoppedByLength => "run_stopped_by_length",
             TaskEventType::RunStoppedByPolicy => "run_stopped_by_policy",
             TaskEventType::RunDegraded => "run_degraded",
             TaskEventType::RunTimedOut => "run_timed_out",
@@ -243,6 +264,8 @@ impl TaskEventType {
             "checkpoint_taken" => TaskEventType::CheckpointTaken,
             "checkpoint_failed" => TaskEventType::CheckpointFailed,
             "run_resumed" => TaskEventType::RunResumed,
+            "skill_loaded" => TaskEventType::SkillLoaded,
+            "skill_refused" => TaskEventType::SkillRefused,
             "memory_recalled" => TaskEventType::MemoryRecalled,
             "memory_refused" => TaskEventType::MemoryRefused,
             "memory_promoted" => TaskEventType::MemoryPromoted,
@@ -255,6 +278,7 @@ impl TaskEventType {
             "run_failed" => TaskEventType::RunFailed,
             "run_cancelled" => TaskEventType::RunCancelled,
             "run_stopped_by_budget" => TaskEventType::RunStoppedByBudget,
+            "run_stopped_by_length" => TaskEventType::RunStoppedByLength,
             "run_stopped_by_policy" => TaskEventType::RunStoppedByPolicy,
             "run_degraded" => TaskEventType::RunDegraded,
             "run_timed_out" => TaskEventType::RunTimedOut,
@@ -273,11 +297,33 @@ impl TaskEventType {
                 | TaskEventType::RunFailed
                 | TaskEventType::RunCancelled
                 | TaskEventType::RunStoppedByBudget
+                | TaskEventType::RunStoppedByLength
                 | TaskEventType::RunStoppedByPolicy
                 | TaskEventType::RunDegraded
                 | TaskEventType::RunTimedOut
                 | TaskEventType::RunInterrupted
         )
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::TaskEventType;
+
+    /// The database spelling of the new ending, pinned.
+    ///
+    /// Written out rather than derived, so a rename of the variant cannot
+    /// rewrite history — and a test rather than a comment, so the rule is
+    /// enforced rather than merely stated.
+    #[test]
+    fn the_length_ending_round_trips_through_its_database_spelling() {
+        let event = TaskEventType::RunStoppedByLength;
+        assert_eq!(event.as_str(), "run_stopped_by_length");
+        assert_eq!(TaskEventType::from_str("run_stopped_by_length"), Some(event));
+        assert!(
+            event.is_terminal(),
+            "a run cut off at the output cap has ended; recovery must not sweep it up again"
+        );
     }
 }
 

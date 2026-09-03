@@ -251,6 +251,22 @@ impl ToolName {
     /// slowest rather than the sum. Anything that writes, produces a file, runs
     /// code or asks a person is sequential: two writes to one path have an
     /// order, and it should not be whichever finished first.
+    /// Whether this tool reads from the organisation's own record.
+    ///
+    /// A plan that permits one of these is a plan for a task the record has to
+    /// answer, which is what the verifier needs to know: an answer to such a
+    /// task with nothing retrieved behind it came from the model rather than
+    /// from a document. See `artifacts::verifier::Grounding`.
+    pub const fn is_retrieval(self) -> bool {
+        matches!(
+            self,
+            ToolName::SearchDocuments
+                | ToolName::LoadMoreEvidence
+                | ToolName::MediaExtractFindings
+                | ToolName::KnowledgeMultimodalRetrieve
+        )
+    }
+
     pub const fn is_read_only(self) -> bool {
         match self {
             ToolName::SearchDocuments

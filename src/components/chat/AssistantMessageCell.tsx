@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  CircleDashed,
   ChevronDown,
   CircleSlash,
   Copy,
@@ -17,18 +18,25 @@ import {
 } from 'lucide-react';
 import {
   agentService,
+  messageStatus,
+  MESSAGE_STATUS_LABELS,
+  type MessageStatusKind,
   type ArtifactPreview,
   type ArtifactReport,
   type ChatMessage,
   type RunSummary,
 } from '../../services/agent.service';
 import { formatDuration, formatTokens } from './format';
+import { collapseForDisplay } from '../../contexts/ConversationContext';
+import { iconForTool, labelForTool } from '../../services/toolNames';
 import { ChatOrb } from './ChatOrb';
 import { ThinkingTree, type ThinkingNode } from './ThinkingTree';
 import { RunProgressPanel } from './RunProgressPanel';
 import type { ProgressStep } from './runProgress';
 import { useTokenMetrics, type TokenMetrics } from './useTokenMetrics';
 import { Markdown } from './Markdown';
+import { ReasoningStream } from './ReasoningStream';
+import type { LiveReasoning } from '../../contexts/ConversationContext';
 import styles from './ChatSurface.module.css';
 
 function size(bytes: number): string {
@@ -90,32 +98,40 @@ function StatusPill({
   runningTools,
   metrics,
 }: {
-  state: 'thinking' | 'usingTool' | 'composing' | 'verifying' | 'verified' | 'failed';
+  state: MessageStatusKind;
   elapsedText: string | null;
   runningTools: number;
   metrics: TokenMetrics;
 }) {
-  const labels: Record<typeof state, string> = {
-    thinking: 'Thinking',
+  const labels: Record<MessageStatusKind, string> = {
+    ...MESSAGE_STATUS_LABELS,
+    // The only label that depends on something outside the status itself.
     usingTool: runningTools > 1 ? `Using ${runningTools} tools…` : 'Using a tool…',
-    composing: 'Composing…',
-    verifying: 'Verifying…',
-    verified: 'Verified',
-    failed: 'Failed',
   };
 
   return (
     <span className={styles.statusPill} data-state={state}>
-      {state === 'thinking' || state === 'usingTool' || state === 'composing' || state === 'verifying' ? (
+      {state === 'thinking' || state === 'usingTool' || state === 'composing' ? (
         <Loader2 size={11} className={styles.spin} />
       ) : state === 'verified' ? (
+        // The tick is reserved for the one state that earned it: the verifier
+        // ran and every claim resolved.
         <CheckCircle2 size={11} />
-      ) : (
+      ) : state === 'failed' ? (
         <X size={11} />
+      ) : (
+        // Finished, but not certified: needs review, unverified, stopped, or
+        // completed with nothing to check. None of those is a failure and none
+        // of them is a pass.
+        <CircleDashed size={11} />
       )}
       <span>{labels[state]}</span>
       {elapsedText && <span className={styles.statusPillSub}>· {elapsedText}</span>}
-      {(state === 'composing' || state === 'verified') && metrics.tokensOut > 0 && (
+      {(state === 'composing' ||
+        state === 'verified' ||
+        state === 'needsReview' ||
+        state === 'unverified') &&
+        metrics.tokensOut > 0 && (
         <span className={styles.statusPillSub} title={tokenTitle(metrics)}>
           · {metrics.approx ? '~' : ''}
           {formatTokens(metrics.tokensOut)} tok
@@ -150,6 +166,14 @@ interface AssistantMessageCellProps {
    * another turn's answer.
    */
   progress?: ProgressStep[];
+  /**
+   * The reasoning this turn has produced so far.
+   *
+   * Live only, and absent on every finished message: it is held in the
+   * reducer for the life of the run and never persisted, so a reopened
+   * conversation shows the answer with no thinking behind it.
+   */
+  reasoning?: LiveReasoning;
   /** Only the newest assistant cell draws the orb. */
   showAvatar?: boolean;
   onOpenInspector?: (runId: string) => void;
@@ -164,14 +188,26 @@ export function AssistantMessageCell({
   activity,
   runSummary,
   progress,
+  // Renamed on the way in. `reasoning` is already spoken for in this
+  // component: `parseThinking` returns the inline <think> block under that
+  // name, and the two are different things — one was streamed on its own
+  // channel, the other was dug out of the answer after the fact.
+  reasoning: liveReasoning,
   showAvatar,
   onOpenInspector,
   onRetry,
 }: AssistantMessageCellProps) {
-  // FIX 1: Eliminate text duplication.
-  const content = isLive
-    ? (liveContent ?? message.content)
-    : message.content;
+  // What was stored: the model's exact words, in the order it produced them.
+  //
+  // Repetition is collapsed for *display* only, and only when the answer has no
+  // fenced code in it. It used to be collapsed inside the streaming reducer,
+  // which meant the edited text was what got persisted, sent as `finalContent`,
+  // resolved against by the verifier and written into the audit record — a
+  // display convenience editing the evidence. `stored` is what everything else
+  // in the product sees; `content` is what this cell draws.
+  const stored = isLive ? (liveContent ?? message.content) : message.content;
+  const display = useMemo(() => collapseForDisplay(stored), [stored]);
+  const content = display.text;
   const isStreaming = isLive === true || message.status === 'streaming';
   const isFailed = message.status === 'failed';
   const isDone = !isStreaming && !isFailed;
@@ -185,18 +221,28 @@ export function AssistantMessageCell({
   const runningTools = activity?.filter(a => a.status === 'running').length ?? 0;
   const toolsTotal = activity?.length ?? 0;
 
-  // FIX 5: Status reflects generation state accurately.
-  const status = isFailed
-    ? 'failed'
-    : isDone
-      ? 'verified'
-      : isStreaming
-        ? content.length > 0
-          ? 'composing'
-          : runningTools > 0
-            ? 'usingTool'
-            : 'thinking'
-        : 'thinking';
+  // What this turn actually is, from what was actually recorded.
+  //
+  // This used to read `isFailed ? 'failed' : isDone ? 'verified' : ...`, so
+  // "not streaming and not failed" was rendered as **Verified**, with a green
+  // tick, for every turn — including ones the verifier never looked at, ones
+  // it found blocking problems in, and ones a person stopped part way through.
+  // The strongest claim the product can make was the one it made by default.
+  const status = messageStatus({
+    isStreaming,
+    contentLength: content.length,
+    runningTools,
+    // Persisted per message, so a cell rendered from disk long after the run's
+    // events have gone still knows how it ended and what checked it.
+    outcome: message.outcome ?? (isFailed ? 'failed' : null),
+    verification:
+      message.verification ??
+      (runSummary?.verification
+        ? runSummary.verification.standing.standing === 'ready'
+          ? 'ready'
+          : 'needsReview'
+        : null),
+  });
 
   const [copied, setCopied] = useState(false);
 
@@ -277,6 +323,17 @@ export function AssistantMessageCell({
                   hasAnswer={displayContent.length > 0}
                 />
               )}
+
+              {/* The model thinking, while it thinks. Above the timeline
+                * and the answer because it covers the interval between
+                * them: the request has gone, the answer has not started,
+                * and this is the only thing happening. It closes itself
+                * when the answer begins. */}
+              <ReasoningStream
+                reasoning={liveReasoning}
+                isLive={isStreaming}
+                hasAnswer={displayContent.length > 0}
+              />
 
               {/* The record of the turn. It stays after the run ends:
                 * this is what happened, not a progress spinner. */}
@@ -384,25 +441,16 @@ const STATUS_LABEL: Record<ActivityEntry['status'], string> = {
   unknown: 'interrupted',
 };
 
-const TOOL_LABEL: Record<string, string> = {
-  search_documents: 'Searching the documents',
-  read_scoped_file: 'Reading a file',
-  write_scoped_file: 'Writing a file',
-  run_calculation: 'Calculating',
-  create_docx: 'Producing a Word document',
-  create_xlsx: 'Producing a workbook',
-  execute_code: 'Running code',
-  validate_artifact: 'Checking a produced file',
-};
-
+// The labels and the icon rule both live in `services/toolNames.ts`. They used
+// to be a second copy of the table in `useRun.ts`, keyed on the pre-namespace
+// spelling, so a live event carrying the current name fell through to the raw
+// string. See that module.
 function toolLabel(tool: string) {
-  return TOOL_LABEL[tool] ?? tool;
+  return labelForTool(tool);
 }
 
 function toolIcon(tool: string): ThinkingNode['icon'] {
-  if (tool.includes('search')) return 'search';
-  if (tool.includes('read')) return 'link';
-  return 'tool';
+  return iconForTool(tool);
 }
 
 /**

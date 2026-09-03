@@ -445,6 +445,12 @@ impl InferenceManager {
             .get_loaded_model_info()
             .map(|m| m.model_id)
             .unwrap_or_else(|| "<unknown>".to_string());
+        // The pre-call estimate. Kept — reconciliation needs both halves to
+        // report a drift — but it is no longer what gets recorded as
+        // `tokens_in`. It used to be: a word count times 1.3, written into a
+        // field every reader takes for a measurement, while the runtime three
+        // frames away held the tokenizer's own answer and merely logged it. An
+        // estimate is fine; an estimate wearing a measurement's name is not.
         let tokens_in_estimate: u32 = final_messages
             .iter()
             .map(|m| m.content.split_whitespace().count() as u32)
@@ -462,6 +468,14 @@ impl InferenceManager {
         let generated = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let counter = Arc::clone(&generated);
 
+        // The tokenizer's own count of the prompt, carried out on every chunk.
+        // `u32::MAX` is the sentinel for "no chunk reported one" so a single
+        // atomic can express absence; zero cannot, because zero is also a
+        // legitimate answer and telling the two apart is the entire point.
+        const UNCOUNTED: u32 = u32::MAX;
+        let prompt_counted = Arc::new(std::sync::atomic::AtomicU32::new(UNCOUNTED));
+        let prompt_counter = Arc::clone(&prompt_counted);
+
         let app_handle_clone = app_handle.clone();
         let result = {
             let mut runtime = self.runtime.lock().unwrap();
@@ -469,10 +483,17 @@ impl InferenceManager {
                     if let Some(count) = chunk.tokens_generated {
                         counter.store(count as u32, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if let Some(count) = chunk.prompt_tokens {
+                        prompt_counter.store(count, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let _ = app_handle_clone.emit("inference:token", &chunk);
                 })
         };
         let tokens_out = generated.load(std::sync::atomic::Ordering::Relaxed);
+        let tokens_in_measured = match prompt_counted.load(std::sync::atomic::Ordering::Relaxed) {
+            UNCOUNTED => None,
+            counted => Some(counted),
+        };
 
         // Model Health: record the call to the in-memory telemetry sink so
         // the /model-health page can show real numbers after the first call.
@@ -492,10 +513,13 @@ impl InferenceManager {
         // and puts the loaded model's id there whether or not anybody asked for
         // diagnostics.
         log::debug!(
-            "[telemetry] sink present={}, model_id={}, exit={:?}, tokens_in~{}, tokens_out={}",
+            "[telemetry] sink present={}, model_id={}, exit={:?}, tokens_in={} (estimate was {}), tokens_out={}",
             sink_state.is_some(),
             model_id,
             exit,
+            tokens_in_measured
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "uncounted".to_string()),
             tokens_in_estimate,
             tokens_out
         );
@@ -508,15 +532,27 @@ impl InferenceManager {
                     intent: "chat".to_string(),
                     role: "reasoning".to_string(),
                     latency: started.elapsed(),
-                    tokens_in: tokens_in_estimate,
+                    // The tokenizer's figure when the runtime reported one.
+                    // Falling back to the estimate keeps the row populated, and
+                    // the note below says which of the two this is — a reader
+                    // comparing two models must be able to tell a measured row
+                    // from an approximated one.
+                    tokens_in: tokens_in_measured.unwrap_or(tokens_in_estimate),
                     tokens_out,
                     used_fallback,
                     exit,
-                    note: Some(
-                        "tokens_in is a word-count estimate; tokens_out is the \
-                         runtime's own count of what it generated"
+                    note: Some(match tokens_in_measured {
+                        Some(measured) => format!(
+                            "tokens_in and tokens_out are both the runtime's own counts; \
+                             the pre-call estimate was {tokens_in_estimate} \
+                             ({} drift)",
+                            crate::ai_engine::token_reconciliation::drift_label(tokens_in_estimate, measured),
+                        ),
+                        None => "tokens_in is a word-count estimate — the runtime \
+                                 reported no tokenizer count for this call; tokens_out \
+                                 is the runtime's own count of what it generated"
                             .to_string(),
-                    ),
+                    }),
                     complexity: None,
                 },
             );

@@ -12,7 +12,8 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { demoService, type DemoId, type DemoScenario } from '../services/demo.service';
-import { useRun } from '../components/run/useRun';
+import { useToast } from '../hooks/useToast';
+import { useActiveRun } from '../contexts/ActiveRunContext';
 import { RunView } from '../components/run/RunView';
 import styles from './Demo.module.css';
 
@@ -36,7 +37,9 @@ import styles from './Demo.module.css';
 export const Demo: React.FC = () => {
   const navigate = useNavigate();
   const scenarios = demoService.list();
-  const { state, start, abort, reset } = useRun();
+  // Shared, so a scenario launched here is the run the SIH dashboard shows.
+  const { state, start, abort, reset } = useActiveRun();
+  const { addToast } = useToast();
   const [history, setHistory] = useState<Array<{ runId: string; title: string; when: string }>>([]);
 
   const isIdle = state.phase === 'idle';
@@ -79,10 +82,22 @@ export const Demo: React.FC = () => {
       // previously-displayed `RunView` does not flash while the new one's
       // first event arrives.
       reset();
-      void start(s.prompt, undefined, {
-        correlationId: `demo-${s.id}-${Date.now()}`,
-        systemPrompt: s.systemPrompt,
-      });
+      // The scenario's own documents, read before the run starts. A scenario
+      // whose fixtures cannot be read does not start: its prompt says
+      // "attached", and a run begun without them would be answering about a
+      // drawing it never saw.
+      void (async () => {
+        try {
+          const launch = await demoService.launch(s.id);
+          await start(launch.prompt, launch.classification, {
+            correlationId: `demo-${s.id}-${Date.now()}`,
+            scenarioInstructions: launch.scenarioInstructions,
+            attachments: launch.attachments,
+          });
+        } catch (error) {
+          addToast('error', error instanceof Error ? error.message : String(error));
+        }
+      })();
     },
     [start, reset],
   );

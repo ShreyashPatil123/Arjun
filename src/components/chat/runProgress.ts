@@ -180,13 +180,15 @@ export function applyProgress(
           at,
           'thinking',
           'Thought it through',
-          `${humanMs(input.elapsedMs)} · ${group(input.characters)} characters of private reasoning`,
+          // No duration here: the row already carries its own measured time
+          // on the right. Printing it twice reads as two different numbers.
+          `${group(input.characters)} characters of private reasoning`,
         );
       }
       // Size and duration only. The reasoning itself never reaches this file.
       const detail =
         input.characters > 0
-          ? `${humanMs(input.elapsedMs)} · ${group(input.characters)} characters so far`
+          ? `${group(input.characters)} characters so far`
           : undefined;
       return advance(steps, at, 'thinking', 'Thinking', detail);
     }
@@ -269,7 +271,6 @@ function applyStage(
     }
 
     case 'modelReady': {
-      const took = num(detail, 'tookMs') ?? 0;
       if (detail['warm'] === true) {
         // Nothing was loaded, so no loading step exists to settle. Saying the
         // model was already up is the honest account of a step that took no
@@ -277,7 +278,11 @@ function applyStage(
         // question answers in two seconds today and forty yesterday.
         return steps;
       }
-      return settle(steps, at, 'loading', 'Loaded the model', humanMs(took));
+      // The duration is not passed as detail: the loading row is timed by the
+      // panel itself, and `tookMs` is the same measurement. One number, one
+      // place. Whatever detail the loading step already had — an offload that
+      // could not fit entirely on the GPU, say — is kept.
+      return settle(steps, at, 'loading', 'Loaded the model');
     }
 
     case 'planning':

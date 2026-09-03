@@ -321,6 +321,10 @@ mod tests {
             key_length: 64,
             value_length: 64,
             parameter_count: Some(20_900_000_000),
+            // Irrelevant to expert-weight arithmetic; this test compares only
+            // that.
+            context_length: None,
+            supports_toggled_reasoning: false,
         }
         .expert_bytes(file_bytes, None);
 

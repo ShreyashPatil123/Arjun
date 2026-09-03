@@ -73,6 +73,11 @@ export function ChatComposer({
   // rather than worked out here: the composer guessing at the routing is how
   // a hint that says "OCR" ends up above a run that used none.
   const [plans, setPlans] = useState<AttachmentPlan[]>([]);
+  // Whether the routing preview has answered for the current attachments.
+  // An empty `plans` means "nothing needs OCR" only once this is true;
+  // before that it means "not asked yet", and the two decide opposite
+  // things about whether the reading control belongs on screen.
+  const [plansResolved, setPlansResolved] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -100,18 +105,28 @@ export function ChatComposer({
   useEffect(() => {
     if (attachments.length === 0) {
       setPlans([]);
+      setPlansResolved(false);
       return;
     }
     let live = true;
+    setPlansResolved(false);
     void previewAttachmentRouting(
       attachments.map(a => ({ name: a.name, mime: a.mime })),
     )
       .then(next => {
-        if (live) setPlans(next);
+        if (live) {
+          setPlans(next);
+          setPlansResolved(true);
+        }
       })
       .catch(() => {
         // No hint is better than a wrong one. The run itself makes the same
         // decision from the same code, so nothing is lost but the preview.
+        //
+        // Deliberately left unresolved rather than resolved-and-empty: the two
+        // are the same empty list and very different facts, and treating a
+        // failed preview as "nothing needs reading" would hide the reading
+        // control on exactly the files whose routing could not be worked out.
         if (live) setPlans([]);
       });
     return () => {
@@ -122,6 +137,23 @@ export function ChatComposer({
   const hasContent = prompt.trim().length > 0 || attachments.length > 0;
   const canSubmit = hasContent;
   const ocrPlans = plans.filter(p => p.needsOcr);
+
+  // Whether the accuracy-to-speed control is shown at all.
+  //
+  // It used to be permanent, on the reasoning that a camera's quality setting
+  // exists before the shot. In a chat composer that reads as a control with
+  // nothing to control: it sat under every message in a conversation that had
+  // no attachment in it, and moving it appeared to do nothing because there was
+  // nothing for it to do.
+  //
+  // So it appears with the file it governs. The `attachments.length > 0` half
+  // matters when the routing preview has not answered yet — a control that
+  // blinked in a beat after the file did would be worse than one that arrives
+  // with it — and `plansResolved` keeps it from lingering once the preview
+  // comes back saying nothing here needs reading, which is the answer for a
+  // .txt or a .csv.
+  const showOcrSlider =
+    attachments.length > 0 && (!plansResolved || ocrPlans.length > 0);
 
   const submit = useCallback(async () => {
     if (!canSubmit) return;
@@ -283,7 +315,7 @@ export function ChatComposer({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md,.markdown,.csv,.json,.log,.tsv,.docx,.xlsx"
+              accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md,.markdown,.csv,.json,.log,.tsv,.docx,.xlsx,.pptx"
               multiple
               hidden
               onChange={onFilesPicked}
@@ -328,7 +360,7 @@ export function ChatComposer({
           )}
         </div>
 
-        {ocrPreference && (
+        {ocrPreference && showOcrSlider && (
           <OcrQualitySlider
             preference={ocrPreference}
             disabled={streaming}

@@ -899,3 +899,182 @@ fn loading_a_skill_nobody_has_heard_of_says_so() {
         other => panic!("expected unknown, got {other:?}"),
     }
 }
+
+/// Loading a skill by name, in production.
+///
+/// ## What was missing
+///
+/// `SkillRegistry::load` has always performed every check this needs: registry
+/// identity, the trust list's hash against the bytes on disk *now*, the ARJUN
+/// version requirement, the required binaries, the signed-in person's
+/// clearance, and the sovereignty mode.
+///
+/// Nothing called it. `capability.search` returned cards and there was no way
+/// to ask for the instructions, so a skill could be listed and never used. The
+/// checking was complete and the capability did not exist.
+///
+/// These pin the two properties that make the capability safe to have: a skill
+/// can only ever *narrow* what a run may do, and a skill nobody signed — or one
+/// edited since somebody did — is refused.
+mod load_by_name {
+    use super::*;
+
+    /// Two tools in the manifest, one of which the run does not hold.
+    fn wants_two() -> String {
+        skill_md(
+            "seal-review",
+            "  - write_scoped_file\n",
+            "none",
+            "Read the inspection report, then draft the note.",
+        )
+    }
+
+    #[test]
+    fn a_skill_cannot_widen_the_run_beyond_what_it_already_held() {
+        // The property the whole design rests on. The manifest asks for a
+        // write; the run holds only a search. The result is the search.
+        let f = Fixture::new();
+        let sha = f.write("seal-review", &wants_two());
+        f.trust(&[("seal-review", &sha)]);
+
+        let session = user();
+        let permits = [ToolName::SearchDocuments];
+        let loaded = f
+            .registry()
+            .load("seal-review", &context(&session, &permits))
+            .expect("loads");
+
+        assert_eq!(loaded.narrowed.tools, vec![ToolName::SearchDocuments]);
+        assert_eq!(loaded.narrowed.refused, vec![ToolName::WriteScopedFile]);
+        assert!(
+            !loaded.narrowed.tools.contains(&ToolName::WriteScopedFile),
+            "a skill obtained a tool the run never held"
+        );
+    }
+
+    #[test]
+    fn a_skill_narrows_a_run_that_held_more_than_it_asked_for() {
+        // The other direction, and the reason "narrow" is the right word: a
+        // run holding three tools that loads a skill wanting one is left with
+        // one, not three.
+        let f = Fixture::new();
+        let sha = f.write("seal-review", &skill_md("seal-review", "", "none", "Search first."));
+        f.trust(&[("seal-review", &sha)]);
+
+        let session = user();
+        let permits = [
+            ToolName::SearchDocuments,
+            ToolName::WriteScopedFile,
+            ToolName::RunCalculation,
+        ];
+        let loaded = f
+            .registry()
+            .load("seal-review", &context(&session, &permits))
+            .expect("loads");
+
+        assert_eq!(loaded.narrowed.tools, vec![ToolName::SearchDocuments]);
+        assert_eq!(
+            loaded.narrowed.withheld,
+            vec![ToolName::WriteScopedFile, ToolName::RunCalculation]
+        );
+    }
+
+    #[test]
+    fn a_skill_edited_after_it_was_signed_is_refused() {
+        // The bytes about to be put in front of a model must be the bytes
+        // somebody trusted. Discovery may have been minutes ago.
+        let f = Fixture::new();
+        let original = f.write("seal-review", &skill_md("seal-review", "", "none", "Original."));
+        f.trust(&[("seal-review", &original)]);
+
+        let registry = f.registry();
+        let session = user();
+        let permits = [ToolName::SearchDocuments];
+        // It loads while it is what it was.
+        registry
+            .load("seal-review", &context(&session, &permits))
+            .expect("loads before the edit");
+
+        // Somebody changes it on disk.
+        f.write("seal-review", &skill_md("seal-review", "", "none", "Edited."));
+
+        match registry.load("seal-review", &context(&session, &permits)) {
+            Err(LoadRefusal::ChangedOnDisk { expected, found }) => {
+                assert_eq!(expected, original);
+                assert_ne!(found, original);
+            }
+            other => panic!("an edited skill was loaded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_skill_nobody_signed_is_refused() {
+        // No trust list entry at all. The registry quarantines it as unsigned,
+        // and the load refuses rather than reading the body.
+        let f = Fixture::new();
+        f.write("seal-review", &skill_md("seal-review", "", "none", "Body."));
+        f.trust(&[]);
+
+        let session = user();
+        let permits = [ToolName::SearchDocuments];
+        match f.registry().load("seal-review", &context(&session, &permits)) {
+            Err(LoadRefusal::Quarantined { .. }) => {}
+            other => panic!("an unsigned skill was loaded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_skill_signed_with_a_different_hash_is_refused_as_tampered() {
+        let f = Fixture::new();
+        f.write("seal-review", &skill_md("seal-review", "", "none", "Body."));
+        // A hash from a different revision entirely.
+        f.trust(&[("seal-review", &"0".repeat(64))]);
+
+        let session = user();
+        let permits = [ToolName::SearchDocuments];
+        match f.registry().load("seal-review", &context(&session, &permits)) {
+            Err(LoadRefusal::Quarantined { .. }) => {}
+            other => panic!("a tampered skill was loaded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_person_without_clearance_cannot_load_the_instructions() {
+        // The card is listable; the body is not readable. That split is what
+        // stops a description leaking the procedure it describes.
+        let f = Fixture::new();
+        let sha = f.write("seal-review", &skill_md("seal-review", "", "none", "Body."));
+        f.trust(&[("seal-review", &sha)]);
+
+        let permits = [ToolName::SearchDocuments];
+        let session = auditor();
+        match f.registry().load("seal-review", &context(&session, &permits)) {
+            Err(LoadRefusal::NotCleared { .. }) => {}
+            other => panic!("an uncleared person read a skill body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_body_is_returned_only_after_every_check_passes() {
+        // The one place in the product that returns a skill's instructions.
+        let f = Fixture::new();
+        let sha = f.write(
+            "seal-review",
+            &skill_md("seal-review", "", "none", "Read the report, then draft the note."),
+        );
+        f.trust(&[("seal-review", &sha)]);
+
+        let session = user();
+        let permits = [ToolName::SearchDocuments];
+        let loaded = f
+            .registry()
+            .load("seal-review", &context(&session, &permits))
+            .expect("loads");
+
+        assert!(loaded.body.contains("Read the report"));
+        assert_eq!(loaded.manifest.sha256, sha);
+        // The frontmatter is not part of the body handed to a model: it is
+        // metadata this side decided with, not instructions.
+        assert!(!loaded.body.contains("allowed-tools"));
+    }
+}

@@ -168,6 +168,16 @@ export type AttachmentOcrEvent =
        * looped on. What came back is as much as fitted, not the page.
        */
       hitDecodeCap: boolean;
+      /**
+       * True when the read degenerated into repetition and was cut there.
+       *
+       * The commoner of the two now that the backend stops a loop as soon as
+       * it recognises one: a page cut this way never reaches the decode cap,
+       * so `hitDecodeCap` stays false and this is the only signal that the
+       * text below stops short of the page. `characters` counts what survived
+       * the cut.
+       */
+      looped: boolean;
     };
 
 export async function listenAttachmentOcr(
@@ -304,6 +314,8 @@ export interface OcrPageRead {
   elapsedMs: number | null;
   /** True when the read ran out of decode budget instead of finishing. */
   hitDecodeCap: boolean;
+  /** True when the read was cut because the model began repeating itself. */
+  looped: boolean;
 }
 
 function blankPage(name: string, page: number): OcrPageRead {
@@ -319,6 +331,7 @@ function blankPage(name: string, page: number): OcrPageRead {
     characters: null,
     elapsedMs: null,
     hitDecodeCap: false,
+    looped: false,
   };
 }
 
@@ -394,5 +407,9 @@ export function applyAttachmentOcrEvent(
   target.characters = event.characters;
   target.elapsedMs = event.elapsedMs;
   target.hitDecodeCap = event.hitDecodeCap;
+  // Defaulted rather than assumed present: a page event from a build that
+  // predates the repetition guard carries no flag, and reading `undefined` as
+  // "looped" would put a warning on every historical read.
+  target.looped = event.looped ?? false;
   return next;
 }

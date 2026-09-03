@@ -2288,3 +2288,28 @@
   color: var(--text-tertiary);
   opacity: 0.7;
 }
+
+/*
+ * The live reasoning panel, while it is streaming.
+ *
+ * Marked rather than animated: the caret inside the body already says the text
+ * is moving, and a second moving thing beside it competes with the answer for
+ * attention without telling anybody more.
+ */
+.thinkingSummary[data-live] {
+  border-color: color-mix(in srgb, var(--accent, #3b82f6) 35%, var(--border-default));
+}
+
+/*
+ * Said when the live buffer has dropped the beginning of a long thought.
+ *
+ * Present because the alternative is a panel showing the middle of a reasoning
+ * pass as though it were the whole of it, which is the same class of quiet
+ * dishonesty as a truncated OCR read that looks complete.
+ */
+.reasoningTrimmed {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}

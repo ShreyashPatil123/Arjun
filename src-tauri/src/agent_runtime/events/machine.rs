@@ -77,6 +77,11 @@ pub enum RunState {
     /// It ran out of steps, time, or went in circles. The budget did its job;
     /// this is not a fault and is deliberately not `Failed`.
     StoppedByBudget,
+    /// The model ran into the output cap for one turn, so the answer stops
+    /// mid-way. Not a fault and deliberately not `Completed`: the text of a
+    /// cut-off answer is indistinguishable from a short one, so the only place
+    /// the difference can be recorded is here.
+    StoppedByLength,
     /// The gateway or the plan refused something the run could not continue
     /// without. Also not a fault: the policy working is the system working.
     StoppedByPolicy,
@@ -105,6 +110,7 @@ impl RunState {
         RunState::Cancelled,
         RunState::Failed,
         RunState::StoppedByBudget,
+        RunState::StoppedByLength,
         RunState::StoppedByPolicy,
         RunState::DegradedNeedsHuman,
     ];
@@ -126,6 +132,7 @@ impl RunState {
             RunState::Cancelled => "cancelled",
             RunState::Failed => "failed",
             RunState::StoppedByBudget => "stopped_by_budget",
+            RunState::StoppedByLength => "stopped_by_length",
             RunState::StoppedByPolicy => "stopped_by_policy",
             RunState::DegradedNeedsHuman => "degraded_needs_human",
         }
@@ -152,6 +159,7 @@ impl RunState {
                 | RunState::Cancelled
                 | RunState::Failed
                 | RunState::StoppedByBudget
+                | RunState::StoppedByLength
                 | RunState::StoppedByPolicy
                 | RunState::DegradedNeedsHuman
         )
@@ -210,6 +218,9 @@ impl RunState {
             RunState::Failed => "Stopped: it did not finish.",
             RunState::StoppedByBudget => {
                 "Stopped: it reached the limit the plan set for it."
+            }
+            RunState::StoppedByLength => {
+                "Stopped: the answer reached the output limit for one turn, so it is cut off."
             }
             RunState::StoppedByPolicy => {
                 "Stopped: it needed to do something it is not permitted to do."
@@ -291,6 +302,7 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         E::RunCancelled => RunState::Cancelled,
         E::RunFailed => RunState::Failed,
         E::RunStoppedByBudget | E::RunTimedOut => RunState::StoppedByBudget,
+        E::RunStoppedByLength => RunState::StoppedByLength,
         E::RunStoppedByPolicy => RunState::StoppedByPolicy,
         E::RunDegraded | E::RunInterrupted => RunState::DegradedNeedsHuman,
 
@@ -317,6 +329,11 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         | E::CheckpointTaken
         | E::CheckpointFailed
         | E::RunResumed
+        // Loading a skill narrows what a run may do and adds instructions to
+        // its context. Neither moves the run to a different state: it is still
+        // running, with a smaller tool set.
+        | E::SkillLoaded
+        | E::SkillRefused
         | E::MemoryRecalled
         | E::MemoryRefused
         | E::MemoryPromoted
@@ -375,6 +392,59 @@ mod tests {
             }
             assert_eq!(state, expected);
         }
+    }
+
+    /// Every ending a run can have, and the state each one lands in.
+    ///
+    /// The point of the table is that no two of these collapse onto the same
+    /// state. Before the typed outcome existed, an operator's stop, a provider
+    /// error and a turn cut off at the output cap all arrived here as
+    /// `RunCompleted`, and the state machine dutifully recorded three different
+    /// things as `Completed`.
+    #[test]
+    fn each_ending_lands_in_its_own_state() {
+        let endings = [
+            (TaskEventType::RunCompleted, RunState::Completed),
+            (TaskEventType::RunFailed, RunState::Failed),
+            (TaskEventType::RunCancelled, RunState::Cancelled),
+            (TaskEventType::RunStoppedByLength, RunState::StoppedByLength),
+            (TaskEventType::RunStoppedByBudget, RunState::StoppedByBudget),
+            (TaskEventType::RunStoppedByPolicy, RunState::StoppedByPolicy),
+            (TaskEventType::RunDegraded, RunState::DegradedNeedsHuman),
+        ];
+        for (event, expected) in endings {
+            assert_eq!(
+                advance(RunState::Running, event),
+                Transition::To(expected),
+                "{event:?}"
+            );
+            assert!(expected.is_terminal(), "{expected:?} must end the run");
+            assert!(event.is_terminal(), "{event:?} must end the run");
+        }
+        // And only one of them counts as having done the work.
+        let successes = endings
+            .iter()
+            .filter(|(_, state)| state.is_success())
+            .count();
+        assert_eq!(successes, 1, "only a completion is a success");
+    }
+
+    #[test]
+    fn a_run_cut_off_at_the_output_cap_is_not_recorded_as_finished() {
+        // The distinction is invisible in the text: a cut-off answer reads
+        // exactly like a short one, so the state is the only place it is said.
+        let state = match advance(RunState::Running, TaskEventType::RunStoppedByLength) {
+            Transition::To(next) => next,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(state, RunState::Completed);
+        assert!(!state.is_success());
+        assert!(state.describe().contains("cut off"));
+        // Nothing follows an ending, this one included.
+        assert!(matches!(
+            advance(state, TaskEventType::RunCompleted),
+            Transition::Illegal { .. }
+        ));
     }
 
     #[test]

@@ -17,6 +17,11 @@
 
 import { describe, expect, it } from "vitest";
 import { TOOL_DEFINITIONS, definitionFor, type ToolDefinition } from "./catalogue.js";
+import {
+  CANONICAL_TOOL_NAMES,
+  LEGACY_TOOL_NAMES,
+  canonicalToolName,
+} from "./tool-names.js";
 
 /**
  * The authoritative wire names from Rust's `ToolName::as_str()`.
@@ -60,6 +65,10 @@ const LEGACY_NAMES: ReadonlyMap<string, string> = new Map([
   ["run_calculation", "calculation.evaluate_with_units"],
   ["create_docx", "artifact.create_approval_note"],
   ["create_xlsx", "artifact.create_calculation_workbook"],
+  // Missing from this list until the shared table was checked against it.
+  // Rust has resolved it since the rename; this file simply never listed it,
+  // which is the drift these tests exist to catch.
+  ["create_pptx", "artifact.create_briefing_deck"],
   ["execute_code", "sandbox.run_code"],
   ["validate_artifact", "artifact.verify_docx"],
 ]);
@@ -90,6 +99,40 @@ const EXPECTED_READ_ONLY: ReadonlyMap<string, boolean> = new Map([
   ["agent.delegate_readonly", true],
   ["sovereignty.get_evidence", true],
 ]);
+
+describe("the shared canonicalisation layer agrees with this file's tables", () => {
+  // `tool-names.ts` is what production classifies by. This file is what pins
+  // the protocol. They must be the same list, or the classification is being
+  // done against names the protocol does not carry -- which is precisely the
+  // defect that made every completed effect go unrecorded after the rename.
+  it("declares exactly the wire names Rust does", () => {
+    expect(new Set(CANONICAL_TOOL_NAMES)).toEqual(RUST_WIRE_NAMES);
+  });
+
+  it("declares exactly the legacy aliases Rust does", () => {
+    expect(new Map(LEGACY_TOOL_NAMES)).toEqual(new Map(LEGACY_NAMES));
+  });
+
+  it("folds every legacy spelling onto its current name", () => {
+    for (const [legacy, current] of LEGACY_NAMES) {
+      expect(canonicalToolName(legacy)).toBe(current);
+    }
+  });
+
+  it("folds every current spelling onto itself", () => {
+    for (const name of RUST_WIRE_NAMES) {
+      expect(canonicalToolName(name)).toBe(name);
+    }
+  });
+
+  it("refuses to guess at a name neither table knows", () => {
+    // Fail-closed. A caller that cannot tell what a name means must not be
+    // handed a default, because the default that matters -- "not
+    // side-effecting" -- is the dangerous one.
+    expect(canonicalToolName("rm_rf")).toBeUndefined();
+    expect(canonicalToolName("")).toBeUndefined();
+  });
+});
 
 describe("catalogue \u2194 Rust conformance", () => {
   it("every TS tool name exists in Rust's ToolName enum", () => {

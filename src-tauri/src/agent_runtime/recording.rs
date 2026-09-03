@@ -169,9 +169,20 @@ pub(super) fn remember_refusal(deps: &Arc<RuntimeDeps>, call: &CallParams, reaso
     );
 }
 
-/// Refuses a call, and records the refusal before returning it.
+/// Refuses a call, records the refusal, and gives back its budget slot.
+///
+/// The release belongs here rather than at each refusal site for the same
+/// reason the recording does: this is the one place a refusal is produced, and
+/// a slot held by a call that was refused is a step the run pays for and never
+/// takes. The plan admits a call *before* the gateway, the hooks and the
+/// approval queue have their say, so every refusal after that point is
+/// releasing a reservation it took a moment ago.
+///
+/// Harmless where no reservation was taken — a call refused before the plan saw
+/// it holds nothing, and releasing nothing answers `false` and changes nothing.
 pub(super) fn refused(deps: &Arc<RuntimeDeps>, call: &CallParams, reason: String) -> Value {
     remember_refusal(deps, call, &reason);
+    super::release_reservation(deps, &call.run_id, &call.tool_call_id);
     json!({ "outcome": "refuse", "reason": reason })
 }
 

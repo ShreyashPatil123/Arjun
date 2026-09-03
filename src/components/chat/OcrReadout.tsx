@@ -48,6 +48,10 @@ function pageSummary(page: OcrPageRead): string {
   // cosmetic: it is the signature of the model looping on a page, where the
   // text below is a repeated fragment rather than the document.
   if (page.hitDecodeCap) bits.push('stopped at the token limit');
+  // Said in the one-line summary as well as the banner below, because the
+  // panel is collapsed by default on a finished read and the summary is all
+  // that is visible.
+  if (page.looped) bits.push('cut short — the model repeated itself');
   return `${where} — ${bits.join(' · ')}`;
 }
 
@@ -114,7 +118,16 @@ export function OcrReadout({ pages, live }: OcrReadoutProps) {
             <div key={`${page.name}-${page.page}`} className={styles.ocrPage}>
               <p className={styles.ocrPageHead}>{pageSummary(page)}</p>
 
-              {page.hitDecodeCap && (
+              {page.looped && (
+                <p className={styles.ocrPageWarning} role="status">
+                  The model began repeating itself partway down this page, so
+                  the read was stopped there. What is shown is the part that
+                  was read; the rest of the page was not. A sharper scan, or a
+                  stop further right on the accuracy slider, usually fixes it.
+                </p>
+              )}
+
+              {page.hitDecodeCap && !page.looped && (
                 <p className={styles.ocrPageWarning} role="status">
                   This page filled its whole token budget without the model
                   stopping, which usually means it repeated itself rather than

@@ -386,6 +386,10 @@ pub fn verify_draft_content(
 
     // 3. Use the existing verifier for citations and figures
     let evidence = Evidence {
+        // This pipeline checks a draft that already carries its own evidence
+        // ids, so the citation check below is the one that applies. It is not
+        // making a claim about the organisation's record from nothing.
+        grounding: crate::artifacts::Grounding::GeneralKnowledge,
         passages: &[], // Would be populated with actual passages
         calculations: &[], // Would be populated with actual calculations
         unread_pages: &[],
@@ -444,6 +448,12 @@ pub fn verify_draft_content(
         findings: all_findings,
         citations_resolved: draft.evidence_ids.len(),
         figures_checked: draft.calculation_ids.len(),
+        coverage: crate::artifacts::Coverage {
+            passages_available: draft.evidence_ids.len(),
+            citations_made: draft.evidence_ids.len(),
+            citations_resolved: draft.evidence_ids.len(),
+            required_evidence: false,
+        },
     })
 }
 

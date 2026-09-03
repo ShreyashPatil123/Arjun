@@ -136,6 +136,20 @@ pub enum StopReason {
     Completed,
     /// The step budget ran out.
     StepsExhausted { taken: u32, allowed: u32 },
+    /// Every remaining step is held by a call that is already under way.
+    ///
+    /// Deliberately distinct from [`Self::StepsExhausted`], and deliberately
+    /// *not* a halt. The runtime authorises read-only tools in parallel, so a
+    /// turn of four searches against three remaining steps has one call arrive
+    /// to find the budget fully committed and nothing yet spent. That call is
+    /// refused; the run is not ended. If one of the three in flight is then
+    /// refused by the gateway its slot comes back, and the model can try again
+    /// with what it learned from the other results.
+    ///
+    /// Ending the run here would mean a model that asked for several things at
+    /// once was punished for it, which is the opposite of what running them in
+    /// parallel is for.
+    StepsInFlight { in_flight: u32, allowed: u32 },
     /// The clock ran out.
     TimeExhausted { allowed_seconds: u64 },
     /// The same call kept coming back — the agent is going in circles.
@@ -185,6 +199,9 @@ impl StopReason {
                 "Stopped after {taken} of {allowed} permitted steps. The work below is what was \
                  completed; the remaining steps were not attempted."
             ),
+            StopReason::StepsInFlight { in_flight, allowed } => format!(
+                "Not started: {in_flight} of {allowed} permitted steps are already under way, so                  there was no room for this call. Wait for the results you asked for and decide                  what to do with them."
+            ),
             StopReason::TimeExhausted { allowed_seconds } => format!(
                 "Stopped after {} minutes, the time allowed for one task. The work below is what \
                  was completed.",
@@ -216,7 +233,39 @@ pub struct PlanRun {
     /// How many times each distinct call has been seen.
     seen: HashMap<String, u32>,
     stopped: Option<StopReason>,
+    /// Slots held by calls that have been authorised and have not yet settled.
+    ///
+    /// Keyed by the tool-call id the runtime supplied, which is unique per call
+    /// and is what makes settling and releasing address one lease rather than
+    /// "the most recent". See [`PlanRun::reserve_at`].
+    leases: HashMap<String, Lease>,
 }
+
+/// A slot in the budget, held between authorisation and settlement.
+#[derive(Debug, Clone)]
+struct Lease {
+    /// When it was taken, so an abandoned one can be reclaimed.
+    at: Instant,
+    /// The tool it was taken for. Kept for the diagnostic, not for the
+    /// decision — the id is what identifies the lease.
+    tool: String,
+}
+
+/// How long an authorised call may hold its slot before it is reclaimed.
+///
+/// A lease is normally settled or released within milliseconds of the tool
+/// finishing. It is not settled at all when the loop authorised a call and then
+/// never ran it — the model changed its mind between the batch being approved
+/// and the batch being executed, the turn was interrupted, the process
+/// stumbled. Nothing tells this side that happened.
+///
+/// Without a ceiling those slots would be held for the life of the run, and a
+/// run that abandoned three calls would quietly lose three steps of budget it
+/// never spent. Five minutes is comfortably longer than the longest tool
+/// timeout in `orchestrator::tools` (two minutes, for producing a document) and
+/// far shorter than the plan's own ten-minute ceiling, so a reclaimed lease is
+/// always one nothing is waiting on.
+const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Whether the run may take another step, and if not, why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +294,7 @@ impl PlanRun {
             steps_taken: 0,
             seen: HashMap::new(),
             stopped: None,
+            leases: HashMap::new(),
         }
     }
 
@@ -303,13 +353,134 @@ impl PlanRun {
         self.steps.iter().filter(|s| !s.done).collect()
     }
 
+    /// Steps committed to: spent, plus reserved by calls still in flight.
+    ///
+    /// The figure the budget is judged against. `steps_taken` alone is what a
+    /// concurrent batch could all read before any of them had settled.
+    pub fn steps_committed(&self) -> u32 {
+        self.steps_taken
+            .saturating_add(self.leases.len() as u32)
+    }
+
+    /// How many authorised calls are holding a slot right now.
+    pub fn leases_held(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// The tools of the calls currently holding a slot, sorted.
+    ///
+    /// What a person watching a parallel batch wants when the step counter
+    /// jumps: which calls are in flight, not merely how many. Sorted so the
+    /// same set reads the same way twice.
+    pub fn leases_outstanding(&self) -> Vec<String> {
+        let mut tools: Vec<String> = self
+            .leases
+            .values()
+            .map(|lease| lease.tool.clone())
+            .collect();
+        tools.sort();
+        tools
+    }
+
+    /// Takes a slot in the budget for a call that is about to be authorised.
+    ///
+    /// ## Why reservation and not a check
+    ///
+    /// [`Self::may_call`] only *asked* whether there was room, and the slot was
+    /// not spent until the tool had finished running. The runtime executes
+    /// read-only tools in parallel, so a turn with four searches put four
+    /// authorisation requests through this while `steps_taken` was unchanged:
+    /// all four read the same figure, all four were told there was room, all
+    /// four were granted, and the budget ended three steps over. The ceiling
+    /// that exists to stop a model going in circles could be passed by a model
+    /// that simply asked for several things at once.
+    ///
+    /// So the slot is taken here, under the same lock as the check, before any
+    /// grant is issued. Everything after this either settles the lease
+    /// ([`Self::settle`]) or gives it back ([`Self::release`]).
+    ///
+    /// `now` is passed in so the reclaim of abandoned leases can be driven in a
+    /// test without sleeping; [`Self::reserve`] supplies the wall clock.
+    pub fn reserve_at(
+        &mut self,
+        tool_call_id: &str,
+        call: &ToolCall,
+        now: Instant,
+    ) -> Continuation {
+        // Slots held by calls that were authorised and never run. Reclaimed
+        // before the ceiling is judged, so an abandoned batch costs the run
+        // nothing beyond the wait. See [`LEASE_TTL`].
+        self.leases
+            .retain(|_, lease| now.duration_since(lease.at) < LEASE_TTL);
+
+        // A lease is per call. A second authorisation for the same tool-call id
+        // is the same call being asked about twice — a retry after an ambiguous
+        // failure, say — and must not take a second slot.
+        if let Some(existing) = self.leases.get_mut(tool_call_id) {
+            existing.at = now;
+            return Continuation::Proceed;
+        }
+
+        match self.admits(call) {
+            Continuation::Proceed => {
+                self.leases.insert(
+                    tool_call_id.to_string(),
+                    Lease {
+                        at: now,
+                        tool: call.tool.clone(),
+                    },
+                );
+                Continuation::Proceed
+            }
+            stop => stop,
+        }
+    }
+
+    /// [`Self::reserve_at`] against the wall clock.
+    pub fn reserve(&mut self, tool_call_id: &str, call: &ToolCall) -> Continuation {
+        self.reserve_at(tool_call_id, call, Instant::now())
+    }
+
+    /// Gives a reserved slot back, for a call that will not run.
+    ///
+    /// The gateway refused it after the plan admitted it, a person declined the
+    /// approval, the grant was never redeemed. None of those spent anything, so
+    /// none of them should cost a step — a budget that charged for refused
+    /// calls would let a policy the model kept running into exhaust the run.
+    ///
+    /// Returns whether a lease was actually held. Releasing twice is harmless
+    /// and answers `false` the second time.
+    pub fn release(&mut self, tool_call_id: &str) -> bool {
+        self.leases.remove(tool_call_id).is_some()
+    }
+
+    /// Turns a reserved slot into a spent step.
+    ///
+    /// Returns whether this call settled *now*. A second settlement for the
+    /// same tool-call id answers `false` and changes nothing, which is what
+    /// makes "a completed call cannot be counted twice" a property of this type
+    /// rather than a rule every call site has to remember. It is also what
+    /// stops a replayed effect and its original both being charged.
+    pub fn settle(&mut self, tool_call_id: &str) -> bool {
+        if self.leases.remove(tool_call_id).is_none() {
+            return false;
+        }
+        self.steps_taken = self.steps_taken.saturating_add(1);
+        true
+    }
+
     /// Checks whether the run may make this call.
     ///
-    /// Budgets are checked before the tool gateway, because a task that is out
-    /// of time should not be asking about permissions — and because the answer
-    /// "you have run out of steps" is more useful than "that path is fine but
-    /// nothing more will happen".
+    /// Kept for callers that drive a plan a step at a time and settle
+    /// immediately — the checklist-style path in this module's own tests. The
+    /// agent path goes through [`Self::reserve_at`], which asks the same
+    /// questions and takes the slot while it still holds the answer.
     pub fn may_call(&mut self, call: &ToolCall) -> Continuation {
+        self.admits(call)
+    }
+
+    /// The questions themselves, asked once and used by both callers.
+    fn admits(&mut self, call: &ToolCall) -> Continuation {
         if let Some(reason) = &self.stopped {
             return Continuation::Stop(reason.clone());
         }
@@ -321,9 +492,22 @@ impl PlanRun {
             });
         }
 
+        // Genuinely spent: the budget is gone and the run ends here.
         if self.steps_taken >= self.budget.max_steps {
             return self.halt(StopReason::StepsExhausted {
                 taken: self.steps_taken,
+                allowed: self.budget.max_steps,
+            });
+        }
+
+        // Spent *or reserved*. A batch of four searches authorised together
+        // holds four slots, and the fourth must see the first three — but this
+        // is contention, not exhaustion, so the call is refused and the run
+        // carries on. A slot released by a refused call becomes available
+        // again, and halting here would have ended the run over a queue.
+        if self.steps_committed() >= self.budget.max_steps {
+            return Continuation::Stop(StopReason::StepsInFlight {
+                in_flight: self.leases.len() as u32,
                 allowed: self.budget.max_steps,
             });
         }
@@ -831,5 +1015,250 @@ mod tests {
     fn last_acknowledged_checkpoint_is_none_before_anything_completes() {
         let run = run();
         assert_eq!(run.last_acknowledged_checkpoint(), None);
+    }
+}
+
+/// The budget under a batch of calls that arrive together.
+///
+/// ## The defect
+///
+/// `may_call` only *asked* whether there was room; the slot was not spent until
+/// the tool had finished running. The agent runtime executes read-only tools in
+/// parallel — a document task typically wants several searches at once — so a
+/// turn with four searches put four authorisations through the check while
+/// `steps_taken` was unchanged. All four read the same figure, all four were
+/// told there was room, all four were granted, and the run ended three steps
+/// past its ceiling.
+///
+/// The ceiling exists to stop a model going in circles. It could be passed by a
+/// model that simply asked for several things at once.
+#[cfg(test)]
+mod reservations {
+    use super::*;
+
+    fn call(tool: &str, query: &str) -> ToolCall {
+        ToolCall::new(tool, serde_json::json!({ "query": query }))
+    }
+
+    /// A plan with `max_steps` to spend and every tool permitted.
+    fn plan_with(max_steps: u32) -> PlanRun {
+        PlanRun::new(
+            "run-1",
+            vec!["do the work".to_string()],
+            Budget {
+                max_steps,
+                max_duration: Duration::from_secs(600),
+                permitted_tools: ToolName::ALL.to_vec(),
+                // High enough that loop detection cannot be what refuses these;
+                // each test below is about the step ceiling alone.
+                repeat_limit: 100,
+            },
+        )
+    }
+
+    #[test]
+    fn several_calls_contending_for_one_slot_admit_exactly_one() {
+        // The whole defect, in one assertion. Four calls arrive before any of
+        // them has settled, and there is room for one.
+        let mut plan = plan_with(1);
+        let admitted = ["tc-1", "tc-2", "tc-3", "tc-4"]
+            .into_iter()
+            .filter(|id| {
+                plan.reserve(id, &call("search_documents", "seal specification"))
+                    == Continuation::Proceed
+            })
+            .count();
+        assert_eq!(admitted, 1, "the ceiling was passed by asking all at once");
+        assert_eq!(plan.leases_held(), 1);
+        assert_eq!(plan.steps_committed(), 1);
+    }
+
+    #[test]
+    fn a_parallel_batch_cannot_commit_more_than_the_budget_allows() {
+        // The realistic shape: a turn of four searches against a budget with
+        // three steps left.
+        let mut plan = plan_with(3);
+        let admitted = (0..4)
+            .filter(|i| {
+                plan.reserve(
+                    &format!("tc-{i}"),
+                    &call("search_documents", &format!("query {i}")),
+                ) == Continuation::Proceed
+            })
+            .count();
+        assert_eq!(admitted, 3);
+        assert_eq!(plan.steps_committed(), 3);
+        // And settling them moves the accounting from reserved to spent
+        // without changing the total.
+        for i in 0..3 {
+            assert!(plan.settle(&format!("tc-{i}")));
+        }
+        assert_eq!(plan.steps_taken(), 3);
+        assert_eq!(plan.leases_held(), 0);
+        assert_eq!(plan.steps_committed(), 3);
+    }
+
+    #[test]
+    fn a_slot_is_taken_before_any_grant_could_be_issued() {
+        // Stated as a property of the ordering rather than of the count: the
+        // second call sees the first one's slot, even though nothing has run.
+        let mut plan = plan_with(2);
+        assert_eq!(
+            plan.reserve("tc-1", &call("search_documents", "a")),
+            Continuation::Proceed
+        );
+        assert_eq!(
+            plan.steps_taken(),
+            0,
+            "nothing has run, so nothing is spent yet"
+        );
+        assert_eq!(
+            plan.steps_committed(),
+            1,
+            "but the slot is committed, which is what the next call must see"
+        );
+    }
+
+    #[test]
+    fn a_refused_call_gives_its_slot_back() {
+        // The gateway refused it after the plan admitted it. Nothing ran, so
+        // nothing should be charged — a budget that paid for refused calls
+        // would let a policy the model kept running into exhaust the run.
+        let mut plan = plan_with(1);
+        assert_eq!(
+            plan.reserve("tc-1", &call("search_documents", "a")),
+            Continuation::Proceed
+        );
+        assert!(plan.release("tc-1"));
+        assert_eq!(plan.steps_committed(), 0);
+        // And the slot is genuinely available again.
+        assert_eq!(
+            plan.reserve("tc-2", &call("search_documents", "b")),
+            Continuation::Proceed
+        );
+    }
+
+    #[test]
+    fn releasing_twice_is_harmless_and_frees_nothing_extra() {
+        let mut plan = plan_with(2);
+        plan.reserve("tc-1", &call("search_documents", "a"));
+        assert!(plan.release("tc-1"));
+        assert!(!plan.release("tc-1"), "there was nothing left to release");
+        assert_eq!(plan.steps_committed(), 0);
+    }
+
+    #[test]
+    fn a_completed_call_cannot_be_charged_twice() {
+        // Structural rather than a rule each call site has to remember: the
+        // second settlement finds no lease and changes nothing.
+        let mut plan = plan_with(5);
+        plan.reserve("tc-1", &call("search_documents", "a"));
+        assert!(plan.settle("tc-1"));
+        assert_eq!(plan.steps_taken(), 1);
+        assert!(!plan.settle("tc-1"), "the same call settled twice");
+        assert_eq!(plan.steps_taken(), 1);
+    }
+
+    #[test]
+    fn a_call_that_never_reserved_a_slot_is_not_charged_to_the_budget() {
+        // A grant issued outside the plan should not be able to spend the
+        // plan's budget by settling against it.
+        let mut plan = plan_with(5);
+        assert!(!plan.settle("tc-never-authorised"));
+        assert_eq!(plan.steps_taken(), 0);
+    }
+
+    #[test]
+    fn asking_twice_about_one_call_does_not_take_two_slots() {
+        // A retry after an ambiguous failure presents the same tool-call id.
+        // It is the same call, and it holds one slot.
+        let mut plan = plan_with(2);
+        assert_eq!(
+            plan.reserve("tc-1", &call("search_documents", "a")),
+            Continuation::Proceed
+        );
+        assert_eq!(
+            plan.reserve("tc-1", &call("search_documents", "a")),
+            Continuation::Proceed
+        );
+        assert_eq!(plan.leases_held(), 1);
+        assert_eq!(plan.steps_committed(), 1);
+    }
+
+    #[test]
+    fn an_abandoned_reservation_is_reclaimed_rather_than_held_forever() {
+        // The loop authorised a call and never ran it — the model changed its
+        // mind between the batch being approved and the batch being executed.
+        // Nothing tells this side that happened, so the slot is reclaimed on
+        // age rather than held for the life of the run.
+        let start = Instant::now();
+        let mut plan = plan_with(1);
+        assert_eq!(
+            plan.reserve_at("tc-abandoned", &call("search_documents", "a"), start),
+            Continuation::Proceed
+        );
+        // Still inside the lease's life: the slot is genuinely taken.
+        let soon = start + Duration::from_secs(30);
+        assert!(matches!(
+            plan.reserve_at("tc-2", &call("search_documents", "b"), soon),
+            Continuation::Stop(_)
+        ));
+
+        // Long past it.
+        let later = start + Duration::from_secs(6 * 60);
+        assert_eq!(
+            plan.reserve_at("tc-3", &call("search_documents", "c"), later),
+            Continuation::Proceed
+        );
+        assert_eq!(plan.leases_held(), 1, "only the live one is held");
+        assert_eq!(
+            plan.steps_taken(),
+            0,
+            "an abandoned call ran nothing and is charged nothing"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_what_is_committed_not_merely_what_has_finished() {
+        // A model told "0 of 1 steps taken" while its own batch holds the last
+        // slot would have no idea what stopped it.
+        let mut plan = plan_with(1);
+        plan.reserve("tc-1", &call("search_documents", "a"));
+        let Continuation::Stop(reason) = plan.reserve("tc-2", &call("search_documents", "b"))
+        else {
+            panic!("the second call must be stopped");
+        };
+        let StopReason::StepsInFlight { in_flight, allowed } = reason else {
+            panic!("stopped for the wrong reason: {reason:?}");
+        };
+        assert_eq!(in_flight, 1);
+        assert_eq!(allowed, 1);
+        // And the run is not over: contention is a queue, not a budget spent.
+        assert!(
+            plan.stopped().is_none(),
+            "a call refused for want of a free slot must not end the run"
+        );
+    }
+
+    #[test]
+    fn reservations_are_still_subject_to_every_other_check() {
+        // The reservation is taken *after* the plan has agreed, not instead of
+        // it. A tool outside the plan takes no slot.
+        let mut plan = PlanRun::new(
+            "run-1",
+            vec!["do the work".to_string()],
+            Budget {
+                max_steps: 5,
+                max_duration: Duration::from_secs(600),
+                permitted_tools: vec![ToolName::SearchDocuments],
+                repeat_limit: 100,
+            },
+        );
+        assert!(matches!(
+            plan.reserve("tc-1", &call("write_scoped_file", "a")),
+            Continuation::Stop(_)
+        ));
+        assert_eq!(plan.leases_held(), 0);
+        assert_eq!(plan.steps_committed(), 0);
     }
 }

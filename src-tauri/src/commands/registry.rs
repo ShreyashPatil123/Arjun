@@ -275,17 +275,36 @@ async fn swap_to(
         };
     };
 
-    let vram = gpu_collector::installed_gpus()
-        .iter()
-        .map(|gpu| gpu.dedicated_video_memory_bytes)
-        .max()
-        .unwrap_or(0);
-    let plan = crate::ai_engine::vram_planner::plan_gpu_offload(
-        vram,
-        entry.weights_bytes,
-        entry.context_length,
-        None,
-    );
+    // Budgeted against free VRAM with the model's own layer count, and any
+    // other server released only if this one will not otherwise fit. See
+    // `serving::admission`.
+    //
+    // A model too large for this machine is reported here, before anything is
+    // started. That is the difference between an administrator being told it
+    // will not fit in a second, and watching the swap sit on "Loading" for the
+    // full three-minute readiness timeout first.
+    let plan = match crate::serving::admission::admit(&servers, entry, registry.models_dir()).await
+    {
+        Ok(admitted) => {
+            if !admitted.released.is_empty() {
+                log::info!(
+                    "[serving] released {} to make room for {}",
+                    admitted.released.join(", "),
+                    entry.name
+                );
+            }
+            admitted.plan
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            step("failed", entry_id, entry_name, Some(detail.clone()));
+            return SwapOutcome {
+                released,
+                serving: false,
+                detail: Some(detail),
+            };
+        }
+    };
 
     match servers
         .endpoint_for(entry, registry.models_dir(), &plan)
@@ -435,6 +454,227 @@ pub async fn list_registered_models(
     // matrix does not gate read paths for the model list itself.
     require_session(&session)?;
     Ok(registry.all().to_vec())
+}
+
+/// One model as the library screen shows it.
+///
+/// Deliberately not `ModelEntry` itself. The screen needs two things the
+/// manifest does not carry — whether the weights are actually where the entry
+/// says they are, and how large they are *now* — and an entry that answers
+/// neither is how a half-finished download comes to be listed as an installed
+/// model.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryModel {
+    pub id: String,
+    pub name: String,
+    pub quantization: Option<String>,
+    pub roles: Vec<crate::registry::ModelRole>,
+    pub modalities: Vec<crate::registry::Modality>,
+    pub parameters_b: f32,
+    pub context_length: u32,
+    /// What the manifest says the weights weigh.
+    pub weights_bytes: u64,
+    pub license: String,
+    pub enabled: bool,
+    /// Empty for everything a scan found, and that is the safety property
+    /// rather than an oversight: a model nobody has reviewed is cleared for
+    /// nothing and cannot be routed to on real material.
+    pub permitted_classifications: Vec<Classification>,
+    pub runtime: String,
+    /// Resolved against the models directory, so the screen shows the file the
+    /// loader will actually open rather than a fragment of a path.
+    pub path: String,
+    pub projector: Option<String>,
+    /// Whether that file exists. A registered model whose weights have been
+    /// moved or deleted is still registered, and saying so is more useful than
+    /// listing it as though it were ready to run.
+    pub present: bool,
+    /// Bytes on disk right now, when the file is there. Absent rather than
+    /// falling back to the manifest figure — a truncated download has to look
+    /// truncated.
+    pub bytes_on_disk: Option<u64>,
+}
+
+fn library_model(entry: &ModelEntry, models_dir: &std::path::Path) -> LibraryModel {
+    // `join` leaves an absolute path alone, so a manifest entry written
+    // relative to the models directory and a scanned one carrying a full path
+    // both resolve to the file the loader opens.
+    let resolved = models_dir.join(&entry.path);
+    let metadata = std::fs::metadata(&resolved).ok();
+    LibraryModel {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        quantization: entry.quantization.clone(),
+        roles: entry.roles.clone(),
+        modalities: entry.modalities.clone(),
+        parameters_b: entry.parameters_b,
+        context_length: entry.context_length,
+        weights_bytes: entry.weights_bytes,
+        license: entry.license.clone(),
+        enabled: entry.enabled,
+        permitted_classifications: entry.permitted_classifications.clone(),
+        runtime: entry.runtime.label().to_string(),
+        path: resolved.display().to_string(),
+        projector: entry
+            .projector
+            .as_ref()
+            .map(|projector| models_dir.join(projector).display().to_string()),
+        present: metadata.is_some(),
+        bytes_on_disk: metadata.map(|meta| meta.len()),
+    }
+}
+
+/// Every directory worth walking for weight files on this machine.
+///
+/// Four sources, because models arrive four ways, and a library that knows
+/// only one of them is why both Unlimited-OCR weights were invisible on the
+/// models screen while the chat was reading documents with them:
+///
+/// 1. `<app data>/models`, where the downloader writes.
+/// 2. `<local app data>/models`, where the OCR weights were placed by hand.
+/// 3. `ARJUN_MODEL_LIBRARY`, when an operator has pointed ARJUN at an existing
+///    library instead of copying it in.
+/// 4. The directory beside every model already registered — which is what
+///    makes a second quantisation dropped next to the first turn up without
+///    anybody having to name the folder.
+fn library_roots(
+    app: &AppHandle,
+    registry: &ModelRegistry,
+    extra: &[String],
+) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(app_data) = app.path().app_data_dir() {
+        roots.push(app_data.join("models"));
+        roots.push(registry.library_root(&app_data));
+    }
+    if let Ok(local) = app.path().app_local_data_dir() {
+        roots.push(local.join("models"));
+    }
+    for entry in registry.all() {
+        if let Some(parent) = registry.models_dir().join(&entry.path).parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    roots.extend(
+        extra
+            .iter()
+            .filter(|root| !root.trim().is_empty())
+            .map(std::path::PathBuf::from),
+    );
+    roots
+}
+
+/// What one detection pass found, as the screen reports it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionReport {
+    /// Directories actually walked. Reported so "nothing new" can be told
+    /// apart from "nowhere was looked".
+    pub roots: Vec<String>,
+    pub files_seen: usize,
+    pub already_registered: usize,
+    /// Newly registered models, every one of them cleared for nothing.
+    pub added: Vec<LibraryModel>,
+    /// The library as it stands after the pass, so the screen does not have to
+    /// guess what changed.
+    pub models: Vec<LibraryModel>,
+    /// True when something was added.
+    ///
+    /// The routing tables are built at startup from the manifest, and this
+    /// command writes the manifest rather than rebuilding them. A model
+    /// detected now is listed now and routed to after the next launch. Saying
+    /// so plainly beats a screen that lists a model the router cannot yet see.
+    pub restart_required: bool,
+}
+
+/// Every model in the manifest, read from disk.
+///
+/// From disk rather than from the registry held in memory, because the two
+/// diverge the moment a detection pass writes a new entry — and a library
+/// screen that cannot show what was just detected is not a library screen.
+#[tauri::command]
+pub async fn list_library_models(
+    registry: State<'_, Arc<ModelRegistry>>,
+    session: State<'_, CurrentSession>,
+) -> Result<Vec<LibraryModel>, String> {
+    require_session(&session)?;
+    let models_dir = registry.models_dir().to_path_buf();
+    let on_disk = ModelRegistry::load(&models_dir).map_err(|error| error.to_string())?;
+    Ok(on_disk
+        .all()
+        .iter()
+        .map(|entry| library_model(entry, &models_dir))
+        .collect())
+}
+
+/// Finds every weight file on this machine and registers the ones the manifest
+/// does not already list.
+///
+/// This is the button behind "the library should know what is installed". It
+/// exists because registering a model was otherwise a text edit: the scanner
+/// underneath it has been in the tree, complete and tested, with no caller at
+/// all — so a model that was on disk and working, as both Unlimited-OCR
+/// weights were, appeared nowhere in the interface.
+///
+/// It adds. It never edits and never removes: an entry an administrator wrote
+/// by hand wins over anything a filename suggests, which is the rule
+/// `discovery::merge` has always followed.
+#[tauri::command]
+pub async fn detect_system_models(
+    app: AppHandle,
+    registry: State<'_, Arc<ModelRegistry>>,
+    session: State<'_, CurrentSession>,
+    extra_roots: Option<Vec<String>>,
+) -> Result<DetectionReport, String> {
+    // Writing the manifest is model management, gated exactly as installing
+    // one is.
+    require_permission(&session, Permission::ImportModel)?;
+
+    let models_dir = registry.models_dir().to_path_buf();
+    let roots = library_roots(&app, &registry, &extra_roots.unwrap_or_default());
+
+    // Read fresh rather than using the registry in memory: an earlier pass in
+    // this same session has already written entries the in-memory copy does
+    // not have, and detecting against a stale list would offer to add every
+    // one of them again under a disambiguated id.
+    let mut declared = ModelRegistry::load(&models_dir).map_err(|error| error.to_string())?;
+    let detection = crate::registry::scan::detect(&roots, declared.all(), &models_dir);
+
+    let added: Vec<LibraryModel> = detection
+        .added
+        .iter()
+        .map(|entry| library_model(entry, &models_dir))
+        .collect();
+
+    if !detection.added.is_empty() {
+        let mut merged = declared.all().to_vec();
+        merged.extend(detection.added.iter().cloned());
+        declared.replace_and_save(merged)?;
+        log::info!(
+            "[REGISTRY] detection registered {} model(s) across {} directories; every one is cleared for no classification until an administrator reviews it",
+            detection.added.len(),
+            detection.roots.len()
+        );
+    }
+
+    Ok(DetectionReport {
+        roots: detection
+            .roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect(),
+        files_seen: detection.files_seen,
+        already_registered: detection.already_registered,
+        restart_required: !added.is_empty(),
+        added,
+        models: declared
+            .all()
+            .iter()
+            .map(|entry| library_model(entry, &models_dir))
+            .collect(),
+    })
 }
 
 /// Where the manifest lives, so an administrator can find the file to edit.

@@ -365,7 +365,14 @@ fn the_baseline_run_produces_a_grounded_artifact_and_a_checkable_package() {
     };
     let calculations = [calculation.clone()];
     let evidence =
-        Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+        Evidence {
+            // An approval note about the organisation's own record: it must
+            // rest on retrieved passages, and it does.
+            grounding: sarathi_lib::artifacts::Grounding::OrganisationRecord,
+            passages: &passages,
+            calculations: &calculations,
+            unread_pages: &[],
+        };
 
     let outcome = sarathi_lib::artifacts::produce(
         &work.path().join("approval-note.docx"),

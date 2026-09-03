@@ -45,9 +45,35 @@ fn deps_with(
         passages: Arc::default(),
         produced: Arc::default(),
         calls: Arc::default(),
-        // No plan registered, so the budget does not apply and these tests go on
-        // exercising the gateway alone. The plan has its own tests below.
-        plans: Arc::default(),
+        // A plan permitting every tool, so these tests exercise the gateway
+        // rather than the budget -- which has its own tests below.
+        //
+        // Registered rather than absent: a run with no plan is now refused
+        // outright, which is the whole of `missing_plan` further down. Leaving
+        // the table empty here would make every test in this file assert that
+        // refusal instead of the thing it is about.
+        plans: {
+            let table: Arc<Mutex<HashMap<String, crate::orchestrator::plan::PlanRun>>> =
+                Arc::default();
+            {
+                let mut plans = table.lock().expect("fresh lock");
+                for run_id in ["r", "planned-without-workspace"] {
+                    plans.insert(
+                        run_id.to_string(),
+                        crate::orchestrator::plan::PlanRun::new(
+                            run_id,
+                            vec!["do the work".to_string()],
+                            crate::orchestrator::plan::Budget::standard(ToolName::ALL.to_vec()),
+                        ),
+                    );
+                }
+            }
+            // `planned-without-workspace` is a real run with a real budget and
+            // no workspace, which is what isolates the path check from the plan
+            // check: without it, a test aimed at "no workspace" would be
+            // satisfied by the refusal for "no plan".
+            table
+        },
         // In memory: these tests are about the gateway, and a durable history
         // is checked where it belongs, in `events::tests`.
         events: Arc::new(
@@ -65,6 +91,22 @@ fn deps_with(
         checkpoints: Arc::default(),
         emit: Arc::new(|_| {}),
         emit_durable: Arc::new(|_| {}),
+        // A manager with no profiles: these tests are about the gateway, and
+        // the subagent system has its own tests in `subagents::tests`. What
+        // matters here is that one is *present*, so a delegation refused for
+        // want of a manager cannot be mistaken for a policy decision.
+        subagents: Arc::new(crate::subagents::SubagentManager::new(
+            Vec::new(),
+            Arc::new(
+                crate::agent_runtime::events::TaskEventLog::in_memory().expect("an event log"),
+            ),
+        )),
+        multimodal: Arc::new(
+            crate::knowledge::MultimodalIndex::open(dir.path()).expect("a multimodal index"),
+        ),
+        // Durable by default: these tests are about the gateway, and a
+        // degraded installation has its own tests in `audit_health`.
+        audit_health: Arc::new(crate::agent_runtime::audit_health::AuditHealth::durable()),
     });
     (deps, dir)
 }
@@ -465,10 +507,12 @@ async fn a_write_outside_the_runs_directory_is_refused_without_troubling_anybody
 
 #[tokio::test]
 async fn a_run_with_no_workspace_cannot_touch_a_path_at_all() {
+    // A real run, with a real budget, that has no workspace: every path it
+    // could name is under no permitted root, so there is nothing it may read.
     let (deps, _dir) = deps_with(signed_in_user());
     let verdict = authorize(
         json!({
-            "runId": "unknown-run",
+            "runId": "planned-without-workspace",
             "toolCallId": "tc",
             "tool": "read_scoped_file",
             "args": { "path": "note.txt" }
@@ -883,4 +927,880 @@ async fn a_produced_file_that_vanished_is_reported_as_missing_rather_than_sound(
     let reports = artifacts::report_for_run(&deps.produced, "r");
     assert!(!reports[0].sound);
     assert!(reports[0].problems.iter().any(|p| p.contains("does not exist")));
+}
+
+/// The gateway when this installation cannot record what it does.
+///
+/// The rule these pin: **a read may still happen; an effect may not.** The
+/// distinction is the one the product rests on. A search that is not written
+/// down costs a line in a trace. A document written to disk that is not written
+/// down is an artefact with no provenance — the thing an engineer would be
+/// asked to sign, and the thing nobody could then stand behind.
+///
+/// Before this existed, a task event log that failed to open was replaced by an
+/// in-memory one at start-up, and the application came up looking entirely
+/// normal: it ran tasks, wrote files, and kept a history that evaporated when
+/// the process exited.
+mod durability {
+    use super::*;
+    use crate::agent_runtime::audit_health::AuditHealth;
+
+    /// The same deps as everything else here, with a broken audit store.
+    fn degraded_deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
+        let (deps, dir) = deps_with(signed_in_user());
+        // The health record is behind an `Arc` inside the deps, so the deps do
+        // not have to be rebuilt to degrade it -- which is also how it works in
+        // production: one health record, shared, flipped by whatever fails.
+        deps.audit_health
+            .writes_failed("The task event log could not be opened: the disk is read-only.");
+        (deps, dir)
+    }
+
+    fn write_call(text: &str) -> Value {
+        json!({
+            "runId": "r",
+            "toolCallId": "tc",
+            "tool": "workspace.write_text",
+            "args": { "path": "note.txt", "content": text }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_write_is_refused_while_the_record_cannot_be_written() {
+        let (deps, _dir) = degraded_deps();
+        let verdict = authorize(write_call("the seal is worn"), &deps)
+            .await
+            .expect("a verdict, not a transport error");
+        assert_eq!(verdict["outcome"], "refuse");
+        let reason = verdict["reason"].as_str().expect("a reason");
+        // The model is told what is wrong, not merely that it may not.
+        assert!(reason.contains("cannot record"), "{reason}");
+        assert!(reason.contains("read-only"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_read_is_still_allowed_while_the_record_cannot_be_written() {
+        // Refusing reads too would leave a degraded installation unable even to
+        // explain itself, and nothing a read does needs recording beyond the
+        // event that names it.
+        let (deps, _dir) = degraded_deps();
+        let verdict = authorize(search("seal specification"), &deps)
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            verdict["outcome"], "allow",
+            "a read has no effect to account for"
+        );
+    }
+
+    #[test]
+    fn a_healthy_installation_refuses_no_write_on_durability_grounds() {
+        // The control. Without it the test above would pass just as well
+        // against a gateway that refused every write for some other reason.
+        //
+        // The guard is driven directly rather than through `authorize`,
+        // because a write that gets *past* it needs a person to approve it and
+        // `authorize` would then wait for a decision that never comes. What is
+        // under test here is the guard, and this asks it exactly.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let call = read_call(&write_call("the seal is worn")).expect("a well-formed call");
+        assert_eq!(
+            durability_refusal(&call, &deps),
+            None,
+            "a healthy installation must not refuse a write on durability grounds"
+        );
+    }
+
+    #[test]
+    fn a_write_is_refused_when_storage_breaks_part_way_through_a_run() {
+        // The case a start-up check alone would miss: the run was already in
+        // flight when the disk filled. It is also the worst one, because this
+        // is the run that would otherwise write a document nobody can account
+        // for.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let call = read_call(&write_call("first")).expect("a well-formed call");
+        assert_eq!(durability_refusal(&call, &deps), None);
+
+        deps.audit_health
+            .writes_failed("There is no space left on the device.");
+
+        let refusal = durability_refusal(&call, &deps).expect("a refusal");
+        assert!(refusal.contains("no space left"), "{refusal}");
+        assert!(refusal.contains("workspace.write_text"), "{refusal}");
+    }
+
+    #[test]
+    fn a_read_is_never_refused_on_durability_grounds() {
+        // The other half of the rule, asked of the guard directly: no matter
+        // how broken the record is, a read has no effect to account for.
+        let (deps, _dir) = deps_with(signed_in_user());
+        deps.audit_health.writes_failed("The disk is full.");
+        let call = read_call(&search("seal specification")).expect("a well-formed call");
+        assert_eq!(durability_refusal(&call, &deps), None);
+    }
+}
+
+/// What actually breaks, and what it does to the installation's health.
+///
+/// The two stores that carry a run's record, driven into the two failures that
+/// happen in the field: a database that will not open, and a disk that will not
+/// take a write.
+mod durability_failures {
+    use crate::agent_runtime::audit_health::{AuditHealth, AuditState};
+    use crate::agent_runtime::events::TaskEventLog;
+    use crate::agent_runtime::tasks;
+
+    /// A path that cannot be a directory, because it is a file.
+    ///
+    /// Portable across platforms in a way that permission bits are not: every
+    /// filesystem this ships on refuses to create a directory where a regular
+    /// file already is.
+    fn blocked_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(tag);
+        std::fs::write(&path, b"not a directory").expect("write the blocking file");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_task_event_log_that_cannot_be_opened_reports_it_rather_than_substituting_one() {
+        let (_dir, path) = blocked_path("data");
+        let Err(error) = TaskEventLog::open(&path) else {
+            panic!("the log must not open where a regular file already is");
+        };
+
+        // The store reports the failure. What start-up does with it is the
+        // point: it may substitute an in-memory log so the window opens, but it
+        // must mark the installation degraded rather than carry on as normal.
+        let health = AuditHealth::degraded_at_startup(format!(
+            "The task event log could not be opened: {error}"
+        ));
+        assert!(!health.is_durable());
+        let refusal = health.refusal().expect("a reason to refuse runs");
+        assert!(refusal.contains("will not run tasks"), "{refusal}");
+
+        // And the read-only half of the bargain: an in-memory log still opens,
+        // so past screens and settings work.
+        assert!(
+            TaskEventLog::in_memory().is_ok(),
+            "the desktop must still open read-only"
+        );
+    }
+
+    #[test]
+    fn a_task_record_that_cannot_be_saved_degrades_the_installation() {
+        let (_dir, path) = blocked_path("appdata");
+        let record = tasks::tests::record("run-1", "2026-08-27T10:00:42+00:00");
+
+        let error = tasks::save(&path, &record).expect_err("the record must not save here");
+
+        // The behaviour under test: this failure is not merely logged. It flips
+        // the installation, and the *next* run is refused with the reason.
+        let health = AuditHealth::durable();
+        assert!(health.is_durable());
+        health.writes_failed(error.clone());
+        assert!(!health.is_durable());
+
+        let AuditState::Degraded {
+            because,
+            at_startup,
+        } = health.state()
+        else {
+            panic!("a failed save must degrade the installation");
+        };
+        assert_eq!(because, error);
+        assert!(
+            !at_startup,
+            "this one broke during the session, and the remedy differs"
+        );
+        assert!(
+            health.refusal().expect("a reason").contains("Restart"),
+            "a mid-session failure tells the person to restart once it is fixed"
+        );
+    }
+
+    #[test]
+    fn a_record_saves_and_reads_back_when_the_disk_is_working() {
+        // The control for the test above: the same record, the same call, a
+        // directory that works.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let record = tasks::tests::record("run-1", "2026-08-27T10:00:42+00:00");
+        tasks::save(dir.path(), &record).expect("the record saves");
+        let health = AuditHealth::durable();
+        assert!(health.is_durable());
+        assert_eq!(health.refusal(), None);
+    }
+}
+
+/// A run id this side never issued, and one whose run has ended.
+///
+/// ## The hole this closes
+///
+/// The plan is the authority for what a run may do, so a run id with no plan
+/// has no authority at all. It used to have a good deal:
+///
+///   - `tool.catalogue` answered with every read-only tool in the product,
+///     justified by "the runtime's health probe belongs to no run" — a probe
+///     that does not ask for a catalogue. `health` is its own RPC, served in
+///     `agent-runtime/src/main.ts` and answered without touching a tool.
+///   - `plan_refusal` returned `None` for a missing plan, because its table
+///     lookup was an early `?`. The caller read that as "no objection", so the
+///     call went on to the gateway, which grants on the signed-in person's
+///     permissions alone.
+///
+/// Put together: any string in the `runId` field could catalogue the read-only
+/// tools and then authorise a search of the organisation's own documents,
+/// outside every budget, with no step counted and no plan to hold it to.
+///
+/// The expired case is the same hole reached honestly. A plan is registered
+/// when a run starts and released when it ends, so a call arriving a moment
+/// after the run finished finds no plan — and used to be treated exactly like
+/// a health probe.
+mod missing_plan {
+    use super::*;
+
+    /// A run id this side has never issued.
+    const INVENTED: &str = "run-that-never-existed";
+
+    fn call_for(run_id: &str, tool: &str) -> Value {
+        json!({
+            "runId": run_id,
+            "toolCallId": "tc",
+            "tool": tool,
+            "args": { "query": "seal specification" }
+        })
+    }
+
+    /// Ends the harness's run the way finishing it does: the plan is released.
+    fn release_plan(deps: &Arc<RuntimeDeps>, run_id: &str) {
+        deps.plans
+            .lock()
+            .expect("plan table")
+            .remove(run_id)
+            .expect("the harness registered this plan");
+    }
+
+    /// A declared role with nothing behind it is not offered to the model.
+    ///
+    /// The shipped build registers profiles and no workers, so every
+    /// delegation was refused with "the role is declared but this build has no
+    /// worker for it" — after the model had spent a turn from a budget fixed
+    /// before it started. The tool is withheld instead.
+    #[tokio::test]
+    async fn the_delegate_tool_is_withheld_when_no_worker_can_perform_a_role() {
+        // A prompt whose plan permits delegation; the deps' manager has no
+        // workers, exactly like the shipped application.
+        let (deps, _dir) = deps_with_plan("Summarise the inspection report and draft a note");
+
+        let planned = deps.plans.lock().expect("plan table")["r"]
+            .budget
+            .permitted_tools
+            .clone();
+        assert!(
+            planned.contains(&ToolName::AgentDelegateReadonly),
+            "this test is only meaningful while the plan still permits delegation"
+        );
+
+        let catalogue = tool_catalogue(json!({ "runId": "r" }), &deps).expect("a catalogue");
+        let names: Vec<&str> = catalogue["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+
+        assert!(
+            !names.contains(&ToolName::AgentDelegateReadonly.as_str()),
+            "a tool that can only refuse was offered anyway: {names:?}"
+        );
+        // The rest of the catalogue is untouched — this withholds one tool, it
+        // does not narrow the run.
+        assert!(names.contains(&ToolName::SearchDocuments.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_invented_run_id_cannot_catalogue_any_tool() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = tool_catalogue(json!({ "runId": INVENTED }), &deps)
+            .expect_err("an unknown run must not be given a catalogue");
+        assert_eq!(error.code, code::REFUSED);
+        assert!(
+            error.message.contains("no plan registered"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_run_id_cannot_authorise_any_tool() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        // Read-only, and one the signed-in person plainly holds the permission
+        // for. It is refused on the run, not on the person.
+        let error = authorize(call_for(INVENTED, "search_documents"), &deps)
+            .await
+            .expect_err("an unknown run must not be authorised");
+        assert_eq!(error.code, code::REFUSED);
+        assert!(
+            error.message.contains("no plan registered"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_run_id_cannot_execute_any_tool() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = execute(
+            json!({
+                "runId": INVENTED,
+                "toolCallId": "tc",
+                "tool": "search_documents",
+                "args": { "query": "seal specification" },
+                "grant": "forged-grant",
+            }),
+            &deps,
+        )
+        .await
+        .expect_err("an unknown run must not execute");
+        assert_eq!(error.code, code::REFUSED);
+        // Refused on the run before the grant is even weighed, so a forged or
+        // replayed grant never gets as far as the ledger.
+        assert!(
+            error.message.contains("no plan registered"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_run_id_cannot_read_the_skill_catalogue_either() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = capability_search(json!({ "runId": INVENTED, "query": "" }), &deps)
+            .expect_err("an unknown run must not be told what this deployment can do");
+        assert_eq!(error.code, code::REFUSED);
+    }
+
+    #[tokio::test]
+    async fn an_expired_run_id_cannot_catalogue_authorise_or_execute() {
+        // The same hole, reached honestly: a plan is registered when the run
+        // starts and released when it ends, so a call arriving a moment after
+        // the run finished finds none.
+        let (deps, _dir) = deps_with(signed_in_user());
+
+        // While it is alive, both work.
+        assert!(tool_catalogue(json!({ "runId": "r" }), &deps).is_ok());
+        let verdict = authorize(call_for("r", "search_documents"), &deps)
+            .await
+            .expect("a live run is authorised");
+        assert_eq!(verdict["outcome"], "allow");
+
+        release_plan(&deps, "r");
+
+        assert!(
+            tool_catalogue(json!({ "runId": "r" }), &deps).is_err(),
+            "a run that has ended must not be given a catalogue"
+        );
+        assert!(
+            authorize(call_for("r", "search_documents"), &deps)
+                .await
+                .is_err(),
+            "a run that has ended must not authorise anything further"
+        );
+        assert!(
+            execute(
+                json!({
+                    "runId": "r",
+                    "toolCallId": "tc",
+                    "tool": "search_documents",
+                    "args": { "query": "seal specification" },
+                    "grant": "any-grant",
+                }),
+                &deps,
+            )
+            .await
+            .is_err(),
+            "a grant issued before the run ended must not execute after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refusal_says_nothing_about_which_runs_do_exist() {
+        // A caller probing ids learns only that this one is not one of them.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = authorize(call_for(INVENTED, "search_documents"), &deps)
+            .await
+            .expect_err("refused");
+        assert!(
+            !error.message.contains("planned-without-workspace"),
+            "{}",
+            error.message
+        );
+        // It does name the id it was given, which is the caller's own string
+        // and helps whoever is reading a trace.
+        assert!(error.message.contains(INVENTED), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn a_registered_run_is_still_served_normally() {
+        // The control. Without it, everything above would pass just as well
+        // against a gateway that refused every call.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let catalogue = tool_catalogue(json!({ "runId": "r" }), &deps).expect("a catalogue");
+        assert!(
+            !catalogue["tools"].as_array().expect("tools").is_empty(),
+            "a live run must still be offered its planned tools"
+        );
+        let verdict = authorize(call_for("r", "search_documents"), &deps)
+            .await
+            .expect("a verdict");
+        assert_eq!(verdict["outcome"], "allow");
+    }
+}
+
+/// The budget when the gateway is asked by several calls at once.
+///
+/// The unit tests in `orchestrator::plan` drive the reservation directly. These
+/// drive it the way the runtime does: through `authorize`, concurrently, on a
+/// plan shared behind the same mutex production uses. Between them they cover
+/// the two halves of the defect — the accounting, and the fact that the
+/// accounting is reached under contention at all.
+mod budget_contention {
+    use super::*;
+
+    /// A run whose plan has exactly `max_steps` to spend.
+    fn deps_with_budget(max_steps: u32) -> (Arc<RuntimeDeps>, tempfile::TempDir) {
+        let (deps, dir) = deps_with(signed_in_user());
+        deps.plans.lock().expect("plan table").insert(
+            "r".to_string(),
+            crate::orchestrator::plan::PlanRun::new(
+                "r",
+                vec!["do the work".to_string()],
+                crate::orchestrator::plan::Budget {
+                    max_steps,
+                    max_duration: std::time::Duration::from_secs(600),
+                    permitted_tools: ToolName::ALL.to_vec(),
+                    // High, so loop detection cannot be what refuses these.
+                    repeat_limit: 100,
+                },
+            ),
+        );
+        (deps, dir)
+    }
+
+    fn search_call(tool_call_id: &str, query: &str) -> Value {
+        json!({
+            "runId": "r",
+            "toolCallId": tool_call_id,
+            "tool": "search_documents",
+            "args": { "query": query }
+        })
+    }
+
+    fn steps_committed(deps: &Arc<RuntimeDeps>) -> u32 {
+        deps.plans
+            .lock()
+            .expect("plan table")
+            .get("r")
+            .expect("the plan")
+            .steps_committed()
+    }
+
+    #[tokio::test]
+    async fn four_concurrent_calls_against_one_free_slot_admit_exactly_one() {
+        // The shape the runtime actually produces: `toolExecution: "parallel"`
+        // puts every read-only call in a turn through `beforeToolCall` at once.
+        // Before the slot was reserved during authorisation, all four read the
+        // same unchanged step count and all four came back with a grant.
+        let (deps, _dir) = deps_with_budget(1);
+
+        let verdicts = futures_util::future::join_all((0..4).map(|i| {
+            let deps = Arc::clone(&deps);
+            async move {
+                authorize(search_call(&format!("tc-{i}"), &format!("query {i}")), &deps)
+                    .await
+                    .expect("a verdict")
+            }
+        }))
+        .await;
+
+        let allowed = verdicts
+            .iter()
+            .filter(|verdict| verdict["outcome"] == "allow")
+            .count();
+        assert_eq!(
+            allowed, 1,
+            "exactly one call may hold the last slot; the others must be refused"
+        );
+        assert_eq!(steps_committed(&deps), 1);
+    }
+
+    #[tokio::test]
+    async fn the_calls_that_lose_the_race_are_told_why_without_the_run_ending() {
+        let (deps, _dir) = deps_with_budget(1);
+        let verdicts = futures_util::future::join_all((0..3).map(|i| {
+            let deps = Arc::clone(&deps);
+            async move {
+                authorize(search_call(&format!("tc-{i}"), &format!("query {i}")), &deps)
+                    .await
+                    .expect("a verdict")
+            }
+        }))
+        .await;
+
+        let refusals: Vec<&str> = verdicts
+            .iter()
+            .filter(|verdict| verdict["outcome"] == "refuse")
+            .filter_map(|verdict| verdict["reason"].as_str())
+            .collect();
+        assert_eq!(refusals.len(), 2);
+        for reason in &refusals {
+            assert!(
+                reason.contains("already under way"),
+                "a call refused for want of a free slot should say so: {reason}"
+            );
+        }
+
+        // Contention is a queue, not a budget spent. The run is still live.
+        let stopped = deps
+            .plans
+            .lock()
+            .expect("plan table")
+            .get("r")
+            .expect("the plan")
+            .stopped()
+            .cloned();
+        assert!(
+            stopped.is_none(),
+            "losing a race for a slot must not end the run: {stopped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_larger_than_the_budget_never_commits_more_than_the_budget() {
+        // Eight calls, three steps. The exact figure matters: this is the
+        // assertion that would have read 8 before the reservation existed.
+        let (deps, _dir) = deps_with_budget(3);
+        let verdicts = futures_util::future::join_all((0..8).map(|i| {
+            let deps = Arc::clone(&deps);
+            async move {
+                authorize(search_call(&format!("tc-{i}"), &format!("query {i}")), &deps)
+                    .await
+                    .expect("a verdict")
+            }
+        }))
+        .await;
+
+        let allowed = verdicts
+            .iter()
+            .filter(|verdict| verdict["outcome"] == "allow")
+            .count();
+        assert_eq!(allowed, 3);
+        assert_eq!(steps_committed(&deps), 3);
+    }
+
+    #[tokio::test]
+    async fn a_call_the_gateway_refuses_gives_its_slot_back_to_the_next_one() {
+        // The plan admits before the gateway decides, so a call the gateway
+        // then refuses took a slot it never used. If it kept it, a run with one
+        // step left that tried one forbidden path would have nothing left for
+        // the legitimate call the model tries next.
+        let (deps, _dir) = deps_with_budget(1);
+
+        // Refused by the gateway: a path outside the run's workspace.
+        let refused = authorize(
+            json!({
+                "runId": "r",
+                "toolCallId": "tc-outside",
+                "tool": "read_scoped_file",
+                "args": { "path": "/etc/passwd" }
+            }),
+            &deps,
+        )
+        .await
+        .expect("a verdict");
+        assert_eq!(refused["outcome"], "refuse");
+        assert_eq!(
+            steps_committed(&deps),
+            0,
+            "a call the gateway refused must not hold a slot"
+        );
+
+        // And the slot is genuinely there for the next call.
+        let allowed = authorize(search_call("tc-next", "seal specification"), &deps)
+            .await
+            .expect("a verdict");
+        assert_eq!(allowed["outcome"], "allow");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_room_still_authorises_normally() {
+        // The control. Everything above would pass just as well against a
+        // gateway that refused every second call.
+        let (deps, _dir) = deps_with_budget(12);
+        let verdicts = futures_util::future::join_all((0..4).map(|i| {
+            let deps = Arc::clone(&deps);
+            async move {
+                authorize(search_call(&format!("tc-{i}"), &format!("query {i}")), &deps)
+                    .await
+                    .expect("a verdict")
+            }
+        }))
+        .await;
+        assert!(verdicts.iter().all(|verdict| verdict["outcome"] == "allow"));
+        assert_eq!(steps_committed(&deps), 4);
+    }
+}
+
+/// `capability.search`, called the way a model calls it.
+///
+/// ## The defect
+///
+/// The tool was in the catalogue and in the plan, and calling it produced an
+/// error. `execute` fell through to `LocalToolRunner`, whose branch for it
+/// reads "served on the agent path, not by this runner" — so a model asking
+/// what skills were available was told the tool existed somewhere else.
+///
+/// Meanwhile a perfectly good handler existed and was reachable only over the
+/// `capability.search` *RPC*, which a model cannot call. Two paths, one of them
+/// dead.
+///
+/// These drive the whole sequence the runtime drives — authorise, take the
+/// grant, execute with it — so a regression in any of the three shows up here
+/// rather than as a model quietly losing a capability.
+mod capability_search_execution {
+    use super::*;
+
+    fn call(query: &str) -> Value {
+        json!({
+            "runId": "r",
+            "toolCallId": "tc-cap",
+            "tool": "capability.search",
+            "args": { "query": query }
+        })
+    }
+
+    /// Authorises, then executes with the grant it was given.
+    async fn authorize_then_execute(
+        deps: &Arc<RuntimeDeps>,
+        query: &str,
+    ) -> Result<Value, WireError> {
+        let verdict = authorize(call(query), deps).await.expect("a verdict");
+        assert_eq!(
+            verdict["outcome"], "allow",
+            "capability.search is read-only and in the plan: {verdict:?}"
+        );
+        let grant = verdict["grant"].as_str().expect("a grant").to_string();
+
+        let mut params = call(query);
+        params["grant"] = Value::String(grant);
+        execute(params, deps).await
+    }
+
+    #[tokio::test]
+    async fn a_model_can_call_it_end_to_end() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let result = authorize_then_execute(&deps, "approval note")
+            .await
+            .expect("capability.search must execute, not report itself unavailable");
+        let text = result["text"].as_str().expect("prose for the model");
+        assert!(
+            !text.contains("not by this runner"),
+            "the tool reported itself unavailable: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_registry_says_so_rather_than_failing() {
+        // The harness installs no skills. "Nothing matched" is an answer; an
+        // error is not, and a model told the call failed retries it.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let result = authorize_then_execute(&deps, "anything").await.expect("executes");
+        let text = result["text"].as_str().expect("prose");
+        assert!(text.contains("No installed skill matches"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_metadata_only() {
+        // The split the whole skill design rests on: cards here, instructions
+        // only through a separate deliberate step.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let result = authorize_then_execute(&deps, "").await.expect("executes");
+        let text = result["text"].as_str().expect("prose").to_lowercase();
+        assert!(
+            text.contains("nothing was loaded") || text.contains("description only"),
+            "the answer should say it is metadata: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_plan_cannot_search_capabilities() {
+        // Fail-closed, the same as every other method acting under a run's
+        // authority. Asserted through the handler because a call with no plan
+        // never gets a grant to execute with.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = capability_search(json!({ "runId": "invented", "query": "" }), &deps)
+            .expect_err("an unknown run must not be told what this deployment can do");
+        assert_eq!(error.code, code::REFUSED);
+    }
+
+    #[tokio::test]
+    async fn executing_without_a_grant_is_refused() {
+        // The grant is what proves the gateway said yes. The tool being
+        // read-only does not make it exempt.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let error = execute(call("anything"), &deps)
+            .await
+            .expect_err("no grant was presented");
+        assert_eq!(error.code, code::REFUSED);
+    }
+}
+
+/// The dependencies the agent path used to build its runner without.
+///
+/// ## The defect
+///
+/// `execute` constructed the runner with `LocalToolRunner::new(index, session)`,
+/// which leaves `multimodal`, `subagents`, `inherited` and `run_workspace` all
+/// `None`. `LocalToolRunner` has fields for every one of them and the
+/// application had built the values — they were simply never handed over.
+///
+/// Three tools in the catalogue were therefore unreachable. A model that
+/// planned to use one, was granted it by the gateway, and called it, got back a
+/// sentence saying the tool was available somewhere else.
+mod runtime_wiring {
+    use super::*;
+
+    #[test]
+    fn the_runner_the_agent_path_builds_carries_the_run_dependencies() {
+        // The defect, stated as the thing that was `None`. `LocalToolRunner`
+        // has a field for each of these and the application had built every
+        // value; the agent path simply never handed them over.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let workspace = deps.root_for("r");
+        let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
+        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref());
+
+        assert!(runner.subagents.is_some(), "no subagent manager");
+        assert!(runner.multimodal.is_some(), "no multimodal index");
+        assert!(runner.inherited.is_some(), "no inherited policy");
+        assert!(runner.run_workspace.is_some(), "no run workspace");
+    }
+
+    #[test]
+    fn a_run_with_a_workspace_and_a_plan_yields_a_policy_a_child_can_inherit() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let workspace = deps.root_for("r").expect("the harness gives run r a workspace");
+
+        let inherited = inherited_policy_for(&deps, &session, "r", Some(&workspace))
+            .expect("a run with a plan and a workspace has a policy to pass on");
+
+        // Every field narrows a child and none widens it.
+        assert_eq!(inherited.depth, 0);
+        assert!(!inherited.network_permitted, "a child may not reach the network");
+        assert!(inherited.approval_required, "a child may not skip approval");
+        assert_eq!(inherited.workspace_root, workspace);
+        assert_eq!(inherited.user_id, session.user.id);
+    }
+
+    #[test]
+    fn a_child_is_never_given_a_tool_its_parent_does_not_hold() {
+        // The property that makes delegation safe: the inherited tool list is
+        // the parent's own, so there is no path by which a worker acquires
+        // something the run was not planned for.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let workspace = deps.root_for("r").expect("a workspace");
+
+        let permitted = registered_plan_tools(&deps, "r").expect("a plan");
+        let inherited = inherited_policy_for(&deps, &session, "r", Some(&workspace))
+            .expect("a policy");
+
+        for tool in &inherited.permitted_tools {
+            assert!(
+                permitted.contains(tool),
+                "{} reached a child without the parent holding it",
+                tool.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_plan_has_no_policy_to_pass_on() {
+        // Fail closed, consistently with everything else that acts under a
+        // run's authority. A worker started under an unknown run would be a
+        // worker bounded by nothing.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let workspace = deps.root_for("r").expect("a workspace");
+        assert!(
+            inherited_policy_for(&deps, &session, "invented-run", Some(&workspace)).is_none()
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_workspace_has_no_policy_to_pass_on() {
+        // A child inherits its parent's workspace as its root. Without one
+        // there is nothing to confine it to, and an unconfined worker is worse
+        // than no worker.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        assert!(inherited_policy_for(&deps, &session, "r", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn delegation_no_longer_reports_itself_unavailable() {
+        // The symptom. Whatever the manager decides about a profile it does
+        // not have, it must not be "subagents are not available on this
+        // machine" — that sentence meant the wiring, not the request.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let workspace = deps.root_for("r");
+        let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
+        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref());
+
+        let call = crate::orchestrator::tools::ToolCall::new(
+            "agent.delegate_readonly",
+            json!({ "profile": "knowledge-retriever", "task": "find the seal specification" }),
+        );
+        let result = runner
+            .run(ToolName::AgentDelegateReadonly, &call, None)
+            .await;
+
+        if let Err(reason) = &result {
+            assert!(
+                !reason.contains("not available on this machine"),
+                "the manager was never handed to the runner: {reason}"
+            );
+            assert!(
+                !reason.contains("not wired into this run"),
+                "the inherited policy was never handed to the runner: {reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multimodal_retrieval_no_longer_reports_itself_unavailable() {
+        // Same shape: the index exists, so a search that finds nothing must
+        // say it found nothing rather than that the tool has no index.
+        let (deps, _dir) = deps_with(signed_in_user());
+        let session = deps.session().expect("signed in");
+        let runner = runner_for(&deps, &session, None, None);
+
+        let call = crate::orchestrator::tools::ToolCall::new(
+            "knowledge.multimodal_retrieve",
+            json!({ "query": "pump P-101 general arrangement" }),
+        );
+        let result = runner
+            .run(ToolName::KnowledgeMultimodalRetrieve, &call, None)
+            .await;
+
+        if let Err(reason) = &result {
+            assert!(
+                !reason.to_lowercase().contains("not available"),
+                "the multimodal index was never handed to the runner: {reason}"
+            );
+        }
+    }
 }

@@ -67,6 +67,67 @@ pub struct Message {
     pub tokens_in: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
+    /// How the run that produced this message ended, as
+    /// [`crate::agent_runtime::outcome::RunOutcome::kind`] spells it:
+    /// `completed`, `failed`, `aborted`, `lengthLimited`, `budgetStopped` or
+    /// `policyStopped`.
+    ///
+    /// Persisted per message because the chat surface has to be able to say
+    /// what happened to a turn it is rendering from disk, long after the run's
+    /// events have scrolled away. Without it the surface can only ask "is this
+    /// still streaming?", and the answer to that question is the same for an
+    /// answer, a fragment cut off at the output cap, and a run somebody
+    /// stopped.
+    ///
+    /// `None` on messages written before this field existed, and on user and
+    /// system messages, which are not produced by a run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// What the verifier concluded about this answer: `ready` or `needsReview`.
+    ///
+    /// Persisted alongside the outcome, and for the same reason: a cell
+    /// rendered from disk has no run events to consult, and the surface used to
+    /// answer "is this verified?" with "has it stopped streaming?" — which is
+    /// not a verdict about the answer at all.
+    ///
+    /// `None` means the verifier did not run: there was nothing to check, or
+    /// the run ended before it got that far. Deliberately distinct from
+    /// `ready`, because "nothing checked it" and "it passed" are the two
+    /// readings the old surface conflated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+}
+
+/// What is known about an assistant message once its run has ended.
+///
+/// A struct rather than a dozen positional arguments, because two writers reach
+/// this row and neither knows everything: the front-end writes on `message_end`,
+/// which is the only place the model's token usage appears, and the run writes
+/// again when `agent_start_run` resolves, which is the only place the routing
+/// decision and the typed ending appear. Every optional field means "I do not
+/// know this", never "clear it".
+#[derive(Debug, Clone, Default)]
+pub struct MessageCompletion<'a> {
+    /// The finished text, when the writer has it. `None` leaves whatever was
+    /// streamed in place.
+    pub final_content: Option<&'a str>,
+    pub elapsed_ms: Option<u64>,
+    pub model_name: Option<&'a str>,
+    pub model_role: Option<&'a str>,
+    pub used_fallback: Option<bool>,
+    /// The sentence explaining a bad ending, shown to a person.
+    pub error: Option<&'a str>,
+    /// The typed ending. See [`Message::outcome`].
+    pub outcome: Option<&'a str>,
+    /// What the verifier concluded. See [`Message::verification`].
+    pub verification: Option<&'a str>,
+    /// Whether the run finished the work it set out to do.
+    ///
+    /// False for every ending except `completed` — a stopped run and a run cut
+    /// off at the output cap did not finish, whatever text they left behind.
+    pub failed: bool,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,6 +489,8 @@ impl ConversationStore {
             used_fallback: None,
             tokens_in: None,
             tokens_out: None,
+            outcome: None,
+            verification: None,
         };
         let conversation = Conversation {
             id: id.clone(),
@@ -480,6 +543,8 @@ impl ConversationStore {
             used_fallback: None,
             tokens_in: None,
             tokens_out: None,
+            outcome: None,
+            verification: None,
         };
         let assistant_msg = Message {
             id: assistant_message_id.to_string(),
@@ -497,6 +562,8 @@ impl ConversationStore {
             used_fallback: None,
             tokens_in: None,
             tokens_out: None,
+            outcome: None,
+            verification: None,
         };
         conversation.messages.push(user_msg);
         conversation.messages.push(assistant_msg);
@@ -549,17 +616,22 @@ impl ConversationStore {
         id: &str,
         message_id: &str,
         run_id: &str,
-        final_content: Option<&str>,
-        elapsed_ms: Option<u64>,
-        model_name: Option<&str>,
-        model_role: Option<&str>,
-        used_fallback: Option<bool>,
-        error: Option<&str>,
-        failed: bool,
-        tokens_in: Option<u64>,
-        tokens_out: Option<u64>,
+        completion: MessageCompletion<'_>,
         owner_user_id: &str,
     ) -> std::io::Result<Option<Conversation>> {
+        let MessageCompletion {
+            final_content,
+            elapsed_ms,
+            model_name,
+            model_role,
+            used_fallback,
+            error,
+            outcome,
+            verification,
+            failed,
+            tokens_in,
+            tokens_out,
+        } = completion;
         let Some(mut conversation) = self.get(id, Some(owner_user_id))? else {
             return Ok(None);
         };
@@ -609,6 +681,18 @@ impl ConversationStore {
             // but a failure with no message keeps the message already there.
             if error.is_some() || !failed {
                 msg.error = error.map(str::to_string);
+            }
+            // The ending, when the writer knows it. Only the run does; the
+            // front-end's `message_end` carries a finish reason for the model's
+            // last turn, which is a narrower thing and not the run's ending.
+            if outcome.is_some() {
+                msg.outcome = outcome.map(str::to_string);
+            }
+            // Same rule as the outcome: only a writer that knows says
+            // anything. A `message_end` writer knows nothing about the
+            // verifier and must not clear what the run recorded.
+            if verification.is_some() {
+                msg.verification = verification.map(str::to_string);
             }
         }
         if let Some(run) = conversation.runs.iter_mut().find(|r| r.run_id == run_id) {
@@ -664,5 +748,94 @@ impl RunToConversation {
             .lock()
             .ok()
             .and_then(|map| map.get(run_id).cloned())
+    }
+}
+
+/// Whether this session's chats will still be here tomorrow.
+///
+/// ## Why this exists
+///
+/// The conversation store's failure path used to be a *fixed* temp directory,
+/// `arjun-conversations-fallback`, opened silently. Three things were wrong
+/// with that, and the third is the serious one:
+///
+///  - it is shared, so two sessions — or two users on one machine — wrote into
+///    each other's conversations;
+///  - it is stale, so a session that recovered found the previous degraded
+///    session's threads sitting there looking like history;
+///  - nothing said so. The chat behaved exactly as normal, and the person's
+///    real conversations were not in it.
+///
+/// The application should still open — a person needs to see what is wrong, and
+/// read whatever history is reachable. What it should not do is hand somebody a
+/// transcript that will be gone tomorrow without telling them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ConversationState {
+    /// The store opened where it should. Conversations persist.
+    Durable,
+    /// The store could not be opened, and this session is writing to a
+    /// scratch directory of its own that nothing will read again.
+    Ephemeral {
+        /// What went wrong, in the sentence shown to a person.
+        because: String,
+        /// Where this session's chats are going. Named so an operator can find
+        /// them before the machine is restarted.
+        directory: String,
+    },
+}
+
+/// The live state of this session's conversation storage.
+#[derive(Debug)]
+pub struct ConversationHealth {
+    state: ConversationState,
+}
+
+impl Default for ConversationHealth {
+    fn default() -> Self {
+        Self::durable()
+    }
+}
+
+impl ConversationHealth {
+    pub fn durable() -> Self {
+        Self {
+            state: ConversationState::Durable,
+        }
+    }
+
+    /// This session is writing somewhere nothing will read again.
+    pub fn ephemeral(because: impl Into<String>, directory: impl AsRef<Path>) -> Self {
+        Self {
+            state: ConversationState::Ephemeral {
+                because: because.into(),
+                directory: directory.as_ref().display().to_string(),
+            },
+        }
+    }
+
+    pub fn state(&self) -> &ConversationState {
+        &self.state
+    }
+
+    pub fn is_durable(&self) -> bool {
+        matches!(self.state, ConversationState::Durable)
+    }
+
+    /// The sentence to refuse a *new* conversation with, or `None`.
+    ///
+    /// Refusing to create rather than refusing to open is the whole design.
+    /// Reading what is already there costs nothing and is the only way a person
+    /// finds out what is wrong; starting a new thread they will lose is the
+    /// thing worth stopping.
+    pub fn refusal(&self) -> Option<String> {
+        match &self.state {
+            ConversationState::Durable => None,
+            ConversationState::Ephemeral { because, directory } => Some(format!(
+                "New conversations cannot be saved on this machine right now, so one was not \
+                 started. {because} Anything this session writes goes to {directory} and will \
+                 not be there after a restart. Existing conversations can still be read."
+            )),
+        }
     }
 }

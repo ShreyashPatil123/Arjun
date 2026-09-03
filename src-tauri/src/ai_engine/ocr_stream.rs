@@ -27,6 +27,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use super::ocr_profile::OcrProfile;
+use super::ocr_repetition::RepetitionGuard;
 use super::ocr_spans::{OcrEvent, RawBox, SpanParser};
 
 /// One server-sent event.
@@ -141,7 +142,30 @@ pub struct StreamSummary {
     /// rather than folded into a duration.
     pub hit_decode_cap: bool,
     pub cancelled: bool,
+    /// Where the read degenerated into repetition, in characters of decoded
+    /// text, when it did.
+    ///
+    /// `Some` means the stream was **aborted deliberately** and everything
+    /// beyond this offset is the model repeating itself rather than the page.
+    /// The caller cuts there and says so. See
+    /// [`crate::ai_engine::ocr_repetition`] for why the sampler cannot
+    /// prevent this and why the decision is taken client-side instead.
+    pub looped_at: Option<usize>,
 }
+
+/// The single DRY sequence breaker sent for OCR, chosen so it never matches.
+///
+/// U+001F UNIT SEPARATOR. A vision model transcribing a page emits the text it
+/// sees; it has no reason to produce a C0 control character, and a page cannot
+/// contain one to be read. So the breaker list is never triggered and DRY
+/// accumulates across the whole decode — including across the newlines,
+/// colons, quotes and asterisks that llama.cpp would otherwise break on, which
+/// is the behaviour `no_repeat_ngram_size` has and the default breaker list
+/// destroys.
+///
+/// Present rather than absent, and one element rather than none, because the
+/// server accepts neither of the alternatives. See `request_body`.
+const DRY_NEVER_MATCHES: &str = "\u{001F}";
 
 /// Builds the request body for one page.
 ///
@@ -173,11 +197,14 @@ pub fn request_body(
         "dry_multiplier": profile.dry_multiplier,
         "dry_allowed_length": profile.dry_allowed_length,
         "dry_penalty_last_n": profile.dry_penalty_last_n,
-        // Empty, and this is the load-bearing part.
+        // One sentinel that cannot occur in decoded text, and this is the
+        // load-bearing part.
         //
-        // llama.cpp defaults `dry_sequence_breakers` to `['\n', ':', '"', '*']`
+        // llama.cpp defaults `dry_sequence_breakers` to the four characters
+        // newline, colon, double-quote and asterisk,
         // and resets the repetition match at every one of them. A read that
-        // degenerates into `*\n*\n*\n…` is therefore built *entirely* out of
+        // degenerates into an endless asterisk-and-newline ladder is therefore
+        // built *entirely* out of
         // sequence breakers: DRY never accumulates a match, never applies a
         // penalty, and — at temperature 0, where there is no sampling noise to
         // knock the decode out of the cycle — the loop runs to the decode cap.
@@ -186,9 +213,21 @@ pub fn request_body(
         //
         // The processor this stands in for has no notion of breakers at all.
         // `no_repeat_ngram_size=35` bans a repeated 35-gram wherever it falls,
-        // punctuation included, so clearing the list is not a liberty — it is
-        // the closer reproduction of the reference implementation.
-        "dry_sequence_breakers": [],
+        // punctuation included, so suppressing the list is not a liberty — it
+        // is the closer reproduction of the reference implementation.
+        //
+        // It cannot be expressed as `[]`. The server validates the field and
+        // rejects an empty array outright:
+        //
+        //     400 Bad Request — "Field 'dry_sequence_breakers': Error:
+        //     dry_sequence_breakers must be a non-empty array of strings"
+        //
+        // and omitting the field is worse than either, because that restores
+        // the very defaults above. So the list is one control character that no
+        // OCR decode can emit. DRY tokenises each breaker and resets on a
+        // match; a breaker that never matches is a list of no breakers, which
+        // is what this needs, expressed in the only shape the server accepts.
+        "dry_sequence_breakers": [DRY_NEVER_MATCHES],
     })
 }
 
@@ -249,6 +288,9 @@ where
     let mut tokens: u32 = 0;
     let mut hit_decode_cap = false;
     let mut cancelled = false;
+    // Watches the decoded text rather than the token stream, because the
+    // failure it exists for is invisible at token level. See the module.
+    let mut repetition = RepetitionGuard::new();
 
     'outer: while let Some(next) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
@@ -274,6 +316,18 @@ where
                         tokens += 1;
                         for event in spans.feed(&delta) {
                             on_event(event);
+                        }
+                        // Tested after the events are emitted, so the scan
+                        // view keeps what was read up to the turn instead of
+                        // losing the last window to the abort.
+                        if repetition.feed(&delta).is_some() {
+                            // Leaving the loop drops `stream`, which closes
+                            // the connection, which is what actually stops
+                            // llama-server generating. Without that the
+                            // server decodes to the cap with nobody reading
+                            // and the page still costs the minutes this guard
+                            // exists to save.
+                            break 'outer;
                         }
                     }
                 }
@@ -301,6 +355,7 @@ where
         elapsed_ms: started.elapsed().as_millis() as u64,
         hit_decode_cap,
         cancelled,
+        looped_at: repetition.tripped_at(),
     })
 }
 
@@ -531,5 +586,45 @@ mod tests {
         assert_eq!(body["temperature"], 0.0);
         assert_eq!(body["dry_allowed_length"], 35);
         assert_eq!(body["max_tokens"], profile.max_decode_tokens);
+    }
+
+    /// llama-server rejects the two obvious ways of saying "no breakers".
+    ///
+    /// An empty array is refused by the field validator:
+    ///
+    ///     400 — dry_sequence_breakers must be a non-empty array of strings
+    ///
+    /// and omitting the key restores the `['\n', ':', '"', '*']` default that
+    /// makes an all-asterisk decode invisible to DRY. Every OCR request failed
+    /// on the first of those for as long as the empty array was sent, so the
+    /// shape is asserted rather than left to the comment beside it.
+    #[test]
+    fn the_dry_breaker_list_is_non_empty_and_cannot_match_a_transcription() {
+        for detent in OcrDetent::ALL {
+            let body = request_body("m", "image/png", "AAAA", &detent.profile());
+            let breakers = body["dry_sequence_breakers"]
+                .as_array()
+                .expect("dry_sequence_breakers must be present, or llama.cpp uses its defaults");
+
+            assert!(
+                !breakers.is_empty(),
+                "{detent:?} sent an empty breaker list, which the server refuses with a 400"
+            );
+            assert!(
+                breakers.iter().all(|b| b.is_string()),
+                "{detent:?} sent a non-string breaker; the server requires an array of strings"
+            );
+
+            // The point of the list is that it never fires. Anything a page can
+            // actually contain would reset the repetition match and reinstate
+            // the loop this setting exists to stop.
+            for breaker in breakers {
+                let text = breaker.as_str().unwrap();
+                assert!(
+                    text.chars().all(|c| c.is_control() && !c.is_whitespace()),
+                    "{detent:?} sent {text:?} as a breaker — a transcription can emit that"
+                );
+            }
+        }
     }
 }

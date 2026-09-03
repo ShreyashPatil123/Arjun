@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   agentService,
+  listenAttachmentContext,
   type AgentEventEnvelope,
+  type AttachmentContextEvent,
   type CompactionRecord,
   type ContextLedgerRecord,
   type RunSummary,
@@ -230,11 +232,24 @@ export function useTaskRecord(runId: string | null) {
           runId: task.runId,
           text: task.answer,
           turns: task.turns,
+          // Records written before the typed ending existed carry only the
+          // failure sentence. Read back as `failed` when there is one and
+          // `completed` when there is not — which is what the record actually
+          // says, rather than a state it never recorded.
+          outcome:
+            task.outcome ??
+            (task.failure
+              ? { kind: 'failed', detail: task.failure }
+              : { kind: 'completed' }),
           routing: task.routing,
           endpoint: task.endpoint,
           plan: task.plan,
           verification: task.verification,
           artifacts: task.artifacts,
+          // The record was read back off disk, so the store this run needed
+          // was working. That is a fact about the read that just succeeded,
+          // not an assumption about the installation now.
+          audit: { state: 'durable' },
         });
       } catch {
         if (!cancelled) setRecord(null);
@@ -254,31 +269,82 @@ export function useTaskRecord(runId: string | null) {
 export function useContextLedger(runId: string | null) {
   const [ledger, setLedger] = useState<ContextLedgerRecord | null>(null);
   const [compactions, setCompactions] = useState<CompactionRecord[]>([]);
+  /**
+   * Per-attachment costs, keyed by content hash.
+   *
+   * Held beside the ledger rather than inside it because the two arrive from
+   * different places at different times: an attachment's cost is known while
+   * the OCR model is still finishing and the run has not made a model call yet,
+   * so there is no ledger to put it in.
+   */
+  const [attachments, setAttachments] = useState<AttachmentContextEvent[]>([]);
+
   useEffect(() => {
     if (!runId) {
       setLedger(null);
       setCompactions([]);
+      setAttachments([]);
       return;
     }
     let cancelled = false;
+    const unsubscribers: (() => void)[] = [];
+
+    // The stored reading first, so a finished run opened from the Tasks screen
+    // shows its ledger without waiting for events that will never come.
     void (async () => {
       try {
         const task = await agentService.task(runId);
         if (cancelled) return;
-        setLedger(task.contextLedger ?? null);
-        setCompactions(task.compactions ?? []);
+        // Only as a starting point. A live event that has already landed
+        // describes a later moment than this fetch does, so it must not be
+        // overwritten by a reply that was in flight when it arrived.
+        setLedger(current => current ?? task.contextLedger ?? null);
+        setCompactions(current => (current.length > 0 ? current : task.compactions ?? []));
       } catch {
-        if (!cancelled) {
-          setLedger(null);
-          setCompactions([]);
-        }
+        // A run with no stored record yet is the normal case for one that has
+        // only just started. The live events below are what populate it, so
+        // this is not an error worth clearing state for.
       }
     })();
+
+    // Live: every turn and every compaction.
+    void agentService
+      .subscribe(({ event }: AgentEventEnvelope) => {
+        if (cancelled) return;
+        if (event.type === 'context_ledger') {
+          setLedger(event.ledger);
+        }
+      }, runId)
+      .then(un => {
+        if (cancelled) un();
+        else unsubscribers.push(un);
+      });
+
+    // Live: what each attached document cost, known before the first model
+    // call and therefore before any ledger exists.
+    void listenAttachmentContext(payload => {
+      if (cancelled) return;
+      setAttachments(current => {
+        // Keyed by content hash, so re-reading the same file replaces its row
+        // rather than adding a second one for the same document.
+        const at = current.findIndex(a => a.sha256 === payload.sha256);
+        if (at === -1) return [...current, payload];
+        const next = current.slice();
+        next[at] = payload;
+        return next;
+      });
+    }).then(un => {
+      if (cancelled) un();
+      else unsubscribers.push(un);
+    });
+
     return () => {
       cancelled = true;
+      for (const un of unsubscribers) un();
     };
   }, [runId]);
-  return { ledger, compactions };
+
+  return { ledger, compactions, attachments };
 }
 
 /**

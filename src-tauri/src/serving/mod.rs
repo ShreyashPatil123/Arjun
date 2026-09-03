@@ -31,8 +31,22 @@
 //! A registry entry therefore says which it is, and an entry that says nothing
 //! gets the default for its runtime.
 
+pub mod admission;
 pub mod probe;
-pub mod transport;
+pub mod reaper;
+// `transport` was removed. It held `trait ArjunTransport` with a
+// `LocalTransport` delegating to the scheduler and an `HttpTransport` stub
+// "describing what a future server-backed implementation would look like".
+//
+// Nothing implemented against it and nothing called it — not the trait, not
+// either impl, not the `default_transport` factory. It was a seam drawn for a
+// remote-server future that has not arrived, and an abstraction with one real
+// implementation and no callers describes an intention rather than a boundary.
+// The scheduler is reached directly, which is what every caller was already
+// doing.
+//
+// If a remote backend is built later, the seam is one file and one afternoon —
+// drawn then against a second implementation that actually exists.
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -111,6 +125,13 @@ pub enum ServingError {
     LaunchFailed(String),
     #[error("no free loopback port could be found: {0}")]
     NoPort(String),
+    #[error("{model} needs {} but this machine has {} of video memory and {} of free system memory. Choose a smaller model, or a smaller quantisation of this one.", crate::serving::human_bytes(*model_bytes), crate::serving::human_bytes(*vram_bytes), crate::serving::human_bytes(*ram_bytes))]
+    WontFit {
+        model: String,
+        model_bytes: u64,
+        vram_bytes: u64,
+        ram_bytes: u64,
+    },
     #[error("{model} was started but never became ready at {base_url}: {detail}")]
     NeverReady {
         model: String,
@@ -176,8 +197,15 @@ pub fn plan_launch(
         port.to_string(),
         "--n-gpu-layers".to_string(),
         gpu.gpu_layers.to_string(),
+        // From the plan, not from the entry.
+        //
+        // These are one decision: the layer count was computed against a KV
+        // cache of exactly this many tokens. Serving a larger window than the
+        // plan reserved for oversubscribes the VRAM the plan just finished
+        // budgeting, and llama.cpp answers that by paging weights over PCIe —
+        // a full-offload plan that runs at CPU speed with the GPU idle.
         "--ctx-size".to_string(),
-        entry.context_length.to_string(),
+        gpu.context_length.to_string(),
         // The server advertises ARJUN's id rather than the file name, so the
         // routing decision and the served model can be matched by name in the
         // trace.
@@ -439,6 +467,14 @@ impl ModelServers {
             .spawn()
             .map_err(|error| ServingError::LaunchFailed(error.to_string()))?;
 
+        // Enrolled before anything else can fail. From here the OS will end
+        // this server when ARJUN ends, whatever ends ARJUN — see `reaper`,
+        // which exists because eight of these were once found alive after the
+        // app had gone, holding 7.4 GB of an 8 GB card between them.
+        if let Some(pid) = child.id() {
+            reaper::adopt(pid);
+        }
+
         let endpoint = Endpoint {
             base_url: plan.base_url.clone(),
             served_model_id: plan.served_model_id,
@@ -598,6 +634,7 @@ mod tests {
 
     fn plan(gpu_layers: u32) -> GpuOffloadPlan {
         GpuOffloadPlan {
+            context_length: 8192,
             gpu_layers,
             full_offload: gpu_layers > 0,
             reason: String::new(),
@@ -863,5 +900,21 @@ mod tests {
             running.len() <= 1,
             "concurrent calls duplicated a managed server entry: {running:?}",
         );
+    }
+}
+
+/// Bytes as an operator reads them.
+///
+/// Lives here rather than in a formatting helper because the only thing that
+/// needs it is a serving error, and an error message is not the place to
+/// discover that a utility crate is missing.
+pub fn human_bytes(bytes: u64) -> String {
+    const GB: f64 = (1024 * 1024 * 1024) as f64;
+    const MB: f64 = (1024 * 1024) as f64;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes / GB)
+    } else {
+        format!("{:.0} MB", bytes / MB)
     }
 }

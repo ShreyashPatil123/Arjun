@@ -18,7 +18,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RpcPeer, type PeerTransport } from "./peer.js";
-import { startRun, type RunRequest } from "./run.js";
+import { startRun, terminationOf, type RunRequest } from "./run.js";
 import { TOOL_DEFINITIONS } from "./catalogue.js";
 
 /** One SSE chunk in the shape an OpenAI-compatible server emits. */
@@ -376,5 +376,209 @@ describe("aborting", () => {
     expect(registered).toBeDefined();
     // Aborting a finished run is a normal race and must not throw.
     expect(() => registered!.abort("operator stopped it")).not.toThrow();
+  });
+});
+
+/**
+ * A model server that opens a stream and never finishes it.
+ *
+ * The only thing that can end a run against this server is the run's own
+ * deadline or an operator, which is exactly what the two tests below are about.
+ */
+function stallingServer(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const open: Array<{ end: () => void }> = [];
+  const server: Server = createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      res.write(chunk({ role: "assistant", content: "" }));
+      open.push(res);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        close: () =>
+          new Promise<void>((done) => {
+            for (const res of open) res.end();
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}
+
+/** A model server that answers every request with a provider error. */
+function erroringServer(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server: Server = createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "the model server is loading a model" } }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        close: () => new Promise<void>((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+/**
+ * How a run ended, as the loop actually ended it.
+ *
+ * The defect these pin: the core used to read "the `run.start` request
+ * resolved" as "the task completed". Every ordinary ending of an agent loop
+ * resolves that request -- a stop button, a provider error, the model's output
+ * cap -- so a truncated fragment, a stopped run and a finished answer were
+ * recorded, listed and shown as the same thing.
+ */
+describe("terminationOf: the ending is read off the loop, not off the transport", () => {
+  it("reports a clean stop as completed, with nothing to excuse", () => {
+    expect(terminationOf({ finalAssistant: { stopReason: "stop" } })).toEqual({
+      kind: "completed",
+    });
+  });
+
+  it("reports a provider error as failed, carrying the provider's sentence", () => {
+    const outcome = terminationOf({
+      finalAssistant: { stopReason: "error", errorMessage: "the model server refused: 503" },
+      errorMessage: "the model server refused: 503",
+    });
+    expect(outcome.kind).toBe("failed");
+    expect(outcome.detail).toContain("503");
+  });
+
+  it("reports the output cap as lengthLimited, never as completed", () => {
+    const outcome = terminationOf({ finalAssistant: { stopReason: "length" } });
+    expect(outcome.kind).toBe("lengthLimited");
+    // The distinction that matters: the answer is a fragment.
+    expect(outcome.detail).toMatch(/cut off/i);
+  });
+
+  it("reports an operator stop as aborted, with the cause recorded at the stop", () => {
+    const outcome = terminationOf({
+      finalAssistant: { stopReason: "aborted" },
+      abortCause: { kind: "aborted", detail: "Stopped: operator stopped it" },
+    });
+    expect(outcome).toEqual({ kind: "aborted", detail: "Stopped: operator stopped it" });
+  });
+
+  it("reports a deadline stop as budgetStopped, not as a plain abort", () => {
+    // Same `stopReason` from the loop's point of view; different endings to a
+    // person reading the run. Which one it was is knowable only where the
+    // abort was asked for, so it is recorded there.
+    const outcome = terminationOf({
+      finalAssistant: { stopReason: "aborted" },
+      abortCause: {
+        kind: "budgetStopped",
+        detail: "Stopped: it ran past the time its plan allowed.",
+      },
+    });
+    expect(outcome.kind).toBe("budgetStopped");
+  });
+
+  it("falls back to a plain abort when nothing recorded who asked", () => {
+    expect(terminationOf({ finalAssistant: { stopReason: "aborted" } })).toEqual({
+      kind: "aborted",
+      detail: "Stopped before it finished.",
+    });
+  });
+
+  it("reports an error the loop recorded after the last turn as failed", () => {
+    const outcome = terminationOf({
+      finalAssistant: { stopReason: "stop" },
+      errorMessage: "the stream ended before the turn did",
+    });
+    expect(outcome.kind).toBe("failed");
+    expect(outcome.detail).toBe("the stream ended before the turn did");
+  });
+
+  it("treats a run with no assistant message as completed only if nothing failed", () => {
+    expect(terminationOf({}).kind).toBe("completed");
+    expect(terminationOf({ errorMessage: "spawn failed" }).kind).toBe("failed");
+  });
+});
+
+describe("startRun: the outcome it returns", () => {
+  it("is completed for a run that answered", async () => {
+    server = await modelServer([
+      [chunk({ role: "assistant", content: "" }), chunk({ content: "ok" }), chunk({}, "stop")],
+    ]);
+    const core = coreStub({});
+    const outcome = await startRun(core.peer, request(server.baseUrl), () => {});
+    expect(outcome.outcome).toEqual({ kind: "completed" });
+  });
+
+  it("is lengthLimited for a turn the model server cut at the output cap", async () => {
+    server = await modelServer([
+      [
+        chunk({ role: "assistant", content: "" }),
+        chunk({ content: "The seal specification is " }),
+        chunk({}, "length"),
+      ],
+    ]);
+    const core = coreStub({});
+    const outcome = await startRun(core.peer, request(server.baseUrl), () => {});
+    expect(outcome.outcome.kind).toBe("lengthLimited");
+    // The fragment is still returned: a cut-off answer is worth showing, as
+    // long as it is not called finished.
+    expect(outcome.text).toContain("The seal specification is");
+  });
+
+  it("is budgetStopped for a run whose deadline expired mid-flight", async () => {
+    const stalled = await stallingServer();
+    try {
+      const core = coreStub({});
+      const outcome = await startRun(
+        core.peer,
+        { ...request(stalled.baseUrl), deadlineMs: Date.now() + 150 },
+        () => {},
+      );
+      expect(outcome.outcome.kind).toBe("budgetStopped");
+      expect(outcome.outcome.detail).toMatch(/time its plan allowed/);
+    } finally {
+      await stalled.close();
+    }
+  });
+
+  it("is aborted for a run an operator stopped mid-flight", async () => {
+    const stalled = await stallingServer();
+    try {
+      const core = coreStub({});
+      const outcome = await startRun(core.peer, request(stalled.baseUrl), (handle) => {
+        setTimeout(() => handle.abort("operator stopped it"), 60);
+      });
+      expect(outcome.outcome.kind).toBe("aborted");
+      expect(outcome.outcome.detail).toContain("operator stopped it");
+    } finally {
+      await stalled.close();
+    }
+  });
+
+  it("is failed, never completed, when the model server errors", async () => {
+    const broken = await erroringServer();
+    try {
+      const core = coreStub({});
+      // This is the case the whole typed outcome exists for. A provider that
+      // refuses is an ordinary ending of an agent loop, so `agent.prompt`
+      // *resolves* and the `run.start` request resolves with it. Reading that
+      // resolution as success is what recorded a 503 as a finished task.
+      const outcome = await startRun(core.peer, request(broken.baseUrl), () => {});
+      expect(outcome.outcome.kind).toBe("failed");
+      expect(outcome.outcome.detail).toBeTruthy();
+    } finally {
+      await broken.close();
+    }
   });
 });

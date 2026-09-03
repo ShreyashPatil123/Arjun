@@ -33,6 +33,8 @@
  */
 
 /** Where the run has got to, in terms the plan uses. */
+import { canonicalToolName } from "./tool-names.js";
+
 export interface NotesStage {
   /** The plan step now being worked, 1-based. Zero before the first. */
   ordinal: number;
@@ -218,21 +220,40 @@ export class WorkingNotes {
    * The thing a recovered run reads before acting. Idempotent on
    * `tool + target`, so replaying the same completion does not grow the list.
    */
+  /**
+   * Records that a side effect happened, under the tool's current name.
+   *
+   * Canonicalised on the way in, so a run that recorded `create_docx` before
+   * the rename and one that records `artifact.create_approval_note` after it
+   * are the same entry to a resumption. A list written in two spellings is one
+   * that matches neither reliably, and the whole value of this list is that a
+   * resumption can trust what is in it.
+   */
   didEffect(tool: string, target: string, at = new Date().toISOString()): void {
     if (this.hasDone(tool, target)) return;
     push(
       this.#completed,
-      { tool, target: trim(target), at },
+      { tool: canonicalToolName(tool) ?? tool, target: trim(target), at },
       NOTE_LIMITS.completed,
       this.#dropped,
       "completed",
     );
   }
 
-  /** Whether this exact side effect is already known to have happened. */
+  /**
+   * Whether this exact side effect is already known to have happened.
+   *
+   * Both sides of the comparison are canonicalised, so a resumption asking in
+   * either spelling finds an entry written in either spelling. The alternative
+   * is a resumption that reads its own notes, does not recognise the name in
+   * them, and does the work again.
+   */
   hasDone(tool: string, target: string): boolean {
     const clean = trim(target);
-    return this.#completed.some((effect) => effect.tool === tool && effect.target === clean);
+    const name = canonicalToolName(tool) ?? tool;
+    return this.#completed.some(
+      (effect) => (canonicalToolName(effect.tool) ?? effect.tool) === name && effect.target === clean,
+    );
   }
 
   get state(): WorkingNotesState {

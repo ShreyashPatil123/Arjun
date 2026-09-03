@@ -34,11 +34,38 @@
 //! - Deduplicates by sha256: three identical Q6_K copies
 //!   across the user's drives count as one model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::ai_engine::gguf_meta::GgufMetadata;
-use crate::registry::{LoadSpec, ModelEntry, Modality, ModelRole, Runtime, RoutingPreference};
+use crate::registry::capability::{infer_modalities, infer_roles};
+
+/// Context length recorded when the GGUF header does not state one.
+///
+/// The value this scan used unconditionally before the header was consulted, so
+/// a file whose converter wrote no `context_length` key is registered exactly as
+/// it was.
+const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
+
+/// Largest window this build will register from a header.
+///
+/// Not a judgement about the model. A KV cache scales linearly with the window,
+/// and a frontier-length context costs more VRAM than the weights do — at which
+/// point `plan_gpu_offload` puts nothing on the GPU and the model runs on the
+/// CPU at a fraction of the speed. An administrator who wants the full window
+/// raises it on the entry, having decided to spend the VRAM.
+const MAX_REGISTERED_CONTEXT_LENGTH: u32 = 32_768;
+
+/// The window this model was trained for, read from its own header.
+fn header_context_length(path: &std::path::Path) -> u32 {
+    crate::ai_engine::gguf_meta::read_gguf_metadata(path)
+        .ok()
+        .and_then(|meta| meta.context_length)
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_REGISTERED_CONTEXT_LENGTH))
+        .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+}
+use crate::registry::{LoadSpec, ModelEntry, Runtime, RoutingPreference};
 
 /// One GGUFs discovered on disk, before it is shaped into a
 /// `ModelEntry`. The `mmproj_path`, when set, points at a
@@ -176,12 +203,28 @@ pub fn entry_for(gguf: &ScannedGguf) -> ModelEntry {
     } else {
         infer_parameters_b(&file_stem)
     };
-    let roles = infer_roles(&file_stem, gguf.mmproj_path.is_some());
-    let modalities = if gguf.mmproj_path.is_some() {
-        vec![Modality::Text, Modality::Image]
-    } else {
-        vec![Modality::Text]
-    };
+    // One flag, two answers, so a model cannot be registered as a vision model
+    // that accepts no images — an entry the modality filter drops on every
+    // vision request, which is a silent way of being unroutable.
+    let has_projector = gguf.mmproj_path.is_some();
+    let roles = infer_roles(&file_stem, has_projector);
+    let modalities = infer_modalities(&file_stem, has_projector);
+    // What the file says it was trained for, capped at what this machine can
+    // plan a KV cache for.
+    //
+    // Every scanned model used to be recorded as 8192 tokens regardless, and
+    // that number is not decoration: it is the window the context meter shows,
+    // and it is what the agent loop compacts against. A 128k model was being
+    // compacted at 8k — throwing away history it had room for on every long
+    // task — and a 4k model was told it had twice the room it has.
+    //
+    // The cap is not timidity about large windows; it is the KV cache. A 262k
+    // window on a 12B model is tens of gigabytes of cache before a single token
+    // is generated, which `plan_gpu_offload` would correctly answer by refusing
+    // to put anything on the GPU. `DEFAULT_CONTEXT_LENGTH` is the value used
+    // when the converter wrote no key, and it is the same number this scan
+    // always used — so a file that says nothing behaves exactly as before.
+    let context_length = header_context_length(&gguf.path);
     ModelEntry {
         id: file_stem.clone(),
         name,
@@ -193,8 +236,17 @@ pub fn entry_for(gguf: &ScannedGguf) -> ModelEntry {
         modalities,
         quantization: Some(quantization.clone()),
         parameters_b,
-        active_parameters_b: None,
-        context_length: 8192,
+        // From the header's own expert geometry where the file is a mixture of
+        // experts, and from the `-A<n>B` naming convention otherwise. A dense
+        // model reports `None`, whose active count is its total and is already
+        // recorded in `parameters_b`.
+        active_parameters_b: meta
+            .as_ref()
+            .filter(|m| m.is_moe())
+            .and_then(|m| m.active_params(m.parameter_count))
+            .map(|count| (count as f32) / 1_000_000_000.0)
+            .or_else(|| crate::registry::capability::infer_active_parameters_b(&file_stem)),
+        context_length,
         weights_bytes: gguf.bytes,
         supports_structured_output: false,
         // Cleared for nothing. See the module note above.
@@ -275,34 +327,131 @@ fn infer_parameters_b(name: &str) -> f32 {
     0.0
 }
 
-/// Guesses what the model is for, from its file name and the
-/// presence of a vision projector. Reasoning is the default
-/// (most open releases are general); specialisations are
-/// added when the name says so.
-fn infer_roles(name: &str, has_mmproj: bool) -> Vec<ModelRole> {
-    let lowered = name.to_ascii_lowercase();
-    let mut roles = vec![ModelRole::Reasoning];
-    if lowered.contains("coder") || lowered.contains("code") {
-        roles.push(ModelRole::Coding);
+
+/// One detection pass over the machine.
+///
+/// Reported rather than applied: the command layer decides whether to write
+/// the manifest, and the operator is shown what changed. A scanner that
+/// quietly rewrote the registry would be a scanner nobody could audit.
+#[derive(Debug, Default)]
+pub struct Detection {
+    /// Directories actually walked, after removing duplicates and any that do
+    /// not exist. Shown to the operator so "nothing found" can be told apart
+    /// from "nowhere looked".
+    pub roots: Vec<PathBuf>,
+    /// Weight files seen, including ones already registered.
+    pub files_seen: usize,
+    /// Entries for files the registry did not already list.
+    pub added: Vec<ModelEntry>,
+    /// Files that resolved to a path an existing entry already names.
+    pub already_registered: usize,
+}
+
+/// Resolves an entry's declared path the way the loader will.
+///
+/// `join` returns an absolute path unchanged, so this handles both a manifest
+/// entry written relative to the models directory and a scanned one carrying
+/// an absolute path — which the live registry contains today, and which a
+/// naive comparison against the scan would have registered a second time.
+fn resolved(models_dir: &Path, declared: &Path) -> PathBuf {
+    models_dir.join(declared)
+}
+
+/// A path in the one form two spellings of the same file agree on.
+///
+/// Canonicalisation is what makes `C:\models.gguf`, `C:/models/a.gguf` and
+/// a path reached through a junction compare equal. It needs the file to
+/// exist; when it does not — a manifest entry whose weights were deleted —
+/// the lossy string is used instead, lowercased, because the alternative is
+/// treating a missing file as a different file and offering to register a
+/// duplicate of it.
+fn identity(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_ascii_lowercase()
+}
+
+/// An id no existing entry has taken.
+///
+/// The file stem is the id a scan wants, and two libraries can hold two
+/// different files with the same stem. Disambiguated by quantisation first,
+/// because that is the difference an operator recognises — the two
+/// Unlimited-OCR weights differ in exactly that and nothing else — and by a
+/// counter only when even that collides.
+fn unique_id(preferred: &str, quantization: Option<&str>, taken: &BTreeSet<String>) -> String {
+    if !taken.contains(preferred) {
+        return preferred.to_string();
     }
-    if has_mmproj || lowered.contains("-vl") || lowered.contains("vision") {
-        roles.push(ModelRole::Vision);
+    if let Some(quant) = quantization {
+        let with_quant = format!("{preferred}-{}", quant.to_ascii_lowercase());
+        if !taken.contains(&with_quant) {
+            return with_quant;
+        }
     }
-    if lowered.contains("ocr") || lowered.contains("docling") {
-        roles = vec![ModelRole::DocumentOcr];
+    for suffix in 2..1000 {
+        let candidate = format!("{preferred}-{suffix}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
     }
-    if lowered.contains("embed") || lowered.contains("bge") {
-        roles = vec![ModelRole::Embedding];
+    // A thousand files sharing a stem is not a library; give up on a unique
+    // name rather than looping, and let the manifest's duplicate check refuse
+    // it loudly.
+    preferred.to_string()
+}
+
+/// Walks every root and reports the weight files the registry does not list.
+///
+/// The safety property is inherited from [`entry_for`] and is the whole reason
+/// this is a detection rather than an installation: a model found on disk
+/// arrives cleared for **no** classification. It is visible in the library and
+/// unusable on real material until an administrator says otherwise. Nothing in
+/// a filename answers the question "may this model see vendor negotiations?",
+/// so nothing here tries to.
+pub fn detect(roots: &[PathBuf], declared: &[ModelEntry], models_dir: &Path) -> Detection {
+    let registered: BTreeSet<String> = declared
+        .iter()
+        .map(|entry| identity(&resolved(models_dir, &entry.path)))
+        .collect();
+    let mut taken: BTreeSet<String> = declared.iter().map(|entry| entry.id.clone()).collect();
+
+    let mut detection = Detection::default();
+    // Roots overlap in practice — the models directory is usually also the
+    // library root — and a file found twice must not be offered twice.
+    let mut seen_roots: BTreeSet<String> = BTreeSet::new();
+    let mut seen_files: BTreeSet<String> = BTreeSet::new();
+
+    for root in roots {
+        if !root.is_dir() || !seen_roots.insert(identity(root)) {
+            continue;
+        }
+        detection.roots.push(root.clone());
+
+        for gguf in scan_library(root).ggufs {
+            let file = identity(&gguf.path);
+            if !seen_files.insert(file.clone()) {
+                continue;
+            }
+            detection.files_seen += 1;
+            if registered.contains(&file) {
+                detection.already_registered += 1;
+                continue;
+            }
+            let mut entry = entry_for(&gguf);
+            entry.id = unique_id(&entry.id, entry.quantization.as_deref(), &taken);
+            taken.insert(entry.id.clone());
+            detection.added.push(entry);
+        }
     }
-    if lowered.contains("rerank") {
-        roles = vec![ModelRole::Rerank];
-    }
-    roles
+
+    detection
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Modality, ModelRole};
 
     #[test]
     fn infer_quantization_picks_the_longest_token() {
@@ -387,6 +536,151 @@ mod tests {
         let result = scan_library(&dir);
         assert_eq!(result.ggufs.len(), 1);
         assert!(result.ggufs[0].path.ends_with("somemodel-Q4.gguf"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory with two weight files, one already registered.
+    fn library_with_two_quantisations() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-detect-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let ocr = dir.join("OCR").join("Unlimited-OCR");
+        std::fs::create_dir_all(&ocr).unwrap();
+        std::fs::write(ocr.join("Unlimited-OCR-Q6_K.gguf"), b"weights").unwrap();
+        std::fs::write(ocr.join("Unlimited-OCR-Q4_K_M.gguf"), b"weights").unwrap();
+        std::fs::write(ocr.join("mmproj-Unlimited-OCR-F16.gguf"), b"projector").unwrap();
+        dir
+    }
+
+    fn declared_at(id: &str, path: std::path::PathBuf) -> ModelEntry {
+        let mut entry = entry_for(&ScannedGguf {
+            path,
+            bytes: 7,
+            mmproj_path: None,
+        });
+        entry.id = id.to_string();
+        entry
+    }
+
+    /// The case the button exists for: weights on disk, nothing in the
+    /// manifest, both quantisations found.
+    #[test]
+    fn detection_finds_both_quantisations_of_an_unregistered_model() {
+        let dir = library_with_two_quantisations();
+        let detection = detect(&[dir.clone()], &[], &dir);
+
+        let mut names: Vec<String> = detection.added.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Unlimited-OCR-Q4_K_M".to_string(),
+                "Unlimited-OCR-Q6_K".to_string()
+            ],
+            "a fast and an accurate weight file are two models, not one"
+        );
+        assert_eq!(detection.already_registered, 0);
+        // The projector is paired, never offered as a model of its own.
+        assert!(detection.added.iter().all(|e| e.projector.is_some()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nothing a scan finds may be usable on real material until somebody has
+    /// looked at it. This is the property the whole registry rests on, so it is
+    /// asserted at the point new entries are minted rather than assumed from
+    /// `entry_for`.
+    #[test]
+    fn everything_detected_arrives_cleared_for_nothing() {
+        let dir = library_with_two_quantisations();
+        let detection = detect(&[dir.clone()], &[], &dir);
+        assert!(!detection.added.is_empty());
+        assert!(detection
+            .added
+            .iter()
+            .all(|entry| entry.permitted_classifications.is_empty()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pressing the button twice must not register everything twice. The live
+    /// manifest stores absolute paths while a hand-written one stores relative
+    /// ones, so the comparison is on the resolved file and not on the string.
+    #[test]
+    fn a_model_already_registered_is_not_offered_again() {
+        let dir = library_with_two_quantisations();
+        let absolute = dir.join("OCR").join("Unlimited-OCR").join("Unlimited-OCR-Q6_K.gguf");
+        let relative = std::path::PathBuf::from("OCR/Unlimited-OCR/Unlimited-OCR-Q4_K_M.gguf");
+
+        let declared = vec![
+            declared_at("unlimited-ocr-q6-k", absolute),
+            declared_at("unlimited-ocr-q4-k-m", relative),
+        ];
+        let detection = detect(&[dir.clone()], &declared, &dir);
+
+        assert!(
+            detection.added.is_empty(),
+            "both files are registered already, one by absolute path and one by relative: {:?}",
+            detection.added.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(detection.already_registered, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two roots that resolve to the same directory are one directory. The
+    /// models folder is usually also the library root, so this is the ordinary
+    /// case rather than an exotic one.
+    #[test]
+    fn overlapping_roots_do_not_double_count() {
+        let dir = library_with_two_quantisations();
+        let nested = dir.join("OCR");
+        let detection = detect(&[dir.clone(), dir.clone(), nested], &[], &dir);
+        assert_eq!(detection.roots.len(), 2, "the same root twice is one root");
+        assert_eq!(detection.added.len(), 2, "a file seen twice is one model");
+        assert_eq!(detection.files_seen, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A different file that happens to share a name cannot take the id of one
+    /// already registered, and cannot silently replace it either.
+    #[test]
+    fn a_name_collision_is_given_its_own_id_rather_than_overwriting() {
+        let dir = library_with_two_quantisations();
+        let elsewhere = dir.join("second-copy");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("Unlimited-OCR-Q6_K.gguf"), b"other").unwrap();
+
+        let declared = vec![declared_at(
+            "Unlimited-OCR-Q6_K",
+            dir.join("OCR").join("Unlimited-OCR").join("Unlimited-OCR-Q6_K.gguf"),
+        )];
+        let detection = detect(&[dir.clone()], &declared, &dir);
+
+        let ids: Vec<String> = detection.added.iter().map(|e| e.id.clone()).collect();
+        assert!(
+            !ids.contains(&"Unlimited-OCR-Q6_K".to_string()),
+            "the declared id must survive: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id.starts_with("Unlimited-OCR-Q6_K-")),
+            "the second copy needs an id of its own: {ids:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A root that is not there is not an error. An operator whose library
+    /// lives on a drive that is currently unplugged gets the models from every
+    /// other root, not a failure.
+    #[test]
+    fn a_missing_root_is_skipped_rather_than_failing() {
+        let dir = library_with_two_quantisations();
+        let missing = dir.join("no-such-folder");
+        let detection = detect(&[missing, dir.clone()], &[], &dir);
+        assert_eq!(detection.roots.len(), 1);
+        assert_eq!(detection.added.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

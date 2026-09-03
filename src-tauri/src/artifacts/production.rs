@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::docx::{self, DocumentCheck, DocumentMetadata, FieldSpec};
-use super::verifier::{self, Evidence, VerificationReport};
+use super::verifier::{self, Evidence, Grounding, VerificationReport};
 
 /// How cool the model samples when it is filling in a document template.
 ///
@@ -355,7 +355,7 @@ mod tests {
         let passages = [passage("c1", "Minimum wall thickness is 9.0 mm; measured 8.2 mm.")];
         let calculations: [CalculationRecord; 0] = [];
         let evidence =
-            Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+            Evidence { grounding: Grounding::OrganisationRecord, passages: &passages, calculations: &calculations, unread_pages: &[] };
 
         let mut source = Scripted::new(vec![Ok(complete())]);
         let outcome = produce(
@@ -379,7 +379,7 @@ mod tests {
         let passages = [passage("c1", "Minimum wall thickness is 9.0 mm; measured 8.2 mm.")];
         let calculations: [CalculationRecord; 0] = [];
         let evidence =
-            Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+            Evidence { grounding: Grounding::OrganisationRecord, passages: &passages, calculations: &calculations, unread_pages: &[] };
 
         let mut incomplete = complete();
         incomplete.remove("recommendation");
@@ -411,7 +411,7 @@ mod tests {
         let passages = [passage("c1", "SOP text.")];
         let calculations: [CalculationRecord; 0] = [];
         let evidence =
-            Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+            Evidence { grounding: Grounding::OrganisationRecord, passages: &passages, calculations: &calculations, unread_pages: &[] };
 
         // First attempt renders but cites a passage that was never retrieved,
         // so it stands as a draft; the file still exists at r1.
@@ -452,7 +452,7 @@ mod tests {
     fn a_model_that_never_supplies_the_field_fails_in_words_a_person_can_act_on() {
         let dir = temp();
         let calculations: [CalculationRecord; 0] = [];
-        let evidence = Evidence { passages: &[], calculations: &calculations, unread_pages: &[] };
+        let evidence = Evidence { grounding: Grounding::OrganisationRecord, passages: &[], calculations: &calculations, unread_pages: &[] };
 
         let mut incomplete = complete();
         incomplete.remove("references");
@@ -483,7 +483,7 @@ mod tests {
         let passages = [passage("c1", "SOP text.")];
         let calculations: [CalculationRecord; 0] = [];
         let evidence =
-            Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+            Evidence { grounding: Grounding::OrganisationRecord, passages: &passages, calculations: &calculations, unread_pages: &[] };
 
         let mut source =
             Scripted::new(vec![Err("the context window was exceeded".into()), Ok(complete())]);
@@ -505,7 +505,7 @@ mod tests {
     fn every_composition_request_carries_the_cool_sampling_temperature() {
         let dir = temp();
         let calculations: [CalculationRecord; 0] = [];
-        let evidence = Evidence { passages: &[], calculations: &calculations, unread_pages: &[] };
+        let evidence = Evidence { grounding: Grounding::OrganisationRecord, passages: &[], calculations: &calculations, unread_pages: &[] };
 
         let mut source = Scripted::new(vec![Ok(complete())]);
         let _ = produce(
@@ -525,7 +525,7 @@ mod tests {
     fn the_request_names_every_field_the_template_will_accept() {
         let dir = temp();
         let calculations: [CalculationRecord; 0] = [];
-        let evidence = Evidence { passages: &[], calculations: &calculations, unread_pages: &[] };
+        let evidence = Evidence { grounding: Grounding::OrganisationRecord, passages: &[], calculations: &calculations, unread_pages: &[] };
 
         let mut source = Scripted::new(vec![Ok(complete())]);
         let _ = produce(
@@ -549,7 +549,7 @@ mod tests {
         let calculations: [CalculationRecord; 0] = [];
         // No passages retrieved, so every citation is to something that was
         // never read.
-        let evidence = Evidence { passages: &[], calculations: &calculations, unread_pages: &[] };
+        let evidence = Evidence { grounding: Grounding::OrganisationRecord, passages: &[], calculations: &calculations, unread_pages: &[] };
 
         let mut source = Scripted::new(vec![Ok(complete())]);
         let outcome = produce(
@@ -575,7 +575,7 @@ mod tests {
         let passages = [passage("c1", "Minimum wall thickness is 9.0 mm; measured 8.2 mm.")];
         let calculations: [CalculationRecord; 0] = [];
         let evidence =
-            Evidence { passages: &passages, calculations: &calculations, unread_pages: &[] };
+            Evidence { grounding: Grounding::OrganisationRecord, passages: &passages, calculations: &calculations, unread_pages: &[] };
 
         let mut lazy = complete();
         lazy.insert("recommendation".into(), "TBD — pending review [E1].".into());
@@ -607,7 +607,7 @@ mod tests {
     fn an_unknown_template_fails_before_asking_the_model_anything() {
         let dir = temp();
         let calculations: [CalculationRecord; 0] = [];
-        let evidence = Evidence { passages: &[], calculations: &calculations, unread_pages: &[] };
+        let evidence = Evidence { grounding: Grounding::OrganisationRecord, passages: &[], calculations: &calculations, unread_pages: &[] };
 
         let mut source = Scripted::new(vec![]);
         let outcome =

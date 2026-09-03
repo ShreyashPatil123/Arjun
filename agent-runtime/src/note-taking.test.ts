@@ -75,7 +75,10 @@ describe("side effects a resumption must not repeat", () => {
       text: "Created approval-note.docx.",
     });
 
+    // Findable by either spelling, and recorded under the current one.
     expect(notes.hasDone("create_docx", "approval-note.docx")).toBe(true);
+    expect(notes.hasDone("artifact.create_approval_note", "approval-note.docx")).toBe(true);
+    expect(notes.state.completed[0]?.tool).toBe("artifact.create_approval_note");
     expect(notes.state.artifactIds).toEqual(["approval-note.docx"]);
   });
 
@@ -88,6 +91,7 @@ describe("side effects a resumption must not repeat", () => {
     });
 
     expect(notes.hasDone("write_scoped_file", "draft.md")).toBe(true);
+    expect(notes.hasDone("workspace.write_text", "draft.md")).toBe(true);
   });
 
   it("records that code ran without claiming which execution it was", () => {
@@ -103,7 +107,7 @@ describe("side effects a resumption must not repeat", () => {
 
     const completed = notes.state.completed;
     expect(completed).toHaveLength(1);
-    expect(completed[0]?.tool).toBe("execute_code");
+    expect(completed[0]?.tool).toBe("sandbox.run_code");
     // Not filed as an artifact: nothing was produced that can be re-opened.
     expect(notes.state.artifactIds).toEqual([]);
   });
@@ -168,5 +172,199 @@ describe("what the notes then let compaction do", () => {
 
     expect(notes.state.evidenceIds).toContain("E1");
     expect(markersIn(text).every((marker) => notes.state.evidenceIds.includes(marker))).toBe(true);
+  });
+});
+
+/**
+ * The canonical names, on the path that actually matters.
+ *
+ * ## The defect
+ *
+ * `note-taking.ts` classified tool results against three sets written in the
+ * pre-namespace spelling — `create_docx`, `search_documents`,
+ * `run_calculation` — while the catalogue hands it the current one. Every
+ * comparison was false, and had been since the rename. So:
+ *
+ *   - a search returned `[E3]` and no marker was recorded;
+ *   - a calculation ran and no calculation id was recorded;
+ *   - a document was produced and **no completed effect** was recorded.
+ *
+ * The last one is the failure this whole mechanism exists to prevent. A
+ * completed effect is what a resumed run reads to find out what already
+ * happened; with none recorded, a run that produced an approval note, lost its
+ * process and resumed would produce the note a second time.
+ */
+describe("canonical tool names are what the notes are keyed on", () => {
+  it("records evidence markers for a search under its current name", () => {
+    const notes = new WorkingNotes();
+    observeToolResult(notes, {
+      tool: "knowledge.search_authorized",
+      args: { query: "seal specification" },
+      text: "The seal is worn beyond the limit [E1]. Replacement is specified [E2].",
+    });
+    expect(notes.state.evidenceIds).toEqual(["E1", "E2"]);
+  });
+
+  it("records evidence markers for every canonical retrieval tool", () => {
+    for (const tool of [
+      "knowledge.search_authorized",
+      "knowledge.load_evidence_region",
+      "knowledge.multimodal_retrieve",
+      "media.extract_findings",
+    ]) {
+      const notes = new WorkingNotes();
+      observeToolResult(notes, { tool, args: {}, text: "A passage [E7]." });
+      expect(notes.state.evidenceIds, tool).toEqual(["E7"]);
+    }
+  });
+
+  it("records a calculation id under the current name", () => {
+    const notes = new WorkingNotes();
+    observeToolResult(notes, {
+      tool: "calculation.evaluate_with_units",
+      args: { expression: "40 bar * 2" },
+      text: "80 bar",
+    });
+    expect(notes.state.calculationIds).toEqual(["C1"]);
+  });
+
+  it("records an artifact and an effect for every canonical document tool", () => {
+    const cases: Array<[string, string]> = [
+      ["artifact.create_approval_note", "approval-note.docx"],
+      ["artifact.create_calculation_workbook", "working.xlsx"],
+      ["artifact.create_briefing_deck", "briefing.pptx"],
+      ["workspace.write_text", "draft.md"],
+    ];
+    for (const [tool, name] of cases) {
+      const notes = new WorkingNotes();
+      observeToolResult(notes, {
+        tool,
+        args: { path: `C:\\data\\runs\\run-1\\${name}` },
+        text: `Created ${name}.`,
+      });
+      expect(notes.state.artifactIds, tool).toEqual([name]);
+      expect(notes.hasDone(tool, name), tool).toBe(true);
+      expect(notes.state.completed[0]?.tool, tool).toBe(tool);
+    }
+  });
+
+  it("records a sandbox execution as an effect and not as an artifact", () => {
+    const notes = new WorkingNotes();
+    observeToolResult(notes, {
+      tool: "sandbox.run_code",
+      args: { language: "python", source: "print(1)" },
+      text: "1",
+    });
+    expect(notes.state.completed).toHaveLength(1);
+    expect(notes.state.completed[0]?.tool).toBe("sandbox.run_code");
+    expect(notes.state.artifactIds).toEqual([]);
+  });
+
+  it("still records nothing for a read, under either spelling", () => {
+    // The control. A rename must not have turned every tool into a
+    // side-effecting one either.
+    for (const tool of ["workspace.read_text", "read_scoped_file"]) {
+      const notes = new WorkingNotes();
+      observeToolResult(notes, { tool, args: { path: "notes.md" }, text: "…" });
+      expect(notes.state.completed, tool).toEqual([]);
+      expect(notes.state.artifactIds, tool).toEqual([]);
+    }
+  });
+});
+
+/**
+ * The restart, end to end.
+ *
+ * A run produces a document, the process goes away, and the notes are handed to
+ * the next attempt. What that attempt must not do is produce the document
+ * again — and the only thing standing between it and doing so is a completed
+ * effect it can recognise.
+ */
+describe("a canonical side effect survives a restart and is not repeated", () => {
+  /** What Rust persists with the task record and hands back on resumption. */
+  function persist(notes: WorkingNotes): string {
+    return JSON.stringify(notes.state);
+  }
+
+  it("does not repeat a document the previous attempt already produced", () => {
+    // ── First attempt ────────────────────────────────────────────────
+    const first = new WorkingNotes();
+    observeToolResult(first, {
+      tool: "artifact.create_approval_note",
+      args: { path: "C:\\data\\runs\\run-1\\approval-note.docx", template: "approval_note" },
+      text: "Created approval-note.docx.",
+    });
+    expect(first.hasDone("artifact.create_approval_note", "approval-note.docx")).toBe(true);
+
+    // ── The process goes away, and the notes go to disk and back ─────
+    const carried = WorkingNotes.from(JSON.parse(persist(first)));
+
+    // ── Second attempt ───────────────────────────────────────────────
+    // The workspace path is different on every attempt, which is exactly why
+    // the effect is recorded by file name rather than by path.
+    expect(
+      carried.hasDone("artifact.create_approval_note", "approval-note.docx"),
+      "the resumption cannot see what the first attempt did, so it will do it again",
+    ).toBe(true);
+
+    // And re-observing the same effect does not double it: the note stays one
+    // entry, so a resumption reading the list is not told it happened twice.
+    observeToolResult(carried, {
+      tool: "artifact.create_approval_note",
+      args: { path: "C:\\data\\runs\\run-2\\approval-note.docx", template: "approval_note" },
+      text: "Created approval-note.docx.",
+    });
+    expect(carried.state.completed).toHaveLength(1);
+  });
+
+  it("recognises an effect a pre-rename attempt recorded under the old name", () => {
+    // The upgrade case: the first attempt ran on a build that wrote
+    // `create_docx`, and the resumption is on this one. If the two spellings do
+    // not fold together, the resumption sees an empty list and writes the
+    // document a second time.
+    const legacyNotes = WorkingNotes.from({
+      completed: [
+        {
+          tool: "create_docx",
+          target: "approval-note.docx",
+          at: "2026-08-27T10:00:42+00:00",
+        },
+      ],
+    });
+    expect(legacyNotes.hasDone("artifact.create_approval_note", "approval-note.docx")).toBe(
+      true,
+    );
+    // And it is not recorded a second time under the new spelling.
+    observeToolResult(legacyNotes, {
+      tool: "artifact.create_approval_note",
+      args: { path: "approval-note.docx" },
+      text: "Created approval-note.docx.",
+    });
+    expect(legacyNotes.state.completed).toHaveLength(1);
+  });
+
+  it("does not confuse two different documents from the same tool", () => {
+    // The other half of the promise: recognising work already done must not
+    // become skipping work that was never done.
+    const notes = new WorkingNotes();
+    observeToolResult(notes, {
+      tool: "artifact.create_approval_note",
+      args: { path: "approval-note.docx" },
+      text: "Created approval-note.docx.",
+    });
+    const carried = WorkingNotes.from(JSON.parse(persist(notes)));
+    expect(carried.hasDone("artifact.create_approval_note", "second-note.docx")).toBe(false);
+  });
+
+  it("carries a sandbox execution across the restart too", () => {
+    const notes = new WorkingNotes();
+    observeToolResult(notes, {
+      tool: "sandbox.run_code",
+      args: { language: "python", source: "deploy()" },
+      text: "done",
+    });
+    const carried = WorkingNotes.from(JSON.parse(persist(notes)));
+    expect(carried.state.completed[0]?.tool).toBe("sandbox.run_code");
+    expect(carried.hasDone("execute_code", "python (an execution)")).toBe(true);
   });
 });

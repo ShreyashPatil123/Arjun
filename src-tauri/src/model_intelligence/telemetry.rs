@@ -198,6 +198,38 @@ impl TelemetrySink {
 
     /// A snapshot of the in-memory aggregate. Cloned, not borrowed,
     /// so the UI thread cannot race the writer.
+    /// Whether the telemetry chain is wired, without adding to what it reports.
+    ///
+    /// ## Why this exists
+    ///
+    /// Start-up used to write a synthetic `<startup>` record — a
+    /// `ModelCallRecord` with `exit: Ok` — so the Model Health page would be
+    /// non-empty after launch and a developer could see the sink, the IPC and
+    /// the page working. It was a model call that never happened, in the
+    /// history of model calls: a fresh installation reported one successful
+    /// inference before anything had been asked of it, and every average on
+    /// that page was computed over a row describing nothing.
+    ///
+    /// This answers the same question — is the chain wired? — by reporting the
+    /// sink's own state rather than by putting a fabricated measurement into
+    /// it. An empty installation says `calls_recorded: 0`, which is both the
+    /// truth and the proof that the endpoint is reachable.
+    pub fn health(&self) -> TelemetryHealth {
+        TelemetryHealth {
+            reachable: true,
+            models_seen: self.snapshot().len(),
+            calls_recorded: self.total_calls(),
+        }
+    }
+
+    /// How many model calls this sink has recorded since the process started.
+    pub fn total_calls(&self) -> u64 {
+        self.snapshot()
+            .iter()
+            .map(|aggregate| aggregate.calls as u64)
+            .sum()
+    }
+
     pub fn snapshot(&self) -> Vec<ModelAggregate> {
         let Ok(map) = self.last.lock() else {
             log::warn!("[telemetry] could not lock for snapshot; returning empty");
@@ -408,5 +440,80 @@ mod tests {
         let ids: Vec<_> = sink.snapshot().into_iter().map(|a| a.model_id).collect();
         assert_eq!(ids.len(), 2);
         assert!(!ids.contains(&"a".to_string()));
+    }
+}
+
+/// What the telemetry endpoint reports about itself.
+///
+/// Deliberately not a `ModelCallRecord`. The question "is this wired?" and the
+/// question "what has this machine run?" have different answers and must have
+/// different homes; answering the first by writing into the second is what made
+/// a fresh installation claim an inference it had never performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryHealth {
+    /// True whenever this responds at all. A caller that gets an answer has
+    /// proved the sink, the command and the IPC chain in one round trip.
+    pub reachable: bool,
+    /// Distinct models this sink has seen. Zero on a fresh installation.
+    pub models_seen: usize,
+    /// Model calls recorded. Zero until real inference happens.
+    pub calls_recorded: u64,
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_installation_reports_no_calls_at_all() {
+        // The defect, in one assertion. This used to be 1 before anything had
+        // been asked of the machine.
+        let sink = TelemetrySink::new();
+        let health = sink.health();
+        assert!(health.reachable, "the endpoint must answer to prove the chain");
+        assert_eq!(health.calls_recorded, 0);
+        assert_eq!(health.models_seen, 0);
+        assert!(
+            sink.snapshot().is_empty(),
+            "a fresh installation has no model-call history"
+        );
+    }
+
+    #[test]
+    fn the_health_endpoint_proves_the_chain_without_contaminating_it() {
+        // What the synthetic row was for, done without writing anything.
+        let sink = TelemetrySink::new();
+        let before = sink.snapshot().len();
+        let health = sink.health();
+        assert!(health.reachable);
+        assert_eq!(
+            sink.snapshot().len(),
+            before,
+            "asking after the health of the sink added to the sink"
+        );
+    }
+
+    #[test]
+    fn a_real_call_is_the_first_thing_counted() {
+        let sink = TelemetrySink::new();
+        sink.record(
+            None,
+            ModelCallRecord {
+                model_id: "qwen2.5-7b".to_string(),
+                task_id: "run-1".to_string(),
+                intent: "reasoning".to_string(),
+                role: "reasoning".to_string(),
+                latency: std::time::Duration::from_millis(1_200),
+                tokens_in: 400,
+                tokens_out: 120,
+                used_fallback: false,
+                exit: CallExit::Ok,
+                note: None,
+                complexity: None,
+            },
+        );
+        assert_eq!(sink.health().calls_recorded, 1);
+        assert_eq!(sink.health().models_seen, 1);
     }
 }

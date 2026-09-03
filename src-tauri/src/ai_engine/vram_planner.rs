@@ -51,18 +51,58 @@ pub struct GpuOffloadPlan {
     pub gpu_layers: u32,
     /// Whether every layer is expected to fit.
     pub full_offload: bool,
+    /// The context window this plan was actually computed for.
+    ///
+    /// Carried on the plan rather than read separately from the registry entry
+    /// because the two must not be able to disagree. The layer count and the
+    /// `--ctx-size` the server is launched with are two halves of one decision:
+    /// planning for 8K and then serving 32K silently oversubscribes exactly the
+    /// VRAM the plan reserved, which is how a full-offload plan ends up paging
+    /// over PCIe.
+    pub context_length: u32,
     /// Human-readable explanation for the load log.
     pub reason: String,
 }
 
 impl GpuOffloadPlan {
-    fn cpu_only(reason: impl Into<String>) -> Self {
+    fn cpu_only(context_length: u32, reason: impl Into<String>) -> Self {
         Self {
             gpu_layers: 0,
             full_offload: false,
+            context_length,
             reason: reason.into(),
         }
     }
+}
+
+/// The smallest context worth serving.
+///
+/// Shrinking the window is how this module buys layers on the GPU, but it is
+/// not free: the assistant reads scanned reports and drafts from them, and
+/// below about this much it cannot hold a document and an answer at once. So
+/// the search stops here even when a smaller window would fit more layers.
+const MIN_SERVING_CONTEXT: u32 = 8192;
+
+/// Context windows to consider, largest first, none above what was asked for.
+///
+/// The trained window is the ceiling and never exceeded; the ladder below it
+/// exists because a window is worth less than the layers it costs. On an 8 GB
+/// card a 5 GB model at 32K reserves 5 GB of KV cache and leaves 1.8 GB for
+/// weights — a third of the layers on the GPU and the rest crossing PCIe for
+/// every token. The same model at 8K fits entirely in VRAM.
+fn context_ladder(requested: u32) -> Vec<u32> {
+    let mut rungs: Vec<u32> = [requested, 32_768, 16_384, MIN_SERVING_CONTEXT]
+        .into_iter()
+        .filter(|rung| *rung <= requested && *rung > 0)
+        .collect();
+    rungs.sort_unstable_by(|a, b| b.cmp(a));
+    rungs.dedup();
+    // A model trained on less than the floor is served at what it was trained
+    // for; the floor lowers windows, it never invents one.
+    if rungs.is_empty() {
+        rungs.push(requested.max(1));
+    }
+    rungs
 }
 
 /// Conservative KV-cache cost per token, in bytes.
@@ -92,19 +132,51 @@ pub fn plan_gpu_offload(
     context_length: u32,
     total_layers: Option<u32>,
 ) -> GpuOffloadPlan {
+    let ladder = context_ladder(context_length);
+
+    // The largest window that still puts the whole model on the GPU.
+    //
+    // Tried in order rather than solved for, because `plan_at_context` is the
+    // only thing that knows the whole cost model — KV, compute reserve and OS
+    // reserve together — and a closed form here would be a second copy of it
+    // that could drift.
+    for rung in &ladder {
+        let plan = plan_at_context(vram_total_bytes, model_bytes, *rung, total_layers);
+        if plan.full_offload {
+            return plan;
+        }
+    }
+
+    // Nothing fits whole. Take the smallest window on the ladder anyway: the
+    // model is crossing PCIe either way, and this is the rung that keeps the
+    // most layers on the GPU while staying above `MIN_SERVING_CONTEXT`.
+    let smallest = ladder.last().copied().unwrap_or(context_length);
+    plan_at_context(vram_total_bytes, model_bytes, smallest, total_layers)
+}
+
+/// The offload arithmetic for one specific context window.
+fn plan_at_context(
+    vram_total_bytes: u64,
+    model_bytes: u64,
+    context_length: u32,
+    total_layers: Option<u32>,
+) -> GpuOffloadPlan {
     if vram_total_bytes == 0 {
-        return GpuOffloadPlan::cpu_only("No GPU VRAM detected");
+        return GpuOffloadPlan::cpu_only(context_length, "No GPU VRAM detected");
     }
 
     // Usable VRAM after the OS and desktop take their share.
     let usable = vram_total_bytes.saturating_sub(OS_RESERVE_BYTES);
     if usable < MIN_USABLE_VRAM_BYTES {
-        return GpuOffloadPlan::cpu_only(format!(
+        return GpuOffloadPlan::cpu_only(
+            context_length,
+            format!(
             "Only {:.2} GB usable VRAM after {:.2} GB OS reserve — below the {:.2} GB minimum",
             as_gb(usable),
             as_gb(OS_RESERVE_BYTES),
             as_gb(MIN_USABLE_VRAM_BYTES)
-        ));
+        ),
+        );
     }
 
     let kv_bytes = estimate_kv_bytes_per_token(model_bytes)
@@ -116,18 +188,22 @@ pub fn plan_gpu_offload(
     let weight_budget = after_kv.saturating_sub(compute_reserve);
 
     if weight_budget == 0 {
-        return GpuOffloadPlan::cpu_only(format!(
+        return GpuOffloadPlan::cpu_only(
+            context_length,
+            format!(
             "KV cache for {} tokens (~{:.2} GB) exhausts {:.2} GB usable VRAM",
             context_length,
             as_gb(kv_bytes),
             as_gb(usable)
-        ));
+        ),
+        );
     }
 
     if weight_budget >= model_bytes {
         return GpuOffloadPlan {
             gpu_layers: FULL_OFFLOAD,
             full_offload: true,
+            context_length,
             reason: format!(
                 "Full offload: {:.2} GB weight budget covers the {:.2} GB model \
                  (VRAM {:.2} GB − {:.2} GB OS − {:.2} GB KV@{} − {:.2} GB compute)",
@@ -148,16 +224,20 @@ pub fn plan_gpu_offload(
     let offload = (fraction * layers as f64).floor() as u32;
 
     if offload == 0 {
-        return GpuOffloadPlan::cpu_only(format!(
+        return GpuOffloadPlan::cpu_only(
+            context_length,
+            format!(
             "Weight budget {:.2} GB covers under one layer of the {:.2} GB model",
             as_gb(weight_budget),
             as_gb(model_bytes)
-        ));
+        ),
+        );
     }
 
     GpuOffloadPlan {
         gpu_layers: offload,
         full_offload: false,
+        context_length,
         reason: format!(
             "Partial offload: {}/{} layers ({:.0}% of the {:.2} GB model fits in a \
              {:.2} GB weight budget after {:.2} GB KV@{})",
@@ -437,6 +517,83 @@ fn as_gb(bytes: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The regression that made a 9B model run at CPU speed on an 8 GB card.
+    ///
+    /// The trained window was read from GGUF (32768) and handed straight to
+    /// both the planner and `--ctx-size`. At 160 KB/token that is 5 GB of KV
+    /// cache on a card with about 7 GB usable, leaving 1.8 GB for a 5 GB model:
+    /// roughly a third of the layers on the GPU and every token crossing PCIe.
+    /// Task Manager showed the card full and 1% busy.
+    ///
+    /// The window is worth less than the layers it costs, so it gives way.
+    #[test]
+    fn a_trained_window_gives_way_to_getting_the_model_onto_the_gpu() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // Qwen3.5-9B-Q4_K_S on an RTX 5060 Laptop.
+        let vram = 8151 * 1024 * 1024;
+        let model = 5 * GB;
+
+        let plan = plan_gpu_offload(vram, model, 32_768, Some(40));
+
+        assert!(
+            plan.full_offload,
+            "the whole model fits at a smaller window and must be put there: {}",
+            plan.reason
+        );
+        assert_eq!(plan.gpu_layers, FULL_OFFLOAD);
+        assert!(
+            plan.context_length < 32_768,
+            "the window had to shrink for this to fit"
+        );
+        assert!(
+            plan.context_length >= MIN_SERVING_CONTEXT,
+            "shrunk past the floor to {} — below this the assistant cannot hold              a document and an answer at once",
+            plan.context_length
+        );
+    }
+
+    /// A window is never invented, only lowered.
+    ///
+    /// The ceiling is what the model was trained for; serving beyond it is
+    /// garbage output, which no amount of free VRAM makes acceptable.
+    #[test]
+    fn a_small_trained_window_is_never_raised_to_fill_spare_vram() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let plan = plan_gpu_offload(24 * GB, 2 * GB, 4096, Some(32));
+
+        assert!(plan.full_offload);
+        assert_eq!(
+            plan.context_length, 4096,
+            "a model trained on 4K must be served at 4K however much VRAM is spare"
+        );
+    }
+
+    /// A model that fits at its full window keeps it.
+    #[test]
+    fn a_window_that_already_fits_is_left_alone() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let plan = plan_gpu_offload(24 * GB, 4 * GB, 32_768, Some(32));
+
+        assert!(plan.full_offload);
+        assert_eq!(
+            plan.context_length, 32_768,
+            "nothing was gained by shrinking, so nothing should have been taken"
+        );
+    }
+
+    /// When the model cannot fit at any window, the layer count still wins.
+    ///
+    /// The run is crossing PCIe whatever happens; the rung that keeps the most
+    /// layers on the GPU is the least bad, and it is still above the floor.
+    #[test]
+    fn a_model_too_large_for_the_card_is_planned_at_the_smallest_window() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let plan = plan_gpu_offload(8 * GB, 20 * GB, 32_768, Some(48));
+
+        assert!(!plan.full_offload, "20 GB cannot fit in 8 GB at any window");
+        assert_eq!(plan.context_length, MIN_SERVING_CONTEXT);
+    }
     use super::*;
 
     const GB: u64 = 1024 * 1024 * 1024;

@@ -37,7 +37,16 @@ pub mod model_package;
 pub mod installer;
 pub mod plugins;
 pub mod memory_engine;
-pub mod media_adapter;
+// `media_adapter` was removed. It was a second media abstraction alongside the
+// attachment/OCR pipeline in `commands::ocr` and `ai_engine::ocr_*`, which is
+// the one that is wired and which every attachment actually goes through.
+//
+// Nothing outside the module ever referenced it, and its two extraction
+// functions returned typed *successes* carrying empty findings and the note
+// "not yet implemented in this phase". A caller reading `Ok(MultimodalResult)`
+// with `needs_human_review: true` and no findings cannot tell a document with
+// nothing in it from a reader that does nothing — which is the shape of silent
+// failure this repository's own rules forbid.
 pub mod sih_workflow;
 pub mod voice;
 pub mod benchmarks;
@@ -219,6 +228,24 @@ pub fn run() {
                 Err(e) => log::error!("[KNOWLEDGE] the index could not be opened: {e}"),
             }
 
+            // The multimodal half of the same index: page regions, table
+            // chunks, and the passages that resolve a citation into a drawing
+            // rather than into prose.
+            //
+            // It was never constructed outside tests, so
+            // `knowledge.multimodal_retrieve` was a tool in the catalogue with
+            // nothing behind it. Managed here, beside the text index, because
+            // it is the same SQLite file and a second connection per request
+            // would be a second lock on it.
+            match knowledge::MultimodalIndex::open(&data_dir) {
+                Ok(index) => {
+                    app.manage(Arc::new(index) as commands::agent::Multimodal);
+                }
+                Err(e) => {
+                    log::error!("[KNOWLEDGE] the multimodal index could not be opened: {e}")
+                }
+            }
+
             app.manage(Arc::new(orchestrator::approvals::ApprovalQueue::new()));
             app.manage(commands::governance::CurrentSession::default());
             // The telemetry sink: per-model call records, written to the
@@ -244,37 +271,22 @@ pub fn run() {
                 telemetry_sink.snapshot().len()
             );
 
-            // Diagnostic: insert one synthetic row at startup so the
-            // Model Health page is guaranteed non-empty after launch.
-            // This is the baseline that proves the IPC + reducer + page
-            // chain is working end-to-end. Any real inference call
-            // adds a second row; if the synthetic row is missing, the
-            // page itself is broken; if only the synthetic row is
-            // there, the inference path is broken.
-            telemetry_sink.record(
-                None,
-                crate::model_intelligence::telemetry::ModelCallRecord {
-                    model_id: "<startup>".to_string(),
-                    task_id: "<startup>".to_string(),
-                    intent: "startup".to_string(),
-                    role: "diagnostic".to_string(),
-                    latency: std::time::Duration::from_millis(0),
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    used_fallback: false,
-                    exit: crate::model_intelligence::telemetry::CallExit::Ok,
-                    note: Some("synthetic startup record inserted to prove \
-                              the IPC + reducer + page chain is wired"
-                        .to_string()),
-                    complexity: None,
-                },
-            );
-            eprintln!(
-                "[telemetry] synthetic startup record inserted; \
-                 snapshot now = {} rows",
-                telemetry_sink.snapshot().len()
-            );
-
+            // A synthetic `<startup>` row used to be written here — a
+            // `ModelCallRecord` with `exit: Ok`, inserted so the Model Health
+            // page would be non-empty after launch and the IPC chain could be
+            // seen working.
+            //
+            // It was a model call that never happened, in the history of model
+            // calls. A fresh installation reported one successful inference
+            // before anything had been asked of it; every average latency,
+            // every success rate and every fallback ratio on that page was
+            // computed over a row describing nothing. This repository ships
+            // evidence to judges, and a diagnostic that fabricates a
+            // measurement is the one kind of diagnostic it cannot have.
+            //
+            // What it was actually for — proving the sink, the IPC and the
+            // page are wired — is answered by `agent_telemetry_health`, which
+            // reports the wiring without adding to what it is reporting on.
             app.manage(telemetry_sink);
             // Started on first run rather than here: the workbench must open for an
             // auditor, and on a machine where the runtime bundle was never built.
@@ -310,18 +322,59 @@ pub fn run() {
             // one or more runs. Sits beside the task record; the two are
             // complementary (the task record is the audit-grade proof a
             // run happened; the conversation is the user-visible chat).
-            let conversation_store = std::sync::Arc::new(
-                agent_runtime::conversations::ConversationStore::open(&data_dir)
-                    .unwrap_or_else(|error| {
-                        // A conversation store that cannot be opened is a
-                        // real degradation. We still fall back to a temp
-                        // directory so the app does not refuse to start.
-                        log::error!("[CONVERSATIONS] the store could not be opened: {error}");
-                        let tmp = std::env::temp_dir().join("arjun-conversations-fallback");
-                        agent_runtime::conversations::ConversationStore::open(&tmp)
-                            .expect("a temp conversation store must open")
-                    }),
-            );
+            //
+            // ## When the store cannot be opened
+            //
+            // The fallback used to be a *fixed* temp directory,
+            // `arjun-conversations-fallback`. Three things were wrong with it,
+            // and the third is the serious one:
+            //
+            //  - it is shared, so two sessions — or two users on one machine —
+            //    wrote into each other's conversations;
+            //  - it is stale, so a session that recovered found the last
+            //    degraded session's threads sitting there looking like history;
+            //  - nothing said so. The chat behaved exactly as normal, and the
+            //    person's real conversations were not in it.
+            //
+            // So a failure now opens a session-unique directory, and the state
+            // records that this is what happened. `ConversationHealth::refusal`
+            // is what the commands consult before creating anything new: the
+            // application stays usable and readable, and a person is not
+            // quietly given a transcript that will be gone tomorrow.
+            let (conversation_store, conversation_health) =
+                match agent_runtime::conversations::ConversationStore::open(&data_dir) {
+                    Ok(store) => (
+                        std::sync::Arc::new(store),
+                        agent_runtime::conversations::ConversationHealth::durable(),
+                    ),
+                    Err(error) => {
+                        log::error!(
+                            "[CONVERSATIONS] the store could not be opened, so this session's \
+                             chats are ephemeral: {error}"
+                        );
+                        // Unique per session, and per process, so nothing
+                        // written here can be mistaken for history or read by
+                        // the next session.
+                        let scratch = std::env::temp_dir().join(format!(
+                            "arjun-conversations-ephemeral-{}-{}",
+                            std::process::id(),
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                        ));
+                        let store =
+                            agent_runtime::conversations::ConversationStore::open(&scratch)
+                                .expect("a scratch conversation store must open");
+                        (
+                            std::sync::Arc::new(store),
+                            agent_runtime::conversations::ConversationHealth::ephemeral(
+                                format!("The conversation store could not be opened: {error}"),
+                                scratch,
+                            ),
+                        )
+                    }
+                };
+            app.manage(commands::conversations::ConversationHealthState(
+                std::sync::Arc::new(conversation_health),
+            ));
             let run_to_conversation =
                 std::sync::Arc::new(agent_runtime::conversations::RunToConversation::new());
             app.manage(commands::conversations::ConversationsState(conversation_store));
@@ -331,17 +384,42 @@ pub fn run() {
             // now dies with this process; this is what a run leaves behind
             // while it is still going, and it is opened before any command can
             // run so that no run starts unrecorded.
-            let task_events: std::sync::Arc<agent_runtime::events::TaskEventLog> = std::sync::Arc::new(
-                agent_runtime::events::TaskEventLog::open(&data_dir).unwrap_or_else(|error| {
-                    // A run with no durable history is a real degradation, and
-                    // it is logged as one. It is not a reason to refuse to
-                    // open: an unrecorded run is worse than a recorded one and
-                    // better than an application that will not start.
-                    log::error!("[TASKS] the task event log could not be opened: {error}");
-                    agent_runtime::events::TaskEventLog::in_memory()
-                        .expect("an in-memory task event log")
-                }),
-            );
+            //
+            // A log that cannot be opened does not stop the window opening —
+            // a person needs to be able to read what is already there, change
+            // settings, and find out what is wrong. It does stop work: the
+            // in-memory substitute keeps the application usable read-only, and
+            // `AuditHealth` refuses every run and every side-effecting tool
+            // for as long as it is in use. Before that split existed, a failed
+            // open produced an application that looked entirely normal and
+            // kept a history that evaporated when the process exited.
+            let audit_health: std::sync::Arc<agent_runtime::audit_health::AuditHealth>;
+            let task_events: std::sync::Arc<agent_runtime::events::TaskEventLog> =
+                match agent_runtime::events::TaskEventLog::open(&data_dir) {
+                    Ok(log) => {
+                        audit_health = std::sync::Arc::new(
+                            agent_runtime::audit_health::AuditHealth::durable(),
+                        );
+                        std::sync::Arc::new(log)
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "[TASKS] the task event log could not be opened, so this session is                              read-only: {error}"
+                        );
+                        audit_health = std::sync::Arc::new(
+                            agent_runtime::audit_health::AuditHealth::degraded_at_startup(format!(
+                                "The task event log could not be opened: {error}"
+                            )),
+                        );
+                        std::sync::Arc::new(
+                            agent_runtime::events::TaskEventLog::in_memory()
+                                .expect("an in-memory task event log"),
+                        )
+                    }
+                };
+            app.manage(commands::agent::AuditHealthState(std::sync::Arc::clone(
+                &audit_health,
+            )));
 
             // Runs that were going when the process last went away. Closed off
             // here, before anything else writes, so the Tasks screen never
@@ -428,10 +506,39 @@ pub fn run() {
                     rejected.error.explain()
                 );
             }
-            app.manage(std::sync::Arc::new(subagents::SubagentManager::new(
-                loaded_profiles.profiles,
-                subagent_events,
-            )) as commands::agent::Subagents);
+            let subagent_manager =
+                subagents::SubagentManager::new(loaded_profiles.profiles, subagent_events);
+
+            // Said out loud at start, because the alternative is a run finding
+            // out mid-task.
+            //
+            // A profile is a declaration; a `ChildWorker` is what performs it.
+            // This build registers no workers, so every declared role is
+            // currently a role the application cannot perform — and the honest
+            // place to say that is here, once, rather than in a refusal the
+            // model reads on turn three. `tool_catalogue` withholds
+            // `agent.delegate_readonly` on the same condition, so the loop is
+            // not offered a tool that can only fail.
+            let performable = subagent_manager
+                .profiles()
+                .filter(|profile| subagent_manager.has_worker(&profile.name))
+                .count();
+            let declared = subagent_manager.profiles().count();
+            if performable < declared {
+                log::warn!(
+                    "[SUBAGENTS] {} of {} declared role(s) have no worker in this build, so                      delegation is unavailable and agent.delegate_readonly is withheld from the                      tool catalogue: {}",
+                    declared - performable,
+                    declared,
+                    subagent_manager
+                        .profiles()
+                        .filter(|profile| !subagent_manager.has_worker(&profile.name))
+                        .map(|profile| profile.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            app.manage(std::sync::Arc::new(subagent_manager) as commands::agent::Subagents);
 
             app.manage(sovereignty::global_broker().clone());
 
@@ -479,8 +586,21 @@ pub fn run() {
 
             // Tracks tools the Launch screen started, so cards can show Running.
 
+            // Started only when it is turned on.
+            //
+            // `enabled` was never read before the socket was bound, so every
+            // installation served the model over HTTP to anything that could
+            // reach loopback — and turning it off in the UI changed nothing.
+            // It now defaults to off; an operator turns it on and the gateway
+            // is started then.
             let app_for_gateway = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                if !gateway_state.enabled() {
+                    info!(
+                        "Sarathi gateway is turned off, so nothing is listening. Turn it on in                          settings to let other tools on this machine use this model."
+                    );
+                    return;
+                }
                 match gateway::start_gateway(gateway_state).await {
                     Ok(handle) => {
                         info!(
@@ -721,6 +841,8 @@ pub fn run() {
             // the streaming content as tokens arrive, and mark the message
             // complete when the run ends.
             commands::conversations::agent_create_conversation,
+            commands::conversations::agent_conversation_health,
+            commands::intelligence::agent_telemetry_health,
             commands::conversations::agent_get_conversation,
             commands::conversations::agent_list_conversations,
             commands::conversations::agent_delete_conversation,
@@ -777,6 +899,8 @@ pub fn run() {
             commands::governance::set_initial_administrator_password,
             commands::governance::set_account_password,
             commands::registry::list_registered_models,
+            commands::registry::list_library_models,
+            commands::registry::detect_system_models,
             commands::registry::model_manifest_path,
             commands::registry::get_orchestrator_model,
             commands::registry::set_orchestrator_model,
@@ -789,18 +913,36 @@ pub fn run() {
             commands::catalog::browse_model_cards,
             commands::catalog::list_model_categories,
 
-            // Phase 6 Memory Engine Commands
-            memory_engine::api::get_memory_health_status,
-            memory_engine::api::get_user_profile_memory,
-            memory_engine::api::update_user_profile_fact,
-            memory_engine::api::list_memory_projects,
-            memory_engine::api::create_memory_project,
-            memory_engine::api::switch_active_project,
-            memory_engine::api::get_active_project,
-            memory_engine::api::search_memory_nodes,
-            memory_engine::api::delete_memory_node_by_id,
-            memory_engine::api::get_memory_diagnostics,
+            // The ten `memory_engine::api::*` commands were removed. See
+            // `memory_engine::api` for the reasoning; in short, every one of
+            // them proved that *somebody* was signed in and then read, wrote or
+            // deleted the memory of *everybody*, and none of them had a
+            // consumer.
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|handle, event| {
+            // The polite half of model-server cleanup.
+            //
+            // `ModelServers::stop_all` has always documented itself as "Called
+            // on shutdown so no server outlives the app" and was never called
+            // by anything — the comment described an intention nobody had
+            // wired. This is that wire.
+            //
+            // It is not the guarantee: an exit handler only runs on exits the
+            // process gets to participate in, and the orphans that prompted
+            // this were made by the ones it does not — force-kills, panics,
+            // and a developer rebuilding over a running binary. That case is
+            // covered by the job object in `serving::reaper`. This exists so
+            // that on a normal quit the servers are asked to stop rather than
+            // killed, which lets them release VRAM and flush their own logs.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(servers) = handle.try_state::<std::sync::Arc<serving::ModelServers>>() {
+                    let servers = std::sync::Arc::clone(&servers);
+                    tauri::async_runtime::block_on(async move {
+                        servers.stop_all().await;
+                    });
+                }
+            }
+        });
 }

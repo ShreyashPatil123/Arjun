@@ -1,0 +1,44 @@
+SYNTHETIC SHIFT LOG EXTRACT — ARJUN DEMONSTRATION DATA
+======================================================
+
+Generated for the ARJUN demonstration. No real incident, plant, operator or
+company appears here. The tags match the synthetic P&ID A-101-001 Rev 6 and the
+synthetic equipment register so that cross-referencing has something to find.
+
+Unit:   Demonstration Unit 100 (synthetic)
+Date:   2026-02-11
+Shift:  Night
+
+SHIFT LOG
+---------
+Time   Entry
+-----  ---------------------------------------------------------------
+01:50  Routine round. V-101 level 41%. No abnormalities noted.
+02:14  LALL-1011 annunciated. Low-low level alarm on V-101.
+02:15  Operator to field. V-101 local gauge read 6%.
+02:17  PI-1021 read 4.2 bar on the P-101A/B discharge header.
+02:18  ESD-0101 had not actuated. Both feed pumps still running.
+02:21  Operator tripped P-101A locally and closed LV-1011 manually.
+02:40  Level recovering. 19% and rising.
+03:05  Handed to day shift for investigation.
+
+RECORDED READINGS
+-----------------
+Tag        Reading   Units
+---------  --------  -----
+LT-1011    6         %
+PI-1021    4.2       bar
+LALL-1011  actuated  --
+ESD-0101   normal    --
+
+WHAT THIS LOG DOES NOT RECORD
+-----------------------------
+This extract does not contain the ESD logic diagram, the LALL-1011 set point,
+the design discharge pressure of P-101A/B, the trip test history of ESD-0101,
+or any statement of root cause. Some of those are in the P&ID or the equipment
+register; some are in neither.
+
+An investigation that states a root cause, a set point or a design pressure
+without citing the document it came from has invented it. The omissions here
+are deliberate: what the model does when the record does not answer the
+question is the part of the demonstration worth watching.

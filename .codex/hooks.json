@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'C:\\Users\\lenovo\\Desktop\\Arjun-1\\.codex\\hooks\\check-gstack.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -24,9 +24,10 @@
 //! the name with reasonable accuracy and a wrong guess is corrected rather than
 //! dangerous — a mis-sized model simply fails the floor check and is not routed to.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::registry::{LoadSpec, ModelEntry, ModelRole, Modality, RoutingPreference, Runtime};
+use crate::registry::capability::{infer_active_parameters_b, infer_modalities, infer_roles};
+use crate::registry::{LoadSpec, ModelEntry, RoutingPreference, Runtime};
 
 /// Reads a parameter count out of a model name.
 ///
@@ -80,54 +81,86 @@ fn infer_parameters_b(name: &str) -> Option<f32> {
     None
 }
 
-/// Guesses what modalities a model supports, from its name.
+/// Context length recorded when the GGUF header does not state one.
 ///
-/// Defaults to text-only. A model with vision, audio or video indicators in
-/// its name gets those modalities added. An administrator corrects this in the
-/// manifest.
-fn infer_modalities(name: &str) -> Vec<Modality> {
-    let lowered = name.to_ascii_lowercase();
-    let mut modalities = vec![Modality::Text];
+/// The value discovery used unconditionally before the header was consulted, so
+/// a file whose converter wrote no `context_length` key is registered exactly as
+/// it was before.
+const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
 
-    if lowered.contains("-vl")
-        || lowered.contains("vision")
-        || lowered.contains("llava")
-        || lowered.contains("llava")
-    {
-        modalities.push(Modality::Image);
-    }
+/// Largest window this build will register from a header.
+///
+/// Not a judgement about the model. A KV cache scales linearly with the window,
+/// and a frontier-length context costs more VRAM than the weights do — at which
+/// point `plan_gpu_offload` correctly puts nothing on the GPU and the model
+/// runs on the CPU at a fraction of the speed. An administrator who wants the
+/// full window raises it on the entry, having decided to spend the VRAM.
+const MAX_REGISTERED_CONTEXT_LENGTH: u32 = 32_768;
 
-    modalities
+/// The window this model was trained for, read from its own header.
+///
+/// Falls back rather than failing: a header this build cannot parse is a reason
+/// to use the old constant, not a reason to leave the model unregistered.
+fn header_context_length(path: &Path) -> u32 {
+    crate::ai_engine::gguf_meta::read_gguf_metadata(path)
+        .ok()
+        .and_then(|meta| meta.context_length)
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_REGISTERED_CONTEXT_LENGTH))
+        .unwrap_or(DEFAULT_CONTEXT_LENGTH)
 }
 
-/// Guesses what a model is for, from its name.
+/// Whether an `mmproj-*.gguf` projector sits beside these weights.
 ///
-/// Everything is assumed capable of reasoning, because a general instruction
-/// model is what most releases are. Specialisations are added when the name
-/// says so. An administrator corrects this in the manifest; the cost of a wrong
-/// guess is a model that is not offered for a task, never one that is misused.
-fn infer_roles(name: &str) -> Vec<ModelRole> {
-    let lowered = name.to_ascii_lowercase();
-    let mut roles = vec![ModelRole::Reasoning];
-
-    if lowered.contains("coder") || lowered.contains("code") {
-        roles.push(ModelRole::Coding);
-    }
-    if lowered.contains("-vl") || lowered.contains("vision") || lowered.contains("llava") {
-        roles.push(ModelRole::Vision);
-    }
-    if lowered.contains("embed") || lowered.contains("bge") {
-        // An embedding model is not a reasoning model, whatever else it is.
-        roles = vec![ModelRole::Embedding];
-    }
-    if lowered.contains("rerank") {
-        roles = vec![ModelRole::Rerank];
-    }
-    if lowered.contains("ocr") || lowered.contains("docling") || lowered.contains("surya") {
-        roles = vec![ModelRole::DocumentOcr];
-    }
-
-    roles
+/// A multimodal GGUF ships as two files, and the second one is what turns an
+/// image into something the model can attend to. Discovery used to ignore the
+/// question entirely — `infer_roles` here took only a name — so an installed
+/// vision model was registered as text-only unless its *name* happened to say
+/// otherwise, and images had no model to go to.
+///
+/// Checked at the weights' own directory, which is the layout the llama.cpp
+/// loader expects and the one the downloader writes.
+/// The `mmproj-*.gguf` sitting beside a model, if one is.
+///
+/// Returns the path rather than a yes-or-no, because both callers need it: the
+/// role and modality inference needs to know a projector *exists*, and the
+/// entry needs to record *which file* so the launcher can pass `--mmproj`.
+/// Returning only the boolean is what left every discovered vision model
+/// recorded with `projector: None` — inferred as vision-capable, and then
+/// started blind, which llama.cpp does silently.
+///
+/// Where several are present the shortest name wins, deterministically. A
+/// directory holding `mmproj-M-F16.gguf` beside `mmproj-M-F16-patched.gguf`
+/// would otherwise pair differently depending on directory order, and a model
+/// that reads pages correctly on one launch and not the next is far worse to
+/// diagnose than one that is consistently wrong.
+fn sibling_projector(weights: &str) -> Option<PathBuf> {
+    let dir = Path::new(weights).parent()?;
+    // An unreadable directory is not evidence of a projector. Text-only is the
+    // answer that fails towards "not offered" rather than towards a model being
+    // handed an image it cannot decode.
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| {
+                    let lowered = name.to_ascii_lowercase();
+                    lowered.starts_with("mmproj-") && lowered.ends_with(".gguf")
+                })
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    found.sort_by_key(|path| {
+        (
+            path.file_name().map(|n| n.len()).unwrap_or(usize::MAX),
+            path.clone(),
+        )
+    });
+    found.into_iter().next()
 }
 
 /// Scans the models directory and describes what it finds.
@@ -141,6 +174,21 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 // but never routed to until somebody states its size.
                 .unwrap_or(0.0);
 
+            // Read once and used for both the role and the modality, so the two
+            // cannot disagree about whether this model can see.
+            let projector = sibling_projector(&installed.file_path);
+            let has_projector = projector.is_some();
+
+            // The window the file declares, not a constant.
+            //
+            // Every discovered model used to be recorded at 8192 tokens
+            // whatever it was. That number is what the context meter shows and
+            // what the agent loop compacts against, so a model trained for 128k
+            // was compacted at 8k — discarding history it had room for on every
+            // long task — while a model trained for 4k was told it had twice
+            // the room it has.
+            let context_length = header_context_length(Path::new(&installed.file_path));
+
             ModelEntry {
                 id: installed.id.clone(),
                 name: installed.model_name.clone(),
@@ -151,20 +199,36 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 license: "unstated".to_string(),
                 sha256: None,
                 runtime: Runtime::LlamaCpp,
-                roles: infer_roles(&installed.model_name),
-                modalities: infer_modalities(&installed.model_name),
+                roles: infer_roles(&installed.model_name, has_projector),
+                modalities: infer_modalities(&installed.model_name, has_projector),
                 quantization: Some(installed.quantization.clone()),
                 parameters_b,
-                active_parameters_b: None,
+                // What the model runs per token, where its name states it.
+                //
+                // `Qwen3.6-35B-A3B` is 35B of weights and 3B consulted per
+                // token. Left as `None`, the router sized it at 35B, sorted it
+                // ahead of every dense model and gave it the agent work a 3B
+                // model cannot hold a tool-call format through — the exact
+                // failure `ModelEntry::meets_floor` documents and could not
+                // prevent while nothing populated this field.
+                active_parameters_b: infer_active_parameters_b(&installed.model_name)
+                    .or_else(|| infer_active_parameters_b(&installed.model_id)),
                 // Conservative: enough for real work, small enough that the
                 // KV-cache estimate does not rule the model out on a laptop.
-                context_length: 8192,
+                context_length,
                 weights_bytes: installed.size_bytes,
                 supports_structured_output: false,
                 // Cleared for nothing. See the module note above.
                 permitted_classifications: Vec::new(),
                 path: installed.file_path.clone().into(),
-                projector: None,
+                // The file the launcher passes to `--mmproj`.
+                //
+                // This was `None` while `has_projector` two lines up was being
+                // used to advertise the model as vision-capable. A vision model
+                // launched without its projector does not fail: llama.cpp loads
+                // it and answers text-only, so every image sent to a discovered
+                // vision model was silently unseen.
+                projector,
                 // Discovery knows exactly how this model was installed, so the
                 // load coordinates are recorded rather than inferred later.
                 load: Some(LoadSpec {
@@ -204,6 +268,7 @@ pub fn merge(declared: Vec<ModelEntry>, discovered: Vec<ModelEntry>) -> Vec<Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Modality, ModelRole};
     use crate::policy::Classification;
 
     #[test]
@@ -260,12 +325,26 @@ mod tests {
 
     #[test]
     fn roles_are_inferred_from_the_name() {
-        assert!(infer_roles("Qwen2.5-Coder-7B").contains(&ModelRole::Coding));
-        assert!(infer_roles("Qwen2.5-VL-7B").contains(&ModelRole::Vision));
-        assert_eq!(infer_roles("bge-m3"), vec![ModelRole::Embedding]);
-        assert_eq!(infer_roles("bge-reranker-v2-m3"), vec![ModelRole::Rerank]);
-        assert_eq!(infer_roles("surya-ocr"), vec![ModelRole::DocumentOcr]);
-        assert_eq!(infer_roles("Llama-3.2-3B-Instruct"), vec![ModelRole::Reasoning]);
+        assert!(infer_roles("Qwen2.5-Coder-7B", false).contains(&ModelRole::Coding));
+        assert!(infer_roles("Qwen2.5-VL-7B", false).contains(&ModelRole::Vision));
+        assert_eq!(infer_roles("bge-m3", false), vec![ModelRole::Embedding]);
+        assert_eq!(infer_roles("bge-reranker-v2-m3", false), vec![ModelRole::Rerank]);
+        assert_eq!(infer_roles("surya-ocr", false), vec![ModelRole::DocumentOcr]);
+    }
+
+    /// A general instruction model is offered for code as well as for prose.
+    ///
+    /// This used to assert the opposite — that `Llama-3.2-3B-Instruct` held
+    /// `[Reasoning]` and nothing else — which is the assertion that made the
+    /// shipped behaviour look correct while every coding request on a machine
+    /// full of general models was refused outright.
+    #[test]
+    fn a_general_instruction_model_is_offered_for_both_prose_and_code() {
+        let roles = infer_roles("Llama-3.2-3B-Instruct", false);
+        assert!(roles.contains(&ModelRole::Reasoning));
+        assert!(roles.contains(&ModelRole::Coding));
+        // Still not a vision model: nothing about this file says it can see.
+        assert!(!roles.contains(&ModelRole::Vision));
     }
 
     /// An embedding model is not a general reasoning model, whatever else the
@@ -274,7 +353,7 @@ mod tests {
     fn specialised_roles_replace_the_reasoning_default_rather_than_adding_to_it() {
         for name in ["bge-m3", "bge-reranker-v2-m3", "surya-ocr"] {
             assert!(
-                !infer_roles(name).contains(&ModelRole::Reasoning),
+                !infer_roles(name, false).contains(&ModelRole::Reasoning),
                 "{name} should not be offered as a reasoning model"
             );
         }
@@ -311,7 +390,7 @@ mod tests {
             license: "unstated".into(),
             sha256: None,
             runtime: Runtime::LlamaCpp,
-            roles: infer_roles("Qwen2.5-7B-Instruct"),
+            roles: infer_roles("Qwen2.5-7B-Instruct", false),
             modalities: vec![Modality::Text],
             quantization: None,
             parameters_b: 7.0,
@@ -336,5 +415,78 @@ mod tests {
                 classification.label()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod projector_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arjun-proj-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The pairing that was computed and then discarded.
+    ///
+    /// `has_sibling_projector` decided the model was vision-capable and the
+    /// entry recorded `projector: None`, so the launcher had nothing to pass to
+    /// `--mmproj`. llama.cpp answers text-only in that case without erroring,
+    /// which made every image sent to a discovered vision model silently
+    /// unseen.
+    #[test]
+    fn a_projector_beside_the_weights_is_recorded_not_merely_noticed() {
+        let dir = temp_dir("paired");
+        let weights = dir.join("some-vision-model-Q4_K_M.gguf");
+        std::fs::write(&weights, b"weights").unwrap();
+        std::fs::write(dir.join("mmproj-F16.gguf"), b"projector").unwrap();
+
+        let found = sibling_projector(weights.to_str().unwrap());
+        assert_eq!(
+            found.as_deref(),
+            Some(dir.join("mmproj-F16.gguf").as_path()),
+            "the projector has to be named, not just counted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_text_only_model_gets_no_projector() {
+        let dir = temp_dir("textonly");
+        let weights = dir.join("plain-model-Q4_K_M.gguf");
+        std::fs::write(&weights, b"weights").unwrap();
+
+        assert_eq!(sibling_projector(weights.to_str().unwrap()), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two projectors in one directory is the real case — a patched build kept
+    /// beside the original — and the pairing must not depend on which one the
+    /// filesystem happens to hand back first.
+    #[test]
+    fn the_choice_between_two_projectors_is_deterministic() {
+        let dir = temp_dir("two");
+        let weights = dir.join("m-Q6_K.gguf");
+        std::fs::write(&weights, b"weights").unwrap();
+        std::fs::write(dir.join("mmproj-M-F16-patched.gguf"), b"a").unwrap();
+        std::fs::write(dir.join("mmproj-M-F16.gguf"), b"b").unwrap();
+
+        let first = sibling_projector(weights.to_str().unwrap());
+        let again = sibling_projector(weights.to_str().unwrap());
+        assert_eq!(first, again);
+        assert_eq!(
+            first.and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())),
+            Some("mmproj-M-F16.gguf".to_string()),
+            "the shortest name wins, so the pairing is stable across runs"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -21,6 +21,30 @@
 //!
 //! The model never directly writes DOCX XML. It fills a typed draft, and
 //! trusted local code renders the document.
+//!
+//! ## This module owns the workflow
+//!
+//! There was a second implementation, in Python, at `sidecars/sih_workflow/` —
+//! 2,888 lines covering the same twelve steps, with its own approval and
+//! evidence-package code. It has been removed, and this is the reasoning, kept
+//! here because the next person to reach for a sidecar deserves to find it.
+//!
+//! Nothing called it. It was not imported by any Rust module, not launched by
+//! any command, not referenced from `package.json`, and its tests were not in
+//! `npm run test:sidecar` — which runs only the document sidecar. Its own suite
+//! had 46 failures: 41 errors from a draft API that had moved underneath it and
+//! 5 assertions that no longer held.
+//!
+//! Two implementations of approval and evidence packaging is the specific thing
+//! this product cannot have. An approval binds a person's decision to an exact
+//! draft hash, and an evidence package is what somebody is asked to stand
+//! behind; if there are two of each and they disagree, the question "what was
+//! approved?" has two answers and no way to choose. A contract test between
+//! them would be the minimum price of keeping both, and there was none.
+//!
+//! So: Rust is canonical, because Rust is what runs. If a Python surface is
+//! wanted later — for a notebook, for an integration — it should call this
+//! through the sidecar protocol rather than reimplement it.
 
 pub mod draft;
 pub mod pipeline;

@@ -199,3 +199,41 @@
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
+
+/* Two buttons where there was one; they stay on the same row as the title. */
+.headerActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/*
+ * The full path of a registered model.
+ *
+ * Shown because a registered model is addressed by a path rather than by a
+ * package the app installed, and "which file is this actually?" is the first
+ * question a second quantisation of the same model raises.
+ */
+.modelPath {
+  margin: 4px 0 0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  color: var(--text-tertiary, #8b8b8b);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * A registered model whose weights are not where the manifest says.
+ *
+ * Called out rather than hidden: the entry is real, the router will try it,
+ * and the load will fail. Better to see it here than at the first request.
+ */
+.missing {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--danger, #d9534f);
+  background: color-mix(in srgb, var(--danger, #d9534f) 12%, transparent);
+}

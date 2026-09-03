@@ -8,7 +8,7 @@ use crate::model_package::ModelPackageRegistry;
 use crate::commands::governance::{require_permission, require_session, CurrentSession};
 use crate::identity::Permission;
 use crate::model_intelligence::{
-    telemetry::{ModelAggregate, TelemetrySink},
+    telemetry::{ModelAggregate, TelemetryHealth, TelemetrySink},
     InferenceParameters, ModelIntelligenceManager, ModelProfile,
 };
 
@@ -107,4 +107,21 @@ pub async fn refresh_model_profile(
 
     ModelIntelligenceManager::refresh_profile(&package_dir, &manifest)
         .map_err(|e| format!("Failed to refresh model profile: {}", e))
+}
+
+/// Whether the telemetry chain is wired, without adding to what it reports.
+///
+/// The endpoint that replaces the synthetic `<startup>` model call. That row
+/// was written so this page would be non-empty after launch; it was an
+/// inference that never happened, counted in the history of inferences, and
+/// every average on the page was computed over it.
+///
+/// A caller that gets an answer here has proved the sink, the command and the
+/// IPC chain in one round trip. A fresh installation answers
+/// `callsRecorded: 0`, which is both the truth and the proof.
+#[tauri::command]
+pub fn agent_telemetry_health(
+    telemetry: tauri::State<'_, std::sync::Arc<TelemetrySink>>,
+) -> TelemetryHealth {
+    telemetry.health()
 }

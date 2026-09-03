@@ -132,10 +132,93 @@ export interface OrchestratorChange {
   detail: string | null;
 }
 
+/**
+ * One model as the library lists it, from the manifest rather than from a
+ * downloaded package.
+ *
+ * The two lists differ, and the difference is the bug this type exists to fix:
+ * the Models screen used to show only packages the downloader had installed,
+ * so the Unlimited-OCR weights — registered, loaded, and reading documents in
+ * chat — appeared nowhere on it.
+ */
+export interface LibraryModel {
+  id: string;
+  name: string;
+  quantization: string | null;
+  roles: string[];
+  modalities: string[];
+  parametersB: number;
+  contextLength: number;
+  /** What the manifest says the weights weigh. */
+  weightsBytes: number;
+  license: string;
+  enabled: boolean;
+  /**
+   * Empty means the model may not be used on any classified material. That is
+   * the state everything detected on disk starts in, deliberately.
+   */
+  permittedClassifications: string[];
+  runtime: string;
+  path: string;
+  projector: string | null;
+  /** Whether the weights are where the entry says they are. */
+  present: boolean;
+  /** Size on disk now, or null when the file is missing. */
+  bytesOnDisk: number | null;
+}
+
+/** What one detection pass found. */
+export interface DetectionReport {
+  /**
+   * Directories actually walked, so "nothing new" is distinguishable from
+   * "nowhere was looked".
+   */
+  roots: string[];
+  filesSeen: number;
+  alreadyRegistered: number;
+  added: LibraryModel[];
+  /** The library as it stands after the pass. */
+  models: LibraryModel[];
+  /**
+   * True when something was added, and so when a restart is needed before the
+   * router can use it.
+   */
+  restartRequired: boolean;
+}
+
 export const registryService = {
   listModels(): Promise<ModelEntry[]> {
     return getBackendService().invoke<ModelEntry[]>('list_registered_models');
   },
+
+  /**
+   * Every model in the manifest, read from disk.
+   *
+   * Separate from {@link listModels}, which returns the registry as it was
+   * loaded at startup. This one re-reads the file, so a model registered by
+   * {@link detectSystemModels} moments ago is listed without a restart.
+   */
+  listLibraryModels(): Promise<LibraryModel[]> {
+    return getBackendService().invoke<LibraryModel[]>('list_library_models');
+  },
+
+  /**
+   * Walks the machine for weight files and registers the ones the manifest
+   * does not list.
+   *
+   * Adds only. An entry an administrator wrote by hand is never edited or
+   * replaced, and everything newly found arrives cleared for no classification
+   * until somebody reviews it.
+   *
+   * `extraRoots` is for a library kept somewhere ARJUN would not think to
+   * look; the standard locations are always searched.
+   */
+  detectSystemModels(extraRoots?: string[]): Promise<DetectionReport> {
+    return getBackendService().invoke<DetectionReport>('detect_system_models', {
+      extraRoots: extraRoots ?? [],
+    });
+  },
+
 
   /** The file an administrator edits to register a model. */
   manifestPath(): Promise<string> {

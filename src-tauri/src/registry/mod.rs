@@ -29,6 +29,7 @@ pub mod fit_score;
 pub mod integrity;
 pub mod router;
 pub mod scan;
+pub mod capability;
 pub mod categorize;
 
 use std::collections::BTreeSet;

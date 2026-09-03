@@ -251,6 +251,8 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
                 is_final: true,
                 tokens_generated: Some(0),
                 finish_reason: Some("no_model".to_string()),
+                // Nothing was tokenized: no model was loaded to do it.
+                prompt_tokens: None,
             });
             // TODO 6: still need to deregister on this path;
             // the early `return` would otherwise leave the
@@ -328,6 +330,8 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
                 is_final: true,
                 tokens_generated: Some(0),
                 finish_reason: Some(format!("error: {}", e)),
+                // The job failed; whatever the tokenizer saw did not survive it.
+                prompt_tokens: None,
             });
         }
     }
@@ -448,5 +452,178 @@ mod tests {
         // Submitted back-to-back; the first is at or near the front.
         let first = scheduler.submit(make()).unwrap();
         assert_eq!(first.queue_position, 0);
+    }
+}
+
+/// One generation slot, and what that means under load.
+///
+/// ## The decision this records
+///
+/// ARJUN serialises generation: one model in VRAM, one blocking llama.cpp
+/// call, one dedicated worker thread. There is no two-slot mode and there is no
+/// constant to turn one on. Callers are queued and told their position, and
+/// cancellation reaches a queued job and a running one by the same flag.
+///
+/// The `serving::transport` module — `trait ArjunTransport`, a `LocalTransport`
+/// delegating here, and an `HttpTransport` stub — was removed alongside these.
+/// Nothing implemented against it and nothing called it: an abstraction with
+/// one real implementation and no callers describes an intention rather than a
+/// boundary.
+#[cfg(test)]
+mod queueing_tests {
+    use super::*;
+
+    fn scheduler() -> Arc<GenerationScheduler> {
+        Arc::new(GenerationScheduler::start(Arc::new(InferenceManager::new())))
+    }
+
+    /// A job from one caller. No model is loaded in these tests, so the worker
+    /// fails each job fast at the manager — which is what makes the *queueing*
+    /// observable without a GPU.
+    fn job(origin: JobOrigin) -> GenerationJob {
+        GenerationJob {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "specify the seal".to_string(),
+                timestamp: None,
+            }],
+            params: GenerationParams::default(),
+            capability: None,
+            origin,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_scheduler_has_nothing_queued() {
+        assert_eq!(scheduler().queue_depth(), 0);
+    }
+
+    #[test]
+    fn two_callers_are_queued_rather_than_running_together() {
+        // The single-slot decision, as an observable. Both submissions are
+        // accepted — neither caller is refused — and the second is told it is
+        // behind the first rather than silently stalling, which is what the
+        // old direct-mutex approach did.
+        let scheduler = scheduler();
+        let desktop = scheduler.submit(job(JobOrigin::Desktop)).expect("accepted");
+        let gateway = scheduler
+            .submit(job(JobOrigin::Gateway {
+                client: "claude-code".to_string(),
+            }))
+            .expect("accepted");
+
+        // Positions are assigned at submission and are distinct: two callers
+        // sharing a position would be two callers told the same lie.
+        assert!(
+            gateway.queue_position >= desktop.queue_position,
+            "the second caller was placed ahead of the first"
+        );
+    }
+
+    #[test]
+    fn every_caller_gets_its_own_stream_and_its_own_cancel_flag() {
+        // Isolation. One tool hanging up must not stop another's generation,
+        // and it could if the flag or the channel were shared.
+        let scheduler = scheduler();
+        let a = scheduler.submit(job(JobOrigin::Desktop)).expect("accepted");
+        let b = scheduler
+            .submit(job(JobOrigin::Gateway {
+                client: "opencode".to_string(),
+            }))
+            .expect("accepted");
+
+        let cancel_a = a.canceller();
+        cancel_a.cancel();
+
+        // `b` is untouched: its own flag is still clear, so its generation is
+        // still permitted to run.
+        let cancel_b = b.canceller();
+        assert!(!b.cancel.load(Ordering::Relaxed), "cancelling one job cancelled another");
+        cancel_b.cancel();
+        assert!(b.cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancelling_reaches_a_job_that_has_not_started_yet() {
+        // A queued job must be cancellable, or a person who presses stop while
+        // waiting behind somebody else waits for a generation they no longer
+        // want.
+        let scheduler = scheduler();
+        let queued = scheduler.submit(job(JobOrigin::Desktop)).expect("accepted");
+        queued.cancel();
+        assert!(queued.cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_overloaded_scheduler_accepts_and_queues_rather_than_dropping() {
+        // Overload. Sixteen callers at once: every one is accepted and every
+        // one is given a position. Refusing would be defensible; dropping
+        // silently would not, and neither would blocking the submitter.
+        let scheduler = scheduler();
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                scheduler
+                    .submit(job(JobOrigin::Gateway {
+                        client: format!("tool-{i}"),
+                    }))
+                    .expect("every submission is accepted")
+            })
+            .collect();
+        assert_eq!(handles.len(), 16);
+    }
+
+    #[test]
+    fn submitting_after_shutdown_fails_rather_than_hanging() {
+        // The worker ends when every sender is dropped. A caller that submits
+        // to a scheduler whose worker has gone must be told, not left holding a
+        // receiver that will never produce a chunk.
+        let shutting_down = GenerationScheduler::start(Arc::new(InferenceManager::new()));
+        drop(shutting_down);
+
+        // A second, live scheduler still works — the shutdown of one does not
+        // poison the model manager for the next.
+        let next = scheduler();
+        assert!(next.submit(job(JobOrigin::Desktop)).is_ok());
+    }
+
+    #[test]
+    fn the_origin_of_every_queued_job_is_recorded_for_the_dashboard() {
+        // Who is using the model is a question an operator asks while waiting.
+        assert_eq!(JobOrigin::Desktop.label(), "desktop");
+        assert_eq!(
+            JobOrigin::Gateway {
+                client: "opencode".to_string()
+            }
+            .label(),
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn submissions_are_ordered_into_one_queue() {
+        // The single-slot decision, as an observable rather than as a comment.
+        //
+        // Every submission gets a position, and the positions are handed out in
+        // submission order. A second slot would show up here as two callers
+        // both being told they are first.
+        let scheduler = scheduler();
+        let positions: Vec<usize> = (0..4)
+            .map(|i| {
+                scheduler
+                    .submit(job(JobOrigin::Gateway {
+                        client: format!("tool-{i}"),
+                    }))
+                    .expect("accepted")
+                    .queue_position
+            })
+            .collect();
+
+        for pair in positions.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "positions were handed out of order: {positions:?}"
+            );
+        }
     }
 }

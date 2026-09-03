@@ -1,0 +1,636 @@
+{
+  "$comment": [
+    "Every Tauri command this application registers, and who consumes it.",
+    "",
+    "Checked by scripts/check-ipc.mjs, which fails when a command is registered",
+    "without an entry here, when an entry names a command that is no longer",
+    "registered, or when the frontend invokes a handler that does not exist.",
+    "",
+    "`consumer` is one of:",
+    "  frontend         - called from src/. The checker verifies this.",
+    "  admin            - operator- or support-invoked, deliberately not on a page.",
+    "  external         - for an embedding host, not for this application's UI.",
+    "  frontend-pending - the backend half exists and no surface calls it yet.",
+    "",
+    "A command with no consumer at all is not a state this file can express.",
+    "That is the point: adding one means choosing which of the four it is and",
+    "writing down why, in front of whoever reviews the change."
+  ],
+  "commands": {
+    "agent_abort_run": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_acknowledge_milestone": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_active_tasks": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_append_turn": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_complete_message": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_conversation_health": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_create_conversation": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_delete_conversation": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_get_conversation": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_get_message": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_list_conversations": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_reconcile_effect": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_resume_run": {
+      "owner": "agent",
+      "consumer": "admin",
+      "note": "Resumes an interrupted run. Reachable from the Tasks screen's recovery flow, which is not yet built; the command is the half that exists and is tested."
+    },
+    "agent_reveal_artifact": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_run_conversation": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_run_resumability": {
+      "owner": "agent",
+      "consumer": "admin",
+      "note": "Reports whether a run can be resumed. Same flow as agent_resume_run."
+    },
+    "agent_runtime_health": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_start_run": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_steer_run": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_task": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_task_artifacts": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_task_events": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_task_history": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_task_snapshot": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_telemetry_health": {
+      "owner": "telemetry",
+      "consumer": "admin",
+      "note": "Proves the telemetry chain without writing to it. Replaces the synthetic <startup> model call; a diagnostic, deliberately not on a page."
+    },
+    "agent_unknown_effects": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_update_streaming_content": {
+      "owner": "chat",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "analyze_system": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "artifact_preview": {
+      "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "assert_confidential_allowed": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "authentication_status": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "browse_model_cards": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "cancel_model_download": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "cancel_scan": {
+      "owner": "ocr",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "current_permissions": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "current_session": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "decide_approval": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "delete_installed_model": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_active_downloads": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_all_package_certifications": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Every certification on this machine. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_app_info": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_app_paths": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_app_state_info": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_compatible_packages": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Packages that will run, certified or not. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_config": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_config_value": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_default_config": {
+      "owner": "platform",
+      "consumer": "admin",
+      "note": "Returns the shipped defaults so a support engineer can diff a broken config against them."
+    },
+    "get_experimental_packages": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Packages known not to be certified. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_hardware_profile": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_hf_token_status": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_inference_status": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_installed_models": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_model_profile": {
+      "owner": "telemetry",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_model_recommendations": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Ranks models against a fresh hardware scan. Its only caller was recommendation.service.ts, which no component imported; the Models screen does its own sizing. Kept because the ranking is real and the screen should use it. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_ocr_detents": {
+      "owner": "ocr",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_operating_mode": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_orchestrator_model": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_package_certification": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Certification for one model package. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_page_image": {
+      "owner": "ocr",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "get_recommended_packages": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Certified packages this hardware can run. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_runtime_profile": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "The runtime profile a package declares. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "get_storage_summary": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "health_snapshot": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "knowledge_documents": {
+      "owner": "knowledge",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "knowledge_health": {
+      "owner": "knowledge",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "knowledge_search": {
+      "owner": "knowledge",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "list_accounts": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "list_approvals": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "list_model_categories": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "list_registered_models": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "load_installed_model": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "log_activity": {
+      "owner": "platform",
+      "consumer": "external",
+      "note": "Lets an embedding host write an attributed line into the audit chain."
+    },
+    "model_health_snapshot": {
+      "owner": "telemetry",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "model_manifest_path": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "model_residency": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "observe_process_connections": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "override_hardware_value": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "pause_model_download": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "prepare_model_for": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "preview_attachment_routing": {
+      "owner": "ocr",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "preview_routing": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "read_zero_trust_config": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "recent_audit_entries": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "recent_benchmarks": {
+      "owner": "benchmarks",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "recent_egress_events": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "refresh_model_profile": {
+      "owner": "telemetry",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "reload_certification_packs": {
+      "owner": "models",
+      "consumer": "frontend-pending",
+      "note": "Re-reads the certification packs after an operator installs one. No surface calls it yet; the service wrapper that did was dead code and was removed."
+    },
+    "reset_config": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "restore_last_session": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "resume_model_download": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "revert_hardware_override": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "run_benchmark": {
+      "owner": "benchmarks",
+      "consumer": "admin",
+      "note": "Runs the measured benchmark suite. Operator-invoked; never on a page, because a benchmark started by a render is a benchmark of the render."
+    },
+    "run_egress_canary": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "scan_page": {
+      "owner": "ocr",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "send_chat_message": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_account_password": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_config": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_config_value": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_hf_token": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_initial_administrator_password": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_operating_mode": {
+      "owner": "sovereignty",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_orchestrator_model": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "set_zero_trust_mode": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "sign_in": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "sign_out": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "sign_provenance": {
+      "owner": "governance",
+      "consumer": "admin",
+      "note": "Signs an evidence package. Part of the export flow, driven by an operator."
+    },
+    "skill_reload": {
+      "owner": "agent",
+      "consumer": "admin",
+      "note": "Re-reads the skills directory after an operator installs or edits one."
+    },
+    "skill_search": {
+      "owner": "agent",
+      "consumer": "admin",
+      "note": "Lists installed skills as cards. The model reaches skills through capability.search; this is the operator's view."
+    },
+    "start_model_download": {
+      "owner": "models",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "stop_chat_generation": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "subagent_profiles": {
+      "owner": "agent",
+      "consumer": "admin",
+      "note": "Lists the loaded subagent profiles, so an operator can see which are available."
+    },
+    "synthetic_benchmark": {
+      "owner": "benchmarks",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "unload_active_model": {
+      "owner": "inference",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "update_model_profile": {
+      "owner": "telemetry",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "validate_system": {
+      "owner": "platform",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "verify_audit_chain": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "verify_audit_merkle": {
+      "owner": "governance",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "verify_provenance": {
+      "owner": "governance",
+      "consumer": "admin",
+      "note": "Verifies a signed evidence package received from elsewhere."
+    },
+    "voice_speak": {
+      "owner": "voice",
+      "consumer": "frontend-pending",
+      "note": "Voice output. The sidecar and command exist; no surface calls them yet."
+    },
+    "voice_status": {
+      "owner": "voice",
+      "consumer": "frontend-pending",
+      "note": "Voice sidecar health."
+    },
+    "voice_transcribe": {
+      "owner": "voice",
+      "consumer": "frontend-pending",
+      "note": "Voice input."
+    },
+    "zero_trust_check_tool_call": {
+      "owner": "governance",
+      "consumer": "external",
+      "note": "Asks the zero-trust gate about a call on behalf of an embedding host."
+    },
+    "zero_trust_confirm_approval": {
+      "owner": "governance",
+      "consumer": "external",
+      "note": "Confirms an approval decision through the zero-trust gate."
+    }
+  }
+}

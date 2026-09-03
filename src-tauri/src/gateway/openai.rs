@@ -116,7 +116,19 @@ pub struct ChatCompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
-    pub usage: Usage,
+    /// Omitted when the prompt was never counted.
+    ///
+    /// The OpenAI schema types `prompt_tokens` as a required integer, so a
+    /// response that does not know it has only two honest options: leave the
+    /// object out, or publish a number nobody measured. This used to do the
+    /// second — `prompt_tokens: 0`, which also made `total_tokens` equal the
+    /// completion alone. A client cannot distinguish that from a genuinely
+    /// empty prompt, so it reads as a measurement and is not one.
+    ///
+    /// Absence is unambiguous where zero is not, so absence is what a caller
+    /// that took no count gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +152,20 @@ pub struct Usage {
 }
 
 impl ChatCompletionResponse {
-    pub fn new(id: String, created: u64, model: String, text: String, finish_reason: &str, completion_tokens: u32) -> Self {
+    /// Builds a finished completion.
+    ///
+    /// `prompt_tokens` is what the model's own tokenizer counted, or `None`
+    /// when no count was taken — see [`ChatCompletionResponse::usage`] for why
+    /// the second case omits the usage object instead of reporting zero.
+    pub fn new(
+        id: String,
+        created: u64,
+        model: String,
+        text: String,
+        finish_reason: &str,
+        completion_tokens: u32,
+        prompt_tokens: Option<u32>,
+    ) -> Self {
         Self {
             id,
             object: "chat.completion",
@@ -151,11 +176,13 @@ impl ChatCompletionResponse {
                 message: ResponseMessage { role: "assistant", content: text },
                 finish_reason: finish_reason.to_string(),
             }],
-            usage: Usage {
-                prompt_tokens: 0,
+            usage: prompt_tokens.map(|prompt_tokens| Usage {
+                prompt_tokens,
                 completion_tokens,
-                total_tokens: completion_tokens,
-            },
+                // Summed from two measured figures rather than carried
+                // separately, so the total cannot drift from its parts.
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            }),
         }
     }
 }
