@@ -1087,45 +1087,68 @@ pub async fn agent_start_run(
     // as an OpenAI-compatible URL on loopback, which is why one agent loop can
     // drive either.
     //
-    // Planned by `admission` rather than here: the offload has to be budgeted
-    // against the VRAM actually free, with the model's real layer count from
-    // its GGUF header, and any other server this machine is running has to be
-    // released first if — and only if — the model will not otherwise fit.
-    // Planning against installed VRAM with an assumed layer count is what made
+    // Two paths, and which one runs is the difference between a warm turn and
+    // a cold one.
+    //
+    // A warm server needs nothing decided: the process is up, the weights are
+    // resident, and the plan that placed them was settled when it started.
+    // Asking again would cost a driver subprocess for the VRAM figure and a
+    // header read for the layer count, both of which would sit between the
+    // person pressing enter and their first token to re-derive a plan for a
+    // server nobody is about to start.
+    //
+    // A cold server is admitted properly: budgeted against the VRAM actually
+    // free, with this model's own layer count from its GGUF header, releasing
+    // another server first if — and only if — this one will not otherwise fit.
+    // Planning against installed VRAM with an assumed layer count is what let
     // a model that could not fit start anyway and then sit unready for the
-    // full readiness timeout.
-    let admitted = crate::serving::admission::admit(&servers, entry, registry.models_dir())
-        .await
-        .map_err(|error| error.to_string())?;
-    let plan = admitted.plan.clone();
-    if !admitted.released.is_empty() {
-        log::info!(
-            "[serving] released {} to make room for {}",
-            admitted.released.join(", "),
-            entry.name
-        );
-    }
-    // Asked before the call, not after: once `endpoint_for` returns there is
-    // no way to tell a server that was already up from one that took forty
-    // seconds to load, and those are exactly the two cases the person needs
-    // told apart. A warm model produces no loading line at all.
-    let warm = servers.is_warm(&entry.id);
-    if !warm {
-        reporter.stage_with(
-            Stage::LoadingModel,
-            json!({
-                "modelName": routing.model_name,
-                "weightsBytes": entry.weights_bytes,
-                "fullyOnGpu": plan.full_offload,
-                "gpuPlan": plan.reason,
-            }),
-        );
-    }
+    // full three-minute readiness timeout.
+    // Read through a per-file cache, so a warm turn costs a hash lookup and
+    // the answer cannot differ between the warm and cold paths below.
+    let model_capabilities =
+        crate::ai_engine::gguf_meta::capabilities(&registry.models_dir().join(&entry.path));
+
     let load_started = std::time::Instant::now();
-    let endpoint = servers
-        .endpoint_for(entry, registry.models_dir(), &plan)
-        .await
-        .map_err(|error| error.to_string())?;
+    let warm_already = servers.warm_endpoint(&entry.id);
+    let warm = warm_already.is_some();
+    let endpoint = match warm_already {
+        Some(endpoint) => endpoint,
+        None => {
+            let admitted =
+                crate::serving::admission::admit(&servers, entry, registry.models_dir())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if !admitted.released.is_empty() {
+                log::info!(
+                    "[serving] released {} to make room for {}",
+                    admitted.released.join(", "),
+                    entry.name
+                );
+            }
+            reporter.stage_with(
+                Stage::LoadingModel,
+                json!({
+                    "modelName": routing.model_name,
+                    "weightsBytes": entry.weights_bytes,
+                    "fullyOnGpu": admitted.plan.full_offload,
+                    "gpuPlan": admitted.plan.reason,
+                    "gpuLayers": admitted.plan.gpu_layers,
+                    // Reported so a slow answer can be read back to its cause.
+                    // "planned against 1.15 GB free" and "planned against 8 GB
+                    // installed because the driver would not say" are very
+                    // different confidences in the same arithmetic.
+                    "vramBudgetBytes": admitted.budget.bytes(),
+                    "vramBudgetMeasured": admitted.budget.measured(),
+                    "modelLayers": admitted.layers,
+                    "released": admitted.released,
+                }),
+            );
+            servers
+                .endpoint_for(entry, registry.models_dir(), &admitted.plan)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+    };
     reporter.stage_with(
         Stage::ModelReady,
         json!({
@@ -1424,8 +1447,8 @@ pub async fn agent_start_run(
             // model that had a switch. Reasoning was therefore off across the
             // whole product, which is why the Thinking panel had nothing to
             // show for the entire length of a run.
-            "supportsReasoning": admitted.supports_reasoning,
-            "reasoning": admitted.supports_reasoning,
+            "supportsReasoning": model_capabilities.supports_toggled_reasoning,
+            "reasoning": model_capabilities.supports_toggled_reasoning,
         },
         // The same instant this side is holding, as epoch milliseconds. Sent so
         // the loop stops itself at the boundary rather than being killed from

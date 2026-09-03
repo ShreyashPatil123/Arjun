@@ -132,7 +132,13 @@ pub fn run() {
         .manage(download_manager)
         // Cloned rather than moved: the activator built in setup below needs
         // the same manager the commands see, not a second one.
-        .manage(inference_manager.clone())
+        .manage({
+            // Named for `serving::admission`, which has to be able to release
+            // the in-process model to make room for a served one. See
+            // `ai_engine::manager::register_global`.
+            ai_engine::manager::register_global(inference_manager.clone());
+            inference_manager.clone()
+        })
         .setup(move |app| {
             info!("Sarathi application starting...");
 

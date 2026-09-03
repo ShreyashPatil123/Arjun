@@ -261,20 +261,38 @@ export function AssistantMessageCell({
   );
   const displayContent = reasoning ? answer : content;
 
-  // The timeline for this turn: the model's own steps first, then the
-  // tool calls the run actually made. Two `group` keys means two cards,
-  // which is how thinking and doing read as separate passes of work.
-  const timelineNodes: ThinkingNode[] = useMemo(() => {
-    const out: ThinkingNode[] = nodes.map(node => ({
-      ...node,
-      group: 'reasoning',
-      // Row labels are ellipsised to one line, so anything long enough
-      // to be cut keeps its full text behind the chevron.
-      detail: node.label.length > 90 ? node.label : undefined,
-    }));
-    for (const item of activity ?? []) out.push(toolNode(item));
-    return out;
-  }, [nodes, activity]);
+  /**
+   * The reasoning to show, from whichever channel carried it.
+   *
+   * Two channels exist because two kinds of server exist. One splits the
+   * reasoning into its own field, which arrives live on `model_thinking` and
+   * is what `liveReasoning` holds. The other leaves it inline in the content
+   * inside `<think>` tags, which `parseThinking` recovers from the answer.
+   *
+   * They are merged here rather than rendered in two places. The inline block
+   * used to become rows in the tool timeline, so the same product had three
+   * surfaces that could be called thinking: this panel, that timeline, and the
+   * stage list titled "Thinking". One concept, one surface.
+   *
+   * `undefined` when there is neither, which is the correct state for a model
+   * with no reasoning switch — the panel then renders nothing at all rather
+   * than an empty box implying a thought nobody can see.
+   */
+  const thinking: LiveReasoning | undefined = useMemo(() => {
+    if (liveReasoning && liveReasoning.text.trim() !== '') return liveReasoning;
+    if (reasoning.trim() !== '') return { text: reasoning, trimmed: false };
+    return undefined;
+  }, [liveReasoning, reasoning]);
+
+  // The tool record for this turn, and only that.
+  //
+  // The model's own reasoning steps used to be prepended here under a
+  // `reasoning` group key. They now go to the Thinking panel, which shows the
+  // prose rather than a bulleted summary of it.
+  const timelineNodes: ThinkingNode[] = useMemo(
+    () => (activity ?? []).map(toolNode),
+    [activity],
+  );
 
   return (
     <div className={styles.assistantRow}>
@@ -330,7 +348,7 @@ export function AssistantMessageCell({
                 * and this is the only thing happening. It closes itself
                 * when the answer begins. */}
               <ReasoningStream
-                reasoning={liveReasoning}
+                reasoning={thinking}
                 isLive={isStreaming}
                 hasAnswer={displayContent.length > 0}
               />

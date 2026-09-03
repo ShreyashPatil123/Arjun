@@ -97,7 +97,7 @@ export function RunProgressPanel({ steps, isLive, hasAnswer }: RunProgressPanelP
         ) : (
           <Check size={11} className={styles.progressDoneIcon} aria-hidden="true" />
         )}
-        <span className={styles.progressTitle}>Thinking</span>
+        <span className={styles.progressTitle}>Activity</span>
         <span className={styles.progressSummary}>{summary}</span>
       </button>
 

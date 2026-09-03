@@ -119,6 +119,13 @@ pub enum ServingError {
     NeedsExternalEndpoint { model: String, runtime: &'static str },
     #[error("{model} has no weights at {path}. Import the model again.")]
     WeightsMissing { model: String, path: PathBuf },
+    #[error("{model} is only partly downloaded: {path} holds {} of the {} it should. Download it again — a truncated model loads without complaining and then produces nothing but blank output.", crate::serving::human_bytes(*actual_bytes), crate::serving::human_bytes(*expected_bytes))]
+    WeightsIncomplete {
+        model: String,
+        path: PathBuf,
+        actual_bytes: u64,
+        expected_bytes: u64,
+    },
     #[error("{model} declares a vision projector at {path}, which is not there. Import the model again — a vision model started without its projector is blind, so ARJUN refuses rather than serving it text-only.")]
     ProjectorMissing { model: String, path: PathBuf },
     #[error("llama-server could not be started: {0}. Set ARJUN_LLAMA_SERVER to its path, or put it on PATH.")]
@@ -184,6 +191,7 @@ pub fn plan_launch(
     projector: Option<&Path>,
     gpu: &GpuOffloadPlan,
     port: u16,
+    auto_fit: bool,
 ) -> LaunchPlan {
     let mut args = vec![
         "--model".to_string(),
@@ -196,7 +204,7 @@ pub fn plan_launch(
         "--port".to_string(),
         port.to_string(),
         "--n-gpu-layers".to_string(),
-        gpu.gpu_layers.to_string(),
+        gpu_layers_arg(gpu, auto_fit),
         // From the plan, not from the entry.
         //
         // These are one decision: the layer count was computed against a KV
@@ -230,6 +238,73 @@ pub fn plan_launch(
         base_url: format!("http://127.0.0.1:{port}/v1"),
         served_model_id: entry.id.clone(),
     }
+}
+
+/// The value for `--n-gpu-layers`.
+///
+/// ## Why this is usually `auto`
+///
+/// Passing an exact number disables llama.cpp's own fitter, which sizes the
+/// split against **free device memory at load time**. Ours is computed
+/// earlier, from a reading that can be seconds stale, and if anything takes
+/// VRAM in between the allocation fails. On the Vulkan backend that failure is
+/// not a graceful fallback to the CPU — it is a `GGML_ASSERT` and the process
+/// dies, after which ARJUN waits out its full readiness timeout on a server
+/// that no longer exists. Reproduced directly:
+///
+/// ```text
+/// common_fit_params: failed to fit params to free device memory:
+///                    n_gpu_layers already set by user to 40, abort
+/// ggml_vulkan: Device memory allocation of size 854175168 failed
+/// GGML_ASSERT(buffer) failed
+/// ```
+///
+/// The same model with no explicit count loaded in nine seconds and answered.
+/// So the number ARJUN computes is used for the decisions only ARJUN can make
+/// — whether this model fits at all, and whether another server has to be
+/// released first — and the split itself is left to the process that can see
+/// the memory at the moment it allocates.
+///
+/// A CPU-only plan is still stated explicitly. "Do not use the GPU" is a
+/// decision, not an absence of one, and `auto` would quietly overrule it.
+fn gpu_layers_arg(gpu: &GpuOffloadPlan, auto_fit: bool) -> String {
+    if gpu.gpu_layers == 0 {
+        return "0".to_string();
+    }
+    if auto_fit {
+        return "auto".to_string();
+    }
+    gpu.gpu_layers.to_string()
+}
+
+/// Whether this llama-server accepts `--n-gpu-layers auto`.
+///
+/// Probed once and remembered. Older builds take only a number and would
+/// refuse to start on the string, so the capability is asked for rather than
+/// assumed — and a build that cannot be probed at all falls back to the
+/// computed number, which is what shipped before.
+fn llama_server_fits_layers_itself() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Ok(output) = std::process::Command::new(llama_server_program())
+            .arg("--help")
+            .output()
+        else {
+            return false;
+        };
+        let help = String::from_utf8_lossy(&output.stdout);
+        // The help text documents the accepted values for the flag. Matching
+        // on that is narrower than searching the whole page for "auto", which
+        // appears in unrelated options.
+        help.lines()
+            .filter(|line| line.contains("--n-gpu-layers"))
+            .any(|line| line.contains("auto"))
+            || help
+                .lines()
+                .skip_while(|line| !line.contains("--n-gpu-layers"))
+                .take(3)
+                .any(|line| line.contains("'auto'"))
+    })
 }
 
 /// What [`ModelServers::spawn_managed`] resolved to, whether it had to start
@@ -405,6 +480,40 @@ impl ModelServers {
             });
         }
 
+        // A file shorter than the registry says it should be is an unfinished
+        // download, and it does not fail loudly on its own.
+        //
+        // This is what "Gemma 3 12B hangs" actually was. The GGUF header and
+        // the tensor index sit at the front of the file and were intact, so
+        // llama.cpp loaded the model and reported itself ready in seconds. The
+        // weights themselves were 854 MB short. The model then generated
+        // nothing but newlines until it reached the decode cap, which the chat
+        // surface showed as a turn that started and never produced an answer.
+        // Measured on the reported machine: two of six installed models were
+        // truncated, one of them the one being reported, and nothing anywhere
+        // in the product had ever compared a weights file to its own manifest.
+        //
+        // A length comparison rather than a hash because it costs one
+        // `metadata` call instead of reading gigabytes, and because it catches
+        // the failure that actually happens. The hash check below still runs
+        // where a hash was declared; this covers the discovered models, which
+        // have no hash to check and are the majority.
+        //
+        // Only a *short* file is refused. Longer than declared is not a
+        // truncation, and an entry that declares nothing is not checked at all
+        // — the same opt-in rule the hash check follows.
+        if entry.weights_bytes > 0 {
+            let actual = std::fs::metadata(&weights).map(|meta| meta.len()).unwrap_or(0);
+            if actual < entry.weights_bytes {
+                return Err(ServingError::WeightsIncomplete {
+                    model: entry.name.clone(),
+                    path: weights,
+                    actual_bytes: actual,
+                    expected_bytes: entry.weights_bytes,
+                });
+            }
+        }
+
         // If the manifest declared a hash, refuse to load a file that does
         // not match it. A model without a declared hash is loaded as before;
         // the check is opt-in by the manifest, and refusing an unhashed
@@ -437,7 +546,14 @@ impl ModelServers {
             None => None,
         };
 
-        let plan = plan_launch(entry, &weights, projector.as_deref(), gpu, free_port()?);
+        let plan = plan_launch(
+            entry,
+            &weights,
+            projector.as_deref(),
+            gpu,
+            free_port()?,
+            llama_server_fits_layers_itself(),
+        );
         let mut child_cmd = Command::new(&plan.program);
         child_cmd
             .args(&plan.args)
@@ -562,15 +678,31 @@ impl ModelServers {
     /// in this table and reports `false`, which is honest: it is about to be
     /// probed.
     pub fn is_warm(&self, model_id: &str) -> bool {
-        self.managed
-            .lock()
-            .ok()
-            .and_then(|table| {
-                table
-                    .get(model_id)
-                    .map(|server| server.ready.load(Ordering::Acquire))
-            })
-            .unwrap_or(false)
+        self.warm_endpoint(model_id).is_some()
+    }
+
+    /// The endpoint of a server that is already up and has answered a probe.
+    ///
+    /// The whole point is what it does *not* do. A warm model needs no VRAM
+    /// budget, no GGUF header read, no offload plan and no readiness probe —
+    /// the server is running and the weights are resident. Every one of those
+    /// is work that only a cold start can justify.
+    ///
+    /// This exists because admission became expensive when it became correct.
+    /// Planning against free VRAM means asking the driver, which is a
+    /// subprocess costing a few hundred milliseconds, and reading the real
+    /// layer count means opening the weights file. Paying either on a warm
+    /// turn would put that latency between the person pressing enter and the
+    /// first token, to re-derive a plan for a server that is not going to be
+    /// started.
+    pub fn warm_endpoint(&self, model_id: &str) -> Option<Endpoint> {
+        self.managed.lock().ok().and_then(|table| {
+            let server = table.get(model_id)?;
+            if !server.ready.load(Ordering::Acquire) {
+                return None;
+            }
+            Some(server.endpoint.clone())
+        })
     }
 }
 
@@ -654,7 +786,7 @@ mod tests {
 
     #[test]
     fn the_server_is_bound_to_loopback_and_never_to_every_interface() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         let host = launch
             .args
             .windows(2)
@@ -666,7 +798,7 @@ mod tests {
 
     #[test]
     fn the_launch_carries_the_offload_the_router_planned() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         let layers = launch
             .args
             .windows(2)
@@ -677,7 +809,7 @@ mod tests {
 
     #[test]
     fn a_cpu_only_plan_starts_the_server_with_no_gpu_layers() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(0), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(0), 8123, false);
         let layers = launch
             .args
             .windows(2)
@@ -690,7 +822,7 @@ mod tests {
     fn the_context_length_comes_from_the_registry_not_a_default() {
         let mut entry = gguf_entry();
         entry.context_length = 8_192;
-        let launch = plan_launch(&entry, Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&entry, Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         let ctx = launch
             .args
             .windows(2)
@@ -707,6 +839,7 @@ mod tests {
             Some(Path::new("/models/mmproj-m-F16.gguf")),
             &plan(33),
             8123,
+            false,
         );
         let mmproj = launch
             .args
@@ -724,13 +857,13 @@ mod tests {
         // Not merely absent from the plan: a bare `--mmproj` with no value, or
         // one pointing at nothing, makes llama-server fail to start. A
         // text-only model has to produce a command line that never mentions it.
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         assert!(!launch.args.iter().any(|arg| arg == "--mmproj"));
     }
 
     #[test]
     fn the_server_advertises_arjuns_model_id_so_the_trace_matches() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         let alias = launch
             .args
             .windows(2)
@@ -742,7 +875,7 @@ mod tests {
 
     #[test]
     fn the_base_url_is_loopback_and_carries_the_version_prefix() {
-        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123);
+        let launch = plan_launch(&gguf_entry(), Path::new("/models/m.gguf"), None, &plan(33), 8123, false);
         assert_eq!(launch.base_url, "http://127.0.0.1:8123/v1");
         assert!(probe::check_loopback(&launch.base_url).is_ok());
     }
@@ -916,5 +1049,81 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{:.2} GB", bytes / GB)
     } else {
         format!("{:.0} MB", bytes / MB)
+    }
+}
+
+#[cfg(test)]
+mod layer_fitting_tests {
+    use super::*;
+
+    fn plan_with(gpu_layers: u32) -> GpuOffloadPlan {
+        GpuOffloadPlan {
+            gpu_layers,
+            full_offload: gpu_layers > 0,
+            context_length: 8192,
+            reason: "test".into(),
+        }
+    }
+
+    /// The fix for the model-switch hang.
+    ///
+    /// An exact count disables llama.cpp's own fitter, and the fitter is the
+    /// only party that can see free device memory at the instant it allocates.
+    /// When ARJUN's count was stale the Vulkan backend aborted the process, and
+    /// the surface then waited out its whole readiness timeout on a server that
+    /// had already died.
+    #[test]
+    fn a_gpu_plan_lets_the_server_fit_the_split_when_it_can() {
+        assert_eq!(gpu_layers_arg(&plan_with(40), true), "auto");
+    }
+
+    /// "Do not use the GPU" is a decision, and `auto` would overrule it.
+    #[test]
+    fn a_cpu_only_plan_stays_explicit_even_when_fitting_is_available() {
+        assert_eq!(gpu_layers_arg(&plan_with(0), true), "0");
+    }
+
+    /// An older binary takes only a number, so the computed count is still
+    /// what ships to it.
+    #[test]
+    fn a_server_that_cannot_fit_gets_the_number_that_was_planned() {
+        assert_eq!(gpu_layers_arg(&plan_with(40), false), "40");
+        assert_eq!(gpu_layers_arg(&plan_with(0), false), "0");
+    }
+}
+
+#[cfg(test)]
+mod weights_integrity_tests {
+    use super::*;
+
+    /// The real cause of "Gemma 3 12B hangs".
+    ///
+    /// Two of the six models installed on the reported machine were short — one
+    /// by 854 MB — because a download had not finished and nothing had ever
+    /// compared a weights file against its own manifest. The header and tensor
+    /// index sit at the front and were intact, so llama.cpp loaded the model,
+    /// reported ready in seconds, and then emitted nothing but newline tokens
+    /// until it hit the decode cap.
+    #[test]
+    fn a_short_file_is_refused_with_both_sizes_named() {
+        let error = ServingError::WeightsIncomplete {
+            model: "gemma-3-12b-it".into(),
+            path: PathBuf::from("/models/gemma.gguf"),
+            actual_bytes: 7_300_778_336,
+            expected_bytes: 8_154_978_784,
+        };
+        let message = error.to_string();
+        assert!(message.contains("6.80 GB"), "{message}");
+        assert!(message.contains("7.59 GB"), "{message}");
+        assert!(
+            message.contains("partly downloaded"),
+            "the operator has to be told what to do about it: {message}"
+        );
+    }
+
+    #[test]
+    fn bytes_are_reported_in_units_a_person_reads() {
+        assert_eq!(human_bytes(8_154_978_784), "7.59 GB");
+        assert_eq!(human_bytes(512 * 1024 * 1024), "512 MB");
     }
 }

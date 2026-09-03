@@ -115,6 +115,7 @@ describe('RunReducer: per-run content isolation', () => {
   it('an event for a different run is dropped, not routed to this reducer', () => {
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onReasoning: () => undefined,
       onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
@@ -207,6 +208,7 @@ describe('the reducer stores the model output byte for byte', () => {
   function reducerFor(messageId: string) {
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onReasoning: () => undefined,
       onProgress: () => undefined,
       onConversation: () => undefined,
       onRunDone: () => undefined,
@@ -293,6 +295,7 @@ describe('Registry: publish callbacks', () => {
     const conversations: Conversation[] = [];
     const registry = new RunReducerRegistry({
       onContent: () => undefined,
+      onReasoning: () => undefined,
       onProgress: () => undefined,
       onConversation: (next) => conversations.push(next),
       onRunDone: () => undefined,
@@ -450,7 +453,9 @@ describe('RunReducer: progress events reach the right turn and no other', () => 
     // While it runs the step reads "Thinking"; once the block closes it
     // becomes "Thought it through", so the live label is checked here rather
     // than after the end event.
-    expect(progress[progress.length - 1].labels).toContain('Thinking');
+    // The Activity row. The reasoning text itself goes to the Thinking
+    // panel; this only marks that a reasoning pass happened and how long for.
+    expect(progress[progress.length - 1].labels).toContain('Reasoning');
 
     a.apply({ runId: 'run-a', event: thinking('msg-a', 'end') });
     expect(progress[progress.length - 1].labels).toContain('Thought it through');
@@ -509,5 +514,76 @@ describe('RunReducer: progress events reach the right turn and no other', () => 
     const before = progress.length;
     a.apply({ runId: 'run-a', event: stage('generating', 'msg-a') });
     expect(progress).toHaveLength(before);
+  });
+});
+
+describe('RunReducer: reasoning is isolated per turn', () => {
+  /**
+   * The reasoning channel is new, and it is a second per-message buffer beside
+   * the content one. Two turns in flight — a queued message answered while the
+   * previous one is still reasoning — must not pour one model's thinking into
+   * the other's panel, for exactly the reason the content buffers are
+   * separate.
+   */
+  it('two reducers do not share reasoning buffers', () => {
+    const seen: Array<{ messageId: string; text: string }> = [];
+    const registry = new RunReducerRegistry({
+      onContent: () => undefined,
+      onReasoning: (messageId, reasoning) =>
+        seen.push({ messageId, text: reasoning.text }),
+      onProgress: () => undefined,
+      onConversation: () => undefined,
+      onRunDone: () => undefined,
+    });
+
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+    const b = new RunReducer(registry, 'run-b', 'conv-1', 'msg-b');
+
+    const thinking = (messageId: string, delta: string): MessageEvent =>
+      ({
+        type: 'model_thinking',
+        messageId,
+        state: 'end',
+        characters: delta.length,
+        elapsedMs: 10,
+        delta,
+      }) as unknown as MessageEvent;
+
+    a.apply(makeEnvelope('run-a', thinking('msg-a', 'thinking about A')));
+    b.apply(makeEnvelope('run-b', thinking('msg-b', 'thinking about B')));
+
+    const forA = seen.filter(s => s.messageId === 'msg-a').pop();
+    const forB = seen.filter(s => s.messageId === 'msg-b').pop();
+    expect(forA?.text).toBe('thinking about A');
+    expect(forB?.text).toBe('thinking about B');
+    expect(forA?.text).not.toContain('B');
+    expect(forB?.text).not.toContain('A');
+  });
+
+  /** An event naming another turn is dropped, not appended to this one. */
+  it('refuses reasoning addressed to a different message', () => {
+    const seen: string[] = [];
+    const registry = new RunReducerRegistry({
+      onContent: () => undefined,
+      onReasoning: (_id, reasoning) => seen.push(reasoning.text),
+      onProgress: () => undefined,
+      onConversation: () => undefined,
+      onRunDone: () => undefined,
+    });
+    const a = new RunReducer(registry, 'run-a', 'conv-1', 'msg-a');
+
+    const consumed = a.apply(
+      makeEnvelope('run-a', {
+        type: 'model_thinking',
+        messageId: 'msg-somebody-else',
+        state: 'end',
+        characters: 5,
+        elapsedMs: 1,
+        delta: 'leak',
+      } as unknown as MessageEvent),
+    );
+
+    expect(consumed).toBe(false);
+    expect(seen.join('')).not.toContain('leak');
   });
 });

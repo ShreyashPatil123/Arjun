@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -800,4 +800,69 @@ mod tests {
             assert_eq!(meta.block_count, 24, "value type {type_tag} did not decode");
         }
     }
+}
+
+/// What a model's header says about how it must be run.
+///
+/// The two facts the serving path needs, and the two it used to guess: how
+/// many layers there are to offload, and whether the model has a reasoning
+/// switch to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelCapabilities {
+    /// Transformer blocks, or `None` when the header could not be read.
+    ///
+    /// `None` is not zero and not a default. The planner scales the offload
+    /// fraction by this count, so a made-up number silently leaves layers on
+    /// the CPU that the plan believed were on the GPU — the planner is told
+    /// "unknown" and applies its own documented assumption instead.
+    pub layers: Option<u32>,
+    /// Whether the chat template branches on `enable_thinking`.
+    pub supports_toggled_reasoning: bool,
+    /// The trained context window, where the header states one.
+    pub context_length: Option<u32>,
+}
+
+/// Reads a model's capabilities once per file, then remembers them.
+///
+/// Memoised because both the admission path and the run-parameter builder need
+/// the same answers on every turn, and the answers cannot change: a GGUF
+/// header is fixed for the life of the file. Without this, asking twice per
+/// message meant opening a multi-gigabyte file twice per message to re-read a
+/// few kilobytes that had not moved.
+///
+/// A file that cannot be read is remembered as unreadable rather than retried,
+/// for the same reason — a missing or corrupt model does not become readable
+/// by being opened again mid-conversation, and the caller's fallbacks are
+/// documented for exactly this case.
+pub fn capabilities(weights: &Path) -> ModelCapabilities {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, ModelCapabilities>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(weights) {
+            return *hit;
+        }
+    }
+
+    let found = match read_gguf_metadata(weights) {
+        Ok(meta) => ModelCapabilities {
+            layers: Some(meta.block_count).filter(|count| *count > 0),
+            supports_toggled_reasoning: meta.supports_toggled_reasoning,
+            context_length: meta.context_length,
+        },
+        Err(error) => {
+            log::warn!(
+                "[gguf] {} could not be read, so its layer count and reasoning support are \
+                 unknown and the defaults apply: {error:#}",
+                weights.display()
+            );
+            ModelCapabilities::default()
+        }
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(weights.to_path_buf(), found);
+    }
+    found
 }

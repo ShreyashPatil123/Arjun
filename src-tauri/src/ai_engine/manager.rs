@@ -1201,3 +1201,47 @@ mod tests {
         assert!(mgr.get_last_used_model_id().is_none());
     }
 }
+
+/// The one in-process runtime this process owns.
+///
+/// ## Why a global, when globals are usually the wrong answer
+///
+/// There is exactly one `InferenceManager` per process — `lib.rs` builds it
+/// once at startup and hands the same `Arc` to every command that needs it —
+/// so this is not introducing a singleton, it is naming the one that already
+/// exists.
+///
+/// It is named because the serving path has to be able to reach it. ARJUN runs
+/// models two ways that do not know about each other: this manager loads one
+/// inside the process for the gateway, and `serving::ModelServers` starts
+/// `llama-server` children for chat and documents. Both allocate from the same
+/// card. On the reported machine the startup restore took 4.3 GB in-process
+/// and the first chat message then started a second copy of the same model in
+/// a child, exhausting an 8 GB card with two loads of one model.
+///
+/// Fixing that means the admission path must be able to release this one, and
+/// the alternative was threading an `Arc<InferenceManager>` through four
+/// layers of helper functions that have no other use for it — a parameter
+/// nobody reads, on every signature between the command and the decision.
+fn global_slot() -> &'static std::sync::OnceLock<Arc<InferenceManager>> {
+    static GLOBAL: std::sync::OnceLock<Arc<InferenceManager>> = std::sync::OnceLock::new();
+    &GLOBAL
+}
+
+/// Names the process-wide runtime. Called once, at startup.
+///
+/// A second call is ignored rather than panicking: the first registration is
+/// the real one, and a test that builds its own manager should not be able to
+/// take the name from a running application.
+pub fn register_global(manager: Arc<InferenceManager>) {
+    let _ = global_slot().set(manager);
+}
+
+/// The process-wide runtime, if startup has registered one.
+///
+/// `None` in unit tests and before startup finishes, which callers must treat
+/// as "there is nothing loaded in-process to release" — the safe reading, and
+/// the true one.
+pub fn global() -> Option<Arc<InferenceManager>> {
+    global_slot().get().cloned()
+}

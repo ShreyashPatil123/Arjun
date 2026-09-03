@@ -75,6 +75,8 @@ pub struct Admission {
     pub plan: GpuOffloadPlan,
     /// Servers stopped to make room, newest first. Empty when none were.
     pub released: Vec<String>,
+    /// True when the in-process model was unloaded to make room.
+    pub released_in_process: bool,
     pub budget: VramBudget,
     /// Layers read from the GGUF header, or `None` when it could not be read
     /// and the planner had to assume.
@@ -103,15 +105,9 @@ pub async fn admit(
     // right for some models and wrong for most — Gemma 3 12B has 48 — and the
     // assumption scales the offload fraction, so a wrong count silently leaves
     // layers on the CPU that the plan believed were on the GPU.
-    let header = gguf_meta::read_gguf_metadata(&weights).ok();
-    let layers = header
-        .as_ref()
-        .map(|meta| meta.block_count)
-        .filter(|count| *count > 0);
-    let supports_reasoning = header
-        .as_ref()
-        .map(|meta| meta.supports_toggled_reasoning)
-        .unwrap_or(false);
+    let header = gguf_meta::capabilities(&weights);
+    let layers = header.layers;
+    let supports_reasoning = header.supports_toggled_reasoning;
 
     let installed = gpu_collector::installed_gpus()
         .iter()
@@ -132,8 +128,9 @@ pub async fn admit(
         });
     }
 
-    let budget = measure_budget(installed);
-    let plan = plan_gpu_offload(budget.bytes(), entry.weights_bytes, entry.context_length, layers);
+    let mut budget = measure_budget(installed);
+    let mut plan =
+        plan_gpu_offload(budget.bytes(), entry.weights_bytes, entry.context_length, layers);
 
     // Already comfortable, or the card is not the constraint. Nothing is
     // disturbed — an OCR server mid-document keeps its memory.
@@ -141,10 +138,50 @@ pub async fn admit(
         return Ok(Admission {
             plan,
             released: Vec::new(),
+            released_in_process: false,
             budget,
             layers,
             supports_reasoning,
         });
+    }
+
+    // The in-process model goes first, and it is usually the whole problem.
+    //
+    // ARJUN has two ways to run a model and they do not know about each other:
+    // `ai_engine::manager` loads one inside this process for the gateway, and
+    // `ModelServers` starts `llama-server` children for chat and documents.
+    // On the reported machine the startup restore loaded Qwen in-process,
+    // taking 4.3 GB, and the first chat message then started a second copy of
+    // the same model in a child — two loads of one model on an 8 GB card. The
+    // card was exhausted by ARJUN talking to itself.
+    //
+    // Released before any server because it is one contiguous reclaim of a
+    // whole model, where the servers may each be small.
+    let mut released_in_process = false;
+    if let Some(inference) = crate::ai_engine::manager::global() {
+        if inference.resident_model_id().is_some() {
+            match inference.unload_active_model_direct() {
+                Ok(()) => {
+                    log::info!(
+                        "[serving] unloaded the in-process model to make room for {}",
+                        entry.name
+                    );
+                    released_in_process = true;
+                    gpu_collector::invalidate_free_vram_cache();
+                    budget = measure_budget(installed);
+                    plan = plan_gpu_offload(
+                        budget.bytes(),
+                        entry.weights_bytes,
+                        entry.context_length,
+                        layers,
+                    );
+                }
+                Err(error) => log::warn!(
+                    "[serving] the in-process model could not be unloaded, so {} is planned                      against what is left: {error:#}",
+                    entry.name
+                ),
+            }
+        }
     }
 
     let others: Vec<String> = servers
@@ -152,10 +189,11 @@ pub async fn admit(
         .into_iter()
         .filter(|id| id != &entry.id)
         .collect();
-    if others.is_empty() {
+    if plan.full_offload || others.is_empty() {
         return Ok(Admission {
             plan,
             released: Vec::new(),
+            released_in_process,
             budget,
             layers,
             supports_reasoning,
@@ -167,8 +205,6 @@ pub async fn admit(
     // model that only needed one released is how a document read loses its
     // OCR model to a chat message.
     let mut released = Vec::new();
-    let mut budget = budget;
-    let mut plan = plan;
     for id in others {
         servers.stop(&id).await;
         gpu_collector::invalidate_free_vram_cache();
@@ -184,6 +220,7 @@ pub async fn admit(
     Ok(Admission {
         plan,
         released,
+        released_in_process,
         budget,
         layers,
         supports_reasoning,

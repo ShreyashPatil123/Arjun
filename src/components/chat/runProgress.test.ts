@@ -213,7 +213,10 @@ describe('applyProgress: the thinking row carries no reasoning', () => {
       { kind: 'thinking', state: 'active', characters: 1240, elapsedMs: 9_000 },
     ]);
     const thinking = steps[steps.length - 1];
-    expect(thinking.label).toBe('Thinking');
+    // "Reasoning" rather than "Thinking": this row lives in the Activity
+    // timeline, and the panel that shows the reasoning prose is the one called
+    // Thinking. The two used to share the word and neither was the other.
+    expect(thinking.label).toBe('Reasoning');
     expect(thinking.detail).toBe('1,240 characters so far');
   });
 

@@ -185,12 +185,20 @@ export function applyProgress(
           `${group(input.characters)} characters of private reasoning`,
         );
       }
-      // Size and duration only. The reasoning itself never reaches this file.
+      // Size and duration only. The reasoning text itself never reaches this
+      // file — it goes to the Thinking panel, which is a separate surface.
+      //
+      // Labelled "Reasoning" rather than "Thinking" because this row lives in
+      // the Activity timeline, which used to be titled "Thinking" as well. A
+      // panel called Thinking containing a step called Thinking, neither of
+      // which was the model's reasoning, is the confusion this rename ends.
+      // The row is still worth having: it marks how long the reasoning pass
+      // took, which the prose panel does not.
       const detail =
         input.characters > 0
           ? `${group(input.characters)} characters so far`
           : undefined;
-      return advance(steps, at, 'thinking', 'Thinking', detail);
+      return advance(steps, at, 'thinking', 'Reasoning', detail);
     }
 
     case 'text':
