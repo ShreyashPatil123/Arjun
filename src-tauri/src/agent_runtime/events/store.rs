@@ -35,6 +35,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use super::checkpoint::{NotResumable, RunCheckpoint};
+use super::approvals::{self, ApprovalStatus, DurableApproval};
+use super::lease::{self, Held, Lease};
 use super::idempotency::{self, EffectLookup, EffectStatus, RecordedOutcome};
 use super::machine::RunState;
 use super::model::{
@@ -208,6 +210,17 @@ impl TaskEventLog {
 
         idempotency::prepare(&conn)
             .map_err(|error| format!("could not prepare the tool effect schema: {error}"))?;
+
+        lease::prepare(&conn)
+            .map_err(|error| format!("could not prepare the run lease schema: {error}"))?;
+
+        // Everything the baseline above does not cover, applied in order and
+        // recorded in the file. Runs after the baseline on purpose: a database
+        // in the field already has the baseline tables and no version number,
+        // so the migrations must be able to assume the baseline is present.
+        let version = super::migrations::apply(&conn)
+            .map_err(|error| format!("could not migrate the task event schema: {error}"))?;
+        log::debug!("[tasks] task event schema is at version {version}");
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -491,11 +504,100 @@ impl TaskEventLog {
         let mut recovered = Vec::new();
 
         for run_id in unfinished {
+            // Whether this run could be picked up again, from the durable facts
+            // this side owns. Deliberately not the whole answer: the authority
+            // on resumability is `checkpoint::resumable_against`, which
+            // re-derives the policy, plan and workspace hashes against the
+            // world as it is now and is re-run by `agent_resume_run` before any
+            // work happens. This is the cheaper question of whether it is worth
+            // offering at all.
+            //
+            // Before this, every interrupted run was marked degraded — and
+            // `DegradedNeedsHuman` is terminal, so `resumable_against` refused
+            // it as `AlreadyEnded`. Startup was therefore closing off precisely
+            // the runs resumption exists for.
+            let snapshot = self.snapshot(&run_id).ok().flatten();
+            let attempts = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.recovery_attempts)
+                .unwrap_or(0);
+            let unsettled = snapshot
+                .as_ref()
+                .map(|snapshot| !snapshot.unknown_effects.is_empty())
+                .unwrap_or(false);
+            let has_checkpoint = matches!(self.checkpoint(&run_id), Ok(Some(_)));
+
+            // An effect nobody settled stops this outright. Continuing would
+            // either repeat it or assume it worked, and nothing here can tell
+            // which — the same rule `agent_resume_run` applies.
+            let worth_offering = has_checkpoint && !unsettled && attempts < MAX_RECOVERY_ATTEMPTS;
+
+            if worth_offering {
+                let draft = EventDraft::idempotent(
+                    &run_id,
+                    TaskEventType::RecoveryStarted,
+                    actor,
+                    "recovery",
+                )
+                .with(json!({
+                    "attempt": attempts + 1,
+                    "maxAttempts": MAX_RECOVERY_ATTEMPTS,
+                    "recoveredAt": chrono::Utc::now().to_rfc3339(),
+                }));
+                match self.record(draft) {
+                    Ok(_) => {
+                        recovered.push(run_id);
+                        continue;
+                    }
+                    Err(AppendError::AlreadyEnded { .. }) | Err(AppendError::Duplicate { .. }) => {
+                        continue
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[tasks] run {run_id} could not be offered for recovery: {error}"
+                        );
+                        // Falls through to being closed off, which is the safe
+                        // direction: a run nothing recorded as recoverable must
+                        // not be left looking live.
+                    }
+                }
+            }
+
+            // A run that has used up its attempts says so before it is closed
+            // off, so a recovery loop is visible as one rather than as a run
+            // that merely kept being interrupted.
+            if attempts >= MAX_RECOVERY_ATTEMPTS {
+                let _ = self.record(
+                    EventDraft::idempotent(
+                        &run_id,
+                        TaskEventType::RecoveryFailed,
+                        actor,
+                        "recovery-exhausted",
+                    )
+                    .with(json!({
+                        "attempts": attempts,
+                        "maxAttempts": MAX_RECOVERY_ATTEMPTS,
+                    })),
+                );
+            }
+
+            // Everything else is closed off exactly as before. The sentence
+            // says which of the reasons applies, because "somebody needs to
+            // look" is not actionable without it.
+            let why = if unsettled {
+                "A side effect was in flight when the application closed, and nobody can say whether it took effect. That has to be settled before this run is continued or relied on."
+            } else if attempts >= MAX_RECOVERY_ATTEMPTS {
+                "This run has already been picked up as many times as it is allowed to be, and was interrupted again each time. Somebody needs to look at it."
+            } else if !has_checkpoint {
+                "Interrupted: the application closed while this was still running, and it never reached a point it could be continued from. Somebody needs to look at this before it is relied on."
+            } else {
+                "Interrupted: the application closed while this was still running. Somebody needs to look at this before it is relied on."
+            };
+
             let draft =
                 EventDraft::idempotent(&run_id, TaskEventType::RunDegraded, actor, "recovery")
                     .with(json!({
-                        "failure": "Interrupted: the application closed while this was still \
-                                    running. Somebody needs to look at this before it is relied on.",
+                        "failure": why,
                         "recoveredAt": chrono::Utc::now().to_rfc3339(),
                     }));
             match self.record(draft) {
@@ -631,6 +733,139 @@ impl TaskEventLog {
             Err(error) => log::warn!("[tasks] run {run_id}: reconciliation not recorded: {error}"),
         }
         Ok(true)
+    }
+
+    // -- Leases -----------------------------------------------------------
+
+    /// Claims the right to advance a run.
+    ///
+    /// `Err(Held)` means something else is working it. The caller must not
+    /// proceed: the event log would accept both, and the work would be done
+    /// twice.
+    pub fn claim_run(
+        &self,
+        run_id: &str,
+        owner: &str,
+        term: chrono::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Result<Lease, Held>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        lease::acquire(&conn, run_id, owner, term, now).map_err(|error| error.to_string())
+    }
+
+    /// Extends a claim. `false` means the caller no longer holds it and must
+    /// stop.
+    pub fn renew_claim(
+        &self,
+        run_id: &str,
+        owner: &str,
+        fence_token: i64,
+        term: chrono::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        lease::renew(&conn, run_id, owner, fence_token, term, now)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Gives a claim up. Token-checked, so a straggler cannot release a lease
+    /// somebody else now holds.
+    pub fn release_claim(
+        &self,
+        run_id: &str,
+        owner: &str,
+        fence_token: i64,
+    ) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        lease::release(&conn, run_id, owner, fence_token).map_err(|error| error.to_string())
+    }
+
+    /// Who is working this run, if anybody. A lapsed claim reads as nobody.
+    pub fn run_holder(
+        &self,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Lease>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        lease::holder(&conn, run_id, now).map_err(|error| error.to_string())
+    }
+
+    // -- Approvals --------------------------------------------------------
+
+    /// Writes an approval request down before anybody is asked.
+    ///
+    /// Called when the request is raised rather than when it is decided, which
+    /// is the whole point: a process that dies while somebody is deciding must
+    /// leave the question behind, not just the answer it never got.
+    pub fn record_approval(&self, approval: &DurableApproval) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        approvals::record(&conn, approval).map_err(|error| error.to_string())
+    }
+
+    /// Records what a person decided.
+    ///
+    /// `false` means it was already decided and this decision did not take. The
+    /// first answer stands: it is the one somebody gave with the run stopped in
+    /// front of them.
+    pub fn resolve_approval(
+        &self,
+        approval_id: &str,
+        status: ApprovalStatus,
+        by: &str,
+        resolution: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        approvals::resolve(&conn, approval_id, status, by, resolution, at)
+            .map_err(|error| error.to_string())
+    }
+
+    /// One approval by id.
+    pub fn approval(&self, approval_id: &str) -> Result<Option<DurableApproval>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        approvals::get(&conn, approval_id).map_err(|error| error.to_string())
+    }
+
+    /// Everything still undecided, oldest first.
+    ///
+    /// What a restart has to put back in front of somebody, and the reason the
+    /// table exists.
+    pub fn pending_approvals(&self) -> Result<Vec<DurableApproval>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        approvals::pending(&conn).map_err(|error| error.to_string())
+    }
+
+    /// Every approval raised for one run, decided or not.
+    pub fn approvals_for_run(&self, run_id: &str) -> Result<Vec<DurableApproval>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        approvals::for_run(&conn, run_id).map_err(|error| error.to_string())
     }
 
     /// How a run ended, if it has.

@@ -66,6 +66,17 @@ pub enum RunState {
     ToolResultRecorded,
     /// The answer is being checked against the evidence the run actually has.
     Verifying,
+    /// The context is being compacted. A distinct state because a run that dies
+    /// here dies holding a half-projected context, and the recovery path needs
+    /// to be able to tell that from a run that died mid-tool.
+    Compacting,
+    /// The process is picking this run back up after an interruption.
+    Recovering,
+    /// Waiting on something outside ARJUN. Not `AwaitingApproval`: no person is
+    /// being asked, so nothing on the approvals screen would show it.
+    WaitingForExternalEvent,
+    /// A person stopped it without ending it, and can start it again.
+    Paused,
 
     // -- Terminal ---------------------------------------------------------
     /// Finished, with an answer.
@@ -106,6 +117,10 @@ impl RunState {
         RunState::ExecutingTool,
         RunState::ToolResultRecorded,
         RunState::Verifying,
+        RunState::Compacting,
+        RunState::Recovering,
+        RunState::WaitingForExternalEvent,
+        RunState::Paused,
         RunState::Completed,
         RunState::Cancelled,
         RunState::Failed,
@@ -128,6 +143,10 @@ impl RunState {
             RunState::ExecutingTool => "executing_tool",
             RunState::ToolResultRecorded => "tool_result_recorded",
             RunState::Verifying => "verifying",
+            RunState::Compacting => "compacting",
+            RunState::Recovering => "recovering",
+            RunState::WaitingForExternalEvent => "waiting_for_external_event",
+            RunState::Paused => "paused",
             RunState::Completed => "completed",
             RunState::Cancelled => "cancelled",
             RunState::Failed => "failed",
@@ -175,7 +194,12 @@ impl RunState {
 
     /// Whether a person needs to do something before this run can be closed.
     pub const fn needs_person(self) -> bool {
-        matches!(self, RunState::AwaitingApproval | RunState::DegradedNeedsHuman)
+        matches!(
+            self,
+            // A paused run is waiting on a person exactly as an unapproved one is;
+            // the difference is which question they have been asked.
+            RunState::AwaitingApproval | RunState::Paused | RunState::DegradedNeedsHuman
+        )
     }
 
     /// How far through the run this state is, for detecting a transition that
@@ -194,7 +218,14 @@ impl RunState {
             RunState::Running
             | RunState::AwaitingApproval
             | RunState::ExecutingTool
-            | RunState::ToolResultRecorded => 4,
+            | RunState::ToolResultRecorded
+            // Compacting, recovering, waiting and pausing are all things that
+            // happen *during* the working phase and return to it. Ranking them
+            // above `Running` would make the return look like a step backwards.
+            | RunState::Compacting
+            | RunState::Recovering
+            | RunState::WaitingForExternalEvent
+            | RunState::Paused => 4,
             RunState::Verifying => 5,
             _ => 6,
         }
@@ -213,6 +244,10 @@ impl RunState {
             RunState::ExecutingTool => "Running a tool.",
             RunState::ToolResultRecorded => "Running.",
             RunState::Verifying => "Checking the answer against the evidence.",
+            RunState::Compacting => "Summarising earlier work to make room in the context.",
+            RunState::Recovering => "Picking this back up after an interruption.",
+            RunState::WaitingForExternalEvent => "Waiting for something outside ARJUN.",
+            RunState::Paused => "Paused. It will carry on when somebody starts it again.",
             RunState::Completed => "Finished.",
             RunState::Cancelled => "Stopped, because somebody stopped it.",
             RunState::Failed => "Stopped: it did not finish.",
@@ -277,6 +312,24 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         };
     }
 
+    // Three events mean "that phase is over, carry on", and only from the state
+    // they end. Written as a pre-match rather than as arms below because the
+    // answer depends on where the run *is*, which the main match cannot see.
+    //
+    // `context_compacted` is the reason this shape exists: it has always been a
+    // `Stays`, and a run can legitimately compact from any working state. Making
+    // it unconditionally move to `Running` would drag a run that compacted
+    // mid-tool out of `ExecutingTool`, losing the fact that a tool was in
+    // flight — which is exactly what the recovery path reads.
+    match (current, event) {
+        (RunState::Compacting, E::ContextCompacted) => return Transition::To(RunState::Running),
+        (RunState::WaitingForExternalEvent, E::WaitCompleted) => {
+            return Transition::To(RunState::Running)
+        }
+        (RunState::Paused, E::RunResumed) => return Transition::To(RunState::Running),
+        _ => {}
+    }
+
     let next = match event {
         E::RunCreated => RunState::Created,
         E::RunClassified => RunState::Classified,
@@ -298,6 +351,15 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
 
         E::VerificationStarted => RunState::Verifying,
 
+        E::CompactionStarted => RunState::Compacting,
+        E::WaitStarted => RunState::WaitingForExternalEvent,
+        E::RecoveryStarted => RunState::Recovering,
+        E::RunPaused => RunState::Paused,
+        // A recovery that failed is not a failure of the *task*: nothing about
+        // the work was decided. It lands where an interruption lands, because
+        // the honest thing to say is that somebody has to look.
+        E::RecoveryFailed => RunState::DegradedNeedsHuman,
+
         E::RunCompleted => RunState::Completed,
         E::RunCancelled => RunState::Cancelled,
         E::RunFailed => RunState::Failed,
@@ -313,7 +375,6 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         E::PlanStep
         | E::PlanStopped
         | E::TurnEnded
-        | E::ContextCompacted
         | E::ArtifactProduced
         | E::ToolEffectPending
         | E::ToolEffectUnknown
@@ -329,6 +390,20 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         | E::CheckpointTaken
         | E::CheckpointFailed
         | E::RunResumed
+        // A model turn is an observation about work already under way. Putting
+        // the run into a state for it would make every turn a transition.
+        | E::ModelRequested
+        | E::ModelResponded
+        // The completion check reports; the ending event that follows decides.
+        // Keeping these apart is what stops "it was checked" being read as "it
+        // passed".
+        | E::CompletionVerified
+        // Reached when compaction finished from a state other than `Compacting`
+        // — the historical shape, where only the finish was ever recorded.
+        | E::ContextCompacted
+        // Reached only when nothing was waiting; the pre-match above handles
+        // the case where something was.
+        | E::WaitCompleted
         // Loading a skill narrows what a run may do and adds instructions to
         // its context. Neither moves the run to a different state: it is still
         // running, with a smaller tool set.
@@ -587,5 +662,109 @@ mod tests {
             let sentence = state.describe();
             assert!(sentence.ends_with('.'), "{state:?}: {sentence}");
         }
+    }
+
+    /// Compaction is a round trip: the run leaves whatever it was doing, and
+    /// `context_compacted` puts it back to work.
+    #[test]
+    fn a_run_that_compacts_goes_back_to_running() {
+        assert_eq!(
+            advance(RunState::Running, TaskEventType::CompactionStarted),
+            Transition::To(RunState::Compacting)
+        );
+        assert_eq!(
+            advance(RunState::Compacting, TaskEventType::ContextCompacted),
+            Transition::To(RunState::Running)
+        );
+    }
+
+    /// The historical shape, still legal: only the finish was ever recorded, so
+    /// a `context_compacted` with no `compaction_started` before it must not
+    /// drag the run out of the state it is actually in.
+    #[test]
+    fn compaction_finishing_from_elsewhere_does_not_move_the_run() {
+        assert_eq!(
+            advance(RunState::ExecutingTool, TaskEventType::ContextCompacted),
+            Transition::Stays
+        );
+    }
+
+    #[test]
+    fn waiting_on_something_outside_is_a_round_trip_too() {
+        assert_eq!(
+            advance(RunState::Running, TaskEventType::WaitStarted),
+            Transition::To(RunState::WaitingForExternalEvent)
+        );
+        assert_eq!(
+            advance(RunState::WaitingForExternalEvent, TaskEventType::WaitCompleted),
+            Transition::To(RunState::Running)
+        );
+    }
+
+    #[test]
+    fn a_paused_run_carries_on_when_it_is_resumed() {
+        assert_eq!(
+            advance(RunState::Running, TaskEventType::RunPaused),
+            Transition::To(RunState::Paused)
+        );
+        assert_eq!(
+            advance(RunState::Paused, TaskEventType::RunResumed),
+            Transition::To(RunState::Running)
+        );
+    }
+
+    /// A resumption of a run that was not paused restores the checkpoint's
+    /// state explicitly, so the event itself must not move anything.
+    #[test]
+    fn resuming_a_run_that_was_not_paused_moves_nothing() {
+        assert_eq!(
+            advance(RunState::Running, TaskEventType::RunResumed),
+            Transition::Stays
+        );
+    }
+
+    #[test]
+    fn recovery_that_fails_asks_for_a_person_rather_than_reporting_a_failure() {
+        assert_eq!(
+            advance(RunState::Running, TaskEventType::RecoveryStarted),
+            Transition::To(RunState::Recovering)
+        );
+        assert_eq!(
+            advance(RunState::Recovering, TaskEventType::RecoveryFailed),
+            Transition::To(RunState::DegradedNeedsHuman)
+        );
+    }
+
+    /// "It was checked" and "it passed" are different facts, so the check
+    /// reporting must not by itself end the run.
+    #[test]
+    fn the_completion_check_reporting_does_not_end_the_run() {
+        assert_eq!(
+            advance(RunState::Verifying, TaskEventType::CompletionVerified),
+            Transition::Stays
+        );
+    }
+
+    #[test]
+    fn a_model_turn_is_an_observation_not_a_transition() {
+        for event in [TaskEventType::ModelRequested, TaskEventType::ModelResponded] {
+            assert_eq!(advance(RunState::Running, event), Transition::Stays);
+        }
+    }
+
+    /// The new live states are not endings, and a paused run is one somebody
+    /// has to come back to.
+    #[test]
+    fn the_new_states_are_live_and_paused_wants_a_person() {
+        for state in [
+            RunState::Compacting,
+            RunState::Recovering,
+            RunState::WaitingForExternalEvent,
+            RunState::Paused,
+        ] {
+            assert!(!state.is_terminal(), "{state:?} must not be an ending");
+        }
+        assert!(RunState::Paused.needs_person());
+        assert!(!RunState::Compacting.needs_person());
     }
 }

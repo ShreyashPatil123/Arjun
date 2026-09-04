@@ -153,9 +153,44 @@ pub enum TaskEventType {
     /// who are not cleared for what the run was handling.
     HookEvaluated,
 
+    // -- Model turns ------------------------------------------------------
+    /// A request was put to the model. Carries counts and a digest, never the
+    /// prompt: ARJUN design rule 14 keeps message content out of a record more
+    /// people can read than could read the original.
+    ModelRequested,
+    /// The model answered. Same rule: how much came back, not what it said.
+    ModelResponded,
+
+    // -- Compaction -------------------------------------------------------
+    /// Compaction is beginning. Paired with `context_compacted`, which reports
+    /// that it finished — before this existed only the finish was recorded, so
+    /// a run that died *during* compaction left no trace of having tried.
+    CompactionStarted,
+
+    // -- Waiting on something outside the run -----------------------------
+    /// The run is waiting on something no part of ARJUN controls.
+    WaitStarted,
+    /// What it was waiting for happened.
+    WaitCompleted,
+
+    // -- Recovery ---------------------------------------------------------
+    /// A recovery attempt is starting. Distinct from `run_resumed`, which is a
+    /// person choosing to continue: this is the process deciding to.
+    RecoveryStarted,
+    /// Recovery was attempted and did not succeed.
+    RecoveryFailed,
+
     // -- Verification -----------------------------------------------------
     /// The answer is being checked against the evidence the run actually holds.
     VerificationStarted,
+    /// The completion check finished, and this is what it concluded. Carries
+    /// the per-criterion verdicts, so "it said it was done" and "it was checked
+    /// to be done" are different rows in the history.
+    CompletionVerified,
+
+    // -- Pausing ----------------------------------------------------------
+    /// A person stopped the run without ending it.
+    RunPaused,
 
     // -- Endings ----------------------------------------------------------
     /// The loop finished and an answer was produced.
@@ -226,7 +261,16 @@ impl TaskEventType {
             TaskEventType::ApprovalRequested => "approval_requested",
             TaskEventType::ApprovalDecided => "approval_decided",
             TaskEventType::HookEvaluated => "hook_evaluated",
+            TaskEventType::ModelRequested => "model_requested",
+            TaskEventType::ModelResponded => "model_responded",
+            TaskEventType::CompactionStarted => "compaction_started",
+            TaskEventType::WaitStarted => "wait_started",
+            TaskEventType::WaitCompleted => "wait_completed",
+            TaskEventType::RecoveryStarted => "recovery_started",
+            TaskEventType::RecoveryFailed => "recovery_failed",
             TaskEventType::VerificationStarted => "verification_started",
+            TaskEventType::CompletionVerified => "completion_verified",
+            TaskEventType::RunPaused => "run_paused",
             TaskEventType::RunCompleted => "run_completed",
             TaskEventType::RunFailed => "run_failed",
             TaskEventType::RunCancelled => "run_cancelled",
@@ -273,7 +317,16 @@ impl TaskEventType {
             "approval_requested" => TaskEventType::ApprovalRequested,
             "approval_decided" => TaskEventType::ApprovalDecided,
             "hook_evaluated" => TaskEventType::HookEvaluated,
+            "model_requested" => TaskEventType::ModelRequested,
+            "model_responded" => TaskEventType::ModelResponded,
+            "compaction_started" => TaskEventType::CompactionStarted,
+            "wait_started" => TaskEventType::WaitStarted,
+            "wait_completed" => TaskEventType::WaitCompleted,
+            "recovery_started" => TaskEventType::RecoveryStarted,
+            "recovery_failed" => TaskEventType::RecoveryFailed,
             "verification_started" => TaskEventType::VerificationStarted,
+            "completion_verified" => TaskEventType::CompletionVerified,
+            "run_paused" => TaskEventType::RunPaused,
             "run_completed" => TaskEventType::RunCompleted,
             "run_failed" => TaskEventType::RunFailed,
             "run_cancelled" => TaskEventType::RunCancelled,

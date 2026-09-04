@@ -695,7 +695,37 @@ impl ConversationStore {
                 msg.verification = verification.map(str::to_string);
             }
         }
-        if let Some(run) = conversation.runs.iter_mut().find(|r| r.run_id == run_id) {
+        // Found by message, then corrected to the runtime's own id.
+        //
+        // The entry was created by `append_user_turn` with the id the chat
+        // surface generated *before* the run existed. The runtime then issues
+        // its own, and that is the id the task record, the audit trail and the
+        // context ledger are all filed under. Matching on `run_id` here
+        // therefore never matched anything, and two things followed from it,
+        // both silent:
+        //
+        //  - Every run stayed `live: true` for ever, because this is the only
+        //    place that clears it.
+        //  - The context meter in the composer read "No context yet" on every
+        //    conversation, because it looks the ledger up by the id it finds
+        //    here and that id addressed no task record.
+        //
+        // `message_id` is the stable identifier across both sides: the surface
+        // reserves it, the runtime is handed it, and every streaming event
+        // carries it. Matching on it and then writing the runtime's id back is
+        // what makes the two halves agree from here on.
+        // Index first, so the fallback search does not hold a second mutable
+        // borrow of the same vector.
+        let at = conversation
+            .runs
+            .iter()
+            .position(|r| r.message_id == message_id)
+            // A record written before this fix has no reconciled id yet, so the
+            // old comparison is kept as a fallback rather than leaving those
+            // conversations permanently live.
+            .or_else(|| conversation.runs.iter().position(|r| r.run_id == run_id));
+        if let Some(run) = at.and_then(|at| conversation.runs.get_mut(at)) {
+            run.run_id = run_id.to_string();
             run.finished_at = Some(now.clone());
             run.live = false;
             run.model_name = model_name.map(str::to_string);

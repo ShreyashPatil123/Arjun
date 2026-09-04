@@ -365,6 +365,35 @@ export async function startRun(
       systemPrompt: request.systemPrompt,
       model,
       tools,
+      /**
+       * Why this is set at all, and why it decides whether anything streams.
+       *
+       * `Agent` defaults `thinkingLevel` to `"off"`. That value is not just a
+       * display preference — it flows into the transport and decides whether
+       * the model's reasoning is *forwarded at all*:
+       *
+       *   thinkingLevel "off"
+       *     -> resolveAgentReasoningOption returns the off fallback
+       *     -> streamSimpleOpenAICompletions computes reasoningEffort = undefined
+       *     -> shouldEmitReasoning = false
+       *     -> every reasoning delta is dropped, and the partitioner that
+       *        watches for reasoning tags holds the visible text back with it.
+       *
+       * The consequence, measured on this machine: a Qwen3.5-9B turn that
+       * reasoned for fifty-seven seconds delivered its whole 342-character
+       * answer as a *single* `text_delta`, with no reasoning events at all.
+       * The event census the translator writes read `text_delta=1 text_end=1
+       * text_start=1`. Nothing streamed because nothing was being sent.
+       *
+       * The model reasons either way — that was confirmed by reading the raw
+       * SSE off llama-server, which emitted sixty-two `reasoning_content`
+       * frames with `content` null throughout. So this does not make the model
+       * do more work. It stops ARJUN throwing away work already done.
+       *
+       * `"off"` for a model whose chat template has no reasoning switch, which
+       * is the honest answer for it and keeps the request unchanged.
+       */
+      thinkingLevel: request.model.supportsReasoning ? "medium" : "off",
     },
     beforeToolCall: (context) => authorizeToolCall(peer, ledger, runId, context),
     /**

@@ -453,6 +453,16 @@ const STATUS_ICONS: Record<
 interface Props {
   state: RunViewState;
   onAbort: () => void;
+  /**
+   * True once a stop has been sent and the run has not yet acknowledged it.
+   *
+   * The button needs this because sending an abort and the run actually
+   * ending are two different moments, and only the second one is worth
+   * telling somebody about. A Stop that goes back to reading "Stop" the
+   * instant the IPC resolves reports that the request was delivered while
+   * looking exactly like it reports that the run has ended.
+   */
+  stopping?: boolean;
   onNewTask: () => void;
   /**
    * Re-run the same prompt. Rendered as a "Rerun" button when the run
@@ -463,7 +473,7 @@ interface Props {
   onRerun?: () => void;
 }
 
-export const RunView = ({ state, onAbort, onNewTask, onRerun }: Props) => {
+export const RunView = ({ state, onAbort, onNewTask, onRerun, stopping = false }: Props) => {
   const running = state.phase === 'starting' || state.phase === 'running';
   const summary = state.summary;
 
@@ -482,9 +492,14 @@ export const RunView = ({ state, onAbort, onNewTask, onRerun }: Props) => {
             </button>
           )}
           {running ? (
-            <button className={styles.stopBtn} onClick={onAbort}>
+            <button
+              className={styles.stopBtn}
+              onClick={onAbort}
+              disabled={stopping}
+              aria-busy={stopping || undefined}
+            >
               <X size={14} />
-              <span>Stop</span>
+              <span>{stopping ? 'Stopping…' : 'Stop'}</span>
             </button>
           ) : (
             <button className={styles.newBtn} onClick={onNewTask}>

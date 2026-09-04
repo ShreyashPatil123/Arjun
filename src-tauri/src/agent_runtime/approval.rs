@@ -77,8 +77,10 @@ impl ApprovalOutcome {
 }
 
 /// Puts a proposed action in front of a person and waits for their answer.
+#[allow(clippy::too_many_arguments)]
 pub async fn await_decision(
     queue: &Arc<ApprovalQueue>,
+    events: &Arc<crate::agent_runtime::events::TaskEventLog>,
     session: &Session,
     run_id: &str,
     tool: ToolName,
@@ -87,6 +89,32 @@ pub async fn await_decision(
     arguments: Vec<String>,
 ) -> ApprovalOutcome {
     let id = uuid::Uuid::new_v4().to_string();
+    let asked_at = chrono::Utc::now();
+
+    // Written down before the queue is touched, so a process that dies while
+    // somebody is deciding leaves the question behind. The queue is memory and
+    // goes with the process; this does not.
+    //
+    // The arguments are stored as the approver reads them, and fingerprinted,
+    // so a resumption can tell whether the call it is about to make is the one
+    // that was actually approved.
+    let durable = crate::agent_runtime::events::DurableApproval::requested(
+        id.clone(),
+        run_id,
+        tool.as_str(),
+        target.clone(),
+        &serde_json::json!({ "tool": tool.as_str(), "arguments": arguments }),
+        summary.clone(),
+        asked_at,
+        None,
+    );
+    if let Err(error) = events.record_approval(&durable) {
+        // Not fatal. An approval that is not durable is worse than one that is,
+        // and far better than refusing to ask at all — the person is still
+        // asked, and the run still stops until they answer.
+        log::warn!("[tasks] run {run_id}: approval {id} was not recorded durably: {error}");
+    }
+
     queue.request(ApprovalRequest {
         id: id.clone(),
         task_id: run_id.to_string(),
@@ -100,7 +128,7 @@ pub async fn await_decision(
         expected_output: summary,
         consequences: tool.describe().to_string(),
         requested_by: session.user.id.clone(),
-        requested_at: chrono::Utc::now(),
+        requested_at: asked_at,
     });
 
     let deadline = tokio::time::Instant::now() + WAIT_LIMIT;
@@ -126,6 +154,15 @@ mod tests {
     use super::*;
     use crate::identity::{Role, User};
 
+    /// An in-memory event log for the tests. The durable write is not what
+    /// these cases are about, and a real file would make them touch the disk.
+    fn log() -> Arc<crate::agent_runtime::events::TaskEventLog> {
+        Arc::new(
+            crate::agent_runtime::events::TaskEventLog::in_memory()
+                .expect("an in-memory task event log"),
+        )
+    }
+
     fn approver() -> Session {
         // In the 2-role model, an Employee holds `ApproveOutput`. The
         // approver and the author are deliberately different sessions,
@@ -145,6 +182,7 @@ mod tests {
             tokio::spawn(async move {
                 await_decision(
                     &queue,
+                    &log(),
                     &author(),
                     "run-1",
                     ToolName::WriteScopedFile,
@@ -179,6 +217,7 @@ mod tests {
             tokio::spawn(async move {
                 await_decision(
                     &queue,
+                    &log(),
                     &author(),
                     "run-1",
                     ToolName::WriteScopedFile,
@@ -222,6 +261,7 @@ mod tests {
             tokio::spawn(async move {
                 await_decision(
                     &queue,
+                    &log(),
                     &author(),
                     "run-42",
                     ToolName::CreateDocx,

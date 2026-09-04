@@ -1142,6 +1142,22 @@
 }
 .inspectorClose:hover { background: var(--bg-hover); }
 
+/* A stop that was sent and never acknowledged.
+ *
+ * Warning-toned rather than error-toned, and the distinction is the whole
+ * message: nothing has failed for certain. The request went out and this
+ * screen cannot confirm the run ended, which is a different thing from
+ * knowing it did not. */
+.inspectorNotice {
+  margin: 0;
+  padding: 10px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--warning-bg, #422006);
+  color: var(--warning, #fbbf24);
+  border-bottom: 1px solid var(--border);
+}
+
 .inspectorBody {
   flex: 1;
   min-height: 0;
@@ -2311,5 +2327,20 @@
   margin: 8px 0 0;
   font-size: 11px;
   line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+/*
+ * The empty-state line inside the context card.
+ *
+ * Says when the meter will fill rather than only that it has not, because the
+ * question a person has when they open an empty panel is "is this broken?" and
+ * "after your next message" answers it.
+ */
+.contextEmptyNote {
+  margin: 0;
+  padding: 10px 12px 12px;
+  font-size: 11.5px;
+  line-height: 1.55;
   color: var(--text-tertiary);
 }

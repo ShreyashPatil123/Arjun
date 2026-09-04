@@ -14,7 +14,7 @@ the day after it is written.
 
 Agent runtime bundle `agent-runtime/dist/arjun-agent-runtime.mjs`
 
-SHA-256 `d87b7f0eea8418d7528a3f18a823f89d78bc9ee7dac8da6e1b92cec6a548ee19`
+SHA-256 `64435c81e17a04a4cb89a0c7fb91f4daf91bef9a0408d80259c9158acca18b52`
 
 ## Gaps, stated rather than hidden
 

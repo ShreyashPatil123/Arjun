@@ -37,13 +37,28 @@
 //! in an event stream. The two answer different questions, and old records
 //! stay readable because nothing about them changed.
 
+/// How many times the process may pick a run back up by itself before it stops
+/// trying and asks a person.
+///
+/// Recovery has to be bounded or a run that fails during recovery is recovered
+/// again, fails again, and the loop is only visible as a growing event log. The
+/// ceiling is low on purpose: a run that could not be picked up twice is not
+/// going to be picked up on the third attempt for any reason this side can act
+/// on.
+pub const MAX_RECOVERY_ATTEMPTS: u32 = 2;
+
+pub mod approvals;
 pub mod checkpoint;
 pub mod idempotency;
+pub mod lease;
 pub mod machine;
+mod migrations;
 pub mod model;
 pub mod projection;
 pub mod store;
 
+pub use approvals::{ApprovalInvalid, ApprovalStatus, DurableApproval};
+pub use lease::{Held, Lease, DEFAULT_LEASE_SECONDS, HEARTBEAT_SECONDS};
 pub use checkpoint::{
     NotResumable, Resumability, RunCheckpoint, WorldNow, CHECKPOINT_SCHEMA_VERSION,
 };

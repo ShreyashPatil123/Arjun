@@ -87,17 +87,46 @@ export function ContextChip() {
   // rows worth showing — that is the whole of the first turn, and a meter that
   // stays idle through it is blank exactly while somebody is watching it.
   if ((!ledger || ledger.committed === 0) && rows.length === 0) {
+    // Expands, because it used to only pretend to.
+    //
+    // This branch returned the button alone while still toggling `open`, and
+    // the card that reads `open` lives past the guard below — so clicking the
+    // idle chip flipped a flag that nothing rendered. It looked frozen, which
+    // is worse than looking disabled: a control that does nothing when pressed
+    // reads as a broken application rather than as an empty state.
     return (
-      <button
-        type="button"
-        className={styles.contextChipIdle}
-        onClick={() => setOpen(o => !o)}
-        aria-expanded={open}
-        title="Context usage"
-      >
-        <Database size={11} />
-        <span>No context yet</span>
-      </button>
+      <div className={styles.contextChipWrap}>
+        <button
+          type="button"
+          className={styles.contextChipIdle}
+          onClick={() => setOpen(o => !o)}
+          aria-expanded={open}
+          title="Context usage"
+        >
+          <Database size={11} />
+          <span>No context yet</span>
+        </button>
+        {open && (
+          <div className={styles.contextCard} role="dialog" aria-label="Context breakdown">
+            <div className={styles.contextCardHeader}>
+              <span>Context</span>
+              <button
+                type="button"
+                className={styles.contextCardClose}
+                onClick={() => setOpen(false)}
+                aria-label="Close"
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <p className={styles.contextEmptyNote}>
+              Nothing has been measured yet. The window is itemised from the
+              first model call of a turn, so this fills in once you send a
+              message — and stays filled for the rest of the conversation.
+            </p>
+          </div>
+        )}
+      </div>
     );
   }
 

@@ -13,7 +13,6 @@ import {
   FolderOpen,
   Loader2,
   RotateCcw,
-  ShieldCheck,
   X,
 } from 'lucide-react';
 import {
@@ -92,6 +91,30 @@ function tokenTitle(metrics: TokenMetrics): string {
   return parts.join(' · ');
 }
 
+/**
+ * The icon for one status.
+ *
+ * Shared by the status pill and the run footer so the two cannot drift. They
+ * already had: the pill was rewritten to derive its state from what was
+ * recorded, and the footer was left rendering a hard-coded shield and the word
+ * "verified" for every turn that had a run id — including failures, runs a
+ * person stopped, and runs the verifier never looked at. One component, two
+ * rules, and only one of them true.
+ */
+function StatusIcon({ state, size }: { state: MessageStatusKind; size: number }) {
+  if (state === 'thinking' || state === 'usingTool' || state === 'composing') {
+    return <Loader2 size={size} className={styles.spin} />;
+  }
+  // The tick is reserved for the one state that earned it: the verifier ran
+  // and every claim resolved.
+  if (state === 'verified') return <CheckCircle2 size={size} />;
+  if (state === 'failed') return <X size={size} />;
+  // Finished, but not certified: needs review, unverified, stopped, or
+  // completed with nothing to check. None of those is a failure and none of
+  // them is a pass.
+  return <CircleDashed size={size} />;
+}
+
 function StatusPill({
   state,
   elapsedText,
@@ -111,20 +134,7 @@ function StatusPill({
 
   return (
     <span className={styles.statusPill} data-state={state}>
-      {state === 'thinking' || state === 'usingTool' || state === 'composing' ? (
-        <Loader2 size={11} className={styles.spin} />
-      ) : state === 'verified' ? (
-        // The tick is reserved for the one state that earned it: the verifier
-        // ran and every claim resolved.
-        <CheckCircle2 size={11} />
-      ) : state === 'failed' ? (
-        <X size={11} />
-      ) : (
-        // Finished, but not certified: needs review, unverified, stopped, or
-        // completed with nothing to check. None of those is a failure and none
-        // of them is a pass.
-        <CircleDashed size={11} />
-      )}
+      <StatusIcon state={state} size={11} />
       <span>{labels[state]}</span>
       {elapsedText && <span className={styles.statusPillSub}>· {elapsedText}</span>}
       {(state === 'composing' ||
@@ -427,8 +437,8 @@ export function AssistantMessageCell({
               <span className={styles.assistantFooterMeta}>
                 {toolsTotal > 0 && <>{toolsTotal} tool{toolsTotal === 1 ? '' : 's'} · </>}
                 {runSummary && <>{runSummary.plan.steps.length} step{runSummary.plan.steps.length === 1 ? '' : 's'} · </>}
-                <ShieldCheck size={10} />
-                <span>verified</span>
+                <StatusIcon state={status} size={10} />
+                <span>{MESSAGE_STATUS_LABELS[status].toLowerCase()}</span>
               </span>
             </div>
           )}

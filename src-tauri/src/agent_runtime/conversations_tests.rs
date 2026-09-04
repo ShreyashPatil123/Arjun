@@ -759,3 +759,71 @@ mod degraded_storage {
         assert_eq!(ephemeral["directory"], "/tmp/x");
     }
 }
+
+/// The run the surface opened and the run the runtime issued are the same run.
+///
+/// The chat surface generates a run id before the run exists, and the runtime
+/// then issues its own. The task record, the audit trail and the context ledger
+/// are all filed under the runtime's. Completion is where the two are
+/// reconciled — and while it matched on `run_id` it reconciled nothing:
+///
+///  - every run stayed `live: true`, because this is the only place that
+///    clears it;
+///  - the context meter read "No context yet" on every conversation, because
+///    it resolves the ledger through the id recorded here.
+///
+/// Measured on the reported machine before the fix: three runs in one
+/// conversation, all still `live`, none of whose ids addressed a task record.
+#[test]
+fn completion_reconciles_the_surface_run_id_to_the_runtime_one() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+    let conv = store
+        .create("Test".to_string(), "Welcome.".to_string(), OWNER)
+        .expect("create");
+
+    let surface_run_id = "client-generated-run";
+    let assistant_message_id = "a-msg-1";
+    store
+        .append_user_turn(&conv.id, "hello", assistant_message_id, surface_run_id, OWNER)
+        .expect("append")
+        .expect("found");
+
+    // The runtime issues its own id, and that is what completion carries.
+    let runtime_run_id = "runtime-issued-run";
+    let updated = store
+        .record_message_completion(
+            &conv.id,
+            assistant_message_id,
+            runtime_run_id,
+            MessageCompletion {
+                final_content: Some("hi"),
+                elapsed_ms: Some(10),
+                model_name: Some("some-model"),
+                model_role: None,
+                used_fallback: None,
+                error: None,
+                outcome: None,
+                verification: None,
+                failed: false,
+                tokens_in: None,
+                tokens_out: None,
+            },
+            OWNER,
+        )
+        .expect("complete")
+        .expect("found");
+
+    let run = updated
+        .runs
+        .iter()
+        .find(|r| r.message_id == assistant_message_id)
+        .expect("the run the turn opened is still there");
+
+    assert_eq!(
+        run.run_id, runtime_run_id,
+        "the id recorded must be the one the task record is filed under"
+    );
+    assert!(!run.live, "a finished run must not stay marked live");
+    assert!(run.finished_at.is_some(), "a finished run must carry when");
+}

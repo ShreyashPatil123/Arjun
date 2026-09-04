@@ -241,23 +241,12 @@ impl DocumentService {
     /// Spawns the document sidecar.
     pub fn spawn(app_data_dir: &Path) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let candidates = vec![
-            app_data_dir.join("sidecars").join("document_sidecar").join("main.py"),
-            cwd.join("sidecars").join("document_sidecar").join("main.py"),
-            cwd.join("src-tauri").join("sidecars").join("document_sidecar").join("main.py"),
-            cwd.parent()
-                .map(|p| p.join("sidecars").join("document_sidecar").join("main.py"))
-                .unwrap_or_default(),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("sidecars").join("document_sidecar").join("main.py")))
-                .unwrap_or_default(),
-        ];
-
-        let script = candidates
-            .into_iter()
-            .find(|p| !p.as_os_str().is_empty() && p.exists())
-            .ok_or_else(|| anyhow!("the document sidecar was not found (looked from {cwd:?})"))?;
+        // Resolved through `deployment`, which tries the installer's resource
+        // directory first. The list this replaced started from
+        // `current_dir()`, which is the repository in a checkout and an
+        // arbitrary directory under an installed build — so the sidecar was
+        // reliably found only on machines that had the source tree.
+        let script = crate::deployment::require_path("document-sidecar").map_err(|e| anyhow!(e))?;
 
         let script_dir = script.parent().unwrap_or(&cwd).to_path_buf();
 
@@ -278,7 +267,7 @@ impl DocumentService {
         }
 
         // Hidden, or a console window pops open every launch in the GUI build.
-        let mut command = create_hidden_command("python");
+        let mut command = create_hidden_command(crate::deployment::program("python"));
         command.arg(&script);
         command.env("PYTHONPATH", &script_dir);
         command.stdin(Stdio::piped());

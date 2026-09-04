@@ -197,13 +197,22 @@ async fn each_routed_model_resolves_to_a_loopback_endpoint_on_its_own_runtime() 
     let launch = plan_launch(
         coding,
         &PathBuf::from("/models/qwen2.5-coder-7b-q4.gguf"),
-        // No multimodal projector: this is a text coding model. The argument
-        // was added to `plan_launch` and never here, so this whole integration
-        // test has not compiled since — which is why `npm run test:integration`
-        // could not be green on a clean checkout.
+        // No multimodal projector: this is a text coding model. Arguments have
+        // been added to `plan_launch` and not here before, which is how this
+        // whole integration test stopped compiling and `npm run
+        // test:integration` stopped being green on a clean checkout.
         None,
         &coding_plan,
         18080,
+        // `auto_fit` false: in production this is
+        // `llama_server_fits_layers_itself()`, which shells out to
+        // `llama-server --help` to find out whether this build accepts
+        // `--n-gpu-layers auto`. A test that called it would produce a
+        // different command line on a machine that has the binary than on one
+        // that does not, and there is no llama-server in CI. Passing the
+        // answer explicitly keeps the plan deterministic — the same choice
+        // every unit test in `serving` makes.
+        false,
     );
 
     // The two arguments that matter for sovereignty and for correctness.

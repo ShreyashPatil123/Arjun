@@ -333,23 +333,44 @@ fn validate_attachment(name: &str, mime: &str, len: usize) -> Result<AttachmentK
 }
 
 /// Where the one-shot document extractor lives.
-fn extractor_script() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let rel = ["sidecars", "document_sidecar", "attachment_extract.py"];
-    let mut candidates = vec![cwd.iter().collect::<PathBuf>()];
-    candidates.clear();
-    candidates.push(rel.iter().collect());
-    candidates.push(cwd.join(rel.iter().collect::<PathBuf>()));
-    candidates.push(cwd.join("src-tauri").join(rel.iter().collect::<PathBuf>()));
-    if let Some(parent) = cwd.parent() {
-        candidates.push(parent.join(rel.iter().collect::<PathBuf>()));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(rel.iter().collect::<PathBuf>()));
-        }
-    }
-    candidates.into_iter().find(|p| p.exists())
+///
+/// Delegated to [`crate::deployment`], which tries the installer's resource
+/// directory before the checkout. The candidate list this replaced walked
+/// outwards from `current_dir()` — the repository root when a developer runs
+/// `tauri dev`, and whatever directory Windows felt like when the installed app
+/// starts from a Start menu shortcut. So the extractor was found on every
+/// machine that had the source tree, and on no machine that had only the
+/// installer.
+fn extractor_script() -> Result<PathBuf, String> {
+    crate::deployment::require_path("document-extractor")
+}
+
+/// How the extractor handled one page of a PDF.
+///
+/// One of these per page, in page order, every page present. `page` is the
+/// number the person sees on the document, which is why the merge below keys
+/// on it rather than on a position in a list: when only some pages are
+/// rendered, a position in the rendered subset is not a page number, and
+/// labelling OCR output by position reported page 5 of a scan as page 1.
+#[derive(Debug, Clone, Deserialize)]
+struct PageDetail {
+    page: u32,
+    /// `text` — read from the PDF's own text layer.
+    /// `ocr` — rendered to an image for the OCR model.
+    /// `unread` — neither was possible; `why` says what happened.
+    source: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    image: Option<PathBuf>,
+    /// Sub-threshold text the page did carry, if any.
+    ///
+    /// Used only when OCR comes back empty. A page holding "Figure 3
+    /// continued" over an illegible scan should report that much.
+    #[serde(default, rename = "layerText")]
+    layer_text: String,
+    #[serde(default)]
+    why: String,
 }
 
 /// What the extractor reported about one file.
@@ -360,12 +381,105 @@ struct Extracted {
     text: String,
     #[serde(default)]
     pages: u32,
-    #[serde(default, rename = "pageImages")]
-    page_images: Vec<PathBuf>,
+    /// Present for PDFs only, and then for every page.
+    ///
+    /// Supersedes the old `pageImages` list, which said which pages had been
+    /// rendered and nothing about the rest — so a page that was neither read
+    /// nor rendered simply did not appear anywhere, and the difference between
+    /// "blank" and "skipped" was unrecoverable on this side.
+    #[serde(default, rename = "pageDetail")]
+    page_detail: Vec<PageDetail>,
     #[serde(default)]
     truncated: bool,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// The pages the extractor already read, and the ones it could not.
+///
+/// Split out from the read loop so it can be tested without an application: it
+/// is the half of the merge that decides which pages exist at all, and the
+/// reported bug was a page that existed and appeared in neither list.
+fn seed_from_detail(
+    detail: &[PageDetail],
+) -> (std::collections::BTreeMap<u32, String>, Vec<(u32, String)>) {
+    let mut by_page = std::collections::BTreeMap::new();
+    let mut unread = Vec::new();
+    for page in detail {
+        match page.source.as_str() {
+            "text" if !page.text.trim().is_empty() => {
+                by_page.insert(page.page, page.text.trim().to_string());
+            }
+            // A text page with nothing on it is a page nothing was made of,
+            // which is the thing this whole change exists to stop losing.
+            "text" => unread.push((page.page, "it has nothing on it".to_string())),
+            "unread" => unread.push((page.page, page.why.clone())),
+            _ => {}
+        }
+    }
+    (by_page, unread)
+}
+
+/// What one page is worth once the model has had its turn.
+///
+/// `Ok` is the text to keep for the page; `Err` is the reason it counts as
+/// unread. The empty case is the one that matters: a rendered page the model
+/// made nothing of used to be dropped here without a word — the same silence
+/// as the whole-file misclassification, one page down. A blank scan and a page
+/// that was never looked at produce identical output if neither is mentioned.
+fn settle_ocr_page(ocr_text: &str, layer_text: &str) -> Result<String, String> {
+    if !ocr_text.trim().is_empty() {
+        return Ok(ocr_text.trim().to_string());
+    }
+    if !layer_text.trim().is_empty() {
+        // The model saw nothing, but the page did carry something.
+        return Ok(layer_text.trim().to_string());
+    }
+    Err("it was read but nothing could be made out on it".to_string())
+}
+
+/// Turns the read pages into the text the model sees.
+///
+/// Two rules, both from the failure this replaced. Pages come out in document
+/// order carrying their own numbers, so a citation to "page 4" means page 4 of
+/// the file the person is holding. And every page that could not be read is
+/// named, because an answer written over a document with a silent hole in it
+/// is indistinguishable from one written over the whole thing.
+fn assemble_pdf_text(
+    by_page: std::collections::BTreeMap<u32, String>,
+    mut unread: Vec<(u32, String)>,
+    pages: u32,
+) -> String {
+    let mut parts: Vec<String> = by_page
+        .iter()
+        .map(|(page, text)| {
+            if pages > 1 {
+                format!("--- page {page} of {pages} ---\n{text}")
+            } else {
+                text.clone()
+            }
+        })
+        .collect();
+
+    if !unread.is_empty() {
+        unread.sort_by_key(|(page, _)| *page);
+        unread.dedup_by_key(|(page, _)| *page);
+        let listed = unread
+            .iter()
+            .map(|(page, why)| format!("page {page} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Said plainly rather than letting an answer describe a document as
+        // though all of it had been read.
+        parts.push(format!(
+            "({} of the {} pages could not be read: {}. Nothing above comes from them, so do \
+             not describe what is on them.)",
+            unread.len(),
+            pages,
+            listed
+        ));
+    }
+    parts.join("\n\n")
 }
 
 /// What the UI shows while a document is being read.
@@ -504,11 +618,6 @@ async fn ocr_one_image(
         .ok_or_else(|| format!("{model_id} is not in the registry, so images cannot be read."))?
         .clone();
 
-    let vram = crate::system_analyzer::gpu_collector::installed_gpus()
-        .iter()
-        .map(|gpu| gpu.dedicated_video_memory_bytes)
-        .max()
-        .unwrap_or(0);
     // Budgeted against free VRAM with the model's own layer count, and any
     // other server released only if this one will not otherwise fit. See
     // `serving::admission`.
@@ -623,15 +732,24 @@ async fn ocr_one_image(
 /// sidecar: this needs no state between calls, and a crash in a PDF parser
 /// then takes nothing else down with it.
 fn run_extractor(path: &std::path::Path, out_dir: &std::path::Path) -> Result<Extracted, String> {
-    let script = extractor_script().ok_or_else(|| {
-        "the document extractor was not found next to the application".to_string()
-    })?;
-    let output = crate::system_analyzer::process_utils::create_hidden_command("python")
+    let script = extractor_script()?;
+    let python = crate::deployment::dependency("python");
+    let output = crate::system_analyzer::process_utils::create_hidden_command(
+        crate::deployment::program("python"),
+    )
         .arg(&script)
         .arg(path)
         .arg(out_dir)
         .output()
-        .map_err(|e| format!("the document extractor could not be started: {e}"))?;
+        // The spawn is the probe. A failure here is almost always a machine
+        // with no interpreter rather than a broken extractor, so the remedy
+        // for the interpreter is what the user needs to read.
+        .map_err(|e| {
+            format!(
+                "the document extractor could not be started: {e}. {}",
+                python.remedy
+            )
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout
         .lines()
@@ -743,9 +861,9 @@ pub async fn read_attachment(
             read_kind = extracted.kind.clone();
             read_pages = pages;
 
-            if extracted.page_images.is_empty() {
-                // A text layer, a spreadsheet, a Word file, a plain text file.
-                // No model was needed to read it, and none was used.
+            if extracted.page_detail.is_empty() {
+                // Not a PDF: a spreadsheet, a Word file, a deck, plain text.
+                // One blob, no pages to put in order, and no model was used.
                 progress(
                     app,
                     tag,
@@ -755,47 +873,90 @@ pub async fn read_attachment(
                     Some(pages),
                     Some(extracted.kind.clone()),
                 );
-                extracted.text
+                let mut blob = extracted.text;
+                if extracted.truncated {
+                    // The spreadsheet and deck readers have always reported
+                    // this, and nothing here has ever repeated it: a workbook
+                    // cut off at its row cap read as a workbook that ended
+                    // there. Silence about what was dropped is the same failure
+                    // the page merge below exists to fix.
+                    blob.push_str(
+                        "\n\n(this file was longer than the reader's limit, so it was cut off \
+                         here — do not describe it as complete)",
+                    );
+                }
+                blob
             } else {
-                // A scan. Each rendered page goes to the OCR model, and the
-                // counter the UI shows is this loop's real position.
-                let mut parts = Vec::new();
-                let total = extracted.page_images.len() as u32;
-                read_pages = total;
-                ocr_model = Some(ocr_model_id(detent).to_string());
-                for (index, image) in extracted.page_images.iter().enumerate() {
+                // A PDF, handled page by page.
+                //
+                // The merge happens here rather than in the extractor because
+                // only this side has the OCR output. Keyed on the real page
+                // number throughout, so a document whose second page is a scan
+                // reports it as page 2 rather than as page 1 of the rendered
+                // subset.
+                let (mut by_page, mut unread) = seed_from_detail(&extracted.page_detail);
+
+                let to_read: Vec<&PageDetail> = extracted
+                    .page_detail
+                    .iter()
+                    .filter(|detail| detail.source == "ocr")
+                    .collect();
+
+                if to_read.is_empty() {
+                    // Every page had a text layer. No model was needed.
                     progress(
                         app,
                         tag,
                         &attachment.name,
-                        "understanding",
-                        Some(index as u32 + 1),
-                        Some(total),
+                        "extracting",
+                        None,
+                        Some(pages),
                         Some(extracted.kind.clone()),
                     );
-                    let page_text = ocr_one_image(
-                        app,
-                        registry,
-                        servers,
-                        image,
-                        detent,
-                        &attachment.name,
-                        index as u32 + 1,
-                        total,
-                    )
-                    .await?;
-                    if !page_text.trim().is_empty() {
-                        parts.push(format!("--- page {} ---\n{}", index + 1, page_text.trim()));
+                } else {
+                    ocr_model = Some(ocr_model_id(detent).to_string());
+                    // The counter counts the pages actually going to the model,
+                    // which is the work being waited on. The page *labels*
+                    // below carry the document's own numbering.
+                    let queued = to_read.len() as u32;
+                    for (index, detail) in to_read.iter().enumerate() {
+                        let Some(image) = detail.image.as_ref() else {
+                            unread.push((
+                                detail.page,
+                                "it was marked for reading but no image was produced".to_string(),
+                            ));
+                            continue;
+                        };
+                        progress(
+                            app,
+                            tag,
+                            &attachment.name,
+                            "understanding",
+                            Some(index as u32 + 1),
+                            Some(queued),
+                            Some(extracted.kind.clone()),
+                        );
+                        let page_text = ocr_one_image(
+                            app,
+                            registry,
+                            servers,
+                            image,
+                            detent,
+                            &attachment.name,
+                            detail.page,
+                            pages,
+                        )
+                        .await?;
+                        match settle_ocr_page(&page_text, &detail.layer_text) {
+                            Ok(text) => {
+                                by_page.insert(detail.page, text);
+                            }
+                            Err(reason) => unread.push((detail.page, reason)),
+                        }
                     }
                 }
-                if extracted.truncated {
-                    // Said plainly rather than letting the answer silently
-                    // describe only part of the document.
-                    parts.push(format!(
-                        "(only the first {total} of {pages} pages were read)"
-                    ));
-                }
-                parts.join("\n\n")
+
+                assemble_pdf_text(by_page, unread, pages)
             }
         }
     };
@@ -933,11 +1094,6 @@ pub async fn scan_page(
         })?
         .clone();
 
-    let vram = crate::system_analyzer::gpu_collector::installed_gpus()
-        .iter()
-        .map(|gpu| gpu.dedicated_video_memory_bytes)
-        .max()
-        .unwrap_or(0);
     // Budgeted against free VRAM with the model's own layer count, and any
     // other server released only if this one will not otherwise fit. See
     // `serving::admission`.
@@ -1275,6 +1431,134 @@ mod tests {
             "a deck carries its own text; sending slides to a vision model would be              slower and lossier than reading the XML"
         );
         assert!(plan.refusal.is_none());
+    }
+
+    fn detail(page: u32, source: &str, text: &str, why: &str) -> PageDetail {
+        PageDetail {
+            page,
+            source: source.to_string(),
+            text: text.to_string(),
+            image: None,
+            layer_text: String::new(),
+            why: why.to_string(),
+        }
+    }
+
+    /// The reported case: a digital cover in front of a scanned page.
+    ///
+    /// The extractor used to weigh the *whole file's* text against one
+    /// threshold, so the cover carried the document over the line on its own.
+    /// It came back `pdf-text` with no page images and `truncated: false`, and
+    /// page two was gone with nothing to say it had ever been there. The
+    /// merged text now has to contain both pages, in order, under their own
+    /// numbers.
+    #[test]
+    fn a_digital_cover_does_not_swallow_the_scanned_page_behind_it() {
+        let (mut by_page, unread) = seed_from_detail(&[
+            detail(1, "text", "Q3 Seal Inspection Report", ""),
+            detail(2, "ocr", "", ""),
+        ]);
+        // What the OCR model gave back for the page that needed it.
+        by_page.insert(2, "Measured 8.2 mm against a 9.0 mm minimum".to_string());
+
+        let merged = assemble_pdf_text(by_page, unread, 2);
+
+        assert!(merged.contains("Q3 Seal Inspection Report"), "{merged}");
+        assert!(merged.contains("Measured 8.2 mm"), "the scanned page was lost: {merged}");
+        assert!(
+            merged.find("page 1 of 2").unwrap() < merged.find("page 2 of 2").unwrap(),
+            "pages came back out of order: {merged}"
+        );
+    }
+
+    /// Page numbers are the document's, not the rendered subset's.
+    ///
+    /// When only some pages go to OCR, indexing by position in the rendered
+    /// list labelled page 5 of a scan as "page 1" — a citation that points at
+    /// the wrong page is worse than one that is missing.
+    #[test]
+    fn a_page_carries_the_number_it_has_in_the_document() {
+        let (mut by_page, unread) = seed_from_detail(&[
+            detail(1, "text", "Cover", ""),
+            detail(2, "text", "Contents", ""),
+            detail(3, "ocr", "", ""),
+        ]);
+        by_page.insert(3, "The drawing".to_string());
+
+        let merged = assemble_pdf_text(by_page, unread, 3);
+        assert!(merged.contains("--- page 3 of 3 ---\nThe drawing"), "{merged}");
+        assert!(!merged.contains("page 1 of 3 ---\nThe drawing"), "{merged}");
+    }
+
+    /// Every page nothing was made of is named.
+    #[test]
+    fn unread_pages_are_named_rather_than_dropped() {
+        let (by_page, unread) = seed_from_detail(&[
+            detail(1, "text", "Cover", ""),
+            detail(2, "unread", "", "the limit of 12 rendered pages was reached"),
+            detail(3, "unread", "", "the page could not be rendered: broken xref"),
+        ]);
+
+        let merged = assemble_pdf_text(by_page, unread, 3);
+        assert!(merged.contains("2 of the 3 pages could not be read"), "{merged}");
+        assert!(merged.contains("page 2 (the limit of 12 rendered pages"), "{merged}");
+        assert!(merged.contains("page 3 (the page could not be rendered"), "{merged}");
+        assert!(
+            merged.contains("do not describe what is on them"),
+            "a hole the model is not warned about is one it will fill in: {merged}"
+        );
+    }
+
+    /// A page whose text layer is empty is a page nothing was made of.
+    ///
+    /// It used to vanish in the join that dropped empty parts, which is the
+    /// same silence one page down.
+    #[test]
+    fn a_blank_page_is_reported_not_skipped() {
+        let (by_page, unread) =
+            seed_from_detail(&[detail(1, "text", "Cover", ""), detail(2, "text", "   ", "")]);
+        assert_eq!(by_page.len(), 1);
+        let merged = assemble_pdf_text(by_page, unread, 2);
+        assert!(merged.contains("page 2 (it has nothing on it)"), "{merged}");
+    }
+
+    /// The reported case, one page down: a scanned page with nothing on it.
+    ///
+    /// Rendering it and getting nothing back is not the same as it not being
+    /// there, and only one of those two is worth an answer written over it.
+    #[test]
+    fn a_scanned_page_the_model_makes_nothing_of_is_marked_unread() {
+        let reason = settle_ocr_page("   ", "").unwrap_err();
+        assert!(reason.contains("nothing could be made out"), "{reason}");
+
+        let (by_page, mut unread) = seed_from_detail(&[
+            detail(1, "text", "Q3 Seal Inspection Report", ""),
+            detail(2, "ocr", "", ""),
+        ]);
+        unread.push((2, reason));
+        let merged = assemble_pdf_text(by_page, unread, 2);
+
+        assert!(merged.contains("Q3 Seal Inspection Report"), "{merged}");
+        assert!(
+            merged.contains("page 2 (it was read but nothing could be made out on it)"),
+            "the empty scan went unmentioned, which is the reported bug: {merged}"
+        );
+    }
+
+    /// A page the model failed on still reports the little it did carry.
+    #[test]
+    fn a_page_the_model_failed_on_falls_back_to_its_text_layer() {
+        assert_eq!(settle_ocr_page("", "Figure 3 continued").unwrap(), "Figure 3 continued");
+        // The model's reading wins when there is one.
+        assert_eq!(settle_ocr_page("The full caption", "Figure 3").unwrap(), "The full caption");
+    }
+
+    /// A single-page document is not labelled, because there is nothing to
+    /// disambiguate and the label would only be noise.
+    #[test]
+    fn a_one_page_document_gets_no_page_labels() {
+        let (by_page, unread) = seed_from_detail(&[detail(1, "text", "All of it", "")]);
+        assert_eq!(assemble_pdf_text(by_page, unread, 1), "All of it");
     }
 
     #[test]

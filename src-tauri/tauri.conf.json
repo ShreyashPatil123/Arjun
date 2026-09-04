@@ -40,7 +40,10 @@
     "resources": [
       "../agent-runtime/dist/arjun-agent-runtime.mjs",
       "../skills/",
-      "../agents/"
+      "../agents/",
+      "../sidecars/document_sidecar/",
+      "../sidecars/memory_engine_sidecar/",
+      "../sidecars/voice_sidecar/"
     ]
   }
 }

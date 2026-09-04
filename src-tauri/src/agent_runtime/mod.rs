@@ -32,6 +32,7 @@
 pub mod approval;
 pub mod artifacts;
 pub mod audit_health;
+pub mod completion;
 pub mod conversations;
 pub mod events;
 pub mod grants;
@@ -45,6 +46,7 @@ pub mod resume;
 pub mod retrieval;
 pub mod stages;
 pub mod tasks;
+pub mod tool_policy;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -59,7 +61,6 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -205,8 +206,13 @@ pub struct RuntimeDeps {
     /// The page-region and table half of the knowledge index.
     ///
     /// Backs `knowledge.multimodal_retrieve`. Never constructed outside tests
-    /// before, so that tool was in the catalogue and in the plan with nothing
-    /// behind it.
+    /// before, so that tool ran with nothing behind it.
+    ///
+    /// Wiring this fixed half the problem. The other half outlived it: no plan
+    /// permitted the tool, so once the index existed the catalogue still never
+    /// offered it and the gateway still refused every call. See
+    /// `planning::derive`, which now permits it wherever it permits a text
+    /// search, and the reachability test that keeps it there.
     pub multimodal: Arc<crate::knowledge::MultimodalIndex>,
     /// Whether this installation can still record what it does.
     ///
@@ -320,7 +326,10 @@ impl AgentRuntime {
             return Err(RuntimeError::BundleMissing(bundle));
         }
 
-        let mut child = Command::new("node");
+        // `ARJUN_NODE` when an offline deployment pack laid one down, the bare
+        // name otherwise. See `crate::deployment`, which like this module has
+        // no Tauri dependency, so the tests still drive a real child process.
+        let mut child = Command::new(crate::deployment::program("node"));
         child
             .arg(&bundle)
             .stdin(Stdio::piped())
@@ -1062,6 +1071,7 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
 
             let outcome = approval::await_decision(
                 &deps.approvals,
+                &deps.events,
                 &session,
                 &call.run_id,
                 tool,

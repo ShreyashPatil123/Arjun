@@ -43,7 +43,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -104,22 +103,21 @@ pub fn has_piper_voice(app_data_dir: &Path) -> bool {
 /// crate root so the build keeps working when the binary is moved.
 pub fn sidecar_path() -> PathBuf {
     // The sidecar is a Python script that the Tauri runtime launches
-    // directly. The exact path is computed at runtime so the build
-    // does not bake in a development-time absolute path.
-    let candidates = [
-        PathBuf::from("../sidecars/voice_sidecar/voice_bridge.py"),
-        PathBuf::from("sidecars/voice_sidecar/voice_bridge.py"),
-    ];
-    let mut fallback: Option<PathBuf> = None;
-    for c in candidates {
-        if c.exists() {
-            return c;
-        }
-        if fallback.is_none() {
-            fallback = Some(c);
-        }
-    }
-    fallback.unwrap_or_else(|| PathBuf::from("voice_bridge.py"))
+    // directly. Resolved through `deployment`, which tries the installer's
+    // resource directory before the checkout; the two relative paths this
+    // replaced were interpreted against the working directory, which under an
+    // installed build is not the repository and often not even predictable.
+    //
+    // Still returns a `PathBuf` rather than a `Result` because
+    // `commands::voice` asks this for `.exists()` to report whether voice is
+    // available — "not installed" is a status this feature reports rather than
+    // an error it raises.
+    crate::deployment::require_path("voice-sidecar").unwrap_or_else(|_| {
+        crate::deployment::dependency("voice-sidecar")
+            .bundle_path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("voice_bridge.py"))
+    })
 }
 
 /// Transcribe a chunk of audio. The audio is the raw bytes from a
@@ -145,7 +143,7 @@ pub async fn transcribe(
         });
     }
     let has_model = !stub_only && has_whisper_model(app_data_dir);
-    let mut cmd = Command::new("python");
+    let mut cmd = Command::new(crate::deployment::program("python"));
     cmd.arg(&sidecar)
         .arg("transcribe")
         .arg("--stdin")
@@ -200,7 +198,7 @@ pub async fn speak(
     }
     let has_model = has_piper_voice(app_data_dir);
     let out_path = voice_dir(app_data_dir).join("last_reply.wav");
-    let mut cmd = Command::new("python");
+    let mut cmd = Command::new(crate::deployment::program("python"));
     cmd.arg(&sidecar)
         .arg("speak")
         .arg("--model-dir")

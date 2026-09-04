@@ -593,6 +593,88 @@ mod tests {
         assert!(message.contains("DRAFT"), "{message}");
     }
 
+    /// The whole path, from a person's words to a file that re-opens.
+    ///
+    /// Every link in this chain was already built and tested except one, and
+    /// that one made the others worthless: no plan permitted `create_pptx`, so
+    /// the catalogue never offered the tool and the gateway refused it. The
+    /// renderer's own tests passed throughout, because the renderer was never
+    /// the problem.
+    ///
+    /// So this test starts where a user starts — a sentence — and refuses to
+    /// stop at "the writer works". It asserts the request reaches the tool, the
+    /// tool writes a file, the file re-opens as a presentation, and the plan
+    /// then closes on that evidence rather than on the model's say-so.
+    #[test]
+    fn a_request_for_slides_plans_the_deck_produces_it_and_re_opens_it() {
+        use crate::agent_runtime::planning::{self, Satisfies};
+        use crate::agent_runtime::tasks::PlanRecord;
+        use crate::orchestrator::tools::ToolName;
+
+        let prompt = "put together a briefing deck on the Q3 seal inspection";
+
+        // 1. The request can reach the tool. This is the link that was missing.
+        let derived = planning::derive(prompt);
+        assert!(
+            derived.budget.permits(ToolName::CreatePptx),
+            "the plan does not permit create_pptx, so the catalogue would not offer it"
+        );
+        let deck_step = derived
+            .steps
+            .iter()
+            .position(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreatePptx))
+            .expect("the plan does not expect a deck");
+
+        // The catalogue is filtered against this list, so a deck tool absent
+        // from it is one the model is never told about.
+        let plan = planning::plan_for("run-e2e", prompt);
+        let mut record = PlanRecord::of(&plan);
+        assert!(
+            record
+                .permitted_tools
+                .iter()
+                .any(|tool| tool == ToolName::CreatePptx.as_str()),
+            "the deck tool is not in the plan the catalogue is filtered against"
+        );
+
+        // 2. The tool runs and writes a real file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("briefing.pptx");
+        let tool_call = ToolCall::new("create_pptx", deck_content());
+        let message = create_pptx(&call_params("run-e2e"), Some(&path), &tool_call)
+            .expect("the deck is written");
+        assert!(path.exists(), "no file was written");
+
+        // 3. It re-opens as a presentation, carrying the template's headings.
+        //    PowerPoint is stricter than Word about what it will open, so a
+        //    deck that wrote without error is not yet a deck that opens.
+        let check = check_deck(&path);
+        assert!(check.is_sound(), "the deck did not re-open: {:?}", check.problems);
+        for heading in BRIEFING_SECTIONS {
+            assert!(
+                check.headings.iter().any(|h| h.eq_ignore_ascii_case(heading)),
+                "{heading} missing from {:?}",
+                check.headings
+            );
+        }
+        assert!(message.contains("DRAFT"), "an unsigned deck must say so: {message}");
+
+        // 4. The plan closes on the evidence. `settle` matches the namespaced
+        //    name the runtime records, which is why the step and the recorded
+        //    call have to agree on spelling — if they drifted, a run could
+        //    produce the deck and still be reported as never having made one.
+        record.settle(
+            &derived.steps,
+            &[ToolName::CreatePptx.as_str().to_string()],
+            true,
+            true,
+        );
+        assert!(
+            record.steps[deck_step].done,
+            "the deck was produced and re-opened, but the plan step did not settle"
+        );
+    }
+
     #[test]
     fn a_missing_section_is_named_and_nothing_is_written() {
         let dir = tempfile::tempdir().expect("temp dir");

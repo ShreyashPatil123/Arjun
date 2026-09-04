@@ -117,6 +117,32 @@ impl ApprovalQueue {
         Self::default()
     }
 
+    /// Puts requests back that were raised before this process started.
+    ///
+    /// Called once at startup from the durable ledger. Anything already in the
+    /// queue with the same id is left alone: the live entry is the one being
+    /// waited on, and replacing it would detach the waiter from its answer.
+    ///
+    /// A restored request has no waiter — the loop that asked for it died with
+    /// the last process. It is put back so a person can still see and decide
+    /// it, and so the run that resumes can read the decision rather than
+    /// asking again.
+    pub fn restore(&self, requests: Vec<ApprovalRequest>) -> usize {
+        let mut items = self
+            .items
+            .lock()
+            .expect("the approval queue lock is never poisoned");
+        let mut restored = 0;
+        for request in requests {
+            if items.iter().any(|held| held.request.id == request.id) {
+                continue;
+            }
+            items.push(ApprovalItem { request, decision: None });
+            restored += 1;
+        }
+        restored
+    }
+
     /// Raises a request and returns its id.
     pub fn request(&self, request: ApprovalRequest) -> String {
         let id = request.id.clone();

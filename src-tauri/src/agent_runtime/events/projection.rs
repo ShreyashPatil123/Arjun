@@ -108,6 +108,22 @@ pub struct TaskSnapshot {
     pub checkpoint_failures: u32,
     /// Times a person picked this task up again.
     pub resumptions: u32,
+    /// How many times the process has tried to pick this run back up by itself.
+    ///
+    /// `serde(default)` because snapshots written before this field existed are
+    /// still in the database, and a cache that refuses to deserialise is a
+    /// cache that silently rebuilds every run on every list.
+    #[serde(default)]
+    pub recovery_attempts: u32,
+    /// How many of those gave up. The ceiling on automatic recovery is counted
+    /// against `recovery_attempts`; this is what tells a person it kept failing.
+    #[serde(default)]
+    pub recovery_failures: u32,
+    /// What the completion check concluded, once it has run. `None` means it
+    /// has not — deliberately three-valued, because "not checked" and "checked
+    /// and failed" must never collapse into the same thing.
+    #[serde(default)]
+    pub completion_verified: Option<bool>,
     pub memory_reads: u32,
     /// Skills whose instructions were loaded into this run's context.
     #[serde(default)]
@@ -176,6 +192,9 @@ impl TaskSnapshot {
             checkpoints_taken: 0,
             checkpoint_failures: 0,
             resumptions: 0,
+            recovery_attempts: 0,
+            recovery_failures: 0,
+            completion_verified: None,
             memory_reads: 0,
             skills_loaded: 0,
             skills_refused: 0,
@@ -383,6 +402,33 @@ impl TaskSnapshot {
             }
 
             TaskEventType::VerificationStarted => {}
+            // What the completion check concluded. Read off the payload rather
+            // than inferred from the run reaching an ending: a run can end
+            // without ever being checked, and that is not a pass.
+            TaskEventType::CompletionVerified => {
+                self.completion_verified = event
+                    .payload
+                    .get("passed")
+                    .and_then(Value::as_bool)
+                    .or(Some(false));
+            }
+
+            // Counted so a recovery loop is visible as one. A run whose
+            // attempts climb without an ending is the shape of a run being
+            // picked up and dropped repeatedly.
+            TaskEventType::RecoveryStarted => self.recovery_attempts += 1,
+            TaskEventType::RecoveryFailed => self.recovery_failures += 1,
+
+            // Observations that carry counts and digests rather than state.
+            // The turn count already comes from `turn_ended`; adding a second
+            // source for it would let the two disagree.
+            TaskEventType::ModelRequested
+            | TaskEventType::ModelResponded
+            // Paired with `context_compacted`, which is what is counted.
+            | TaskEventType::CompactionStarted
+            | TaskEventType::WaitStarted
+            | TaskEventType::WaitCompleted
+            | TaskEventType::RunPaused => {}
 
             TaskEventType::SubagentStarted => self.subagents_started += 1,
             TaskEventType::SubagentStopped => {

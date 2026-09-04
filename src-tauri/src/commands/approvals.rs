@@ -34,6 +34,7 @@ pub async fn decide_approval(
     queue: State<'_, Arc<ApprovalQueue>>,
     session: State<'_, CurrentSession>,
     audit: State<'_, Arc<AuditService>>,
+    events: State<'_, crate::commands::agent::TaskEvents>,
     id: String,
     approve: bool,
     because: Option<String>,
@@ -70,6 +71,25 @@ pub async fn decide_approval(
             "approved": approve,
         })),
     );
+
+    // Recorded durably as well as in memory, so a restart does not lose the
+    // answer. Written after the queue has accepted it: the queue is what
+    // enforces who may decide, and a decision it refused must not appear here
+    // as one that was taken.
+    let status = if approve {
+        crate::agent_runtime::events::ApprovalStatus::Approved
+    } else {
+        crate::agent_runtime::events::ApprovalStatus::Rejected
+    };
+    if let Err(error) = events.resolve_approval(
+        &id,
+        status,
+        &signed_in.user.id,
+        because.as_deref(),
+        chrono::Utc::now(),
+    ) {
+        log::warn!("[approvals] decision on {id} was not recorded durably: {error}");
+    }
 
     Ok(decision)
 }

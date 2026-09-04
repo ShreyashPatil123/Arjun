@@ -19,27 +19,21 @@ pub struct SidecarAdapter {
 
 impl SidecarAdapter {
     /// Spawns the embedded Python Memory Engine Sidecar
-    pub fn spawn(app_data_dir: &std::path::Path) -> Result<Self> {
+    pub fn spawn(_app_data_dir: &std::path::Path) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let candidate_paths = vec![
-            app_data_dir.join("sidecars").join("memory_engine_sidecar").join("main.py"),
-            cwd.join("sidecars").join("memory_engine_sidecar").join("main.py"),
-            cwd.join("src-tauri").join("sidecars").join("memory_engine_sidecar").join("main.py"),
-            cwd.parent().map(|p| p.join("sidecars").join("memory_engine_sidecar").join("main.py")).unwrap_or_default(),
-            std::env::current_exe().ok().and_then(|p| p.parent().map(|dir| dir.join("sidecars").join("memory_engine_sidecar").join("main.py"))).unwrap_or_default(),
-        ];
-
-        let target_script = candidate_paths
-            .into_iter()
-            .find(|p| p.as_os_str().len() > 0 && p.exists())
-            .ok_or_else(|| anyhow!("Memory sidecar main.py script not found in any candidate path from CWD '{:?}'", cwd))?;
+        // Resolved through `deployment`, which tries the installer's resource
+        // directory before the checkout. The candidate list this replaced was
+        // anchored on `current_dir()`, so it found the sidecar on a developer's
+        // machine and missed it on an installed one.
+        let target_script =
+            crate::deployment::require_path("memory-sidecar").map_err(|e| anyhow!(e))?;
 
         log::info!("[SIDECAR] Spawning Python sidecar from {:?}", target_script);
         let script_dir = target_script.parent().unwrap_or(&cwd);
 
         // Hidden: a bare Command::new pops a console window when the GUI build
         // (windows_subsystem = "windows") spawns a console application.
-        let mut command = create_hidden_command("python");
+        let mut command = create_hidden_command(crate::deployment::program("python"));
         command.arg(&target_script);
         command.env("PYTHONPATH", script_dir);
         command.stdin(Stdio::piped());

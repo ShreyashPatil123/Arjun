@@ -96,6 +96,47 @@ pub type Multimodal = Arc<crate::knowledge::MultimodalIndex>;
 /// process that has just started can both find out what a run has been doing.
 pub type TaskEvents = Arc<TaskEventLog>;
 
+/// Who this process is, when it claims a run.
+///
+/// One id per process, minted at first use. It has to survive for the life of
+/// the process and differ between processes: the point of the owner field is
+/// that a claim made by a process which has since died is recognisable as such.
+fn worker_id() -> &'static str {
+    static WORKER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| format!("arjun-{}-{}", std::process::id(), uuid::Uuid::new_v4()))
+}
+
+/// Holds a run's lease for as long as the work is in scope, and gives it back
+/// however the work ends.
+///
+/// `drive_run` returns from a great many places, most of them `?` on something
+/// unrelated to leases. A release written at the end of the function would be
+/// skipped by every one of them, and a run would stay claimed by a process that
+/// had already given up on it until the term lapsed. `Drop` is the only thing
+/// that covers all those paths without each of them having to remember.
+struct RunClaim {
+    events: TaskEvents,
+    run_id: String,
+    owner: &'static str,
+    fence_token: i64,
+}
+
+impl Drop for RunClaim {
+    fn drop(&mut self) {
+        // Token-checked inside `release_claim`, so a claim that lapsed and was
+        // taken by somebody else is not released out from under them here.
+        if let Err(error) = self
+            .events
+            .release_claim(&self.run_id, self.owner, self.fence_token)
+        {
+            log::warn!(
+                "[tasks] run {}: the lease could not be given back ({error}); it will lapse on its own",
+                self.run_id
+            );
+        }
+    }
+}
+
 /// Whether this installation can still record what it does.
 ///
 /// Managed separately from the log itself because it outlives any one store: a
@@ -826,8 +867,80 @@ fn describe_attachment_reads(reads: &[crate::commands::ocr::AttachmentRead]) -> 
         .collect()
 }
 
+/// Starts a new run.
+///
+/// A thin wrapper over [`drive_run`]. The separation exists so that continuing
+/// an interrupted run and starting a fresh one are the *same* execution path
+/// with one difference — which run id the work is recorded under — rather than
+/// two paths that have to be kept in step with each other.
 #[tauri::command]
 pub async fn agent_start_run(
+    app: AppHandle,
+    request: StartRunRequest,
+    handle: State<'_, AgentRuntimeHandle>,
+    registry: State<'_, Arc<ModelRegistry>>,
+    servers: State<'_, Arc<ModelServers>>,
+    index: State<'_, Arc<KnowledgeIndex>>,
+    session: State<'_, CurrentSession>,
+    audit: State<'_, Arc<AuditService>>,
+    workspaces: State<'_, RunWorkspaces>,
+    approvals: State<'_, Arc<ApprovalQueue>>,
+    passages: State<'_, RunPassages>,
+    produced: State<'_, RunArtifacts>,
+    plans: State<'_, RunPlans>,
+    calculations: State<'_, RunCalculations>,
+    calls: State<'_, RunToolCalls>,
+    events: State<'_, TaskEvents>,
+    skills: State<'_, Skills>,
+    memory: State<'_, AgentMemory>,
+    checkpoints: State<'_, RunCheckpoints>,
+    conversations: State<'_, super::conversations::ConversationsState>,
+    run_to_conversation: State<'_, super::conversations::RunToConversationState>,
+    audit_health: State<'_, AuditHealthState>,
+    subagents: State<'_, Subagents>,
+    multimodal: State<'_, Multimodal>,
+) -> Result<RunSummary, String> {
+    drive_run(
+        None,
+        app,
+        request,
+        handle,
+        registry,
+        servers,
+        index,
+        session,
+        audit,
+        workspaces,
+        approvals,
+        passages,
+        produced,
+        plans,
+        calculations,
+        calls,
+        events,
+        skills,
+        memory,
+        checkpoints,
+        conversations,
+        run_to_conversation,
+        audit_health,
+        subagents,
+        multimodal,
+    )
+    .await
+}
+
+/// Drives one run, either fresh or continuing one that already exists.
+///
+/// `existing_run_id` is `None` for a new run and `Some` only for a resumption
+/// that has already been checked — see `agent_resume_run`, which is the sole
+/// caller that supplies one. It is deliberately not reachable from
+/// [`StartRunRequest`]: a caller that could name a run could write events into
+/// somebody else's, and the check that makes a resumption safe (the checkpoint's
+/// policy, plan and workspace hashes) happens before this is ever called.
+#[allow(clippy::too_many_arguments)]
+async fn drive_run(
+    existing_run_id: Option<String>,
     app: AppHandle,
     request: StartRunRequest,
     handle: State<'_, AgentRuntimeHandle>,
@@ -1178,12 +1291,44 @@ pub async fn agent_start_run(
         multimodal: &multimodal,
     };
     let runtime = runtime(&handle, &app, &state)?;
-    let run_id = uuid::Uuid::new_v4().to_string();
+    // A resumption continues under the id the earlier attempt used, so its
+    // events, checkpoint and effect ledger are one history rather than two. A
+    // fresh run mints its own, and no caller can ask for a particular one.
+    let run_id = existing_run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // From here the run has an id of its own and every later stage is
     // addressed by it. The correlation id stays on the event as well, so a
     // reducer that has not yet seen `plan_ready` still recognises its own run.
     reporter.tag_mut().with_run_id(&run_id);
     let started_at = chrono::Utc::now();
+
+    // Claimed before any work, and given back by `Drop` however this ends.
+    //
+    // A fresh run cannot lose this race — its id was invented a line ago and
+    // nothing else has heard of it. A resumption very much can: the process
+    // that was running this may still be alive, or another window may be
+    // resuming it too. Both would append to one event stream and do the work
+    // twice, and the second half of that is the half that writes files.
+    let _claim = {
+        let claimed = events
+            .claim_run(
+                &run_id,
+                worker_id(),
+                chrono::Duration::seconds(crate::agent_runtime::events::DEFAULT_LEASE_SECONDS),
+                started_at,
+            )
+            .map_err(|error| {
+                format!("This run was not started: its lease could not be taken ({error}).")
+            })?;
+        match claimed {
+            Ok(lease) => RunClaim {
+                events: Arc::clone(&events),
+                run_id: run_id.clone(),
+                owner: worker_id(),
+                fence_token: lease.fence_token,
+            },
+            Err(held) => return Err(held.explain()),
+        }
+    };
 
     // ─────────────────────────────────────────────────────────────────────
     // The turn's identity, settled before anything streams.
@@ -1402,15 +1547,32 @@ pub async fn agent_start_run(
     // A resumption reads what the earlier attempt recorded. On a first attempt
     // this is `null`, and the loop starts with empty notes.
     //
-    // Read from the saved task record rather than from the event history: the
-    // record holds the notes as the loop last reported them, and the history
-    // holds only that compactions happened. A run whose record was never
-    // written has nothing to resume from, and saying so honestly is better than
-    // reconstructing a plausible set of notes nobody actually recorded.
-    let resumed_notes = tasks::load(&app_data_dir(&app)?, &run_id, Some(&signed_in.user.id))
-        .ok()
-        .and_then(|previous| previous.working_notes)
-        .filter(|notes| !notes.is_empty());
+    // Two durable places hold those notes, and they are read in the order they
+    // were written. The task record is written once, when a run ends, and is
+    // therefore the later and more complete of the two whenever it exists. The
+    // checkpoint is written *during* the run, at points the run was safe to
+    // interrupt, and is therefore the only one that exists for a run that was
+    // interrupted -- which is precisely the run a resumption is for.
+    //
+    // Reading only the record, as this did before, meant the notes were empty
+    // for exactly the runs that most needed them: the process died, no record
+    // was ever written, and the resumed loop started blind and re-did work it
+    // had already done. The event history is still not consulted for this, and
+    // for the original reason -- it records that compactions happened, not what
+    // the notes were, so anything derived from it would be a plausible
+    // reconstruction rather than something the loop actually reported. The
+    // checkpoint is not a reconstruction: it is the notes as the loop reported
+    // them, stored verbatim at a safe point.
+    let resumed_notes = notes_to_resume_from(
+        tasks::load(&app_data_dir(&app)?, &run_id, Some(&signed_in.user.id))
+            .ok()
+            .and_then(|previous| previous.working_notes),
+        events
+            .checkpoint(&run_id)
+            .ok()
+            .flatten()
+            .map(|checkpoint| checkpoint.notes),
+    );
 
     let params = json!({
         "runId": run_id,
@@ -1744,6 +1906,85 @@ pub async fn agent_start_run(
     // The plan only knows the endings it caused. A loop that simply finished,
     // or a runtime that fell over, ends the run without it hearing about it.
     final_plan.ended(failure.as_deref());
+
+    // Whether this run may be called finished, decided from what it left
+    // behind rather than from the loop having stopped.
+    //
+    // Every input is a record something else wrote for its own reasons: the
+    // plan's step ledger, the effect ledger, the approval queue, files
+    // re-opened from disk, the grounding report. Nothing here reads the
+    // answer's claims about itself.
+    let completion = {
+        let unknown_effects = events
+            .snapshot(&run_id)
+            .ok()
+            .flatten()
+            .map(|snapshot| {
+                snapshot
+                    .unknown_effects
+                    .iter()
+                    .map(|effect| effect.idempotency_key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        crate::agent_runtime::completion::verify(
+            &crate::agent_runtime::completion::CompletionInputs {
+                failure: failure.clone(),
+                unfinished_steps: final_plan.unfinished().len(),
+                unknown_effects,
+                pending_approvals: asked
+                    .iter()
+                    .filter(|approval| approval.state == "pending")
+                    .count(),
+                artifacts: produced_files
+                    .iter()
+                    .map(|artifact| (artifact.name.clone(), artifact.sound))
+                    .collect(),
+                grounding_ready: verification
+                    .as_ref()
+                    .map(crate::artifacts::verifier::VerificationReport::is_ready),
+                has_answer: !answer.trim().is_empty(),
+            },
+            finished_at,
+        )
+    };
+
+    // Recorded as its own event, distinct from `verification_started`. Before
+    // this, the history said a check had begun and never what it concluded, so
+    // "it was checked" and "it passed" were indistinguishable after the fact.
+    let _ = record_and_publish(
+        &app,
+        &events,
+        EventDraft::new(
+            &run_id,
+            TaskEventType::CompletionVerified,
+            &signed_in.user.id,
+        )
+        .with(json!({
+            "passed": completion.passed(),
+            "outcome": completion.outcome.as_str(),
+            "verifierVersion": completion.verifier_version,
+            "verifiedAt": completion.verified_at,
+            // Ids, statuses and short evidence strings. No passage, no answer.
+            "criteria": completion
+                .criteria
+                .iter()
+                .map(|criterion| json!({
+                    "criterionId": criterion.criterion_id,
+                    "status": criterion.status.as_str(),
+                    "evidence": criterion.evidence,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+
+    if !completion.passed() {
+        log::info!(
+            "[tasks] run {run_id}: {}",
+            completion.explain()
+        );
+    }
 
     let record = TaskRecord {
         run_id: run_id.clone(),
@@ -2977,6 +3218,7 @@ pub async fn agent_run_resumability(
 /// stops this outright — continuing would either repeat it or assume it worked,
 /// and nothing on this side can tell which.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn agent_resume_run(
     app: AppHandle,
     run_id: String,
@@ -2985,7 +3227,25 @@ pub async fn agent_resume_run(
     events: State<'_, TaskEvents>,
     registry: State<'_, Arc<ModelRegistry>>,
     audit: State<'_, Arc<AuditService>>,
-) -> Result<crate::agent_runtime::resume::Attempt, String> {
+    handle: State<'_, AgentRuntimeHandle>,
+    servers: State<'_, Arc<ModelServers>>,
+    index: State<'_, Arc<KnowledgeIndex>>,
+    workspaces: State<'_, RunWorkspaces>,
+    approvals: State<'_, Arc<ApprovalQueue>>,
+    passages: State<'_, RunPassages>,
+    produced: State<'_, RunArtifacts>,
+    plans: State<'_, RunPlans>,
+    calculations: State<'_, RunCalculations>,
+    calls: State<'_, RunToolCalls>,
+    skills: State<'_, Skills>,
+    memory: State<'_, AgentMemory>,
+    checkpoints: State<'_, RunCheckpoints>,
+    conversations: State<'_, super::conversations::ConversationsState>,
+    run_to_conversation: State<'_, super::conversations::RunToConversationState>,
+    audit_health: State<'_, AuditHealthState>,
+    subagents: State<'_, Subagents>,
+    multimodal: State<'_, Multimodal>,
+) -> Result<RunSummary, String> {
     use crate::agent_runtime::events::Resumability;
 
     let signed_in = require_permission(&session, Permission::UseModel)?;
@@ -3038,7 +3298,69 @@ pub async fn agent_resume_run(
         None,
     );
 
-    Ok(attempt)
+    // What the run was asked to do, read back off its own durable record rather
+    // than taken from the caller. A resumption that let the caller supply the
+    // prompt would not be a resumption: the plan is derived from the prompt, and
+    // a different prompt is a different plan than the one the checkpoint's
+    // `plan_hash` was just checked against.
+    let snapshot = events
+        .snapshot(&run_id)
+        .map_err(|error| format!("This run could not be read back: {error}"))?
+        .ok_or_else(|| {
+            "This run has no recorded state, so there is nothing to continue from.".to_string()
+        })?;
+
+    let request = StartRunRequest {
+        prompt: snapshot.prompt.clone(),
+        classification: snapshot.classification.as_deref().and_then(|label| {
+            Classification::ALL
+                .iter()
+                .copied()
+                .find(|candidate| candidate.label() == label)
+        }),
+        scenario_instructions: None,
+        correlation_id: None,
+        // A resumption is not a turn in a conversation. The original turn is
+        // already in the transcript with the answer the interrupted attempt
+        // never produced, and appending a second assistant cell for the same
+        // question would make the thread read as though it were asked twice.
+        conversation_id: None,
+        message_id: None,
+        // Attachments belong to the request that carried them and are
+        // deliberately not remembered between runs; see `StartRunRequest`. What
+        // the earlier attempt read from them is in its notes.
+        attachments: Vec::new(),
+        ocr_detent: None,
+    };
+
+    drive_run(
+        Some(run_id),
+        app,
+        request,
+        handle,
+        registry,
+        servers,
+        index,
+        session,
+        audit,
+        workspaces,
+        approvals,
+        passages,
+        produced,
+        plans,
+        calculations,
+        calls,
+        events,
+        skills,
+        memory,
+        checkpoints,
+        conversations,
+        run_to_conversation,
+        audit_health,
+        subagents,
+        multimodal,
+    )
+    .await
 }
 
 /// The read-only half of both commands above.
@@ -3110,6 +3432,76 @@ fn assess_resumability(
     };
 
     Resumability::of(checkpoint.as_ref(), &context.world())
+}
+
+/// Which of the two durable note sources a resumption should start from.
+///
+/// Split out from `agent_start_run` because the precedence is the whole
+/// substance of it, and a rule embedded in a Tauri command is a rule that can
+/// only be tested by standing up an `AppHandle`.
+///
+/// The record wins when it has anything to say, because it is written when a
+/// run ends and is therefore the later of the two. The checkpoint is the
+/// fallback, and is the only source that exists for an interrupted run.
+///
+/// Each source is independently required to be non-empty. Filtering after the
+/// fallback instead would let a record that ended with empty notes mask a
+/// checkpoint that has real ones -- the caller would read "there is a record"
+/// as "there is nothing to resume from", which are not the same fact.
+fn notes_to_resume_from(
+    from_record: Option<crate::agent_runtime::memory::RunMemory>,
+    from_checkpoint: Option<crate::agent_runtime::memory::RunMemory>,
+) -> Option<crate::agent_runtime::memory::RunMemory> {
+    from_record
+        .filter(|notes| !notes.is_empty())
+        .or_else(|| from_checkpoint.filter(|notes| !notes.is_empty()))
+}
+
+#[cfg(test)]
+mod resumed_notes_tests {
+    use super::notes_to_resume_from;
+    use crate::agent_runtime::memory::RunMemory;
+
+    /// Notes with something in them. `goal` alone is enough for `is_empty` to
+    /// be false, which is what these cases turn on.
+    fn notes(goal: &str) -> RunMemory {
+        RunMemory {
+            goal: goal.into(),
+            ..RunMemory::default()
+        }
+    }
+
+    #[test]
+    fn the_record_wins_when_it_has_something_to_say() {
+        let chosen = notes_to_resume_from(Some(notes("from record")), Some(notes("from checkpoint")));
+        assert_eq!(chosen.expect("notes").goal, "from record");
+    }
+
+    /// The case the fallback exists for: the process died, so no task record
+    /// was ever written, and the checkpoint is all there is.
+    #[test]
+    fn an_interrupted_run_resumes_from_its_checkpoint() {
+        let chosen = notes_to_resume_from(None, Some(notes("from checkpoint")));
+        assert_eq!(chosen.expect("notes").goal, "from checkpoint");
+    }
+
+    /// A record that ended with empty notes must not mask a checkpoint that has
+    /// real ones. This is the ordering bug the filter placement guards against.
+    #[test]
+    fn an_empty_record_does_not_mask_a_useful_checkpoint() {
+        let chosen = notes_to_resume_from(Some(RunMemory::default()), Some(notes("from checkpoint")));
+        assert_eq!(chosen.expect("notes").goal, "from checkpoint");
+    }
+
+    #[test]
+    fn empty_notes_are_reported_as_nothing_to_resume_from() {
+        assert!(notes_to_resume_from(Some(RunMemory::default()), Some(RunMemory::default())).is_none());
+    }
+
+    #[test]
+    fn a_first_attempt_has_no_notes_at_all() {
+        assert!(notes_to_resume_from(None, None).is_none());
+    }
 }
 
 #[cfg(test)]

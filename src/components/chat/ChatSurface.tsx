@@ -4,12 +4,24 @@ import { useConversation } from '../run/useConversation';
 import { useActiveRun } from '../../contexts/ActiveRunContext';
 import { ChatComposer } from './ChatComposer';
 import {
+  agentService,
+  isTerminal,
   listenAttachmentProgress,
   describeAttachmentProgress,
   describeAttachmentKind,
   type AttachmentProgress,
   type ComposerAttachment,
 } from '../../services/agent.service';
+
+/**
+ * How long a stop waits for the run to say it ended.
+ *
+ * Long enough to cover a run finishing the tool call it was in the middle of,
+ * short enough that a person is not left watching a disabled button. When it
+ * expires nothing is assumed either way — the message says the stop was sent
+ * and that this screen cannot confirm the run ended.
+ */
+const STOP_ACKNOWLEDGEMENT_TIMEOUT_MS = 15_000;
 import {
   applyAttachmentOcrEvent,
   listenAttachmentOcr,
@@ -159,8 +171,93 @@ export function ChatSurface({
     if (!isStreaming) setReading(null);
   }, [isStreaming]);
   const [flushing, setFlushing] = useState(false);
+  /**
+   * The run a stop has been sent for, until that run acknowledges it.
+   *
+   * Held as an id rather than a boolean so switching the inspector to a
+   * different run cannot leave a second run's button reading "Stopping".
+   */
+  const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
+  /** Said out loud when a stop was sent and nothing came back. */
+  const [stopProblem, setStopProblem] = useState<string | null>(null);
+
   const adopted = useAdoptedRun(inspectorRunId);
   const taskSummary = useTaskRecord(inspectorRunId);
+
+  /**
+   * Stop the run the inspector is showing.
+   *
+   * This used to be `() => setInspectorRunId(null)` — the panel closed, the
+   * button had said Stop, and the run carried on using the machine with
+   * nothing on screen to say so. Closing a window is not stopping work, and
+   * the two had become the same gesture.
+   *
+   * Sending the abort is only half of it. `agent_abort_run` resolving means
+   * the backend accepted the request, not that the run has ended: a run
+   * mid-tool-call finishes what it is doing first. So the button stays in
+   * its stopping state until the run's *own* events say it reached a
+   * terminal state — see the effect below, which is the acknowledgement.
+   */
+  const stopInspectedRun = useCallback(async () => {
+    const runId = inspectorRunId;
+    if (!runId || stoppingRunId) return;
+    setStopProblem(null);
+    setStoppingRunId(runId);
+    try {
+      const accepted = await agentService.abort(runId);
+      if (!accepted) {
+        // The run finished between the render and the click. An ordinary
+        // race, and the record already says how it ended, so there is
+        // nothing to report and nothing left to wait for.
+        setStoppingRunId(current => (current === runId ? null : current));
+      }
+    } catch (error) {
+      setStopProblem(
+        `The stop could not be sent: ${
+          error instanceof Error ? error.message : String(error)
+        }. The run is still going.`,
+      );
+      setStoppingRunId(current => (current === runId ? null : current));
+    }
+  }, [inspectorRunId, stoppingRunId]);
+
+  /**
+   * The acknowledgement: the run itself reporting that it has ended.
+   *
+   * Keyed on the run's terminal *state* rather than on its phase. A run
+   * paused at a milestone gate is not "running" either, and treating that as
+   * a stop would report the work as over while it waits for a person.
+   */
+  const stoppedState = adopted?.view.state ?? null;
+  useEffect(() => {
+    if (!stoppingRunId) return;
+    if (stoppedState && isTerminal(stoppedState)) setStoppingRunId(null);
+  }, [stoppingRunId, stoppedState]);
+
+  /**
+   * A stop that is never acknowledged is reported, not waited on forever.
+   *
+   * The button would otherwise sit disabled and reading "Stopping" with no
+   * way back, which tells a person less than saying plainly that the request
+   * went out and nothing came back.
+   */
+  useEffect(() => {
+    if (!stoppingRunId) return;
+    const timer = window.setTimeout(() => {
+      setStopProblem(
+        'Stop was sent, but the run has not reported that it ended. It may still be ' +
+          'finishing the step it was on. Nothing here can confirm it has stopped.',
+      );
+      setStoppingRunId(null);
+    }, STOP_ACKNOWLEDGEMENT_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [stoppingRunId]);
+
+  // Clear a stale message when the inspector moves to a different run.
+  useEffect(() => {
+    setStopProblem(null);
+    setStoppingRunId(null);
+  }, [inspectorRunId]);
 
   // runsByMessageId: a stable map of `messageId → runId` for the
   // current conversation, used to find which run a message belongs to
@@ -433,11 +530,17 @@ export function ChatSurface({
                 Close
               </button>
             </div>
+            {stopProblem && (
+              <p className={styles.inspectorNotice} role="status">
+                {stopProblem}
+              </p>
+            )}
             <div className={styles.inspectorBody}>
               <RunView
                 state={adopted.view}
-                onAbort={() => setInspectorRunId(null)}
+                onAbort={() => void stopInspectedRun()}
                 onNewTask={() => setInspectorRunId(null)}
+                stopping={stoppingRunId === inspectorRunId}
               />
             </div>
           </div>

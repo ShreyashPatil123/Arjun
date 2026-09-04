@@ -100,6 +100,7 @@ describe('applyAttachmentOcrEvent', () => {
         characters: 6,
         elapsedMs: 1200,
         hitDecodeCap: false,
+        looped: false,
       },
     ])[0];
     expect(after.done).toBe(true);
@@ -145,14 +146,47 @@ describe('applyAttachmentOcrEvent', () => {
         characters: 16384,
         elapsedMs: 42000,
         hitDecodeCap: true,
+        // Not the repetition guard: that cuts a page long before the decode
+        // budget runs out, so a page that reaches the cap has `looped` false.
+        // The two flags name different failures and this fixture is the cap.
+        looped: false,
       },
     ])[0];
     expect(page.done).toBe(true);
     expect(page.hitDecodeCap).toBe(true);
+    expect(page.looped).toBe(false);
+  });
+
+  // The other way a page stops short, and the commoner one. The backend cuts
+  // a repeating read as soon as it recognises the repetition, so the decode
+  // cap is never reached and `hitDecodeCap` stays false — `looped` is the only
+  // thing standing between a truncated page and a readout that presents it as
+  // a complete one.
+  it('records a read that was cut because the model repeated itself', () => {
+    const page = fold([
+      region(0, 'text'),
+      text(0, 'the pump the pump the pump'),
+      {
+        event: 'page',
+        name: FILE,
+        page: 1,
+        pages: 1,
+        modelId: 'unlimited-ocr-q6-k',
+        detent: 'maximum',
+        characters: 26,
+        elapsedMs: 8000,
+        hitDecodeCap: false,
+        looped: true,
+      },
+    ])[0];
+    expect(page.done).toBe(true);
+    expect(page.looped).toBe(true);
+    expect(page.hitDecodeCap).toBe(false);
   });
 
   it('defaults to not having hit the cap before the page completes', () => {
     expect(fold([region(0, 'title')])[0].hitDecodeCap).toBe(false);
+    expect(fold([region(0, 'title')])[0].looped).toBe(false);
   });
 
   it('never mutates the array it was given', () => {

@@ -33,11 +33,32 @@
 //! - `create_xlsx` is out unless the plan expects a calculation. The tool
 //!   already refuses when the run has computed nothing, so this only moves the
 //!   same refusal earlier and makes it legible in the plan.
+//! - `memory.promote_approved` is out unless the run establishes something
+//!   durable — a document, a deck, or an explicit "remember this". It writes
+//!   what later runs will read, and a run that only answered a question has
+//!   found nothing the project did not already hold.
 //!
 //! Everything else is permitted on every plan. The tools that could do
 //! something a person would mind already stop for that person's approval at the
 //! gateway; narrowing them again on a keyword guess would buy no safety and
 //! would cost a run that phrased its request unusually.
+//!
+//! ## The cost of getting that wrong, once
+//!
+//! `create_pptx` used to be permitted by no plan at all. Not excluded on a
+//! stated ground — simply never added, while the deck renderer, the tool
+//! function and the dispatcher arm were all written and tested. The effect was
+//! total rather than partial, because two other mechanisms honour this list
+//! faithfully: [`super::tool_catalogue`] only ever offers a run the tools its
+//! plan permits, and the gateway refuses any call to a tool outside it. So the
+//! model was never told the deck tool existed, and could not have called it if
+//! it had guessed.
+//!
+//! That is the failure mode this list is uniquely able to cause, and it is
+//! silent: every test of the renderer passed, because the renderer was fine.
+//! Nothing failed except the product's ability to do the thing. It is the
+//! reason the default here is to permit, and to write down the ground whenever
+//! something is held back.
 
 use crate::orchestrator::plan::{Budget, PlanRun};
 use crate::orchestrator::tools::{spec_for, ToolName};
@@ -58,8 +79,40 @@ const DELIVERABLE_WORDS: &[&str] = &[
 /// Words that mean a workbook showing the working is wanted.
 const WORKBOOK_WORDS: &[&str] = &["workbook", "spreadsheet", "excel", "xlsx", "working"];
 
+/// Words that mean somebody expects slides.
+///
+/// Bare `"deck"` is deliberately absent. This product is used around plant
+/// equipment, where a deck is a floor somebody stands on — "the pump on B deck"
+/// is a question about a pump, and planning a briefing for it would report the
+/// run unfinished for not producing a presentation nobody asked for. So `deck`
+/// is matched only in the two phrases where it names a document; `slide` covers
+/// "slide deck" on its own.
+const DECK_WORDS: &[&str] = &[
+    "slide",
+    "presentation",
+    "powerpoint",
+    "power point",
+    "pptx",
+    "ppt",
+    "briefing deck",
+    "pitch deck",
+];
+
 /// Words that mean a sandbox is wanted.
 const CODE_WORDS: &[&str] = &["script", "python", "code", "program"];
+
+/// Words that mean the person wants something to outlast this run.
+///
+/// Deliberately narrow. `"record"` on its own is not here: in a plant, records
+/// are the things being *read* — "the maintenance records show" — and matching
+/// it would offer a writing tool to every run that searched a logbook.
+const MEMORY_WORDS: &[&str] = &[
+    "remember",
+    "for future reference",
+    "for future runs",
+    "going forward",
+    "from now on",
+];
 
 fn mentions(prompt: &str, words: &[&str]) -> bool {
     words.iter().any(|word| prompt.contains(word))
@@ -124,7 +177,22 @@ pub fn derive(prompt: &str) -> DerivedPlan {
     let lower = prompt.to_lowercase();
 
     let calculates = mentions(&lower, CALCULATION_WORDS);
-    let produces_document = mentions(&lower, DELIVERABLE_WORDS);
+    let produces_deck = mentions(&lower, DECK_WORDS);
+
+    // The document question is asked of the prompt with the deck's own words
+    // taken out.
+    //
+    // "briefing deck" contains "brief", which is a deliverable word. Asked of
+    // the raw prompt, a request for slides would also plan a Word file, and the
+    // run would finish having produced exactly what was asked for and be
+    // reported unfinished for the document nobody wanted. Stripping first also
+    // keeps the honest case working: "write a report and a slide deck" still
+    // has "report" left over once "slide" is gone, so it plans both.
+    let deck_free = DECK_WORDS
+        .iter()
+        .fold(lower.clone(), |text, word| text.replace(word, " "));
+    let produces_document = mentions(&deck_free, DELIVERABLE_WORDS);
+
     let produces_workbook = mentions(&lower, WORKBOOK_WORDS) || (calculates && produces_document);
     let writes_code = mentions(&lower, CODE_WORDS);
 
@@ -153,7 +221,7 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         ));
     }
 
-    steps.push(if produces_document {
+    steps.push(if produces_document || produces_deck {
         step(
             "Draft the deliverable from the passages retrieved, citing each claim.",
             Satisfies::Answer,
@@ -169,6 +237,14 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         steps.push(step(
             "Produce the document and re-open it to confirm it is sound before saying it is ready.",
             Satisfies::Tool(ToolName::CreateDocx),
+        ));
+    }
+
+    if produces_deck {
+        steps.push(step(
+            "Produce the briefing deck and re-open it to confirm it opens as a presentation \
+             before saying it is ready.",
+            Satisfies::Tool(ToolName::CreatePptx),
         ));
     }
 
@@ -199,10 +275,18 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         // could not read from a page with nothing on it — and those two lead to
         // opposite conclusions about whether a clause exists.
         ToolName::MediaExtractFindings,
+        // The same argument again, and it was missed the same way `create_pptx`
+        // was: implemented, dispatched, and in no plan. This reads the prose
+        // index *and* the image and table index in one call, under the
+        // `SearchKnowledge` clearance the plain search already holds, and it is
+        // the only way to find a region on a drawing or a row in a scanned
+        // table. A run without it can search the words around a P&ID and never
+        // reach the P&ID.
+        ToolName::KnowledgeMultimodalRetrieve,
         // Reading memory is always available: a run that may not consult what
         // the project already agreed a term means will re-derive it, differently
         // each time. Promotion is not here — writing something later runs read
-        // is opt-in per plan, and `derive` adds it only where it belongs.
+        // is opt-in per plan, and `derive` adds it below, where it belongs.
         ToolName::MemoryRecallAuthorized,
         ToolName::ReadScopedFile,
         ToolName::RunCalculation,
@@ -222,12 +306,44 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         ToolName::AgentDelegateReadonly,
         ToolName::WriteScopedFile,
         ToolName::CreateDocx,
+        // Alongside `create_docx`, and for that entry's reason rather than a
+        // new one: the three artifact tools share a single `ToolSpec` and so a
+        // single approval class, and a deck is no more dangerous to produce
+        // than a note. Withholding it unless a keyword matched would have cost
+        // exactly what the module comment above warns about — and did: the
+        // renderer, the tool and the dispatcher were all finished while no plan
+        // ever listed the tool, so the catalogue never offered it and the
+        // gateway refused every call. A capability reachable only by wording
+        // luck is one nobody can rely on.
+        ToolName::CreatePptx,
     ];
     if produces_workbook || calculates {
         permitted.push(ToolName::CreateXlsx);
     }
     if writes_code {
         permitted.push(ToolName::ExecuteCode);
+    }
+
+    // Promotion, where the comment above says it belongs.
+    //
+    // That comment used to promise that `derive` "adds it only where it
+    // belongs", and then added it nowhere — so the entitlement, the approval
+    // check and the dispatcher arm were all built and none of them could be
+    // reached. A stated exclusion nobody implemented reads exactly like a
+    // decision, which is why it survived longer than `create_pptx` did.
+    //
+    // Where it belongs: a run that establishes something durable. An approval
+    // note fixes a decision, a deck fixes a set of findings, and "remember that
+    // X" says so outright — those are the runs with a fact worth handing to the
+    // next one. A run that answers a question has discovered nothing the
+    // project did not already hold, and a writing tool it cannot use is one
+    // more thing for the model to be refused for trying.
+    //
+    // Permitted, not planned: the tool needs the id of an approval a person
+    // granted, which most runs will never have. A *step* would report every
+    // deliverable run unfinished for not promoting something nobody approved.
+    if produces_document || produces_deck || mentions(&lower, MEMORY_WORDS) {
+        permitted.push(ToolName::MemoryPromoteApproved);
     }
 
     // The sovereignty filter, applied once and last.
@@ -301,6 +417,217 @@ mod tests {
             .iter()
             .any(|step| step.intent.contains("calculation engine")));
         assert!(plan.budget.permits(ToolName::CreateXlsx));
+    }
+
+    #[test]
+    fn asking_for_slides_plans_to_produce_and_re_open_the_deck() {
+        for prompt in [
+            "put together a briefing deck on the seal failures",
+            "make a slide deck summarising the Q3 inspections",
+            "I need a powerpoint for the shutdown review",
+            "prepare a short presentation on the wear findings",
+            "can you do a ppt for tomorrow",
+        ] {
+            let plan = derive(prompt);
+            assert!(
+                plan.steps
+                    .iter()
+                    .any(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreatePptx)),
+                "{prompt:?} planned no deck step"
+            );
+            assert!(
+                plan.budget.permits(ToolName::CreatePptx),
+                "{prompt:?} did not permit create_pptx"
+            );
+        }
+    }
+
+    /// The regression that made the tool unreachable.
+    ///
+    /// `create_pptx` was permitted by no plan, so the catalogue never offered
+    /// it and the gateway refused it. Every plan permits it now, for the same
+    /// reason every plan permits `create_docx`, and a plan that does not is the
+    /// bug coming back.
+    #[test]
+    fn every_plan_permits_the_deck_tool_however_the_request_was_phrased() {
+        for prompt in [
+            "what does the maintenance SOP say about seal wear?",
+            "draft an approval note for replacing the P-101 seal",
+            "calculate the replacement interval",
+            "brief the team on this",
+        ] {
+            assert!(
+                derive(prompt).budget.permits(ToolName::CreatePptx),
+                "{prompt:?} could not reach create_pptx"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_gets_no_deck_step() {
+        let plan = derive("what is the wall thickness limit for P-101?");
+        assert!(!plan
+            .steps
+            .iter()
+            .any(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreatePptx)));
+    }
+
+    /// A deck is a deliverable, so the run drafts rather than chats — but it is
+    /// not *also* a Word file. "briefing deck" contains "brief"; before the
+    /// prompt was stripped of its deck words, asking for slides planned a
+    /// document too, and the run was then reported unfinished for not producing
+    /// something nobody had asked for.
+    #[test]
+    fn asking_only_for_a_deck_does_not_also_demand_a_document() {
+        let plan = derive("put together a briefing deck on the seal failures");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| step.intent.contains("Produce the document")),
+            "a deck request planned a Word document as well"
+        );
+        assert!(
+            plan.steps.iter().any(|step| step.intent.contains("Draft the deliverable")),
+            "a deck is a deliverable, so the run should draft rather than chat"
+        );
+    }
+
+    /// The other half of that trade. Stripping the deck words must not lose a
+    /// document somebody genuinely asked for alongside the slides.
+    #[test]
+    fn asking_for_both_a_report_and_slides_plans_both() {
+        let plan = derive("write a report on the seal failures and a slide deck to present it");
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreateDocx)),
+            "the report was dropped"
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreatePptx)),
+            "the deck was dropped"
+        );
+    }
+
+    /// A deck is a floor in a plant before it is a document.
+    #[test]
+    fn a_deck_somebody_stands_on_is_not_a_presentation() {
+        let plan = derive("what is the inspection interval for the pump on B deck?");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| step.satisfied_by == Satisfies::Tool(ToolName::CreatePptx)),
+            "a question about plant decking planned a briefing"
+        );
+    }
+
+    /// Prompts that between them exercise every branch of [`derive`].
+    ///
+    /// Kept next to the reachability test below, which is the only thing that
+    /// reads it. A branch added to `derive` without a prompt added here shows
+    /// up as an unreachable tool rather than as silence.
+    const EVERY_BRANCH: &[&str] = &[
+        "what does the maintenance SOP say about seal wear?",
+        "draft an approval note for replacing the P-101 mechanical seal",
+        "calculate the replacement interval from the wear rate",
+        "build me a workbook of the inspection figures",
+        "write a python script to parse the log",
+        "put together a briefing deck on the Q3 inspection",
+        "remember that P-101 uses the type 21 seal",
+    ];
+
+    /// Every tool this build implements is reachable from some plan.
+    ///
+    /// This is the test that would have caught `create_pptx`, and it caught two
+    /// more when it was written: `knowledge.multimodal_retrieve` and
+    /// `memory.promote_approved` were both implemented, dispatched and
+    /// entitled, and named by no plan — so the catalogue never offered them and
+    /// the gateway refused every call.
+    ///
+    /// The failure is invisible to every other kind of test. A tool's own tests
+    /// pass, because the tool is fine; nothing fails except the product's
+    /// ability to do the thing. So the check has to be made from this end: not
+    /// "does the tool work" but "can anybody ask for it".
+    ///
+    /// A tool that genuinely should be unreachable belongs in `WITHHELD` below,
+    /// with the ground for withholding it written down. The list is empty, and
+    /// an empty list is the honest state of this build — every tool in
+    /// [`ToolName::ALL`] can be reached by asking for it in plain words.
+    #[test]
+    fn every_tool_is_reachable_from_some_plan() {
+        /// Tools deliberately reachable from no plan, and why.
+        ///
+        /// Empty. An entry here is a claim that a working, dispatched tool
+        /// should never be offered — which is a decision worth writing a
+        /// sentence for, and worth someone disagreeing with in review.
+        const WITHHELD: &[(ToolName, &str)] = &[];
+
+        let reachable: std::collections::HashSet<ToolName> = EVERY_BRANCH
+            .iter()
+            .flat_map(|prompt| derive(prompt).budget.permitted_tools)
+            .collect();
+
+        let unreachable: Vec<&ToolName> = ToolName::ALL
+            .iter()
+            .filter(|tool| !reachable.contains(tool))
+            .filter(|tool| !WITHHELD.iter().any(|(held, _)| held == *tool))
+            .collect();
+
+        assert!(
+            unreachable.is_empty(),
+            "these tools are implemented but no plan permits them, so the catalogue will \
+             never offer them and the gateway will refuse every call: {:?}. Either permit \
+             them in `derive`, or add them to WITHHELD with the ground for withholding.",
+            unreachable
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multimodal_search_is_available_wherever_a_text_search_is() {
+        // It reads the same shelf under the same clearance, and it is the only
+        // way to reach a region on a drawing. A run that may search the words
+        // around a P&ID and not the P&ID is the bug this prevents.
+        for prompt in EVERY_BRANCH {
+            let plan = derive(prompt);
+            assert_eq!(
+                plan.budget.permits(ToolName::SearchDocuments),
+                plan.budget.permits(ToolName::KnowledgeMultimodalRetrieve),
+                "{prompt:?} permits the two searches differently"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_is_offered_where_the_run_establishes_something_durable() {
+        for prompt in [
+            "draft an approval note for replacing the P-101 seal",
+            "put together a briefing deck on the Q3 inspection",
+            "remember that P-101 uses the type 21 seal",
+            "from now on treat 8.0 mm as the minimum",
+        ] {
+            assert!(
+                derive(prompt).budget.permits(ToolName::MemoryPromoteApproved),
+                "{prompt:?} could not record what it established"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_is_withheld_from_a_run_that_only_answers() {
+        // Nothing was established, so there is nothing to promote — and an
+        // unusable writing tool is one more thing to be refused for trying.
+        let plan = derive("what is the wall thickness limit for P-101?");
+        assert!(!plan.budget.permits(ToolName::MemoryPromoteApproved));
+        // Reading memory stays available: the question may well be one the
+        // project has already answered.
+        assert!(plan.budget.permits(ToolName::MemoryRecallAuthorized));
     }
 
     #[test]

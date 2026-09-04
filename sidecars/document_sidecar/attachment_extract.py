@@ -12,14 +12,18 @@ present is slower, lossier, and needlessly uses the GPU.
 So this routes by what the file *is*:
 
     text-native (txt, md, csv, json)  ->  decoded, never OCR'd
-    pdf with a text layer             ->  pypdf, never OCR'd
-    pdf without one (a scan)          ->  pages rendered to PNG for the OCR model
+    pdf                               ->  page by page: a page with a text
+                                          layer is read with pypdf, a page
+                                          without one is rendered to PNG for
+                                          the OCR model, and a page that is
+                                          neither is reported unread
     docx                              ->  paragraphs and tables, never OCR'd
     xlsx                              ->  sheet cells, never OCR'd
     pptx                              ->  slide text and speaker notes, never OCR'd
     anything else                     ->  refused by name, with the reason
 
-Only a scanned PDF reaches the OCR model. That is the point.
+Only a page with no text layer reaches the OCR model. That is the point — and
+it is decided per page, because a PDF is not obliged to be all one thing.
 
 Dependencies
 ------------
@@ -34,11 +38,23 @@ Contract
 
 Prints one JSON object on stdout:
 
-    {"kind": "pdf-text"|"pdf-scan"|"text"|"docx"|"xlsx"|"pptx",
-     "text": "...",          # empty for pdf-scan
+    {"kind": "pdf-text"|"pdf-scan"|"pdf-mixed"|"text"|"docx"|"xlsx"|"pptx",
+     "text": "...",          # the text layer alone; empty for pdf-scan
      "pages": 6,             # real page/sheet count, or 1
-     "pageImages": [...],    # absolute PNG paths, only for pdf-scan
-     "truncated": false}
+     "pageImages": [...],    # absolute PNG paths of the pages needing OCR
+     "pageDetail": [...],    # PDFs only: one entry per page, in page order
+     "unreadPages": [4, 5],  # pages nothing could be made of
+     "truncated": false}     # true whenever unreadPages is non-empty
+
+`pageDetail` is the authoritative account of a PDF, one entry per page:
+
+    {"page": 1, "source": "text",   "text": "..."}
+    {"page": 2, "source": "ocr",    "image": "/abs/page-2.png", "layerText": ""}
+    {"page": 3, "source": "unread", "why": "..."}
+
+Every page of the document appears exactly once. A page that could not be read
+says so; it is never left out, because a missing entry and a blank page are
+different facts and the caller cannot tell them apart afterwards.
 
 or, on refusal:
 
@@ -91,6 +107,33 @@ def read_text_native(path):
 
 
 def extract_pdf(path, out_dir, max_pages):
+    """Read a PDF, deciding page by page whether it needs the OCR model.
+
+    Why the decision is per page
+    ---------------------------
+    This used to compare the *whole file's* text against one threshold and
+    label the result `pdf-text` or `pdf-scan`. Real documents are not one or
+    the other. A digitally-produced cover sheet in front of scanned drawings is
+    the ordinary shape of an engineering document, and against an aggregate
+    threshold the cover alone carried the whole file over the line: the scanned
+    pages were never rendered, never OCR'd, and never mentioned. The reader got
+    the cover and no sign that anything else existed.
+
+    The threshold was capped at three pages' worth (`min(total, 3)`), so it
+    never grew with the document. One readable page anywhere in a hundred-page
+    scan was enough to declare the whole thing text.
+
+    Both failures were silent, which is what made them serious. `truncated`
+    came back `False`, so nothing downstream could tell a PDF that had been
+    read from one that had been skipped.
+
+    What comes back
+    ---------------
+    `pageDetail` is the authoritative record: one entry per page, in page
+    order, saying how that page was handled. Every page appears in it exactly
+    once, including the ones nothing could be done with — a page this function
+    cannot read is reported as unread, never omitted.
+    """
     import pypdf
 
     reader = pypdf.PdfReader(path)
@@ -101,36 +144,100 @@ def extract_pdf(path, out_dir, max_pages):
             return {"error": "This PDF is password protected."}
 
     total = len(reader.pages)
-    parts = []
+    if total == 0:
+        return {"error": "This PDF has no pages in it."}
+
+    # What the text layer gives for each page, kept per page rather than
+    # concatenated. The concatenation is precisely what lost the page
+    # boundaries, and with them any way to tell which pages were covered.
+    layer = []
     for page in reader.pages:
         try:
-            parts.append(page.extract_text() or "")
+            layer.append((page.extract_text() or "").strip())
         except Exception:
-            parts.append("")
-    text = "\n\n".join(p.strip() for p in parts if p.strip())
+            # One unreadable page is not an unreadable document. It falls to
+            # OCR below like any other page with no usable text.
+            layer.append("")
 
-    # A real text layer means no OCR at all.
-    if len(text) >= MIN_TEXT_CHARS_PER_PAGE * max(1, min(total, 3)):
-        return {"kind": "pdf-text", "text": text, "pages": total,
-                "pageImages": [], "truncated": False}
+    # The per-page decision. The same threshold as before, applied to the page
+    # it is about rather than to a sum across pages.
+    needs_ocr = [i for i in range(total) if len(layer[i]) < MIN_TEXT_CHARS_PER_PAGE]
 
-    # No usable text layer: it is a scan. Render pages for the OCR model.
-    import fitz
+    detail = [None] * total
+    for index in range(total):
+        if index not in needs_ocr:
+            detail[index] = {"page": index + 1, "source": "text",
+                             "text": layer[index]}
 
-    doc = fitz.open(path)
     rendered = []
-    limit = min(total, max_pages)
-    for index in range(limit):
-        page = doc.load_page(index)
-        rect = page.rect
-        scale = RENDER_WIDTH / rect.width if rect.width else 1.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-        target = os.path.join(out_dir, "page-%d.png" % (index + 1))
-        pix.save(target)
-        rendered.append(target)
-    doc.close()
-    return {"kind": "pdf-scan", "text": "", "pages": total,
-            "pageImages": rendered, "truncated": limit < total}
+    if needs_ocr:
+        import fitz
+
+        doc = fitz.open(path)
+        try:
+            for index in needs_ocr:
+                # Rendering is the expensive path, so it stays bounded — but a
+                # page dropped for the budget is now *recorded* as dropped
+                # rather than vanishing.
+                if len(rendered) >= max_pages:
+                    detail[index] = {
+                        "page": index + 1, "source": "unread",
+                        "why": "the limit of %d rendered pages was reached" % max_pages,
+                    }
+                    continue
+                try:
+                    page = doc.load_page(index)
+                    rect = page.rect
+                    scale = RENDER_WIDTH / rect.width if rect.width else 1.0
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                    target = os.path.join(out_dir, "page-%d.png" % (index + 1))
+                    pix.save(target)
+                except Exception as error:  # noqa: BLE001 - shown to a person
+                    detail[index] = {"page": index + 1, "source": "unread",
+                                     "why": "the page could not be rendered: %s" % error}
+                    continue
+                rendered.append(target)
+                detail[index] = {
+                    "page": index + 1, "source": "ocr", "image": target,
+                    # Whatever the text layer did hold, below the threshold.
+                    # Kept as a fallback for when OCR comes back with nothing: a
+                    # page carrying "Figure 3 continued" over an unreadable scan
+                    # should report that much rather than nothing at all.
+                    "layerText": layer[index],
+                }
+        finally:
+            doc.close()
+
+    unread = [d["page"] for d in detail if d["source"] == "unread"]
+
+    # Nothing readable at all is a failure, not a result — the rule
+    # `extract_pptx` already follows. A document of nothing but "could not
+    # read" lets a summary be written about a file that was never opened.
+    if not rendered and not any(d["source"] == "text" for d in detail):
+        return {"error": "no page of this PDF could be read; the file may be corrupt"}
+
+    if not needs_ocr:
+        kind = "pdf-text"
+    elif len(needs_ocr) == total:
+        kind = "pdf-scan"
+    else:
+        kind = "pdf-mixed"
+
+    return {
+        "kind": kind,
+        # The digital text alone, as before, for any reader that wants one
+        # blob. Merging this with the OCR output in page order is the caller's
+        # job, because only the caller has the OCR output.
+        "text": "\n\n".join(d["text"] for d in detail if d["source"] == "text"),
+        "pages": total,
+        # The images from `pageDetail`, in page order. Its own field because
+        # "is there OCR work?" is the caller's first question, and this answers
+        # it without walking the detail.
+        "pageImages": rendered,
+        "pageDetail": detail,
+        "unreadPages": unread,
+        "truncated": bool(unread),
+    }
 
 
 def extract_docx(path):
@@ -147,48 +254,198 @@ def extract_docx(path):
             "pageImages": [], "truncated": False}
 
 
+SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+RELS_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def column_index(reference):
+    """`A1` -> 0, `B3` -> 1, `AA7` -> 26. `None` when there is no reference.
+
+    A cell carries the square it sits in, and until this was read the reader
+    laid cells out by their order in the XML instead. Those are not the same
+    thing: a writer is free to omit an empty cell entirely — ARJUN's own does,
+    emitting nothing at all for `Cell::Empty` — and every cell after the gap
+    then shifts one column left. A value under the wrong heading is worse than
+    a value that is missing, because nothing about it looks wrong.
+    """
+    letters = ""
+    for character in reference:
+        if character.isalpha():
+            letters += character
+        else:
+            break
+    if not letters:
+        return None
+    index = 0
+    for character in letters.upper():
+        index = index * 26 + (ord(character) - ord("A") + 1)
+    return index - 1
+
+
+def cell_value(cell, shared):
+    """The text of one cell, whichever of the several ways it is stored.
+
+    OOXML has more than one place to keep a value, and the reader used to look
+    in exactly one of them — `<v>`, interpreted as a shared-string index when
+    `t="s"`. That covers what Excel writes and misses what ARJUN writes: this
+    codebase's own workbook writer emits every label as an *inline* string,
+    `<c t="inlineStr"><is><t>...</t></is></c>`, which has no `<v>` element at
+    all. So a row reading `Inspection result | 9.0` came back as ` | 9.0` — the
+    number kept, the word for it dropped, and no sign anything had gone.
+    """
+    kind = cell.get("t")
+
+    # Inline: the text lives in the cell, and there is no <v> to find.
+    if kind == "inlineStr":
+        inline = cell.find("%sis" % SHEET_NS)
+        if inline is None:
+            return ""
+        return "".join(t.text or "" for t in inline.iter("%st" % SHEET_NS))
+
+    value = cell.find("%sv" % SHEET_NS)
+    raw = "" if value is None or value.text is None else value.text
+
+    # Shared: <v> is an index into the workbook-wide string table.
+    if kind == "s":
+        try:
+            index = int(raw)
+        except ValueError:
+            return ""
+        return shared[index] if 0 <= index < len(shared) else ""
+
+    if kind == "b":
+        return "TRUE" if raw.strip() == "1" else "FALSE"
+
+    # An Excel error (#DIV/0!, #REF!) is reported as it stands. Blanking it
+    # would turn a broken figure into a missing one, and a reader deciding
+    # whether to trust a workbook needs to see it.
+    if kind == "e":
+        return raw
+
+    formula = cell.find("%sf" % SHEET_NS)
+    if formula is not None:
+        expression = (formula.text or "").strip()
+        if expression and raw:
+            # Both, because they answer different questions. The cached value
+            # is what the workbook says; the formula is how it got there, and
+            # a calculation workbook exists to show exactly that.
+            return "%s (=%s)" % (raw, expression)
+        if expression:
+            # A formula Excel has never evaluated has no cache. Saying so beats
+            # reporting the cell as empty.
+            return "=%s" % expression
+    return raw
+
+
+def sheet_parts(archive):
+    """Every sheet as `(name, part)`, in the order the workbook lists them.
+
+    Read through `workbook.xml` and its relationships rather than by globbing
+    the parts directory, for two reasons. The names are only in the workbook —
+    "Calculation" is a great deal more use to a reader than "sheet1" — and the
+    order is only correct there: sorting part names as text puts `sheet10`
+    ahead of `sheet2`.
+    """
+    from xml.etree import ElementTree as ET
+
+    names = archive.namelist()
+    targets = {}
+    if "xl/_rels/workbook.xml.rels" in names:
+        root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        for relationship in root:
+            target = (relationship.get("Target") or "").lstrip("/")
+            if not target:
+                continue
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            targets[relationship.get("Id")] = target
+
+    named = []
+    if "xl/workbook.xml" in names:
+        root = ET.fromstring(archive.read("xl/workbook.xml"))
+        for sheet in root.iter("%ssheet" % SHEET_NS):
+            part = targets.get(sheet.get("%sid" % RELS_NS))
+            if part and part in names:
+                named.append((sheet.get("name") or "Sheet", part))
+    if named:
+        return named
+
+    # No usable workbook part. Fall back to the sheet files themselves, ordered
+    # by their number rather than as text.
+    def number(part):
+        digits = "".join(c for c in os.path.basename(part) if c.isdigit())
+        return int(digits) if digits else 0
+
+    parts = [n for n in names
+             if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+    return [(os.path.splitext(os.path.basename(p))[0], p)
+            for p in sorted(parts, key=number)]
+
+
 def extract_xlsx(path, max_rows=2000):
     """Read sheet values straight from the package.
 
     `openpyxl` is not installed, and adding it for one format would be a new
-    dependency. An .xlsx is a zip of XML: the shared-string table plus each
-    sheet's cell values is all that is needed, and the standard library
-    already reads both.
+    dependency in an air-gapped deployment. An .xlsx is a zip of XML, and the
+    standard library reads both halves of it.
+
+    The rule this follows is that a cell's *position* and a cell's *label* are
+    part of its value. A workbook read as a bag of numbers with the headings
+    dropped and the columns shifted is not a workbook that was read.
     """
     from xml.etree import ElementTree as ET
 
-    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    with zipfile.ZipFile(path) as z:
+    with zipfile.ZipFile(path) as archive:
         shared = []
-        if "xl/sharedStrings.xml" in z.namelist():
-            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
-            for si in root.findall("%ssi" % ns):
-                shared.append("".join(t.text or "" for t in si.iter("%st" % ns)))
-        sheets = sorted(n for n in z.namelist()
-                        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
-        out, count = [], 0
-        for name in sheets:
-            root = ET.fromstring(z.read(name))
-            for row in root.iter("%srow" % ns):
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall("%ssi" % SHEET_NS):
+                shared.append("".join(t.text or "" for t in item.iter("%st" % SHEET_NS)))
+
+        sheets = sheet_parts(archive)
+        out, count, truncated = [], 0, False
+
+        for name, part in sheets:
+            root = ET.fromstring(archive.read(part))
+            rows = []
+            for row in root.iter("%srow" % SHEET_NS):
                 if count >= max_rows:
-                    return {"kind": "xlsx", "text": "\n".join(out),
-                            "pages": len(sheets), "pageImages": [], "truncated": True}
-                values = []
-                for c in row.findall("%sc" % ns):
-                    v = c.find("%sv" % ns)
-                    if v is None or v.text is None:
-                        values.append("")
-                        continue
-                    if c.get("t") == "s":
-                        idx = int(v.text)
-                        values.append(shared[idx] if idx < len(shared) else "")
-                    else:
-                        values.append(v.text)
-                if any(x.strip() for x in values):
-                    out.append(" | ".join(values))
+                    truncated = True
+                    break
+                # Keyed on the column the cell says it is in, so a gap stays a
+                # gap instead of pulling everything after it one place left.
+                cells, widest = {}, -1
+                for cell in row.findall("%sc" % SHEET_NS):
+                    index = column_index(cell.get("r") or "")
+                    if index is None:
+                        index = widest + 1
+                    cells[index] = cell_value(cell, shared)
+                    widest = max(widest, index)
+                values = [cells.get(i, "") for i in range(widest + 1)]
+                if any(v.strip() for v in values):
+                    rows.append(" | ".join(values))
                 count += 1
+
+            if rows:
+                # Which sheet a row came from, said once per sheet — but only
+                # when there is more than one sheet to be confused about. A
+                # figure quoted out of a five-tab workbook with no idea which
+                # tab it came from cannot be checked; a header over the only
+                # sheet there is answers a question nobody can ask, and every
+                # single-sheet attachment would carry the noise.
+                #
+                # Keyed on how many sheets the *workbook* declares, not on how
+                # many turned out to have rows: a three-sheet workbook with
+                # content on one of them is exactly the case where naming it
+                # earns its line.
+                if len(sheets) > 1:
+                    out.append("--- sheet: %s ---" % name)
+                out.extend(rows)
+            if truncated:
+                break
+
         return {"kind": "xlsx", "text": "\n".join(out), "pages": len(sheets),
-                "pageImages": [], "truncated": False}
+                "pageImages": [], "truncated": truncated}
 
 
 def extract_pptx(path, max_slides=500):

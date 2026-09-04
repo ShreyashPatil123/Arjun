@@ -301,6 +301,86 @@ mod tests {
         assert_eq!(column_letter(27), "AB");
     }
 
+    /// The workbook this writes must be readable by the reader that reads it.
+    ///
+    /// Both halves were correct on their own and did not meet. This writer
+    /// emits every label as an *inline* string — `<c t="inlineStr"><is><t>` —
+    /// and `attachment_extract.py` looked only in `<v>`, which an inline
+    /// string does not have. It also laid cells out by their order in the XML
+    /// rather than by the square each one names, and `rows_for` below emits
+    /// `Text, Empty, Text` with the empty cell written as nothing at all.
+    ///
+    /// Together those two facts did more than drop the headings: a row of
+    /// label-gap-value came back as `" | "`, which the reader discards as
+    /// blank. ARJUN's own calculation workbook — the artifact that exists so a
+    /// figure can be checked six months later — read back as almost nothing,
+    /// and nothing anywhere said so.
+    ///
+    /// This is the test that cannot go stale, because it runs the real writer
+    /// into the real reader. A unit test on either side would have passed
+    /// throughout, and both did.
+    #[test]
+    fn a_workbook_this_writes_can_be_read_back_by_the_document_extractor() {
+        let dir = temp();
+        let path = dir.path().join("calc.xlsx");
+        let record = evaluate("(9.0 - 8.2) / 9.0 * 100").unwrap();
+        write_workbook(&path, std::slice::from_ref(&record), "Inspection report").unwrap();
+
+        let script = crate::deployment::require_path("document-extractor")
+            .expect("the attachment extractor ships with this build");
+        let output = std::process::Command::new(crate::deployment::program("python"))
+            .arg(&script)
+            .arg(&path)
+            .arg(dir.path())
+            .output()
+            .expect(
+                "python is a core dependency of this build (see crate::deployment); \
+                 the writer and the reader cannot be checked against each other without it",
+            );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .rev()
+            .find(|line| line.trim_start().starts_with('{'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the extractor printed no JSON: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("well-formed JSON");
+        let text = parsed["text"].as_str().unwrap_or_default();
+
+        assert_eq!(parsed["kind"], "xlsx");
+        // The labels this writer puts in column A, which used to vanish.
+        for label in ["Calculation record", "Expression", "Result"] {
+            assert!(text.contains(label), "the label {label:?} was lost:\n{text}");
+        }
+        // This writer emits one sheet, so no sheet header is expected: naming
+        // the only tab there is answers a question nobody can ask. Asserting
+        // its *absence* rather than its presence, because "Calculation" also
+        // appears in the body above — an assertion that passed on the body
+        // while believing it had found a header would be worse than none.
+        // The multi-sheet case is covered in
+        // sidecars/document_sidecar/tests/test_attachment_xlsx.py.
+        assert!(
+            !text.contains("--- sheet:"),
+            "a one-sheet workbook should carry no sheet header:\n{text}"
+        );
+        // The expression, which sits in column C behind an empty column B —
+        // the gap that used to shift every value one place left.
+        assert!(
+            text.contains("(9.0 - 8.2) / 9.0 * 100"),
+            "the expression was lost:\n{text}"
+        );
+        assert!(
+            text.contains(&record.formatted),
+            "the result {:?} was lost:\n{text}",
+            record.formatted
+        );
+    }
+
     #[test]
     fn a_workbook_is_written_and_reopens_soundly() {
         let dir = temp();

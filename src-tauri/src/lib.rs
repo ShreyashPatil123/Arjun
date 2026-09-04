@@ -4,6 +4,7 @@
 pub mod core;
 pub mod database;
 pub mod config;
+pub mod deployment;
 pub mod logging;
 pub mod commands;
 pub mod sovereignty;
@@ -142,6 +143,32 @@ pub fn run() {
         .setup(move |app| {
             info!("Sarathi application starting...");
 
+            // Where the installer put the files this build ships. Recorded
+            // before anything can want one, because `deployment` is the only
+            // module that knows how to find a sidecar and it is deliberately
+            // Tauri-free — this is the one place the two meet.
+            //
+            // A checkout has no resource directory and does not get one; the
+            // module's checkout fallback covers that case and the preflight
+            // reports it as development-only rather than as working.
+            match app.path().resource_dir() {
+                Ok(dir) => deployment::set_resource_dir(dir),
+                Err(error) => log::warn!(
+                    "[DEPLOYMENT] no packaged resource directory ({error}); \
+                     bundled scripts will be looked for in the checkout"
+                ),
+            }
+            for status in deployment::preflight() {
+                if let Some(remedy) = &status.remedy {
+                    log::warn!(
+                        "[DEPLOYMENT] {} ({}) is not properly installed: {:?}. {remedy}",
+                        status.label,
+                        status.needed_for,
+                        status.resolution,
+                    );
+                }
+            }
+
             // Resolve app_data_dir dynamically from Tauri app handle
             let app_data_dir = app
                 .path()
@@ -252,7 +279,8 @@ pub fn run() {
                 }
             }
 
-            app.manage(Arc::new(orchestrator::approvals::ApprovalQueue::new()));
+            let approval_queue = Arc::new(orchestrator::approvals::ApprovalQueue::new());
+            app.manage(Arc::clone(&approval_queue));
             app.manage(commands::governance::CurrentSession::default());
             // The telemetry sink: per-model call records, written to the
             // audit log on each call so the Model Health page reads from
@@ -431,6 +459,63 @@ pub fn run() {
             // here, before anything else writes, so the Tasks screen never
             // shows a run that has been "running" since last Tuesday next to
             // one that is running now.
+            // Approvals raised before this process started, put back in front
+            // of somebody. Until they were durable, a crash while a person was
+            // deciding lost both the question and the answer, and the operator
+            // came back to a run that had stopped for a reason nothing recorded.
+            match task_events.pending_approvals() {
+                Ok(waiting) if !waiting.is_empty() => {
+                    let requests = waiting
+                        .into_iter()
+                        .map(|approval| orchestrator::approvals::ApprovalRequest {
+                            id: approval.approval_id,
+                            task_id: approval.run_id,
+                            tool: approval.tool,
+                            target: approval.target,
+                            // Rendered back from what was stored. The durable
+                            // row keeps the arguments as one value; the screen
+                            // wants them as lines.
+                            arguments: serde_json::from_str::<serde_json::Value>(
+                                &approval.arguments,
+                            )
+                            .ok()
+                            .and_then(|value| {
+                                value.get("arguments").and_then(|args| {
+                                    args.as_array().map(|list| {
+                                        list.iter()
+                                            .map(|item| match item.as_str() {
+                                                Some(text) => text.to_string(),
+                                                None => item.to_string(),
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                            })
+                            .unwrap_or_default(),
+                            // Not stored: evidence is gathered by the run that
+                            // asked, and that run is gone. Empty is honest.
+                            evidence: Vec::new(),
+                            expected_output: approval.reason,
+                            consequences: String::new(),
+                            requested_by: String::new(),
+                            requested_at: chrono::DateTime::parse_from_rfc3339(
+                                &approval.created_at,
+                            )
+                            .map(|at| at.with_timezone(&chrono::Utc))
+                            .unwrap_or_else(|_| chrono::Utc::now()),
+                        })
+                        .collect::<Vec<_>>();
+                    let count = approval_queue.restore(requests);
+                    info!(
+                        "[TASKS] {count} approval(s) raised before this start are waiting for a                          decision"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!("[TASKS] pending approvals could not be read back: {error}")
+                }
+            }
+
             match task_events.recover_interrupted(agent_runtime::events::SYSTEM_ACTOR) {
                 Ok(recovered) if !recovered.is_empty() => {
                     info!(

@@ -56,7 +56,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
@@ -161,8 +160,13 @@ pub struct LaunchPlan {
 }
 
 /// Where `llama-server` is.
+///
+/// Still `ARJUN_LLAMA_SERVER` first and the bare name second — the behaviour
+/// this had before — but routed through [`crate::deployment`] so the override
+/// and the remedy live in the same table as every other external dependency,
+/// and so the preflight reports this one alongside the rest.
 fn llama_server_program() -> String {
-    std::env::var("ARJUN_LLAMA_SERVER").unwrap_or_else(|_| "llama-server".to_string())
+    crate::deployment::program("llama-server")
 }
 
 /// Finds a free loopback port by taking one and letting go.

@@ -39,10 +39,18 @@ export function TaskPanel({ runId }: { runId: string | null }) {
     return null;
   }
 
+  // The assistant cell this run produced, found through the run's own
+  // `messageId` rather than by position. It is the only durable record of how
+  // the turn ended: `status`, `verification` and `outcome` are all written to
+  // it when the run completes and survive a restart, where the run's events do
+  // not.
+  const message = conversation?.messages.find(m => m.id === run?.messageId);
+
   const stepCards: StepCard[] = buildSteps({
     activity,
     plan: plan ?? null,
     summary: summary ?? null,
+    message,
     run,
     turns,
     compactions,
@@ -89,10 +97,11 @@ interface StepCard {
   detail?: string;
 }
 
-function buildSteps({
+export function buildSteps({
   activity,
   plan,
   summary,
+  message,
   run,
   turns,
   compactions,
@@ -100,10 +109,28 @@ function buildSteps({
   activity?: Activity[];
   plan: { steps: { intent: string }[] } | null;
   summary: Pick<RunSummary, 'verification'> | null;
+  /**
+   * The assistant message this run wrote, when the conversation has it.
+   *
+   * The last three cards used to key off `summary`, which is set from a live
+   * run view — and that view hard-codes `summary: null` for anything adopted
+   * from a snapshot, which is every run this panel ever sees. Nothing anywhere
+   * assigned it. So "Composed the answer" spun for ever, "Verifying" never
+   * left pending, and the final card read "Not yet done" under a finished
+   * answer, on every run.
+   *
+   * The message is the durable answer to the same question. `status` says
+   * whether the turn is still writing, and `verification` says what the
+   * verifier concluded; both are persisted with the conversation.
+   */
+  message: { status?: string; verification?: 'ready' | 'needsReview' | null; outcome?: string | null } | undefined;
   run: { modelName?: string | null; live?: boolean } | undefined;
   turns: number;
   compactions: number;
 }): StepCard[] {
+  // "Finished" is a property of the turn, not of the panel's own state.
+  const streaming = message?.status === 'streaming';
+  const finished = message ? !streaming : Boolean(summary);
   const steps: StepCard[] = [];
 
   // 1. Plan
@@ -143,17 +170,27 @@ function buildSteps({
   }
 
   // 4. Composing
-  if (turns > 0 || summary) {
-    steps.push({
-      state: summary ? 'done' : 'running',
-      title: 'Composed the answer',
-    });
+  if (finished) {
+    steps.push({ state: 'done', title: 'Composed the answer' });
+  } else if (streaming || turns > 0) {
+    steps.push({ state: 'running', title: 'Composing the answer' });
   } else {
     steps.push({ state: 'pending', title: 'Composing' });
   }
 
   // 5. Verifying
-  if (summary?.verification) {
+  //
+  // The message's verdict first: it is written when the run completes and is
+  // still there after a restart, which is when this panel is most often read.
+  if (message?.verification) {
+    const ready = message.verification === 'ready';
+    steps.push({
+      state: 'done',
+      title: ready ? 'Verified' : 'Needs review',
+    });
+  } else if (finished) {
+    steps.push({ state: 'done', title: 'No verification required' });
+  } else if (summary?.verification) {
     const v: VerificationReport = summary.verification;
     const ready = v.standing.standing === 'ready';
     steps.push({
@@ -178,10 +215,16 @@ function buildSteps({
   }
 
   // 7. Done
-  steps.push({
-    state: summary ? 'done' : 'pending',
-    title: summary ? 'Done' : 'Not yet done',
-  });
+  //
+  // Named for what happened rather than only that it stopped. A turn the
+  // operator interrupted and one that failed are both "not running", and
+  // showing them the same word is how a failure goes unnoticed.
+  if (finished) {
+    const failed = message?.status === 'failed' || message?.outcome === 'failed';
+    steps.push({ state: 'done', title: failed ? 'Ended without an answer' : 'Done' });
+  } else {
+    steps.push({ state: 'pending', title: 'Not yet done' });
+  }
 
   return steps;
 }
