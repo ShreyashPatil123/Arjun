@@ -44,6 +44,7 @@ use super::model::{
     SYSTEM_ACTOR,
 };
 use super::projection::{fold, TaskSnapshot};
+use super::MAX_RECOVERY_ATTEMPTS;
 
 /// Why an append did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
