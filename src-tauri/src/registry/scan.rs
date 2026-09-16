@@ -298,6 +298,7 @@ pub fn entry_for(gguf: &ScannedGguf) -> ModelEntry {
         required_runtime_profile: None,
         enabled: true,
         routing: RoutingPreference::default(),
+        sampling: None,
     }
 }
 

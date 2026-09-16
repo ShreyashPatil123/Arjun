@@ -23,6 +23,8 @@
 //! `model_recommendation::estimator` has the exact GQA-aware formula for the
 //! catalog path, where the metadata is available.
 
+use crate::ai_engine::gguf_meta::KvCost;
+
 /// VRAM held back for the OS, desktop compositor, and other applications.
 ///
 /// On Windows the desktop alone commonly holds 0.5–1.0 GB on a discrete GPU.
@@ -105,10 +107,25 @@ const MIN_SERVING_CONTEXT: u32 = 16_384;
 /// weights — a third of the layers on the GPU and the rest crossing PCIe for
 /// every token. The same model at 8K fits entirely in VRAM.
 fn context_ladder(requested: u32) -> Vec<u32> {
-    let mut rungs: Vec<u32> = [requested, 65_536, 32_768, 16_384, MIN_SERVING_CONTEXT]
-        .into_iter()
-        .filter(|rung| *rung <= requested && *rung > 0)
-        .collect();
+    let mut rungs: Vec<u32> = [
+        requested,
+        // The rungs above 64k exist for hybrid-attention models, whose long
+        // windows are actually reachable on a consumer card. Without them a
+        // model declaring 1 048 576 fell from its trained window straight to
+        // 65 536, so a card with room for 262 144 was never offered it — the
+        // ladder had no rung to find. A dense model reaches these and fails
+        // them on cost, which is one arithmetic pass each.
+        524_288,
+        262_144,
+        131_072,
+        65_536,
+        32_768,
+        16_384,
+        MIN_SERVING_CONTEXT,
+    ]
+    .into_iter()
+    .filter(|rung| *rung <= requested && *rung > 0)
+    .collect();
     rungs.sort_unstable_by(|a, b| b.cmp(a));
     rungs.dedup();
     // A model trained on less than the floor is served at what it was trained
@@ -179,12 +196,14 @@ pub enum ContextChoice {
 /// Plans GPU offload, told where the window came from and what the KV cache
 /// actually costs.
 ///
-/// `kv_bytes_per_token` is the model's own geometry from its GGUF header —
-/// `block_count * head_count_kv * (key_length + value_length) * 2`, which
-/// [`super::gguf_meta::GgufMetadata::kv_bytes_per_token`] already computes and
-/// the MoE planner already uses. `None` falls back to
+/// `kv_cost` is the model's own geometry from its GGUF header, which
+/// [`super::gguf_meta::GgufMetadata::kv_cost`] computes. `None` falls back to
 /// [`estimate_kv_bytes_per_token`], the size band, for a caller that has not
 /// read the header.
+///
+/// Two figures rather than one because a hybrid-attention model's cache does
+/// not all scale with the window: see [`KvCost`]. A dense model has a `fixed`
+/// of zero and plans exactly as it did before this existed.
 ///
 /// The band is deliberately high, and on a card with no room to spare that
 /// conservatism is not free. Qwen3.5-9B is 32 layers x 4 KV heads x 512, so
@@ -197,7 +216,7 @@ pub fn plan_gpu_offload_with(
     model_bytes: u64,
     context: ContextChoice,
     total_layers: Option<u32>,
-    kv_bytes_per_token: Option<u64>,
+    kv_cost: Option<KvCost>,
 ) -> GpuOffloadPlan {
     let ladder = match context {
         // One rung, because the answer is already decided.
@@ -217,7 +236,7 @@ pub fn plan_gpu_offload_with(
             model_bytes,
             *rung,
             total_layers,
-            kv_bytes_per_token,
+            kv_cost,
         );
         if plan.full_offload {
             return plan;
@@ -234,7 +253,7 @@ pub fn plan_gpu_offload_with(
         model_bytes,
         smallest,
         total_layers,
-        kv_bytes_per_token,
+        kv_cost,
     )
 }
 
@@ -244,7 +263,7 @@ fn plan_at_context(
     model_bytes: u64,
     context_length: u32,
     total_layers: Option<u32>,
-    kv_bytes_per_token: Option<u64>,
+    kv_cost: Option<KvCost>,
 ) -> GpuOffloadPlan {
     if vram_total_bytes == 0 {
         return GpuOffloadPlan::cpu_only(context_length, "No GPU VRAM detected");
@@ -272,11 +291,10 @@ fn plan_at_context(
     // server's actual allocation.  Without this, the per-token cost is the
     // FP16 figure while the server runs `q8_0`, and the planner walks the
     // context ladder down to a window the server's cache already fits in.
-    let kv_per_token_fp16 = kv_bytes_per_token
-        .filter(|per_token| *per_token > 0)
-        .unwrap_or_else(|| estimate_kv_bytes_per_token(model_bytes));
-    let kv_per_token = (kv_per_token_fp16 as f64 * KV_QUANT_FACTOR) as u64;
-    let kv_bytes = kv_per_token.saturating_mul(context_length.max(1) as u64);
+    let kv_cost = kv_cost
+        .filter(|cost| cost.per_token > 0)
+        .unwrap_or_else(|| KvCost::dense(estimate_kv_bytes_per_token(model_bytes)));
+    let kv_bytes = kv_cost.bytes_for(context_length, KV_QUANT_FACTOR);
 
     // KV cache and compute buffers are charged before any weights.
     let after_kv = usable.saturating_sub(kv_bytes);
@@ -723,7 +741,7 @@ mod tests {
             WEIGHTS,
             ContextChoice::Planned(8192),
             Some(32),
-            Some(REAL_KV),
+            Some(KvCost::dense(REAL_KV)),
         );
         assert!(
             measured.full_offload,
@@ -731,6 +749,113 @@ mod tests {
             measured.reason
         );
         assert_eq!(measured.context_length, 8192, "and does not buy it by shrinking the window");
+    }
+
+    /// What the hybrid-attention reading is actually worth, in served tokens.
+    ///
+    /// Spark-X2.5-4B on the 7.9 GB RTX 5060 this was developed against. The
+    /// size band charges it 160 KB a token; its real geometry costs 36 KB for
+    /// the 9 blocks that grow plus a fixed 54 MB for the 27 that do not. Both
+    /// plans put the whole model on the GPU — the difference is the window
+    /// they can afford while doing it, and it is a four-fold one.
+    #[test]
+    fn hybrid_attention_buys_a_larger_window_than_the_size_band_allows() {
+        const VRAM: u64 = 7899 * 1024 * 1024;
+        const WEIGHTS: u64 = 4_375_021_152;
+        const TRAINED_WINDOW: u32 = 1_048_576;
+        let spark = KvCost {
+            per_token: 9 * 4 * (256 + 256) * 2,
+            fixed: 27 * 4 * (256 + 256) * 2 * 512,
+        };
+
+        let banded = plan_gpu_offload(VRAM, WEIGHTS, TRAINED_WINDOW, Some(36));
+        let measured = plan_gpu_offload_with(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(TRAINED_WINDOW),
+            Some(36),
+            Some(spark),
+        );
+
+        assert!(banded.full_offload, "{}", banded.reason);
+        assert!(measured.full_offload, "{}", measured.reason);
+        assert!(
+            measured.context_length > banded.context_length,
+            "the model's own geometry must buy a larger window than the band: \
+             band {} vs geometry {}",
+            banded.context_length,
+            measured.context_length
+        );
+        assert_eq!(
+            banded.context_length, 16_384,
+            "the size band's answer for this model, which is what shipped"
+        );
+        assert_eq!(
+            measured.context_length, 65_536,
+            "and what its real geometry affords on the same card"
+        );
+    }
+
+    /// Each rung is offered exactly where the card can pay for it.
+    ///
+    /// The rungs above 64k were added for hybrid models, and they have to be
+    /// two things at once: reachable on a card with the memory, and never a
+    /// route to over-committing one without it. Spark's trained window costs
+    /// about 19 GB of `q8_0` KV cache, so a 24 GB card gets all 1 048 576 of
+    /// it, a 16 GB card gets a long window below that, and the 8 GB card this
+    /// was developed on gets 65 536 — three different honest answers from one
+    /// ladder.
+    #[test]
+    fn each_long_rung_is_offered_exactly_where_it_fits() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        const WEIGHTS: u64 = 4_375_021_152;
+        const TRAINED: u32 = 1_048_576;
+        let spark = KvCost {
+            per_token: 9 * 4 * (256 + 256) * 2,
+            fixed: 27 * 4 * (256 + 256) * 2 * 512,
+        };
+        let plan_on = |vram: u64| {
+            plan_gpu_offload_with(
+                vram,
+                WEIGHTS,
+                ContextChoice::Planned(TRAINED),
+                Some(36),
+                Some(spark),
+            )
+        };
+
+        let workstation = plan_on(24 * GB);
+        assert!(workstation.full_offload, "{}", workstation.reason);
+        assert_eq!(
+            workstation.context_length, TRAINED,
+            "a 24 GB card pays for the trained window outright"
+        );
+
+        let midrange = plan_on(16 * GB);
+        assert!(midrange.full_offload, "{}", midrange.reason);
+        assert!(
+            midrange.context_length > 65_536 && midrange.context_length < TRAINED,
+            "16 GB affords a long window but not the trained one: {}",
+            midrange.context_length
+        );
+
+        let laptop = plan_on(7899 * 1024 * 1024);
+        assert!(laptop.full_offload, "{}", laptop.reason);
+        assert_eq!(
+            laptop.context_length, 65_536,
+            "and the 8 GB card is told what it can actually hold"
+        );
+
+        // The ladder never invents a rung above what was asked for, however
+        // much memory there is to spare.
+        let modest = plan_gpu_offload_with(
+            24 * GB,
+            WEIGHTS,
+            ContextChoice::Planned(32_768),
+            Some(36),
+            Some(spark),
+        );
+        assert_eq!(modest.context_length, 32_768);
     }
 
     /// A window an operator set is not walked back down.

@@ -296,6 +296,60 @@ pub fn plan_launch(
         args.extend(flash_flags);
     }
 
+    // Which device, on a machine that has more than one.
+    //
+    // The laptop this was developed on reports two: `Vulkan0` is the RTX 5060
+    // and `Vulkan1` the integrated Radeon sharing system RAM. Left unsaid,
+    // llama.cpp may split the model across both, and a model half-resident on
+    // an iGPU decodes at a fraction of the speed of one wholly on the discrete
+    // card — while `vram_planner` sized the entire plan against the discrete
+    // card's memory alone. The two then disagree, and the plan is the one that
+    // is right.
+    //
+    // Unset by default, which is the behaviour every existing deployment has:
+    // an operator with one GPU needs nothing, one with two names the card.
+    if let Some(device) = llama_server_device() {
+        args.push("--device".to_string());
+        args.push(device);
+    }
+
+    // Sampling this model is served with, when its entry declares any.
+    //
+    // Defaults rather than overrides: llama-server applies these to a request
+    // that does not carry its own, and ARJUN's agent loop does not. So an
+    // orchestrator can be served at the low temperature its tool arguments need
+    // without moving the global default that every other model also reads.
+    //
+    // Absent on an entry that says nothing, which is every entry that existed
+    // before this field did.
+    if let Some(sampling) = entry.sampling.filter(|s| !s.is_empty()) {
+        if let Some(temperature) = sampling.temperature {
+            args.push("--temp".to_string());
+            args.push(format!("{temperature}"));
+        }
+        if let Some(top_p) = sampling.top_p {
+            args.push("--top-p".to_string());
+            args.push(format!("{top_p}"));
+        }
+        if let Some(top_k) = sampling.top_k {
+            args.push("--top-k".to_string());
+            args.push(format!("{top_k}"));
+        }
+    }
+
+    // Skip the empty forward pass llama-server runs before reporting ready.
+    //
+    // The warm-up faults the weights in and populates the compute buffers, for
+    // a benefit ARJUN does not collect: the first real request arrives
+    // immediately afterwards and warms the same buffers itself. What the wait
+    // does buy is a readiness probe that can time out on a model which was, in
+    // fact, loading normally.
+    //
+    // Probed rather than assumed, like every other flag here.
+    if llama_server_help_text().is_some_and(|help| help.contains("--no-warmup")) {
+        args.push("--no-warmup".to_string());
+    }
+
     if crate::ai_engine::gguf_meta::capabilities(weights).emits_reasoning
         && llama_server_splits_reasoning()
     {
@@ -404,6 +458,32 @@ fn llama_server_splits_reasoning() -> bool {
     };
     // Both are needed together, so both are required before either is sent.
     help.contains("--reasoning-format") && help.contains("--jinja")
+}
+
+/// The device llama.cpp should offload to, when an operator has named one.
+///
+/// `ARJUN_LLAMA_DEVICE` holds a backend device id as `llama-server
+/// --list-devices` prints it — `Vulkan0`, `CUDA0`. Empty or unset means "let
+/// llama.cpp choose", which is what every deployment did before this existed.
+///
+/// Verified against the build before it is sent: an older `llama-server` has no
+/// `--device` and refuses to start on an unknown argument, and a machine whose
+/// only GPU is the right one would then fail to serve anything at all over a
+/// setting that could only ever have been a no-op for it.
+fn llama_server_device() -> Option<String> {
+    let device = std::env::var("ARJUN_LLAMA_DEVICE").ok()?;
+    let device = device.trim().to_string();
+    if device.is_empty() {
+        return None;
+    }
+    if !llama_server_help_text().is_some_and(|help| help.contains("--device")) {
+        log::warn!(
+            "[serving] ARJUN_LLAMA_DEVICE is set to {device}, but this llama-server has no \
+             --device flag, so the setting is ignored and llama.cpp picks the device itself."
+        );
+        return None;
+    }
+    Some(device)
 }
 
 /// Probe whether this llama-server accepts `--flash-attn` and KV cache flags.
@@ -940,6 +1020,7 @@ mod tests {
             required_runtime_profile: None,
             enabled: true,
         routing: RoutingPreference::default(),
+        sampling: None,
         }
     }
 
@@ -950,6 +1031,82 @@ mod tests {
             full_offload: gpu_layers > 0,
             reason: String::new(),
         }
+    }
+
+    /// Declared sampling reaches the command line, and an entry that declares
+    /// none is launched exactly as it was before the field existed.
+    ///
+    /// The second half is the one worth a test: every model already on an
+    /// operator's shelf has no `sampling` block, and any of them starting with
+    /// flags it did not ask for would be a silent behaviour change to models
+    /// this work was not about.
+    #[test]
+    fn declared_sampling_is_served_and_its_absence_changes_nothing() {
+        let bare = plan_launch(
+            &gguf_entry(),
+            Path::new("model.gguf"),
+            None,
+            &plan(999),
+            8080,
+            false,
+        );
+        assert!(
+            !bare.args.iter().any(|arg| arg == "--temp" || arg == "--top-p"),
+            "an entry that declares no sampling must be launched without sampling flags"
+        );
+
+        let mut declared = gguf_entry();
+        declared.sampling = Some(crate::registry::SamplingDefaults {
+            temperature: Some(0.15),
+            top_p: Some(0.95),
+            top_k: None,
+        });
+        let launch = plan_launch(
+            &declared,
+            Path::new("model.gguf"),
+            None,
+            &plan(999),
+            8080,
+            false,
+        );
+        let pairs: Vec<_> = launch.args.windows(2).collect();
+        assert!(
+            pairs.iter().any(|pair| pair[0] == "--temp" && pair[1] == "0.15"),
+            "the declared temperature must reach the server: {:?}",
+            launch.args
+        );
+        assert!(
+            pairs.iter().any(|pair| pair[0] == "--top-p" && pair[1] == "0.95"),
+            "the declared top-p must reach the server: {:?}",
+            launch.args
+        );
+        assert!(
+            !launch.args.iter().any(|arg| arg == "--top-k"),
+            "an undeclared field is left to the server rather than given a default here"
+        );
+    }
+
+    /// An empty sampling block is the same as no sampling block.
+    ///
+    /// An operator who writes `"sampling": {}` has said nothing, and saying
+    /// nothing must not produce a launch line that differs from the one they
+    /// had before they wrote it.
+    #[test]
+    fn an_empty_sampling_block_says_nothing() {
+        let mut entry = gguf_entry();
+        entry.sampling = Some(crate::registry::SamplingDefaults::default());
+        let launch = plan_launch(
+            &entry,
+            Path::new("model.gguf"),
+            None,
+            &plan(999),
+            8080,
+            false,
+        );
+        assert!(!launch
+            .args
+            .iter()
+            .any(|arg| arg == "--temp" || arg == "--top-p" || arg == "--top-k"));
     }
 
     #[test]

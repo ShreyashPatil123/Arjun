@@ -18,6 +18,10 @@
 //! - `token_reconciliation`: compares a token estimate against what the
 //!   tokenizer actually counted, and keeps the two apart in the record
 //! - `ocr_budget`: decides how much of an OCR'd document fits in the prompt
+//! - `token_budget`: how many tokens one generation may produce, decided by
+//!   what the turn is doing and the window it is served in
+//! - `continuation`: carries a task across several generations when one is not
+//!   enough, and breaks the chain when it stops converging
 
 pub mod traits;
 pub mod runtime;
@@ -39,6 +43,8 @@ pub mod ocr_repetition;
 pub mod ocr_stream;
 pub mod token_reconciliation;
 pub mod ocr_budget;
+pub mod token_budget;
+pub mod continuation;
 
 pub use traits::*;
 pub use manager::InferenceManager;

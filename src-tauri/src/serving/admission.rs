@@ -37,7 +37,8 @@
 use std::path::Path;
 
 use crate::ai_engine::gguf_meta;
-use crate::ai_engine::vram_planner::{plan_gpu_offload, GpuOffloadPlan};
+use crate::ai_engine::gguf_meta::KvCost;
+use crate::ai_engine::vram_planner::{plan_gpu_offload_with, ContextChoice, GpuOffloadPlan};
 use crate::registry::ModelEntry;
 use crate::serving::{ModelServers, ServingError};
 use crate::system_analyzer::{gpu_collector, memory_collector};
@@ -108,6 +109,15 @@ pub async fn admit(
     let header = gguf_meta::capabilities(&weights);
     let layers = header.layers;
     let supports_reasoning = header.supports_toggled_reasoning;
+    // The exact KV geometry, from the header this line already read.
+    //
+    // It used to be dropped here, so every plan on this path was costed by the
+    // size band — a proxy for `layers x kv_heads x head_dim` that is right
+    // within a factor for a dense model and wrong by four for a hybrid one.
+    // Spark-X2.5-4B has 27 of its 36 blocks on a 512-token window: the band
+    // charged 80 KB a token where the model costs 18 KB, and the planner
+    // answered by serving 16 384 tokens on a card measured to hold 65 536.
+    let kv_cost = header.kv_cost;
 
     let installed = gpu_collector::installed_gpus()
         .iter()
@@ -129,8 +139,7 @@ pub async fn admit(
     }
 
     let mut budget = measure_budget(installed);
-    let mut plan =
-        plan_gpu_offload(budget.bytes(), entry.weights_bytes, entry.context_length, layers);
+    let mut plan = plan_for(budget.bytes(), entry, layers, kv_cost);
 
     // Already comfortable, or the card is not the constraint. Nothing is
     // disturbed — an OCR server mid-document keeps its memory.
@@ -169,12 +178,7 @@ pub async fn admit(
                     released_in_process = true;
                     gpu_collector::invalidate_free_vram_cache();
                     budget = measure_budget(installed);
-                    plan = plan_gpu_offload(
-                        budget.bytes(),
-                        entry.weights_bytes,
-                        entry.context_length,
-                        layers,
-                    );
+                    plan = plan_for(budget.bytes(), entry, layers, kv_cost);
                 }
                 Err(error) => log::warn!(
                     "[serving] the in-process model could not be unloaded, so {} is planned                      against what is left: {error:#}",
@@ -220,7 +224,7 @@ pub async fn admit(
         released.push(id);
 
         budget = measure_budget(installed);
-        plan = plan_gpu_offload(budget.bytes(), entry.weights_bytes, entry.context_length, layers);
+        plan = plan_for(budget.bytes(), entry, layers, kv_cost);
         if plan.full_offload {
             break;
         }
@@ -234,6 +238,31 @@ pub async fn admit(
         layers,
         supports_reasoning,
     })
+}
+
+/// One offload plan for this entry against a measured budget.
+///
+/// A named helper rather than four copies of the same five arguments: `admit`
+/// re-plans after every reclaim, and the four calls disagreeing about what the
+/// KV cache costs is precisely the class of drift this wraps up.
+///
+/// The window is `Planned`, which is what this path has always passed — the
+/// registry entry states the model's trained window and the planner is free to
+/// walk down it to buy layers. An operator's fixed window is set in Settings
+/// and handled on the in-process path, not here.
+fn plan_for(
+    budget_bytes: u64,
+    entry: &ModelEntry,
+    layers: Option<u32>,
+    kv_cost: Option<KvCost>,
+) -> GpuOffloadPlan {
+    plan_gpu_offload_with(
+        budget_bytes,
+        entry.weights_bytes,
+        ContextChoice::Planned(entry.context_length),
+        layers,
+        kv_cost,
+    )
 }
 
 /// Free VRAM where the driver will say, the installed total where it will not.

@@ -247,6 +247,46 @@ pub struct ModelEntry {
     /// VRAM filters, it only wins a tie against a same-size peer.
     #[serde(default)]
     pub routing: RoutingPreference,
+    /// Sampling defaults this model should be served with.
+    ///
+    /// Absent means the server's own defaults, which is what every entry had
+    /// before this field existed and what every entry without it still gets.
+    ///
+    /// Declared per model rather than set globally because it is a property of
+    /// the model, not of the deployment: an orchestrator driving tools wants a
+    /// low temperature so its JSON arguments come out stable, and the same
+    /// number would make a drafting model repetitive. Moving the global default
+    /// to suit one model is how every other model quietly gets worse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingDefaults>,
+}
+
+/// Sampling a managed server is started with.
+///
+/// Defaults, not overrides: they apply to requests that do not state their own.
+/// A caller sending its own `temperature` still wins, so this takes no decision
+/// away from anything already making one.
+///
+/// Every field is optional and an absent one is left to the server, so a
+/// partial block means exactly what it says — a temperature without a top-p
+/// declares the temperature and nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+}
+
+impl SamplingDefaults {
+    /// True when nothing is declared, so the launcher can skip the flags
+    /// rather than emit a block that says nothing.
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none() && self.top_p.is_none() && self.top_k.is_none()
+    }
 }
 
 /// How the router should treat this model when it is one of several that
@@ -857,6 +897,7 @@ pub(crate) mod tests {
             required_runtime_profile: None,
             enabled: true,
             routing: RoutingPreference::default(),
+            sampling: None,
         }
     }
 

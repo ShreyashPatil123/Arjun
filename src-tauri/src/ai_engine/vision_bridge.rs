@@ -451,6 +451,7 @@ mod tests {
             required_runtime_profile: None,
             enabled: true,
             routing: RoutingPreference::default(),
+            sampling: None,
         }
     }
 

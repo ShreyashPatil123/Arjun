@@ -326,6 +326,8 @@ mod tests {
             // that.
             context_length: None,
             supports_toggled_reasoning: false,
+            sliding_window: None,
+            full_attention_layers: None,
         }
         .expert_bytes(file_bytes, None);
 

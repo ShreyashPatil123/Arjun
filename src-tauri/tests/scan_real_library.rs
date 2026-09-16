@@ -197,9 +197,31 @@ fn every_installed_model_reports_its_reasoning_capability() {
             }
         };
         let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let cost = meta.kv_cost();
         println!(
             "{name}: emits_reasoning={} toggle={}",
             meta.emits_reasoning, meta.supports_toggled_reasoning
+        );
+        // The attention shape, because it decides the served window and is not
+        // visible anywhere else on a real file. A dense model prints its one
+        // figure; a hybrid one prints both, and the gap between them is the
+        // over-charge the planner used to pay.
+        match (meta.full_attention_layers, meta.sliding_window) {
+            (Some(full), Some(window)) => println!(
+                "  hybrid attention: {full} of {} blocks full, {window}-token window; \
+                 KV {} B/token + {} B fixed (dense reading charges {} B/token)",
+                meta.block_count,
+                cost.per_token,
+                cost.fixed,
+                meta.kv_bytes_per_token()
+            ),
+            _ => println!("  dense attention: KV {} B/token", cost.per_token),
+        }
+        // A hybrid model's growing cost must be a strict saving, never a larger
+        // charge. If this ever inverts, the pattern is being read backwards.
+        assert!(
+            cost.per_token <= meta.kv_bytes_per_token(),
+            "{name}: the per-token cost may never exceed the dense figure"
         );
         if meta.emits_reasoning {
             reasoning += 1;

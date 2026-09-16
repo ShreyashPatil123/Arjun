@@ -2695,6 +2695,38 @@ async fn drive_run(
         );
     }
 
+    // How much this particular turn may produce.
+    //
+    // Computed here, beside the window, because the two are one decision: the
+    // cap is also the reply reserve the runtime's compactor keeps free, so a
+    // cap chosen without reference to the window is a reserve taken out of a
+    // conversation that needed it. See `ai_engine::token_budget`.
+    //
+    // The signals are ones this turn already produced — the plan's step count,
+    // the complexity estimate, the router's intent — so classifying a model
+    // call costs no model call.
+    let complexity = crate::model_intelligence::complexity::ComplexityEstimator::default()
+        .estimate(
+            &question,
+            &crate::model_intelligence::complexity::TaskSignals {
+                planned_steps: planned.steps.len() as u32,
+                planned_tool_calls: permitted_tool_count as u32,
+                ..Default::default()
+            },
+        );
+    let generation_budget = crate::ai_engine::token_budget::budget_for(
+        crate::ai_engine::token_budget::GenerationKind::classify(
+            planned.steps.len(),
+            complexity.bucket,
+            &routing.intent,
+        ),
+        Some(served_window),
+    );
+    log::info!(
+        "[budget] run {run_id}: {}",
+        generation_budget.reason
+    );
+
     // What the tool definitions will cost, charged before anything else is
     // budgeted. See [`TOOL_FLOOR_TOKENS_PER_TOOL`]: the schemas are attached by
     // the runtime and are invisible from here, and leaving them out is what let
@@ -3012,7 +3044,19 @@ async fn drive_run(
             // here leaves the compactor waiting for an overflow that has
             // already happened.
             "contextWindow": served_window,
-            "maxTokens": DEFAULT_MAX_TOKENS,
+            // What this turn may produce, not what every turn may produce.
+            //
+            // This was `DEFAULT_MAX_TOKENS` — one number, 4 096, for a routing
+            // decision and a nine-step decomposition alike. Both directions
+            // cost something: a plan cut off at step four reads as complete,
+            // and a routing answer allowed 4 096 tokens makes the compactor
+            // reserve 4 096 it will never use, out of a window with other work
+            // for them.
+            //
+            // Charged against the window the server actually holds, so the cap
+            // and the compaction reserve are computed from the same figure the
+            // rest of this function budgets against.
+            "maxTokens": generation_budget.max_tokens,
             // Read from this model's own chat template, not from a list of
             // families. `false` means the model has no reasoning switch — it
             // either never produces a separable reasoning block or always
@@ -3161,8 +3205,34 @@ async fn drive_run(
     // side classifying a refusal it recognises. A timeout is this side's own
     // decision and overrides whatever the loop was about to say, because the
     // run stopped for a reason the loop never learned.
-    let (outcome, run_outcome): (Result<Value, String>, RunOutcome) =
-        match tokio::time::timeout(allowed, runtime.request("run.start", params)).await {
+    // The continuation chain, and the generation loop around it.
+    //
+    // A run that ends at the output cap with work still outstanding is not
+    // finished and is not a failure: it is a task that needs more than one
+    // generation. `ai_engine::continuation` decides which, from the working
+    // notes the loop already keeps — see `Checkpoint::from_run_memory` — and
+    // this loop carries out its decision.
+    //
+    // The deadline is *not* reset per generation. `allowed` is the whole task's
+    // budget and every generation spends from it, so a chain cannot outlive the
+    // time the plan allowed by splitting itself into pieces.
+    let mut chain = crate::ai_engine::continuation::ContinuationChain::new();
+    let mut params = params;
+    let mut carried: Vec<String> = Vec::new();
+    let chain_started = std::time::Instant::now();
+
+    let (outcome, run_outcome): (Result<Value, String>, RunOutcome) = loop {
+        let remaining = allowed.saturating_sub(chain_started.elapsed());
+        if remaining.is_zero() {
+            let detail = format!(
+                "Stopped: it ran past the {} minutes this task was allowed.",
+                allowed.as_secs() / 60
+            );
+            break (Err(detail.clone()), RunOutcome::BudgetStopped { detail });
+        }
+
+        let attempt: (Result<Value, String>, RunOutcome) =
+        match tokio::time::timeout(remaining, runtime.request("run.start", params.clone())).await {
             Ok(Ok(value)) => {
                 // Never `RunCompleted` by default. A runtime that answered
                 // without saying how the run ended is a runtime this build
@@ -3201,6 +3271,91 @@ async fn drive_run(
                 )
             }
         };
+
+        // Anything but the output cap is the run's real ending, and the chain
+        // has no business rewriting it.
+        let RunOutcome::LengthLimited { .. } = attempt.1 else {
+            break attempt;
+        };
+
+        // The notes the loop kept, which are the checkpoint. A generation that
+        // reported none left nothing to resume from, and continuing on an empty
+        // checkpoint would restart the task rather than carry it.
+        let Some(memory) = attempt
+            .0
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("notes"))
+            .and_then(|notes| {
+                serde_json::from_value::<crate::agent_runtime::memory::RunMemory>(notes.clone())
+                    .ok()
+            })
+        else {
+            log::info!(
+                "[continuation] run {run_id}: cut off at the output cap with no working notes to                  resume from, so it is reported as cut off rather than continued"
+            );
+            break attempt;
+        };
+
+        let generation = chain.generations().saturating_add(1);
+        let checkpoint =
+            crate::ai_engine::continuation::Checkpoint::from_run_memory(&memory, generation);
+        let decision = chain.record(checkpoint, true);
+
+        // Durable, not merely logged. A person looking at an answer assembled
+        // from four generations is owed the record of that, and the ledger is
+        // where this product keeps such things.
+        let _ = record_and_publish(
+            &app,
+            &events,
+            EventDraft::new(&run_id, TaskEventType::ContextCompacted, &signed_in.user.id).with(
+                json!({
+                    "continuation": {
+                        "generation": generation,
+                        "stalledRounds": chain.stalled_rounds(),
+                        "decision": &decision,
+                    }
+                }),
+            ),
+        );
+
+        match decision {
+            crate::ai_engine::continuation::ContinuationDecision::Continue {
+                resumption_prompt,
+                ..
+            } => {
+                // What this generation produced is kept. The answer a person
+                // reads is every generation's text in order, not the last
+                // one's — the earlier ones are not drafts, they are the first
+                // parts of the reply.
+                if let Ok(value) = attempt.0.as_ref() {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            carried.push(text.to_string());
+                        }
+                    }
+                }
+                log::info!(
+                    "[continuation] run {run_id}: generation {generation} reached the output cap                      with work outstanding; continuing from its checkpoint"
+                );
+                // The checkpoint replaces the question. The history and system
+                // prompt are untouched, so the next generation runs with the
+                // same tools, the same policy and the same window.
+                params["prompt"] = json!(resumption_prompt);
+                continue;
+            }
+            crate::ai_engine::continuation::ContinuationDecision::Finished => break attempt,
+            crate::ai_engine::continuation::ContinuationDecision::Stop { detail, escalate } => {
+                log::info!(
+                    "[continuation] run {run_id}: stopping after {generation} generation(s):                      {detail} (escalate={escalate})"
+                );
+                // Still `LengthLimited`, deliberately. The task did not finish,
+                // and relabelling it would undo the distinction that ending
+                // exists to preserve — `detail` says what happened instead.
+                break (attempt.0, RunOutcome::LengthLimited { detail });
+            }
+        }
+    };
     let ending = run_outcome.event_type();
 
     // From here the run is over, one way or the other, and everything below is
@@ -3218,6 +3373,26 @@ async fn drive_run(
             value.get("turns").and_then(Value::as_u64).unwrap_or(0) as u32,
         ),
         Err(_) => (String::new(), 0),
+    };
+    // Every generation's text, in order.
+    //
+    // A task carried across a chain produced its answer in parts, and the last
+    // part is not the answer — it is the end of it. Taking only the final
+    // generation would silently discard everything before it, which is the
+    // failure the chain exists to prevent, arriving one step later.
+    //
+    // Empty for the overwhelming majority of runs, which take one generation
+    // and leave `carried` untouched.
+    let answer = if carried.is_empty() {
+        answer
+    } else {
+        carried.push(answer);
+        carried
+            .iter()
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
     // Taken from the typed ending, not from whether the request errored.
     //
@@ -4159,13 +4334,17 @@ fn describe_plan(plan: &PlanRun) -> String {
     )
 }
 
-/// Cap on one turn's output.
-///
-/// Not read from the model: a GGUF advertises its training context, not what
-/// this deployment should let one turn produce. Large enough for an approval
-/// note, small enough that a looping model does not fill the context window
-/// before the budget stops it.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+// `DEFAULT_MAX_TOKENS` lived here: a single 4 096-token cap on every turn's
+// output, whatever the turn was doing. It has been replaced by
+// `ai_engine::token_budget`, which picks a band from the work in front of it
+// and clamps that band against the window the server was actually started with.
+//
+// The reasoning the constant carried is still right and now lives there: the
+// cap is not read from the model, because a GGUF advertises its training
+// context rather than what this deployment should let one turn produce.
+//
+// The default band is still 4 096, so an ordinary turn on a roomy window is
+// capped exactly where it was before.
 
 /// What the agent runtime calls this provider.
 ///

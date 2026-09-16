@@ -921,17 +921,24 @@ impl InferenceManager {
                             // person to discover the reason from an allocator
                             // error is not. Said before the attempt, with the
                             // arithmetic, so the remedy is obvious.
-                            let per_token = gguf_meta
+                            // The model's own geometry, hybrid attention
+                            // included. A model whose windowed layers cost a
+                            // constant would otherwise be warned about a cache
+                            // four times the size of the one it allocates, and
+                            // a warning that is wrong that often is one an
+                            // operator learns to ignore.
+                            let kv_cost = gguf_meta
                                 .as_ref()
-                                .map(|m| m.kv_bytes_per_token())
-                                .filter(|bytes| *bytes > 0)
+                                .map(|m| m.kv_cost())
+                                .filter(|cost| cost.per_token > 0)
                                 .unwrap_or_else(|| {
-                                    crate::ai_engine::vram_planner::estimate_kv_bytes_per_token(
-                                        model_bytes,
+                                    crate::ai_engine::gguf_meta::KvCost::dense(
+                                        crate::ai_engine::vram_planner::estimate_kv_bytes_per_token(
+                                            model_bytes,
+                                        ),
                                     )
                                 });
-                            let kv_bytes =
-                                per_token.saturating_mul(u64::from(planned_context.max(1)));
+                            let kv_bytes = kv_cost.bytes_for(planned_context, 1.0);
                             if kv_bytes > budget.saturating_add(usable_ram) {
                                 log::warn!(
                                     "[INFERENCE_MGR] The context length set for {model_id}                                      ({planned_context} tokens) needs about {:.1} GB of KV cache,                                      more than the {:.1} GB of VRAM and {:.1} GB of usable RAM                                      this machine has together. It is being served as set; if the                                      load fails for memory, lower Context Length in Settings.",
@@ -951,7 +958,7 @@ impl InferenceManager {
                             model_bytes,
                             choice,
                             gguf_meta.as_ref().map(|m| m.block_count),
-                            gguf_meta.as_ref().map(|m| m.kv_bytes_per_token()),
+                            gguf_meta.as_ref().map(|m| m.kv_cost()),
                         );
                         log::info!("[INFERENCE_MGR] Selected {gpu_label}: {}", plan.reason);
                         (plan.gpu_layers, 0)

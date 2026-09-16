@@ -1,0 +1,36 @@
+{
+  "_comment": "Spark-X2.5-4B (Q8_0) as ARJUN's orchestrator — the model that runs the chat. Merge the entry below into <app data>/models/registry.json, or copy this file over it if you have no other declared models. The id is tagged 'orchestrator.' so it is elected without an administrator having to choose in Models; a choice made in Models always outranks this tag. See docs/models/spark-x2-5-orchestrator.md for what each field was measured from, and why contextLength is what it is.",
+  "models": [
+    {
+      "_comment": "contextLength is the model's TRAINED window, not the window it will be served at. ARJUN's vram_planner walks down from here to the largest window the card can actually hold: measured on an RTX 5060 Laptop (7.9 GB) that is 65 536; on a 16 GB card 524 288; on 24 GB the full 1 048 576. Declaring the trained figure is what lets the planner make that choice per machine — declaring a smaller one would cap every machine at the weakest one's answer.",
+      "id": "orchestrator.spark-x2-5-4b",
+      "name": "Spark-X2.5 4B (Q8_0)",
+      "version": "2.5",
+      "license": "apache-2.0",
+      "sha256": "5c2c3c190e4337e1016b8593ca8e26e8b18c972200b107385d4ec61a25d9dea2",
+      "runtime": "llamaCpp",
+      "roles": ["reasoning", "coding"],
+      "modalities": ["text"],
+      "quantization": "Q8_0",
+      "parametersB": 4.1,
+      "contextLength": 1048576,
+      "weightsBytes": 4375021152,
+      "supportsStructuredOutput": true,
+      "_comment_classifications": "Empty means this model is cleared for NOTHING until somebody decides otherwise. That is the registry's safety property and it is deliberately not pre-filled here: an administrator who has reviewed this model's provenance adds the classifications it may be used on, for example [\"internal\", \"processDiagram\"].",
+      "permittedClassifications": [],
+      "path": "C:\\Users\\lenovo\\models\\Spark-X2.5-4B-Q8\\Spark-X2.5-4B-Q8_0.gguf",
+      "serving": {
+        "mode": "managed"
+      },
+      "_comment_sampling": "Defaults the managed server is started with, applied to any request that does not state its own. Low temperature because this model's job is orchestration: tool-call arguments have to come out as valid JSON against a schema every time, and that is worth more here than variety. The model's own header suggests temp 1.0 / top_p 0.95, which is a chat default rather than an agent one.",
+      "sampling": {
+        "temperature": 0.15,
+        "topP": 0.95
+      },
+      "enabled": true,
+      "routing": {
+        "preferred": true
+      }
+    }
+  ]
+}

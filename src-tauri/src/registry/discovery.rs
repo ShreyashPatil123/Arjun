@@ -243,6 +243,7 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 required_runtime_profile: None,
                 enabled: true,
                 routing: RoutingPreference::default(),
+                sampling: None,
             }
         })
         .collect()
@@ -318,6 +319,7 @@ mod tests {
             required_runtime_profile: None,
             enabled: true,
             routing: RoutingPreference::default(),
+            sampling: None,
         };
         assert!(!entry.meets_floor(ModelRole::Coding));
         assert!(!entry.meets_floor(ModelRole::Reasoning));
@@ -406,6 +408,7 @@ mod tests {
             required_runtime_profile: None,
             enabled: true,
             routing: RoutingPreference::default(),
+            sampling: None,
         };
 
         for classification in Classification::ALL {

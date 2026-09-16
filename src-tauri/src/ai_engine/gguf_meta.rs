@@ -51,6 +51,42 @@ const PROJECTIONS_PER_EXPERT: u64 = 3;
 /// and leave nothing resident.
 const MAX_EXPERT_FRACTION: f64 = 0.95;
 
+/// What a KV cache costs, split into the part that grows with the conversation
+/// and the part that does not.
+///
+/// Two numbers rather than one because hybrid-attention models exist and the
+/// difference between them is a factor of four on the model this was written
+/// for. `fixed` is charged once; `per_token` is charged per token of context.
+/// Both are f16 figures — a quantised cache scales both by the same factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCost {
+    pub per_token: u64,
+    pub fixed: u64,
+}
+
+impl KvCost {
+    /// The dense reading: everything scales, nothing is constant.
+    ///
+    /// For a caller that has a per-token figure and nothing else — the
+    /// size-banded estimate, a model whose header could not be read.
+    pub const fn dense(per_token: u64) -> Self {
+        Self {
+            per_token,
+            fixed: 0,
+        }
+    }
+
+    /// Total bytes for a context of `tokens`, at a cache-quantisation factor of
+    /// `quant` (1.0 for f16, 0.5 for `q8_0`).
+    pub fn bytes_for(&self, tokens: u32, quant: f64) -> u64 {
+        let raw = self
+            .per_token
+            .saturating_mul(u64::from(tokens.max(1)))
+            .saturating_add(self.fixed);
+        (raw as f64 * quant) as u64
+    }
+}
+
 /// The header figures the planner needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufMetadata {
@@ -66,6 +102,21 @@ pub struct GgufMetadata {
     pub head_count_kv: u32,
     pub key_length: u32,
     pub value_length: u32,
+    /// Attention window of this model's sliding-window layers, in tokens.
+    ///
+    /// `None` for a model whose every layer attends to the whole context,
+    /// which is still the common case. A model that states one is telling us
+    /// that most of its layers cost a *constant* amount of KV cache however
+    /// long the conversation gets — see [`Self::kv_cost`].
+    pub sliding_window: Option<u32>,
+    /// How many blocks attend to the full context.
+    ///
+    /// Read from `<arch>.attention.sliding_window_pattern`, a per-layer array
+    /// of booleans where `true` marks a layer as windowed. `None` when the
+    /// header states no pattern, and that must be read as "assume every layer
+    /// is full" rather than as zero — under-charging the KV cache is how a
+    /// plan that claimed to fit dies in `ggml_vulkan` at allocation time.
+    pub full_attention_layers: Option<u32>,
     /// From `general.parameter_count`, which not every converter writes.
     pub parameter_count: Option<u64>,
     /// Training context length, from `<arch>.context_length`.
@@ -126,10 +177,60 @@ impl GgufMetadata {
     /// dimensions carry the factor of two that the size-banded estimate spells
     /// out separately.
     pub fn kv_bytes_per_token(&self) -> u64 {
-        u64::from(self.block_count)
+        self.kv_bytes_per_token_for(self.block_count)
+    }
+
+    /// The same arithmetic over a stated number of layers.
+    fn kv_bytes_per_token_for(&self, layers: u32) -> u64 {
+        u64::from(layers)
             * u64::from(self.head_count_kv)
             * (u64::from(self.key_length) + u64::from(self.value_length))
             * KV_BYTES_PER_ELEMENT
+    }
+
+    /// What this model's KV cache costs, split by whether it grows.
+    ///
+    /// For a model where every layer attends to the whole context the answer
+    /// is the one [`Self::kv_bytes_per_token`] already gave: all cost is
+    /// per-token and `fixed` is zero.
+    ///
+    /// A model with sliding-window layers is a different shape, and reading it
+    /// as the first kind is not a rounding error. Spark-X2.5-4B has 36 blocks
+    /// of which 27 attend to a 512-token window and 9 attend to everything.
+    /// Only those 9 grow with the conversation, so the dense figure charges it
+    /// four times what it costs — and a planner that believes that walks the
+    /// context ladder down to a window the card had ample room for. Measured
+    /// on an RTX 5060 (7.9 GB): the dense figure served this model at 16 384
+    /// tokens where the real geometry fits 65 536.
+    ///
+    /// The windowed layers are not free, so they are charged as `fixed`: their
+    /// cache is allocated once at the window size and never grows. Figures are
+    /// f16, as [`Self::kv_bytes_per_token`] is; a caller serving a quantised
+    /// cache scales both parts by the same factor.
+    pub fn kv_cost(&self) -> KvCost {
+        let Some(full) = self.full_attention_layers.filter(|_| self.block_count > 0) else {
+            return KvCost {
+                per_token: self.kv_bytes_per_token(),
+                fixed: 0,
+            };
+        };
+        // A pattern longer than the block count, or one claiming every layer is
+        // windowed, is a header this build does not understand. Charging the
+        // dense figure is the reading that cannot under-allocate.
+        let full = full.min(self.block_count);
+        let Some(window) = self.sliding_window.filter(|w| *w > 0) else {
+            return KvCost {
+                per_token: self.kv_bytes_per_token(),
+                fixed: 0,
+            };
+        };
+        let windowed = self.block_count.saturating_sub(full);
+        KvCost {
+            per_token: self.kv_bytes_per_token_for(full),
+            fixed: self
+                .kv_bytes_per_token_for(windowed)
+                .saturating_mul(u64::from(window)),
+        }
     }
 
     /// Routed-expert parameters across every layer.
@@ -221,9 +322,22 @@ pub fn parse_gguf_metadata<R: Read + Seek>(r: &mut R) -> Result<GgufMetadata> {
     for _ in 0..kv_count {
         let key = read_string(r)?;
         let value_type = read_u32(r)?;
-        // Only the token list is worth looking inside. Every other array in a
-        // GGUF header is numeric or is not about what the model can emit.
-        let scan = key == "tokenizer.ggml.tokens";
+        // Two arrays are worth looking inside: the token list, for what the
+        // model can emit, and the attention pattern, for what its KV cache
+        // costs. Every other array in a GGUF header is numeric and is not about
+        // either question.
+        //
+        // The pattern is matched on its suffix because the key is prefixed by
+        // the architecture, which is read from this same loop and may not have
+        // arrived yet — `general.architecture` is conventionally first but
+        // nothing in the format requires it.
+        let scan = if key == "tokenizer.ggml.tokens" {
+            ArrayScan::Vocabulary
+        } else if key.ends_with(".attention.sliding_window_pattern") {
+            ArrayScan::AttentionPattern
+        } else {
+            ArrayScan::None
+        };
         match read_value(r, value_type, scan)? {
             ArrayOrScalar::Scalar(value) => {
                 kv.insert(key, value);
@@ -235,6 +349,14 @@ pub fn parse_gguf_metadata<R: Read + Seek>(r: &mut R) -> Result<GgufMetadata> {
                         Scalar::Bool(true),
                     );
                 }
+            }
+            ArrayOrScalar::CountedAttentionPattern {
+                full_attention_layers,
+            } => {
+                kv.insert(
+                    FULL_ATTENTION_LAYERS.to_string(),
+                    Scalar::U(u64::from(full_attention_layers)),
+                );
             }
             ArrayOrScalar::Skipped => {}
         }
@@ -264,6 +386,13 @@ const REASONING_OPENERS: &[&str] =
 /// records this one bit instead, in the same map, so `from_kv` stays a pure
 /// function of the parsed header.
 const VOCABULARY_HAS_REASONING_TOKEN: &str = "arjun.vocabulary_has_reasoning_token";
+
+/// The key under which the attention-pattern scan records what it counted.
+///
+/// Not a real GGUF key either, and here for the same reason: the pattern is an
+/// array, arrays do not survive as `Scalar`, and `from_kv` stays a pure
+/// function of the parsed header.
+const FULL_ATTENTION_LAYERS: &str = "arjun.full_attention_layers";
 
 fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
     let architecture = kv
@@ -295,6 +424,24 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
     let expert_used_count = get("expert_used_count").unwrap_or(0);
     let expert_ff_length = get("expert_feed_forward_length").unwrap_or(0);
     let context_length = get("context_length");
+
+    // Hybrid attention, where the model declares it.
+    //
+    // Both keys are required before either is believed. A window with no
+    // pattern does not say which layers use it, and a pattern with no window
+    // does not say how large it is; guessing either would charge a KV cache
+    // that does not match what llama.cpp allocates, in the direction that
+    // fails at load time rather than the direction that merely wastes.
+    let sliding_window = get("attention.sliding_window").filter(|window| *window > 0);
+    let full_attention_layers = kv
+        .get(FULL_ATTENTION_LAYERS)
+        .and_then(Scalar::as_u32)
+        // A pattern in which every layer is windowed describes a model with no
+        // long-range attention at all, which no released architecture is. It
+        // is read as a pattern this build does not understand, and the dense
+        // figure applies.
+        .filter(|full| *full > 0)
+        .filter(|_| sliding_window.is_some());
 
     // Substring rather than a template parse. The question is only whether the
     // template branches on the variable at all; rendering it would mean
@@ -356,6 +503,8 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
         head_count_kv,
         key_length,
         value_length,
+        sliding_window,
+        full_attention_layers,
         parameter_count: kv.get("general.parameter_count").and_then(Scalar::as_u64),
         // Deliberately not defaulted here. A caller that needs a number when the
         // key is missing has to choose one and say why; a default invented in
@@ -411,6 +560,24 @@ enum ArrayOrScalar {
     Scalar(Scalar),
     Skipped,
     ScannedVocabulary { has_reasoning_token: bool },
+    /// The per-layer attention pattern, reduced to the count that matters.
+    CountedAttentionPattern { full_attention_layers: u32 },
+}
+
+/// Which array, if any, is worth looking inside.
+///
+/// Both exceptions are the same shape of decision: a header array whose
+/// *contents* change what this build does, reduced to the one number or bit it
+/// was opened for rather than materialised. Everything else is stepped over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayScan {
+    /// Step over it.
+    None,
+    /// The token list, checked for a reasoning tag.
+    Vocabulary,
+    /// `<arch>.attention.sliding_window_pattern`, counted for full-attention
+    /// layers. Bounded by the block count, so this is dozens of bytes.
+    AttentionPattern,
 }
 
 /// Reads one value, stepping over arrays.
@@ -421,7 +588,7 @@ enum ArrayOrScalar {
 fn read_value<R: Read + Seek>(
     r: &mut R,
     value_type: u32,
-    scan_vocabulary: bool,
+    scan: ArrayScan,
 ) -> Result<ArrayOrScalar> {
     let scalar = match value_type {
         0 => Scalar::U(u64::from(read_n::<_, 1>(r)?[0])),
@@ -434,11 +601,17 @@ fn read_value<R: Read + Seek>(
         7 => Scalar::Bool(read_n::<_, 1>(r)?[0] != 0),
         8 => Scalar::Str(read_string(r)?),
         9 => {
-            let has_reasoning_token = skip_array(r, scan_vocabulary)?;
-            return Ok(if scan_vocabulary {
-                ArrayOrScalar::ScannedVocabulary { has_reasoning_token }
-            } else {
-                ArrayOrScalar::Skipped
+            let finding = skip_array(r, scan)?;
+            return Ok(match (scan, finding) {
+                (ArrayScan::Vocabulary, ArrayFinding::ReasoningToken(has_reasoning_token)) => {
+                    ArrayOrScalar::ScannedVocabulary { has_reasoning_token }
+                }
+                (ArrayScan::AttentionPattern, ArrayFinding::FullAttentionLayers(count)) => {
+                    ArrayOrScalar::CountedAttentionPattern {
+                        full_attention_layers: count,
+                    }
+                }
+                _ => ArrayOrScalar::Skipped,
             });
         }
         10 => Scalar::U(read_u64(r)?),
@@ -468,20 +641,42 @@ fn scalar_width(value_type: u32) -> Option<u64> {
 /// vocabulary is around 130k entries and this parse runs for every model on the
 /// shelf at startup, so the cost of the scan is a bounded read of a few dozen
 /// bytes per short token, not a 2 MB allocation.
-fn skip_array<R: Read + Seek>(r: &mut R, scan: bool) -> Result<bool> {
+fn skip_array<R: Read + Seek>(r: &mut R, scan: ArrayScan) -> Result<ArrayFinding> {
     let element_type = read_u32(r)?;
     let len = read_u64(r)?;
 
     match scalar_width(element_type) {
+        // The attention pattern is a bool array, so it lands here — short
+        // enough to read outright, unlike the vocabulary below.
+        Some(_) if scan == ArrayScan::AttentionPattern && element_type == 7 => {
+            if len > u64::from(MAX_ATTENTION_PATTERN_LAYERS) {
+                bail!("GGUF attention pattern of {len} layers is not credible");
+            }
+            let mut full = 0u32;
+            let mut flag = [0u8; 1];
+            for _ in 0..len {
+                r.read_exact(&mut flag)
+                    .context("GGUF header ended inside the attention pattern")?;
+                // `true` marks a windowed layer, so a full-attention layer is
+                // the `false` one. Counting the wrong way round would charge a
+                // hybrid model as dense, which is the bug this reading exists
+                // to remove.
+                if flag[0] == 0 {
+                    full += 1;
+                }
+            }
+            Ok(ArrayFinding::FullAttentionLayers(full))
+        }
         Some(width) => {
             let bytes = width
                 .checked_mul(len)
                 .ok_or_else(|| anyhow!("GGUF array length {len} overflows"))?;
             seek_forward(r, bytes)?;
-            Ok(false)
+            Ok(ArrayFinding::Nothing)
         }
         // Strings are variable-length, so each has to be stepped over.
         None if element_type == 8 => {
+            let scan = scan == ArrayScan::Vocabulary;
             let mut found = false;
             let mut token = Vec::new();
             for _ in 0..len {
@@ -506,12 +701,27 @@ fn skip_array<R: Read + Seek>(r: &mut R, scan: bool) -> Result<bool> {
                     seek_forward(r, bytes)?;
                 }
             }
-            Ok(found)
+            Ok(ArrayFinding::ReasoningToken(found))
         }
         None if element_type == 9 => bail!("nested GGUF arrays are not supported"),
         None => bail!("unknown GGUF array element type {element_type}"),
     }
 }
+
+/// What stepping over an array turned up, for the arrays worth looking in.
+enum ArrayFinding {
+    Nothing,
+    ReasoningToken(bool),
+    FullAttentionLayers(u32),
+}
+
+/// Ceiling on the per-layer attention pattern.
+///
+/// A bound rather than a guess, for the same reason
+/// [`MAX_REASONING_TOKEN_BYTES`] is one: this array is read rather than
+/// seeked, and it is trusted only as far as a real block count goes. The
+/// largest open-weight models are a few hundred layers.
+const MAX_ATTENTION_PATTERN_LAYERS: u32 = 1024;
 
 /// Longest reasoning opener plus room for `>` and an attribute or two.
 ///
@@ -583,6 +793,40 @@ mod tests {
         out.extend_from_slice(&10u32.to_le_bytes());
         out.extend_from_slice(&value.to_le_bytes());
         out
+    }
+
+    /// A boolean array, as the per-layer attention pattern is stored.
+    fn kv_bool_array(key: &str, values: &[bool]) -> Vec<u8> {
+        let mut out = gguf_string(key);
+        out.extend_from_slice(&9u32.to_le_bytes());
+        out.extend_from_slice(&7u32.to_le_bytes());
+        out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            out.push(u8::from(*v));
+        }
+        out
+    }
+
+    /// Spark-X2.5-4B's real geometry, read from
+    /// `Spark-X2.5-4B-Q8_0.gguf` with a GGUF reader.
+    ///
+    /// 36 blocks, 4 KV heads, 256-wide K and V, and a `[T,T,T,F]` attention
+    /// pattern repeated nine times — so 27 blocks on a 512-token window and 9
+    /// attending to the whole context.
+    fn spark_entries() -> Vec<Vec<u8>> {
+        let pattern: Vec<bool> = (0..36).map(|layer| (layer + 1) % 4 != 0).collect();
+        vec![
+            kv_str("general.architecture", "spark2_5"),
+            kv_u32("spark2_5.block_count", 36),
+            kv_u32("spark2_5.embedding_length", 2560),
+            kv_u32("spark2_5.attention.head_count", 16),
+            kv_u32("spark2_5.attention.head_count_kv", 4),
+            kv_u32("spark2_5.attention.key_length", 256),
+            kv_u32("spark2_5.attention.value_length", 256),
+            kv_u32("spark2_5.attention.sliding_window", 512),
+            kv_bool_array("spark2_5.attention.sliding_window_pattern", &pattern),
+            kv_u32("spark2_5.context_length", 1_048_576),
+        ]
     }
 
     /// A string array, as the tokenizer vocabulary is stored.
@@ -829,6 +1073,121 @@ mod tests {
         // At the working context this is a few hundred MB, not the ~2 GB the
         // banded estimate would charge a 4 GB card.
         assert!(meta.kv_bytes_per_token() * 8192 < 512 * 1024 * 1024);
+    }
+
+    /// A dense model is costed exactly as it was before hybrid attention
+    /// existed here: everything scales, nothing is constant.
+    #[test]
+    fn a_model_with_no_attention_pattern_is_costed_as_it_always_was() {
+        let meta = parse_gguf_metadata(&mut header(gpt_oss_entries())).unwrap();
+
+        assert_eq!(meta.full_attention_layers, None);
+        assert_eq!(meta.sliding_window, None);
+
+        let cost = meta.kv_cost();
+        assert_eq!(cost.per_token, meta.kv_bytes_per_token());
+        assert_eq!(cost.fixed, 0, "a dense model has no constant part to charge");
+    }
+
+    /// The pattern is counted the right way round.
+    ///
+    /// `true` marks a *windowed* layer, so the full-attention layers are the
+    /// `false` ones. Counting the other way would report 27 growing layers
+    /// where there are 9 — a three-fold over-charge that looks plausible and
+    /// silently shrinks the served window.
+    #[test]
+    fn the_attention_pattern_says_which_layers_grow_with_the_conversation() {
+        let meta = parse_gguf_metadata(&mut header(spark_entries())).unwrap();
+
+        assert_eq!(meta.architecture, "spark2_5");
+        assert_eq!(meta.block_count, 36);
+        assert_eq!(
+            meta.full_attention_layers,
+            Some(9),
+            "9 of Spark's 36 blocks attend to the whole context"
+        );
+        assert_eq!(meta.sliding_window, Some(512));
+    }
+
+    /// The figure the dense reading gets four times wrong.
+    ///
+    /// Not a tidiness argument. On the 7.9 GB card this was measured on, the
+    /// dense figure served Spark at 16 384 tokens; the real geometry fits
+    /// 65 536 with the model wholly on the GPU.
+    #[test]
+    fn a_hybrid_models_growing_cost_is_only_its_full_attention_layers() {
+        let meta = parse_gguf_metadata(&mut header(spark_entries())).unwrap();
+        let cost = meta.kv_cost();
+
+        // 9 layers × 4 KV heads × (256 + 256) × 2 bytes
+        assert_eq!(cost.per_token, 36_864);
+        // 27 layers × 4 KV heads × (256 + 256) × 2 bytes × a 512-token window
+        assert_eq!(cost.fixed, 56_623_104);
+
+        assert_eq!(
+            meta.kv_bytes_per_token(),
+            147_456,
+            "the dense figure is still what it was, for the callers that want it"
+        );
+        assert!(
+            cost.per_token * 4 == meta.kv_bytes_per_token(),
+            "the dense reading over-charges this model exactly four-fold"
+        );
+    }
+
+    /// The arithmetic that predicted the measured ceiling.
+    ///
+    /// On the card this was developed against, `llama-server` loaded
+    /// Spark at 163 840 tokens and failed to allocate its KV cache at
+    /// 196 608, with 4.38 GB of weights and about 7.1 GB free. The cost model
+    /// has to land between those two or it is not describing this model.
+    #[test]
+    fn the_cost_model_brackets_the_context_that_was_measured_to_fit() {
+        let meta = parse_gguf_metadata(&mut header(spark_entries())).unwrap();
+        let cost = meta.kv_cost();
+
+        // `q8_0` for both K and V, which is how ARJUN launches llama-server.
+        const Q8: f64 = 0.5;
+        const WEIGHTS: u64 = 4_375_021_152;
+        const MEASURED_FREE_VRAM: u64 = 7_131 * 1024 * 1024;
+
+        let at_163840 = cost.bytes_for(163_840, Q8) + WEIGHTS;
+        let at_196608 = cost.bytes_for(196_608, Q8) + WEIGHTS;
+
+        assert!(
+            at_163840 < MEASURED_FREE_VRAM,
+            "163 840 tokens loaded on the real card; the model says {at_163840} against {MEASURED_FREE_VRAM}"
+        );
+        assert!(
+            at_196608 > MEASURED_FREE_VRAM,
+            "196 608 tokens failed to allocate on the real card; the model says {at_196608} against {MEASURED_FREE_VRAM}"
+        );
+    }
+
+    /// A pattern without a window, or a window without a pattern, is a header
+    /// this build does not understand — and the safe reading of that is the
+    /// dense one. Under-charging a KV cache does not produce a slower server;
+    /// it produces `ggml_vulkan: Device memory allocation ... failed`.
+    #[test]
+    fn half_a_hybrid_declaration_is_costed_densely() {
+        let mut entries = spark_entries();
+        entries.retain(|e| {
+            !String::from_utf8_lossy(e).contains("attention.sliding_window\u{0}")
+                && !String::from_utf8_lossy(e).contains("sliding_window")
+        });
+        let pattern: Vec<bool> = (0..36).map(|layer| (layer + 1) % 4 != 0).collect();
+        entries.push(kv_bool_array(
+            "spark2_5.attention.sliding_window_pattern",
+            &pattern,
+        ));
+
+        let meta = parse_gguf_metadata(&mut header(entries)).unwrap();
+        assert_eq!(
+            meta.full_attention_layers, None,
+            "a pattern with no window does not say how large the window is"
+        );
+        assert_eq!(meta.kv_cost().per_token, meta.kv_bytes_per_token());
+        assert_eq!(meta.kv_cost().fixed, 0);
     }
 
     /// The window is read from the file, and its absence is reported as absence.
@@ -1107,6 +1466,15 @@ pub struct ModelCapabilities {
     pub emits_reasoning: bool,
     /// The trained context window, where the header states one.
     pub context_length: Option<u32>,
+    /// What this model's KV cache costs, from its own geometry.
+    ///
+    /// `None` when the header could not be read, which the planner answers
+    /// with its size-banded estimate. Carried here so the admission path —
+    /// which already reads this header for the layer count — can hand the
+    /// planner the exact figure instead of the band. On a hybrid-attention
+    /// model the band is wrong by a factor of four, and it is wrong in the
+    /// direction that serves a short context on a card with room to spare.
+    pub kv_cost: Option<KvCost>,
 }
 
 /// Reads a model's capabilities once per file, then remembers them.
@@ -1138,6 +1506,7 @@ pub fn capabilities(weights: &Path) -> ModelCapabilities {
             supports_toggled_reasoning: meta.supports_toggled_reasoning,
             emits_reasoning: meta.emits_reasoning,
             context_length: meta.context_length,
+            kv_cost: Some(meta.kv_cost()).filter(|cost| cost.per_token > 0),
         },
         Err(error) => {
             log::warn!(
