@@ -37,6 +37,54 @@ follow from it:
 
 ---
 
+## Recent Updates & Engineering Log (September 2026)
+
+ARJUN has undergone intensive architectural evolution over the recent days across its agent runtime, shared memory bus, multi-agent governance, hardware planning, and user interface. Every change is logged below:
+
+### 1. Shared Agent Memory Bus & Dynamic Context Compiler
+- **1,000,000-Token Chat Memory Bus (`chat_memory_bus.rs`):** Implemented an ultra-long context memory bus supporting up to 1M tokens with proactive, budget-aware context window truncation and deterministic token accounting.
+- **Dynamic Context Compiler (`context_compiler.rs`):** Assembles system instructions, active conversational history, grounded knowledge passages, and persistent context pins into a compiled, hardware-bounded context window tailored to the active model.
+- **Context Manifests & State Commits (`context_manifest.rs`, `state_commit.rs`):** Structured manifests capture the exact state of compiled context and pin bindings per turn, providing auditable state commits for reproducibility and session resumption.
+- **Token Pinning Architecture (`pins.rs`):** Allows crucial system instructions, active tool definitions, and user-selected knowledge snippets to be pinned in memory so they are never evicted during context compaction.
+- **Stateful Model Handoff & Model Transitions (`model_handoff.rs`, `model_transition.rs`):** Seamless runtime handoff between the primary orchestrator and specialist models (e.g., coding, reasoning, vision), preserving conversational turn state and memory boundaries without session restarts.
+
+### 2. Multi-Agent Administration & Governance Dashboard
+- **Agent Definitions & Store (`src-tauri/src/agents/`):** Persistent, declarative agent definitions with configurable system prompts, tool bindings, model preference orders, and role-based access control.
+- **Agent Administration IPC (`commands/agent_admin.rs`, `commands/agents.rs`):** Robust IPC command suite for agent lifecycle management (creation, quarantine, activation, model bindings, skill verification).
+- **Agents Management UI (`src/pages/Agents.tsx`):** Dedicated administration view in the desktop interface for configuring autonomous agents, monitoring active workloads, and managing model/skill assignments.
+- **Frontend Agent Registry Service (`src/services/agentRegistry.service.ts`):** Typed TypeScript bridge connecting UI components to the Rust agent governance backend.
+
+### 3. Interactive Knowledge & Memory Graph Canvas
+- **Real-Time Memory Feed & Storage (`runtime_feed.rs`, `runtime_memory.rs`, `runtime_store.rs`):** Reactive event streaming architecture that publishes memory graph mutations (entity discoveries, relationship links, topic clusters) directly from the agent loop.
+- **High-Performance Graph Canvas (`src/components/graph/MemoryGraphCanvas.tsx`):** Accelerated canvas renderer supporting hundreds of concurrent nodes and edges with smooth zoom, pan, force simulation, and hierarchical clustering.
+- **Label Geometry & Collision Avoidance (`labelGeometry.ts`):** Multi-pass collision detection and bounding box placement preventing text overlap across dense entity clusters.
+- **Visual Evidence & Stress Test Harness (`evidence/memory-graph/`):** Comprehensive automated visual regression and stress test harness (`harness.html`, `harness.tsx`) with recorded evidence for up to 500-node live mutation benchmarks, reduced-motion adaptations, and parent/child aggregation.
+
+### 4. Subagent Worker Loop & Live Model Execution
+- **Subagent Child Loop & Scheduler (`child_loop.rs`, `scheduling.rs`):** Concurrency-safe background worker execution loop enabling agents to spawn autonomous subagents for parallel research and task execution.
+- **Bi-Directional Graph I/O (`graph_io.rs`):** Subagents stream findings, extracted relations, and memory nodes directly back into the shared workspace memory graph.
+- **Live Integration Tests (`tests/model_binding_handoff_live.rs`, `tests/subagent_model_loop_live.rs`):** End-to-end integration test coverage ensuring deterministic execution of the subagent loop and model transitions under real inference loads.
+
+### 5. Spark Orchestrator, Token Budgeting & VRAM Planning
+- **Spark-X2.5-4B Orchestrator Support (`orchestrator-spark-registry.json`):** Integrated `Spark-X2.5-4B (Q8_0)` as an official orchestrator candidate with 32,768 served context tokens and FlashAttention acceleration.
+- **Hardware-Aware VRAM Planner (`vram_planner.rs`):** Upgraded memory estimation engine that parses GGUF header geometry, context KV-cache requirements, and available VRAM to determine exact GPU layer offloading.
+- **Fine-Grained Token Budgeting (`token_budget.rs`):** Dynamically allocates token quotas across prompt ingestion, tool grammar constraints, and completion limits.
+- **Transparent Response Continuation (`continuation.rs`):** Multi-part generation handler that automatically detects output token boundary exhaustion and transparently continues generation without losing reasoning state.
+
+### 6. Document Ingestion, Notebook Research & Evidence Citations
+- **Deep Document & Attachment Extraction (`sidecars/document_sidecar/attachment_extract.py`):** Multi-format parser capable of extracting and indexing text, tables, and images from PDFs, Word documents, Excel spreadsheets, and PowerPoint presentations.
+- **Evidence Citations & Notebook Scope (`EvidenceCitations.tsx`, `NotebookScopeControls.tsx`):** UI components that render verifiable citations linking model statements directly back to source document chunks.
+- **Seamless Notebook-to-Chat Handoff (`notebookHandoff.ts`):** Smooth transfer of grounded research notes and context boundaries directly into active agent chat sessions.
+
+### 7. Reliability, Platform Hardening & Verification Gates
+- **Windows Console Popup Suppression (`src-tauri/src/serving/mod.rs`):** Applied `CREATE_NO_WINDOW` process flags when probing `llama-server.exe` on Windows to eliminate flickering background command prompt windows.
+- **Synchronous Crash Logger & Standard Logging (`src-tauri/src/logging/mod.rs`):** Replaced custom telemetry early boot logging with standard log facilities and added a synchronous crash reporter to capture unhandled panics.
+- **Ratcheted Lint Gate (`scripts/lint-budget.json`):** Lowered the unused-code ceiling from 43 to 40 warnings via the staged lint budget ratchet.
+- **CycloneDX SBOM Regeneration (`evidence/sbom.cdx.json`, `evidence/sbom.md`):** Updated full software bill of materials cataloging 1,153 verified components.
+- **Autonomous E2E CDP Test Suite (`ARJUN_SPARK_TEST_REPORT.md`):** Full end-to-end test run against the live desktop application via Chrome DevTools Protocol on Edge WebView2, validating reasoning, structured JSON decode (154 tok/s), and river crossing problem-solving.
+
+---
+
 ## Requirements
 
 | Tool | Version | Notes |
@@ -120,32 +168,38 @@ The individual gates, if you want them one at a time:
 
 ```
 src/                    React 19 + TypeScript frontend
-  pages/                Workbench, Browse, Health, Approvals, AuditNetwork, …
-  services/             typed bridges to Tauri commands
+  pages/                Workbench, Agents, Browse, Health, Approvals, AuditNetwork, …
+  components/           ChatSurface, AgentMemoryPanel, MemoryGraphCanvas, RunView, …
+  services/             typed bridges to Tauri commands (agentRegistry, memoryGraph, …)
   sdk/  hooks/  contexts/
 
 src-tauri/              Rust core (crate: sarathi)
   agent_runtime/        supervises the TS runtime; workspace sandbox,
-                        capability grants, approval gating, artifact capture
+                        chat memory bus (1M tokens), dynamic context compiler,
+                        context manifests, token pins, state commits, model handoff
     events/             durable, ordered task history in SQLite — snapshots
                         for the UI, idempotency keys for side effects, and
                         recovery of runs a restart interrupted
-  serving/              model serving lifecycle and probing
+  agents/               agent definitions, persistent store, and governance
+  subagents/            subagent worker loops, scheduling, and graph I/O
+  knowledge/            graph runtime store, memory feeds, notebook retrieval
+  ai_engine/            token budgeting, response continuation, VRAM planner
+  serving/              model serving lifecycle, llama-server probing, and admission
   model_manager/        download, sizing, and installation
   model_intelligence/   hardware-aware recommendation
   model_package/        base-model package manifests and repair
   sovereignty/          the single egress broker
   policy/  capability/  audit/  identity/
-  memory_engine/  knowledge/  documents/
+  memory_engine/  documents/
 
 agent-runtime/          vendored OpenClaw agent loop (TypeScript)
-  src/                  protocol, run loop, providers, tools, compaction
+  src/                  protocol, run loop, context refresh, state commit, providers, tools
   vendor/openclaw/      pruned upstream packages
   scripts/              vendor audit and bundler
 
-sidecars/               Python sidecars (documents, memory engine, packs)
+sidecars/               Python sidecars (documents, memory engine, packs, graph)
 scripts/                build, verification, and evidence gates
-evidence/               generated SBOM and audit output
+evidence/               generated SBOM, test reports, and memory graph visual artifacts
 ```
 
 ---
@@ -165,6 +219,12 @@ evidence/               generated SBOM and audit output
    finished run leaves behind. That is what lets a window reattach to a run
    after a remount, and what lets the next start find the runs the previous
    process was carrying when it went away.
+7. The **shared agent memory bus** (`chat_memory_bus.rs`) and **dynamic context compiler**
+   assemble active dialogue turns, token pins, and grounded knowledge passages into
+   hardware-bounded manifests, supporting up to 1M tokens with seamless model transitions.
+8. **Autonomous subagents** execute concurrently in supervised child loops (`subagents/`),
+   streaming extracted knowledge, relations, and memory nodes directly into the reactive
+   **memory graph runtime store**, visualizable live on the interactive canvas.
 
 ---
 
