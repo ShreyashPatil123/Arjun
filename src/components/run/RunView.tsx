@@ -26,6 +26,7 @@ import {
 import { artifactPresentation, type ArtifactGlyph } from '../../services/artifactKind';
 import { previewDisplay } from '../../services/artifactPreview';
 import { InlineErrorBoundary } from '../ui';
+import { AgentMemoryPanel } from '../graph/AgentMemoryPanel';
 import { labelFor, type RunViewState } from './useRun';
 import type { Activity } from './recovery';
 import { MilestoneGate } from './MilestoneGate';
@@ -612,6 +613,18 @@ export const RunView = ({ state, onAbort, onNewTask, onRerun, stopping = false }
       )}
 
       {summary?.verification && <Verification report={summary.verification} />}
+
+      {/* What the agents on this task have established, as a graph.
+        *
+        * Keyed on the run id, which is how the runtime scopes a task's memory.
+        * Shown whether or not the run has finished: "what does it know so far"
+        * is a live question during a run and an audit question after one, and
+        * the same picture answers both. */}
+      {state.runId && (
+        <InlineErrorBoundary label="the memory graph">
+          <AgentMemoryPanel runId={state.runId} />
+        </InlineErrorBoundary>
+      )}
 
       {summary && (
         <section className={styles.section}>

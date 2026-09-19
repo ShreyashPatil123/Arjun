@@ -1239,6 +1239,26 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             arguments: &[
                 ArgumentSpec { name: "profile", kind: Text },
                 ArgumentSpec { name: "task", kind: Text },
+                // What the worker is pointed at. References, never contents —
+                // see `subagents::packet`, and `runner::delegation_inputs`,
+                // which turns these into the packet's input list.
+                //
+                // Declared here so the model can actually pass them. They were
+                // absent, and the runner passed `Vec::new()` regardless, so
+                // three of the four roles had no way to be told what to read.
+                ArgumentSpec { name: "documents", kind: Object },
+                ArgumentSpec { name: "files", kind: Object },
+                ArgumentSpec { name: "expressions", kind: Object },
+                ArgumentSpec { name: "artifacts", kind: Object },
+                // What counts as done, which the parent's completion check
+                // reads back.
+                ArgumentSpec { name: "deliverable", kind: Text },
+                // How one worker waits for another. A model that has just been
+                // told "Published … at graph revision 12" passes 12 here, and
+                // the next worker does not start until the task's shared memory
+                // holds it. This is the whole of the handoff: no transcript
+                // moves between them.
+                ArgumentSpec { name: "after_revision", kind: Integer },
             ],
             // Read-only by construction: the child's inherited policy permits no
             // writing tool, so no approval can be needed for what it may do.

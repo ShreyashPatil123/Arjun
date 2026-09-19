@@ -360,7 +360,11 @@ function hostTool(options: {
    * detail beside it. That is deliberate: the notes exist to record what the
    * model was told, and a marker the model never saw is one it cannot cite.
    */
-  observe?: (observation: { tool: string; args: unknown; text: string }) => void;
+  observe?: (observation: {
+    tool: string;
+    args: unknown;
+    text: string;
+  }) => void | Promise<void>;
 }): AgentTool {
   const {
     name,
@@ -425,8 +429,14 @@ function hostTool(options: {
       // Best-effort: a note that could not be taken costs the next attempt some
       // context, and throwing here would cost this attempt the tool result it
       // has already paid for.
+      //
+      // Awaited, because what happens here is no longer only a local note: the
+      // run's state is committed to Rust from inside this callback, and a
+      // floating promise would let the loop start the next model turn before
+      // the resume point had moved. A crash in that window would recover to a
+      // point that does not know about the tool that just ran.
       try {
-        observe?.({ tool: name, args: params, text: execution.text });
+        await observe?.({ tool: name, args: params, text: execution.text });
       } catch {
         // Deliberately swallowed. See above.
       }
@@ -625,7 +635,11 @@ export function buildTools(
   ledger: GrantLedger,
   runId: string,
   modelId: string,
-  observe?: (observation: { tool: string; args: unknown; text: string }) => void,
+  observe?: (observation: {
+    tool: string;
+    args: unknown;
+    text: string;
+  }) => void | Promise<void>,
   eligible?: readonly EligibleTool[],
 ): AgentTool[] {
   type Entry = { definition: ToolDefinition; readOnly: boolean; timeoutMs: number };

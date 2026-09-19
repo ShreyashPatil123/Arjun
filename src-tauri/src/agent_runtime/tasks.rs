@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::artifacts::VerificationReport;
 use crate::knowledge::SearchResult;
 use crate::orchestrator::calculation::CalculationRecord;
-use crate::orchestrator::plan::{PlanRun, PlanStep, StopReason};
+use crate::orchestrator::plan::{PlanRun, StopReason};
 use crate::registry::router::RoutingDecision;
 use crate::serving::Endpoint;
 
@@ -324,8 +324,9 @@ pub struct ContextLedgerRecord {
 
 /// What a turn could not fit of its own conversation.
 ///
-/// Counted before the model is called, from `turn_context::fit`, so the numbers
-/// describe what was *offered* to the turn rather than what it did with it.
+/// Counted before the model is called, from `turn_context::fit_with_memory_bus`,
+/// so the numbers describe what was *offered* to the turn rather than what it
+/// did with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryTrim {
@@ -338,6 +339,21 @@ pub struct HistoryTrim {
     /// The served window this was budgeted against, so a reader can see why a
     /// thread that was fine yesterday is not today.
     pub window_tokens: u32,
+    /// Protected content the budget could not carry, one entry per pin.
+    ///
+    /// Kept apart from `dropped` because they are different events. `dropped`
+    /// is an old message ageing out of a window, which is the window working.
+    /// An entry here is somebody's explicit instruction that the turn could not
+    /// honour, and it used to be reported as an increment of `dropped` — that
+    /// is, not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_pins: Vec<super::chat_memory_bus::OmittedPin>,
+    /// What the whole thread costs to retain, measured.
+    ///
+    /// `None` on a record written before this was measured, and from paths that
+    /// do not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<super::chat_memory_bus::RetentionStatus>,
 }
 
 /// One time a run's older history was replaced by a summary.

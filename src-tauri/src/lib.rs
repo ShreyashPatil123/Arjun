@@ -9,6 +9,7 @@ pub mod logging;
 pub mod commands;
 pub mod sovereignty;
 pub mod artifacts;
+pub mod agents;
 pub mod audit;
 pub mod documents;
 pub mod health;
@@ -613,6 +614,9 @@ pub fn run() {
                 Err(error) => log::error!("[TASKS] interrupted runs could not be closed off: {error}"),
             }
             let subagent_events = std::sync::Arc::clone(&task_events);
+            // The same log again, for the workers. Cloned before the manage below
+            // takes ownership of the original.
+            let worker_events = std::sync::Arc::clone(&task_events);
             app.manage(task_events as commands::agent::TaskEvents);
 
             // Skills: reusable instructions an operator installs. Discovered
@@ -681,8 +685,118 @@ pub fn run() {
                     rejected.error.explain()
                 );
             }
-            let subagent_manager =
-                subagents::SubagentManager::new(loaded_profiles.profiles, subagent_events);
+            let mut subagent_manager =
+                // Cloned rather than moved: the registry imports the same
+                // profiles just below, and the manager is what performs them.
+                subagents::SubagentManager::new(loaded_profiles.profiles.clone(), subagent_events);
+
+            // The workers that actually perform the declared roles.
+            //
+            // This registration is what the whole subagent lifecycle was
+            // guarding an empty room for: the narrowing, the lanes, the
+            // deadlines and the idempotency ledger were all real, and
+            // `has_worker` answered false for every profile because nothing was
+            // ever registered. See `subagents::worker`.
+            //
+            // Built from what this process already manages, so a worker reads
+            // the same index, the same graph and the same session the parent
+            // does — the point of `graph_io` is that there is one memory
+            // service, not a private one per worker.
+            {
+                use std::sync::Arc as StdArc;
+                let index = app.state::<StdArc<knowledge::index::KnowledgeIndex>>();
+                let models = app.state::<StdArc<registry::ModelRegistry>>();
+                let servers = app.state::<StdArc<serving::ModelServers>>();
+                let session = app.state::<commands::governance::CurrentSession>();
+                let cancellations = app.state::<commands::agent::CancellationsState>();
+
+                // Opened once here rather than per child: `MemoryGraph::open`
+                // creates its tables, and doing that per worker would be a
+                // schema check between a task and its own shared memory.
+                let graph =
+                    match knowledge::graph::runtime_store::MemoryGraph::open(&app_data_dir) {
+                        Ok(graph) => Some(StdArc::new(graph)),
+                        Err(error) => {
+                            // Said out loud at start. A deployment without it
+                            // can still delegate; what it cannot do is let one
+                            // worker read another's result, and a worker
+                            // finding that out mid-task would report it as an
+                            // empty answer.
+                            log::error!(
+                                "[SUBAGENTS] the runtime memory graph could not be opened, so \
+                                 workers cannot publish to a task's shared memory: {error}"
+                            );
+                            None
+                        }
+                    };
+
+                // The same graph the workers write to is the one the memory
+                // view reads and the one the watcher announces from. Managed
+                // here rather than opened a second time for the UI: two handles
+                // to the same file would each create their own tables, and a
+                // window would be watching a revision counter that the writers
+                // were not advancing.
+                if let Some(graph) = graph.as_ref() {
+                    use tauri::Emitter as _;
+                    let notify = app.handle().clone();
+                    graph.on_change(StdArc::new(move |revision: i64| {
+                        // Deliberately only a number. See the module note on
+                        // `commands::memory_graph`: this reaches every window,
+                        // and what each of them may see is not decidable here.
+                        let _ = notify.emit(
+                            commands::memory_graph::MEMORY_GRAPH_EVENT,
+                            commands::memory_graph::GraphMoved { revision },
+                        );
+                    }));
+                    app.manage(StdArc::clone(graph));
+                }
+
+                let services = StdArc::new(subagents::WorkerServices {
+                    index: index.inner().clone(),
+                    graph,
+                    events: StdArc::clone(&worker_events),
+                    // Residency is decided against this machine's own measured
+                    // memory, so four logically parallel children on an 8 GB
+                    // card take turns rather than each getting a fraction of
+                    // it. See `subagents::scheduling`.
+                    scheduler: StdArc::new(subagents::ModelScheduler::new(
+                        models.inner().clone(),
+                        servers.inner().clone(),
+                    )),
+                    session: session.inner().clone(),
+                    // A child's own model loop, on the runtime the parent is
+                    // using. The handle is the lazily-filled slot
+                    // `commands::agent::runtime` writes into, so this is empty
+                    // until the first run starts and holds the live runtime
+                    // afterwards — which is exactly when a child could have one.
+                    child_loop: Some(StdArc::new(subagents::ChildLoop {
+                        runtime: app
+                            .state::<commands::agent::AgentRuntimeHandle>()
+                            .inner()
+                            .clone(),
+                        plans: app.state::<commands::agent::RunPlans>().inner().clone(),
+                        calls: app.state::<commands::agent::RunToolCalls>().inner().clone(),
+                        workspaces: app
+                            .state::<commands::agent::RunWorkspaces>()
+                            .inner()
+                            .clone(),
+                        passages: app
+                            .state::<agent_runtime::retrieval::RunPassages>()
+                            .inner()
+                            .clone(),
+                        servers: servers.inner().clone(),
+                        registry: models.inner().clone(),
+                        models_dir: models.models_dir().to_path_buf(),
+                    })),
+                    cancellations: StdArc::clone(&cancellations.0),
+                });
+
+                for worker in
+                    subagents::SpecialistWorker::register_all(&loaded_profiles.profiles, services)
+                {
+                    subagent_manager = subagent_manager.with_worker(worker);
+                }
+            }
 
             // Said out loud at start, because the alternative is a run finding
             // out mid-task.
@@ -714,6 +828,51 @@ pub fn run() {
             }
 
             app.manage(std::sync::Arc::new(subagent_manager) as commands::agent::Subagents);
+
+            // The deployment's own record of its agents.
+            //
+            // Opened before the import, and kept even when the import finds
+            // nothing: an empty registry is what a fresh installation has, and
+            // the administration screen is how the first agent gets made.
+            //
+            // The import is safe to run on every launch — it is keyed on the
+            // profile name, so a profile already mapped to an agent updates
+            // only the fields the profile owns and leaves the colour, the
+            // model binding and the enabled state exactly as somebody set
+            // them. See `agents::store::AgentRegistry::import_bundled`.
+            if let Some(agents) = commands::agents::open(&app.handle().clone()) {
+                commands::agents::import_bundled_profiles(&agents, &loaded_profiles.profiles);
+                app.manage(agents);
+
+                // Settle any model change the last run of this process died in
+                // the middle of.
+                //
+                // A row left unsettled is not a handoff in progress — nothing
+                // is running it — and the ledger's partial unique index treats
+                // one as under way, so leaving it would block that agent from
+                // ever being moved again. The sweep reads the registry to find
+                // out whether the binding write landed and closes each row
+                // accordingly; the one case it cannot read off the record is
+                // reported as needing a person rather than guessed.
+                //
+                // Spawned rather than awaited here, because it may have to
+                // serve a model again and start-up should not wait on a model
+                // load. Passed no authority at all: see
+                // `Handoff::reconcile_open` for why a recovery sweep neither
+                // needs nor is given an administrator's.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::agents::reconcile_interrupted_transitions(&handle).await;
+                });
+            } else {
+                // Said once, at start. A deployment running without a registry
+                // can still chat and still run tasks; what it cannot do is
+                // administer agents, and the refusal a person would otherwise
+                // meet on the Agents screen would not say why.
+                log::warn!(
+                    "[agents] this session is running without an agent registry, so agents                      cannot be listed or changed"
+                );
+            }
 
             app.manage(sovereignty::global_broker().clone());
 
@@ -973,6 +1132,8 @@ pub fn run() {
             commands::knowledge::knowledge_documents,
             commands::knowledge::knowledge_search,
             commands::knowledge::knowledge_health,
+            commands::memory_graph::memory_graph_snapshot,
+            commands::memory_graph::memory_graph_changes,
             commands::agent::agent_steer_run,
             commands::agent::agent_pin_context,
             commands::agent::agent_task_context,
@@ -1099,6 +1260,23 @@ pub fn run() {
             commands::notebook_research::notebook_set_conversation_scope,
             commands::notebook_research::notebook_conversation_scope,
             commands::notebook_research::notebook_clear_conversation_scope,
+
+            commands::agents::agent_registry_list,
+            commands::agents::agent_registry_get,
+            commands::agents::agent_registry_create,
+            commands::agents::agent_registry_update,
+            commands::agents::agent_registry_clone,
+            commands::agents::agent_registry_set_state,
+            commands::agents::agent_registry_palette,
+            commands::agent_admin::agent_skill_catalog,
+            commands::agent_admin::agent_preview,
+            commands::agent_admin::agent_dependents,
+            commands::agent_admin::agent_test_run,
+            commands::registry::registry_review_model,
+            commands::agents::agent_model_transition_begin,
+            commands::agents::agent_model_transition_status,
+            commands::agents::agent_model_transition_rollback,
+            commands::agents::agent_model_transition_reconcile,
 
             // The ten `memory_engine::api::*` commands were removed. See
             // `memory_engine::api` for the reasoning; in short, every one of

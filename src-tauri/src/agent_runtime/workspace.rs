@@ -59,6 +59,20 @@ impl Workspace {
         Ok(Self { root })
     }
 
+    /// Adopts a directory that already exists.
+    ///
+    /// For a child, which reads and writes under the *run's* directory rather
+    /// than one of its own: `InheritedPolicy::workspace_root` is where that is
+    /// decided, and a child given a second directory would be a child whose
+    /// reads could not see the files the run is working on.
+    ///
+    /// Creates nothing. Where a child may *write* is still
+    /// `EffectivePolicy::write_root`, which the gateway enforces separately —
+    /// adopting a root is about what is reachable, not about what is writable.
+    pub fn at(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

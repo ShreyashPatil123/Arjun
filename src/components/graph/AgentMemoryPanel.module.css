@@ -1,0 +1,269 @@
+/* The agent-memory panel.
+ *
+ * The canvas is black in both themes — eight saturated agent colours only hold
+ * their relative weight against a dark ground, and a palette that inverted with
+ * the theme would mean an agent changed colour when somebody flipped a switch.
+ * The chrome around it follows the product's tokens as usual, so the panel sits
+ * inside the Run screen rather than looking pasted on. */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--border-default);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* "Behind" is a real state and is said out loud: what is on screen was true, it
+ * is merely no longer known to be current. */
+.stale {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.refresh {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.refresh:hover {
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+.counts {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.counts strong {
+  color: var(--text-primary);
+}
+
+.dot {
+  margin: 0 6px;
+  color: var(--text-tertiary);
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.searchBox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  color: var(--text-tertiary);
+}
+
+.searchInput {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.chip,
+.chipOn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chipOn {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-width: 1.5px;
+}
+
+.swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.clear {
+  border: none;
+  background: transparent;
+  color: var(--accent-primary);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* The black surface. A fixed height rather than one driven by the graph: the
+ * canvas fits the graph to whatever box it is given, and a box that grew with
+ * the graph would push the rest of the Run screen off the page. Resizable,
+ * because how much room a graph deserves is the reader's call. */
+.canvasWrap {
+  position: relative;
+  height: 420px;
+  min-height: 220px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: #000000;
+  overflow: hidden;
+  resize: vertical;
+}
+
+.quiet {
+  margin: 0;
+  padding: 24px;
+  color: #8a8a8a;
+  font-size: 12px;
+  text-align: center;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.legendItem {
+  white-space: nowrap;
+}
+
+.legendSep {
+  width: 1px;
+  height: 11px;
+  background: var(--border-default);
+}
+
+.note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--status-error, #f87171);
+}
+
+.inspector {
+  padding: 10px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.inspectorTitle {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+}
+
+.content {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.facts dt {
+  color: var(--text-tertiary);
+}
+
+.facts dd {
+  margin: 0;
+  color: var(--text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Reduced motion is honoured in the canvas itself — it settles the layout
+ * without animating rather than merely shortening a transition. This covers the
+ * chrome around it. */
+@media (prefers-reduced-motion: reduce) {
+  .panel *,
+  .panel *::before,
+  .panel *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

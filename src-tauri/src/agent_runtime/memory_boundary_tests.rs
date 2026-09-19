@@ -48,7 +48,11 @@ fn deps_in(department: Option<&str>) -> (Arc<RuntimeDeps>, tempfile::TempDir) {
             .expect("the artifact store opens"),
     );
     let deps = Arc::new(RuntimeDeps {
+        memory_graph: None,
         conversation_artifacts,
+        // No registry in these tests: a delegation then refuses by name
+        // rather than inventing a model, which is the behaviour under test.
+        registry: None,
         index: Arc::new(KnowledgeIndex::open(dir.path()).expect("index opens")),
         session: signed_in(department),
         workspaces,

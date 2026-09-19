@@ -48,14 +48,16 @@ struct Migration {
 ///
 /// The index is the version: after applying all of these, `user_version` is
 /// `MIGRATIONS.len()`.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "run_approvals",
-    // Approvals were an in-memory `Mutex<Vec<_>>` and died with the process, so
-    // a run waiting on a person at the moment of a crash lost both the question
-    // and the answer. `args_fingerprint` is stored beside the arguments on
-    // purpose: an approval authorises a specific call, and the check at resume
-    // time is that the call has not changed since a person looked at it.
-    sql: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "run_approvals",
+        // Approvals were an in-memory `Mutex<Vec<_>>` and died with the process,
+        // so a run waiting on a person at the moment of a crash lost both the
+        // question and the answer. `args_fingerprint` is stored beside the
+        // arguments on purpose: an approval authorises a specific call, and the
+        // check at resume time is that the call has not changed since a person
+        // looked at it.
+        sql: "
         CREATE TABLE IF NOT EXISTS run_approvals (
             approval_id       TEXT PRIMARY KEY,
             run_id            TEXT NOT NULL,
@@ -79,7 +81,52 @@ const MIGRATIONS: &[Migration] = &[Migration {
         CREATE INDEX IF NOT EXISTS run_approvals_status_idx
             ON run_approvals(status);
     ",
-}];
+    },
+    Migration {
+        name: "agent_model_transitions",
+        // Changing the model an agent is bound to used to be a field in an
+        // edit form, so there was nothing to record and nowhere to record it.
+        // This is the ledger: one row per handoff, holding where it got to and
+        // enough hashes to answer afterwards what moved.
+        //
+        // `settled_at IS NULL` is the definition of "still going", and the
+        // partial unique index below makes "at most one open handoff per agent"
+        // a property of the storage engine rather than a check somebody
+        // remembers to write. Two administrators pressing the button at once is
+        // the ordinary case for a screen that lists agents, and two concurrent
+        // handoffs of the same agent would race over one registry row.
+        //
+        // `run_id` is nullable on purpose: reassigning an idle agent is a real
+        // transition with no run to hand over, and inventing a run id for it
+        // would put a task in the task list that nobody started.
+        sql: "
+        CREATE TABLE IF NOT EXISTS agent_model_transitions (
+            transition_id   TEXT PRIMARY KEY,
+            agent_id        TEXT NOT NULL,
+            run_id          TEXT,
+            phase           TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            from_model_id   TEXT NOT NULL,
+            to_model_id     TEXT NOT NULL,
+            requested_by    TEXT NOT NULL,
+            requested_at    TEXT NOT NULL,
+            settled_at      TEXT,
+            schema_version  INTEGER NOT NULL,
+            body            TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS agent_model_transitions_agent_idx
+            ON agent_model_transitions(agent_id, requested_at);
+
+        CREATE INDEX IF NOT EXISTS agent_model_transitions_run_idx
+            ON agent_model_transitions(run_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS agent_model_transitions_one_open
+            ON agent_model_transitions(agent_id)
+            WHERE settled_at IS NULL;
+    ",
+    },
+];
 
 /// Applies every migration the database has not had, and returns the version
 /// it is now on.

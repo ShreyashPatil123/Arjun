@@ -1,0 +1,42 @@
+Loading weights:   0%|          | 0/515 [00:00<?, ?it/s]Loading weights: 100%|##########| 515/515 [00:00<00:00, 46828.68it/s]
+== environment ==
+{
+  "python": "3.11.9",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "script": "C:/Users/lenovo/AppData/Local/Temp/claude/C--Users-lenovo-Desktop-Arjun-1/9836762d-ddd6-4f83-8b2f-519e5d079b24/scratchpad/installed-resources\\sidecars\\graph_sidecar\\main.py",
+  "cwd": "C:/Users/lenovo/AppData/Local/Temp/claude/C--Users-lenovo-Desktop-Arjun-1/9836762d-ddd6-4f83-8b2f-519e5d079b24/scratchpad",
+  "repo_on_path": false,
+  "model_dir": "C:/Users/lenovo/AppData/Roaming/com.arjun.workbench/models/local/Babelscape_rebel-large/base",
+  "weights_sha256": "407feb8d55cae8ee077aa032a4aab5577a5503f910d090593626ebd6fccb6cff",
+  "config_sha256": "63451351d4bc53bfd8a0ddaf8e8a71b7e3e9d377771981869d030f2bc917e90c"
+}
+
+== graph.ping (78 ms) ==
+{
+  "jsonrpc": "2.0",
+  "id": "ping",
+  "result": {
+    "ok": true,
+    "loaded": false
+  }
+}
+
+== graph.extract_triplets (12.89 s, includes 1.6 GB model load) ==
+passage: Pump PV-2201 was supplied by Acme Pumps Ltd under contract CT-4471. Acme Pumps Ltd is headquartered in Pune and maintains the unit under an annual service agreement with the Refining Division.
+{
+  "jsonrpc": "2.0",
+  "id": "extract",
+  "result": {
+    "triplets": [
+      {
+        "chunk_id": "probe-chunk-1",
+        "subject": "Acme Pumps Ltd",
+        "relation": "headquarters location",
+        "object": "Pune"
+      }
+    ],
+    "chunksSeen": 1
+  }
+}
+
+== exit code: 0 ==

@@ -233,6 +233,14 @@ pub struct AgentProfile {
     pub required_schema: SchemaKind,
     /// SHA-256 of the profile file.
     pub sha256: String,
+    /// What the role is told to do, in its own words: the Markdown body after
+    /// the frontmatter.
+    ///
+    /// This is the child's system prompt. Defaulted so an `AgentProfile` built
+    /// from somewhere other than a file — `agents::AgentDefinition::to_profile`
+    /// builds one from a registry record — does not have to invent one.
+    #[serde(default)]
+    pub instructions: String,
 }
 
 impl AgentProfile {
@@ -454,6 +462,16 @@ pub fn compile(source: &str, file_stem: &str, sha256: &str) -> Result<AgentProfi
         classification_ceiling,
         required_schema,
         sha256: sha256.to_string(),
+        // The prose after the frontmatter, which is what the role actually
+        // *says*. It was parsed and discarded, so a worker had the profile's
+        // permissions and none of its instructions — which is fine for a
+        // mechanical routine and useless for a model, because the body is the
+        // system prompt. See `subagents::child_loop`.
+        //
+        // Untrusted, like every other part of a profile: it is only ever used
+        // as the child's own instructions, inside a policy narrowed before it
+        // was read, and it cannot widen anything.
+        instructions: split.body.trim().to_string(),
     })
 }
 

@@ -168,6 +168,234 @@ pub struct CompletionInputs {
     pub grounding_ready: Option<bool>,
     /// Whether the run produced any answer at all.
     pub has_answer: bool,
+    /// Every worker this run delegated to, and what it actually handed back.
+    ///
+    /// ## Why a child's own word is not enough
+    ///
+    /// Because a worker's status is the manager's, but its *payload* is its
+    /// own, and the failure this guards against is a child returning
+    /// `Completed` with nothing behind it. A retrieval that found no passages
+    /// and a retrieval that returned six sentences citing nothing both look
+    /// like success from the outside; a parent that folded either in as done
+    /// would be writing an answer on a search it cannot show anybody.
+    ///
+    /// So the parent checks the *contract*: did the child hand back the shape
+    /// it was asked for, with evidence or artifacts behind it, and did it
+    /// publish anything a later step can actually read. See [`ChildOutcome`].
+    pub children: Vec<ChildOutcome>,
+}
+
+/// What one delegated worker came back with, as the parent sees it.
+///
+/// Deliberately not the `ChildResult` itself: this is the parent's reading of
+/// it, and the fields are the questions the parent has to answer rather than
+/// everything the child said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildOutcome {
+    pub child_id: String,
+    pub profile: String,
+    /// What the manager recorded — never what the worker claimed. See
+    /// `subagents::result::ChildStatus`.
+    pub status: String,
+    /// True only for the one status that means the work is done.
+    pub complete: bool,
+    /// What the parent asked it to hand back, in the parent's words. Empty when
+    /// the dispatch named nothing, which is itself worth seeing.
+    pub deliverable: String,
+    /// How many findings it returned.
+    pub findings: usize,
+    /// How many of those carry an evidence reference.
+    ///
+    /// The number that matters. A worker reporting six findings and citing
+    /// nothing has produced six sentences, and a parent that repeated them
+    /// would be citing the worker rather than a source.
+    pub evidenced: usize,
+    /// Items it committed to the task's shared memory, by id.
+    ///
+    /// The strongest form of the contract, because a later step can go and read
+    /// them. A child that published nothing handed nothing to its siblings,
+    /// whatever its result said.
+    pub published: Vec<String>,
+    /// Whether a later step depends on this one having finished.
+    ///
+    /// A failed worker nobody was waiting for is a degraded run; a failed
+    /// worker a later step needed is a blocked one, and the two must not read
+    /// the same.
+    pub blocking: bool,
+}
+
+impl ChildOutcome {
+    /// Whether this worker handed back what it was asked for.
+    ///
+    /// Three things, and all three are required: the manager recorded it as
+    /// finished, it returned something, and what it returned rests on evidence
+    /// somebody can go and read. A worker that found nothing and *said so* is
+    /// handled separately — see [`Self::found_nothing`] — because "no source
+    /// says this" is a legitimate deliverable and an uncited claim is not.
+    pub fn honoured(&self) -> bool {
+        self.complete && self.findings > 0 && self.evidenced > 0
+    }
+
+    /// Whether this worker finished and legitimately found nothing.
+    ///
+    /// Told apart from a broken one by the status, which the manager sets from
+    /// what happened: a child that ran to completion and returned no findings
+    /// genuinely searched and genuinely found none.
+    pub fn found_nothing(&self) -> bool {
+        self.complete && self.findings == 0
+    }
+
+    /// The sentence the parent's report carries for this worker.
+    pub fn explain(&self) -> String {
+        if self.honoured() {
+            return format!(
+                "{} finished with {} finding(s), {} of them evidenced, and published {} item(s) \
+                 to the task's shared memory",
+                self.profile,
+                self.findings,
+                self.evidenced,
+                self.published.len()
+            );
+        }
+        if self.found_nothing() {
+            return format!(
+                "{} finished and found nothing, which is an answer rather than a failure",
+                self.profile
+            );
+        }
+        if !self.complete {
+            return format!(
+                "{} did not finish ({}), so anything it returned is incomplete{}",
+                self.profile,
+                self.status,
+                if self.blocking {
+                    " and a later step depends on it"
+                } else {
+                    ""
+                }
+            );
+        }
+        format!(
+            "{} reported {} finding(s) and none of them cite anything, so there is nothing a \
+             reader could check them against",
+            self.profile, self.findings
+        )
+    }
+}
+
+/// Every worker this run delegated to, read back off the durable record.
+///
+/// ## Why this is read from the log and not held in memory
+///
+/// Because the parent's completion check has to survive the thing it is
+/// checking. A run that was interrupted and resumed has a fresh process with an
+/// empty map, and a verifier reading that map would conclude the run delegated
+/// to nobody — which would let a task whose only real work was done by a child
+/// that died pass as complete.
+///
+/// So the pair of events the manager writes is the record: `subagent_started`
+/// carries who the child was and what it was asked for, and `subagent_stopped`
+/// carries what the manager recorded about how it ended. A child with a start
+/// and no stop is one that never came back, and is reported as exactly that
+/// rather than being left out.
+pub fn children_of(events: &super::events::TaskEventLog, run_id: &str) -> Vec<ChildOutcome> {
+    use std::collections::BTreeMap;
+
+    let Ok(page) = events.events_since(run_id, 0) else {
+        return Vec::new();
+    };
+
+    // Started first, so a stop has something to attach to.
+    let mut started: BTreeMap<String, ChildOutcome> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for event in &page.events {
+        if event.event_type != super::events::TaskEventType::SubagentStarted {
+            continue;
+        }
+        let payload = &event.payload;
+        let Some(child_id) = payload.get("childId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        order.push(child_id.to_string());
+        started.insert(
+            child_id.to_string(),
+            ChildOutcome {
+                child_id: child_id.to_string(),
+                profile: payload
+                    .get("profile")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                // Until a stop is seen, the honest reading of a child is that it
+                // has not come back. A start with no stop stays here.
+                status: "no result recorded".to_string(),
+                complete: false,
+                deliverable: payload
+                    .get("deliverable")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                findings: 0,
+                evidenced: 0,
+                published: Vec::new(),
+                // A child another child was told to wait for is one a later step
+                // depends on, and the packet's requirement is where that is
+                // recorded. Anything else is a fan-out nobody is blocked on.
+                blocking: payload
+                    .get("requirement")
+                    .and_then(|requirement| requirement.get("mode"))
+                    .and_then(|mode| mode.as_str())
+                    .is_some_and(|mode| mode != "latest"),
+            },
+        );
+    }
+
+    for event in &page.events {
+        if event.event_type != super::events::TaskEventType::SubagentStopped {
+            continue;
+        }
+        let payload = &event.payload;
+        let Some(child_id) = payload.get("childId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(outcome) = started.get_mut(child_id) else {
+            continue;
+        };
+        outcome.status = payload
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        // The manager's own reading, not the worker's. See
+        // `subagents::result::ChildStatus::is_complete`.
+        outcome.complete = payload
+            .get("complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        outcome.findings = payload
+            .get("findings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        outcome.evidenced = payload
+            .get("evidenced")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        outcome.published = payload
+            .get("published")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    order
+        .into_iter()
+        .filter_map(|child_id| started.remove(&child_id))
+        .collect()
 }
 
 /// Decides whether the run may be called finished.
@@ -226,6 +454,71 @@ pub fn verify(
             )
         },
     });
+
+    // -- The workers this run delegated to ------------------------------
+    //
+    // A child saying "done" is not enough, and this is where that is enforced.
+    // The manager already refuses to let a worker *set* its own status; these
+    // two criteria go further and check the payload, because a status of
+    // `completed` with six uncited sentences behind it is exactly what a parent
+    // must not fold into an answer.
+    if !inputs.children.is_empty() {
+        let broken: Vec<&ChildOutcome> = inputs
+            .children
+            .iter()
+            .filter(|child| !child.honoured() && !child.found_nothing())
+            .collect();
+        criteria.push(Criterion {
+            criterion_id: "children.contract_honoured".into(),
+            status: if broken.is_empty() {
+                CriterionStatus::Passed
+            } else {
+                CriterionStatus::Failed
+            },
+            evidence: if broken.is_empty() {
+                format!(
+                    "{} delegated worker(s) handed back what they were asked for",
+                    inputs.children.len()
+                )
+            } else {
+                broken
+                    .iter()
+                    .map(|child| child.explain())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            },
+        });
+
+        // A worker a later step was waiting for is a different failure from one
+        // nobody needed. Named separately so an operator reading a blocked run
+        // is sent to the dependency rather than to the answer.
+        let blocked: Vec<&ChildOutcome> = inputs
+            .children
+            .iter()
+            .filter(|child| child.blocking && !child.complete)
+            .collect();
+        criteria.push(Criterion {
+            criterion_id: "children.none_blocking".into(),
+            status: if blocked.is_empty() {
+                CriterionStatus::Passed
+            } else {
+                CriterionStatus::Failed
+            },
+            evidence: if blocked.is_empty() {
+                "no dependent step is waiting on a worker that did not finish".into()
+            } else {
+                format!(
+                    "{} step(s) depend on worker(s) that did not finish: {}",
+                    blocked.len(),
+                    blocked
+                        .iter()
+                        .map(|child| format!("{} ({})", child.profile, child.status))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+        });
+    }
 
     // A run holding an undecided approval has not finished; it stopped.
     criteria.push(Criterion {
@@ -327,6 +620,7 @@ mod tests {
             failure: None,
             unfinished_steps: 0,
             unknown_effects: Vec::new(),
+            children: Vec::new(),
             pending_approvals: 0,
             artifacts: vec![("approval-note.docx".into(), true)],
             grounding_ready: Some(true),

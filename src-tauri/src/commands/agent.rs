@@ -21,8 +21,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::agent_runtime::artifacts::{ArtifactReport, RunArtifacts};
 use crate::agent_runtime::audit_health::{AuditHealth, AuditState};
 use crate::agent_runtime::events::{
-    EventDraft, RecordedOutcome, RunState, TaskEvent, TaskEventLog, TaskEventType, TaskSnapshot,
-    SYSTEM_ACTOR,
+    EventDraft, RecordedOutcome, TaskEvent, TaskEventLog, TaskEventType, TaskSnapshot,
 };
 use crate::agent_runtime::outcome::RunOutcome;
 use crate::agent_runtime::retrieval::RunPassages;
@@ -748,6 +747,9 @@ pub struct RuntimeState<'a> {
     pub audit_health: &'a AuditHealthState,
     /// The workers a run may delegate a read-only sub-task to.
     pub subagents: &'a Subagents,
+    /// The models this machine has, so a delegated worker's model is chosen
+    /// against real entries rather than asserted.
+    pub registry: &'a Arc<ModelRegistry>,
     /// The page-region and table half of the knowledge index.
     pub multimodal: &'a Multimodal,
     /// Everything the OCR models have read, kept past the turn that read it.
@@ -805,8 +807,31 @@ fn runtime(
         let _ = durable_emitter.emit(AGENT_DURABLE_EVENT, event);
     });
 
+    // Opened once, here, rather than per call: `MemoryGraph::open` creates its
+    // tables, and doing that on every model round would be a schema check
+    // between the model and its own context.
+    //
+    // `None` when it cannot be opened. The run still works; `context.refresh`
+    // then says plainly that context cannot be recompiled, rather than
+    // answering with an empty set that reads as "the graph holds nothing".
+    let memory_graph = app_data_dir(app)
+        .ok()
+        .and_then(|dir| {
+            match crate::knowledge::graph::runtime_store::MemoryGraph::open(&dir) {
+                Ok(graph) => Some(Arc::new(graph)),
+                Err(error) => {
+                    log::error!(
+                        "[context] the runtime memory graph could not be opened, so this session                          cannot compile graph context: {error}"
+                    );
+                    None
+                }
+            }
+        });
+
     let deps = Arc::new(RuntimeDeps {
+        memory_graph,
         index: state.index.clone(),
+        registry: Some(Arc::clone(state.registry)),
         session: Arc::clone(state.session),
         workspaces: state.workspaces.clone(),
         approvals: state.approvals.clone(),
@@ -1458,15 +1483,52 @@ pub async fn agent_start_run(
 
 /// Drives one run, either fresh or continuing one that already exists.
 ///
-/// `existing_run_id` is `None` for a new run and `Some` only for a resumption
-/// that has already been checked — see `agent_resume_run`, which is the sole
-/// caller that supplies one. It is deliberately not reachable from
+/// Everything a resumption carries into the driver.
+///
+/// ## Why this is a struct and not a run id
+///
+/// It used to be `Option<String>` — just the run id — and everything else a
+/// resumption needed was re-derived, wrongly:
+///
+/// - The **attempt id** was minted here, and `agent_resume_run` had minted a
+///   different one for the `RunResumed` event it had already written. A third
+///   came back from `assess_resumability` and was discarded on the next line
+///   (`let _ = attempt_id;`). So the event announcing an attempt and the
+///   checkpoints that attempt wrote could never name the same attempt.
+/// - The **conversation and cell** were left `None`, so `resolve_turn_identity`
+///   took its new-conversation branch and the continuation of a turn appeared
+///   as a fresh thread — carrying a cell id derived from the same run id, so
+///   two conversations held a message with one id and the original cell was
+///   orphaned with no answer.
+/// - The **model** was re-routed, so a run interrupted under one model could
+///   silently continue under whatever the router preferred that day.
+///
+/// Carrying them explicitly is what makes each of those a decision rather than
+/// an omission.
+struct Continuation {
+    run_id: String,
+    /// Minted once, by `agent_resume_run`, and used by its `RunResumed` event,
+    /// its audit line, its lease and every checkpoint this attempt writes.
+    attempt_id: String,
+    /// What the interrupted attempt was built from. `None` for a run
+    /// checkpointed by a build older than schema 2, which is refused earlier
+    /// rather than resumed blind.
+    manifest: Option<crate::agent_runtime::context_manifest::ContextManifest>,
+    /// The model the interrupted attempt ran under. Until Phase 7 implements an
+    /// explicit transition, a resumption uses this or refuses; it does not get
+    /// quietly re-routed.
+    model_id: String,
+}
+
+/// `continuation` is `None` for a new run and `Some` only for a resumption that
+/// has already been checked — see `agent_resume_run`, which is the sole caller
+/// that supplies one. It is deliberately not reachable from
 /// [`StartRunRequest`]: a caller that could name a run could write events into
 /// somebody else's, and the check that makes a resumption safe (the checkpoint's
 /// policy, plan and workspace hashes) happens before this is ever called.
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
-    existing_run_id: Option<String>,
+    continuation: Option<Continuation>,
     app: AppHandle,
     request: StartRunRequest,
     handle: State<'_, AgentRuntimeHandle>,
@@ -1535,7 +1597,10 @@ async fn drive_run(
     // ─────────────────────────────────────────────────────────────────────
     let cancel = {
         let correlation = request.correlation_id.clone().unwrap_or_default();
-        let existing = existing_run_id.clone().unwrap_or_default();
+        let existing = continuation
+            .as_ref()
+            .map(|resuming| resuming.run_id.clone())
+            .unwrap_or_default();
         cancellations
             .0
             .register(&[correlation.as_str(), existing.as_str()])
@@ -1563,8 +1628,8 @@ async fn drive_run(
             if let Some(id) = request.correlation_id.clone() {
                 ids.push(id);
             }
-            if let Some(id) = existing_run_id.clone() {
-                ids.push(id);
+            if let Some(resuming) = continuation.as_ref() {
+                ids.push(resuming.run_id.clone());
             }
             ids
         },
@@ -1860,6 +1925,78 @@ async fn drive_run(
     )
     .map_err(|failure| failure.reason)?;
 
+    // A resumption keeps the model it was interrupted under, or refuses.
+    //
+    // Routing is a decision about *this* question against *this* machine, and
+    // it was re-run on every resumption — so a run interrupted under one model
+    // could continue under another whenever the registry, the VRAM or the
+    // sticky preference had moved. That is not a continuation: the window is
+    // different, the tokenizer is different, and the notes the new model is
+    // handed were written by a model that is no longer the one working.
+    //
+    // There are exactly two honest outcomes here — "the model its saved state
+    // was written under" and "not right now" — and a third act that is not this
+    // one. Moving a task to a different model is
+    // `agent_runtime::model_handoff`: it drains the run at a boundary, settles
+    // what is in flight, checkpoints, proves the new model can hold the task,
+    // recompiles the context for the window that model actually came up with,
+    // and moves this very resume point onto it. A resumption that re-routed
+    // would be doing all of that by accident and none of it on purpose.
+    //
+    // So a resumption reads the model off the checkpoint and never off routing.
+    // When a handoff has already moved this run, the checkpoint it moved is the
+    // one being read here, and this branch does not fire at all.
+    if let Some(resuming) = continuation.as_ref() {
+        if routing.model_id != resuming.model_id {
+            if registry.find(&resuming.model_id).is_some() {
+                log::info!(
+                    "[tasks] run {}: routing preferred {}, and this attempt continues \n                     under {} because that is the model its saved state was written under",
+                    resuming.run_id,
+                    routing.model_id,
+                    resuming.model_id
+                );
+                routing.model_id = resuming.model_id.clone();
+                routing.reasons.insert(
+                    0,
+                    format!(
+                        "Continuing under {}, the model this run's saved state was written \n                         under, rather than re-routing.",
+                        resuming.model_id
+                    ),
+                );
+            } else {
+                // The model is gone. Before this was simply a dead end; now
+                // there is a supported way out, so the refusal names it — and
+                // names the handoff that already moved this run, if one did,
+                // because "your run is on a model that no longer exists" and "a
+                // handoff moved it and could not finish" send somebody to very
+                // different places.
+                let moved = events
+                    .latest_transition_for_run(&resuming.run_id)
+                    .unwrap_or_else(|error| {
+                        log::warn!(
+                            "[tasks] run {}: the model-change ledger could not be read, so this \n                             refusal cannot say whether a handoff moved it: {error}",
+                            resuming.run_id
+                        );
+                        None
+                    })
+                    .map(|record| {
+                        format!(
+                            " A model change was recorded for this run (handoff {}, {}): {}",
+                            record.transition_id,
+                            record.outcome().as_str(),
+                            record.describe()
+                        )
+                    })
+                    .unwrap_or_default();
+
+                return Err(format!(
+                    "This run's saved state was written under {}, which is not in the registry \n                     now, so it cannot be continued as the same run.{moved} Moving a task to a \n                     different model is a handoff with its own checks — it saves the run's \n                     state, proves the new model can hold it, and rebuilds the context for that \n                     model's window — and it is not something a resumption does quietly. \n                     Re-register that model and continue, move this agent with a model change, \n                     or read what the run did and start a new task.",
+                    resuming.model_id
+                ));
+            }
+        }
+    }
+
     // A turn that carried a document was answered by two models, not one. The
     // reasons list used to name only the second, so a person who attached a
     // scan and opened "Why?" saw a reasoning model explaining itself with no
@@ -2004,6 +2141,7 @@ async fn drive_run(
         checkpoints: &checkpoints,
         audit_health: &audit_health,
         subagents: &subagents,
+        registry: &registry,
         multimodal: &multimodal,
         documents: &documents,
         run_to_conversation: &run_to_conversation,
@@ -2014,7 +2152,23 @@ async fn drive_run(
     // A resumption continues under the id the earlier attempt used, so its
     // events, checkpoint and effect ledger are one history rather than two. A
     // fresh run mints its own, and no caller can ask for a particular one.
-    let run_id = existing_run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let run_id = continuation
+        .as_ref()
+        .map(|resuming| resuming.run_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // One attempt id, minted in one place.
+    //
+    // A resumption brings the id `agent_resume_run` already wrote into its
+    // `RunResumed` event; a fresh run makes one. Either way this is the only
+    // mint, so the event announcing an attempt, the lease it holds and every
+    // checkpoint it writes all name the same attempt. Three separate mints is
+    // what this replaces, and the symptom was a trace in which no record of an
+    // attempt could be joined to any other.
+    let attempt_id = continuation
+        .as_ref()
+        .map(|resuming| resuming.attempt_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // From here the run has an id of its own and every later stage is
     // addressed by it. The correlation id stays on the event as well, so a
     // reducer that has not yet seen `plan_ready` still recognises its own run.
@@ -2434,7 +2588,7 @@ async fn drive_run(
     // checkpoint after each tool result without re-deriving any of it.
     {
         let seed = crate::agent_runtime::resume::CheckpointSeed {
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: attempt_id.clone(),
             // The question, matching what `promptShown` records and therefore
             // what `ResumeContext::world()` re-derives. Hashing the composed
             // prompt here meant any run that carried an attachment could never
@@ -2455,6 +2609,32 @@ async fn drive_run(
                 .and_then(crate::agent_runtime::resume::workspace_hash_of)
                 .unwrap_or_default(),
             model_id: routing.model_id.clone(),
+            // What a resumption established, if this attempt is continuing one.
+            //
+            // Seeded here rather than left empty because the very first
+            // checkpoint this attempt writes is taken before the loop has had a
+            // chance to commit anything — and a resumed run whose first
+            // checkpoint said "nothing has happened" would be a resumed run
+            // that had just forgotten the write it was resuming around.
+            // Filled in below, the moment the resumed notes are read. It
+            // cannot be set here because those are read further down, and
+            // moving that read up here would put a disk read ahead of the
+            // cheap checks that can still refuse the turn.
+            committed_notes: Default::default(),
+            // On a resumption, the manifest the interrupted attempt recorded,
+            // until this attempt builds its own below.
+            //
+            // Seeded rather than left empty because the checkpoints this
+            // attempt takes *before* it finishes assembling context would
+            // otherwise carry none — and a checkpoint with no manifest is one
+            // a later resumption refuses to continue from. The store already
+            // refuses to overwrite a manifest with nothing; this is the other
+            // half, so the window between starting a resumed attempt and
+            // rebuilding its context is not a window in which the run becomes
+            // unresumable.
+            manifest: continuation
+                .as_ref()
+                .and_then(|resuming| resuming.manifest.clone()),
         };
         if let Ok(mut seeds) = checkpoints.lock() {
             seeds.insert(run_id.clone(), seed);
@@ -2528,6 +2708,21 @@ async fn drive_run(
             .map(|checkpoint| checkpoint.notes),
     );
 
+    // What a resumption established becomes this attempt's starting state.
+    //
+    // Written onto the seed rather than only sent to the loop, because the seed
+    // is what every checkpoint this attempt takes is built from. Without this
+    // the first checkpoint of a resumed run would say nothing had happened —
+    // which is a resumed run that has just forgotten the write it is resuming
+    // around, and the next thing it does is perform that write again.
+    if let Some(notes) = resumed_notes.clone() {
+        if let Ok(mut seeds) = checkpoints.lock() {
+            if let Some(seed) = seeds.get_mut(&run_id) {
+                seed.committed_notes = notes;
+            }
+        }
+    }
+
     // What this conversation's documents are, so their ids are reachable.
     //
     // Read after the extractions above were written, so a document attached to
@@ -2583,6 +2778,11 @@ async fn drive_run(
     // than refusing: they would have no way to tell.
     // ─────────────────────────────────────────────────────────────────────
     let mut research_note = String::new();
+    // The frozen scope, kept for the manifest. Recorded where it is *resolved*
+    // rather than where it arrived, so what is written down is what the turn
+    // was actually allowed to read after ownership and membership were checked.
+    let mut research_binding: Option<crate::agent_runtime::context_manifest::ResearchBinding> =
+        None;
     if let Some(scope) = request.research.clone() {
         // The scope arrived from outside Rust, so it must say which sources it
         // may read. One that does not is refused here rather than resolved with
@@ -2634,6 +2834,22 @@ async fn drive_run(
                  answer's citations will not survive a restart: {error}"
             );
         }
+
+        research_binding = Some(crate::agent_runtime::context_manifest::ResearchBinding {
+            notebook_id: resolved.notebook.id.clone(),
+            // The evidence manifest is stored under the run id, and the run id
+            // survives a resumption, so this is how a continuation finds it.
+            manifest_run_id: run_id.clone(),
+            // The selection as the person made it. For `All` that is already
+            // the concrete list frozen at this moment, so a source added to the
+            // notebook afterwards does not join a continuation of this turn.
+            selection: scope.sources.clone().unwrap_or_else(|| {
+                crate::knowledge::graph::SourceSelection::subset(scope.source_sha256s.clone())
+            }),
+            node_ids: scope.node_ids.clone(),
+            assertion_ids: scope.assertion_ids.clone(),
+            graph_revision: manifest.graph_revision.clone(),
+        });
 
         research_note = format!(
             "--- NOTEBOOK RESEARCH CONTEXT ---\n{}\n\n{}",
@@ -2966,11 +3182,20 @@ async fn drive_run(
     // `None` when the whole thread fitted, which is the ordinary case and the
     // one that must stay silent - a meter reporting "0 dropped" on every turn
     // would train people to ignore it.
-    let history_trim = (history.dropped > 0).then(|| crate::agent_runtime::tasks::HistoryTrim {
-        dropped: history.dropped,
-        carried: history.turns.len() as u32,
-        tokens: history.tokens,
-        window_tokens: served_window,
+    //
+    // Raised when a pin could not be honoured even if nothing was dropped: a
+    // turn that carried its whole short history and still could not fit the one
+    // document somebody protected has nothing to say under `dropped`, and that
+    // is exactly the turn they need told about.
+    let history_trim = (history.dropped > 0 || !history.omitted_pins.is_empty()).then(|| {
+        crate::agent_runtime::tasks::HistoryTrim {
+            dropped: history.dropped,
+            carried: history.turns.len() as u32,
+            tokens: history.tokens,
+            window_tokens: served_window,
+            omitted_pins: history.omitted_pins.clone(),
+            retention: history.retention,
+        }
     });
 
     if let Some(trim) = history_trim.as_ref() {
@@ -2980,6 +3205,26 @@ async fn drive_run(
             trim.carried,
             trim.tokens
         );
+        // Logged at warning level and named individually, because a pin is a
+        // person's instruction rather than a budget outcome. One line per pin,
+        // so a log a person greps says which thing was not carried.
+        for omitted in &trim.omitted_pins {
+            log::warn!(
+                "[context] run {run_id}: the pinned {} {} could not be carried into this turn                  (message {}): {:?}",
+                omitted.kind,
+                omitted.pin,
+                omitted.message_id,
+                omitted.reason
+            );
+        }
+        if let Some(retention) = trim.retention.filter(|status| status.exceeds_limit) {
+            // Nothing is deleted when this happens. See `CHAT_RETENTION_LIMIT`.
+            log::warn!(
+                "[context] run {run_id}: this conversation now retains about {} tokens, past the                  {} it is documented to hold. Nothing has been deleted; the thread is outside the                  envelope the product describes.",
+                retention.retained_tokens,
+                retention.limit_tokens
+            );
+        }
 
         // Recorded and published, not merely logged.
         //
@@ -2999,8 +3244,71 @@ async fn drive_run(
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // What this turn was built from, written down before the model sees it.
+    //
+    // Assembled here because this is the first point at which all of it is
+    // settled: the cell is reserved, the model is chosen and its served window
+    // is known, the documents have been read, the notebook scope has been
+    // resolved and the history has been fitted. Recorded onto the seed, so
+    // every checkpoint this attempt writes carries it.
+    //
+    // Without this a resumption had nothing to rebuild from and re-derived
+    // each piece from the world as it looked when somebody pressed the button:
+    // a new conversation, no documents, no notebook scope, and whatever model
+    // the router preferred that day. See `agent_runtime::context_manifest`.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        use crate::agent_runtime::context_manifest::{
+            ContextManifest, DocumentBinding, HistoryBinding,
+        };
+        let manifest = ContextManifest::new(
+            &run_id,
+            &attempt_id,
+            &conversation_id,
+            &message_id,
+            &routing.model_id,
+            served_window,
+            prepared
+                .iter()
+                .map(|document| DocumentBinding {
+                    // The content address, which is the version. A different
+                    // hash is a different document, so nothing else is needed
+                    // to pin what this turn actually read.
+                    sha256: document.sha256.clone(),
+                    name: document.name.clone(),
+                    pages: document.pages,
+                })
+                .collect(),
+            research_binding.clone(),
+            HistoryBinding {
+                carried: history.turns.len() as u32,
+                dropped: history.dropped,
+                tokens: history.tokens,
+                pinned: pinned.clone(),
+                omitted_pins: history.omitted_pins.clone(),
+            },
+        );
+        if let Ok(mut seeds) = checkpoints.lock() {
+            if let Some(seed) = seeds.get_mut(&run_id) {
+                seed.manifest = Some(manifest);
+            }
+        }
+    }
+
     let params = json!({
         "runId": run_id,
+        // The attempt this run is, so every state commit the loop makes can
+        // be checked against the attempt Rust started. Without it the loop
+        // cannot commit at all, and the resume point never advances past the
+        // moment the run began.
+        "attemptId": attempt_id,
+        // Who this run is, so the loop can ask Rust to compile task memory
+        // before each model round. Empty until an agent is bound to a chat
+        // turn, which is Phase 8/10 work — and an empty id compiles no memory,
+        // which is the honest answer rather than somebody else's.
+        "agentId": "",
+        "definitionVersion": 0,
         // The assistant `Message` id the front-end reserved via
         // `agent_append_turn`. The runtime attaches it to every
         // `message_start` / `message_update` / `message_end` event so the chat
@@ -3568,6 +3876,11 @@ async fn drive_run(
                 failure: failure.clone(),
                 unfinished_steps: final_plan.unfinished().len(),
                 unknown_effects,
+                // Every worker this run delegated to, read back off the
+                // durable record rather than from anything a child said about
+                // itself. See `completion::ChildOutcome`: the status is the
+                // manager's, and the payload is checked here.
+                children: crate::agent_runtime::completion::children_of(&events, &run_id),
                 pending_approvals: asked
                     .iter()
                     .filter(|approval| approval.state == "pending")
@@ -4467,6 +4780,23 @@ pub async fn agent_pin_context(
         ));
     }
 
+    // Read into typed references and written back canonically.
+    //
+    // The frontend sends `msg:<id>`, `sha256:<hash>` or `artifact:<id>` so Rust
+    // is told what a pin means rather than guessing from its shape. Anything
+    // without a prefix is a pin from before this existed; `PinRef::parse`
+    // classifies it `Legacy` and `encode` returns it byte-for-byte, so
+    // normalising a stored list never narrows an old pin.
+    //
+    // Blank entries are dropped here rather than stored. A blank pin matches
+    // every message under the content test, which pins the entire history from
+    // one empty string — a window that fills and a turn that fails. The
+    // projection guards this too; this is the guard that stops it reaching disk.
+    let pinned: Vec<String> = crate::agent_runtime::pins::PinRef::parse_all(&pinned)
+        .iter()
+        .map(|pin| pin.encode())
+        .collect();
+
     // Stored first, and the run told second.
     //
     // The order is the contract. A pin that reached the loop and was not
@@ -4850,6 +5180,7 @@ pub async fn agent_runtime_health(
     checkpoints: State<'_, RunCheckpoints>,
     audit_health: State<'_, AuditHealthState>,
     subagents: State<'_, Subagents>,
+    registry: State<'_, Arc<ModelRegistry>>,
     multimodal: State<'_, Multimodal>,
     documents: State<'_, DocumentsState>,
     run_to_conversation: State<'_, super::conversations::RunToConversationState>,
@@ -4876,6 +5207,7 @@ pub async fn agent_runtime_health(
         checkpoints: &checkpoints,
         audit_health: &audit_health,
         subagents: &subagents,
+        registry: &registry,
         multimodal: &multimodal,
         documents: &documents,
         run_to_conversation: &run_to_conversation,
@@ -5673,17 +6005,62 @@ pub async fn agent_resume_run(
     // records its own intent and then discovers it may not proceed has written a
     // line saying a person continued a run that never continued.
     let verdict = assess_resumability(&app, &run_id, &signed_in, &events, &registry);
-    let (attempt_id, from_seq) = match verdict {
-        Resumability::Resumable {
-            attempt_id,
-            from_seq,
-            ..
-        } => (attempt_id, from_seq),
+    let from_seq = match verdict {
+        Resumability::Resumable { from_seq, .. } => from_seq,
         Resumability::NeedsReconciliation { because, .. } => return Err(because),
         Resumability::ViewOnly { because } => return Err(because),
     };
-    let _ = attempt_id;
 
+    // The checkpoint itself, not only the verdict about it.
+    //
+    // The verdict answers "may this be continued"; this answers "continued as
+    // what". Everything below — which conversation the turn belongs to, which
+    // documents it read, which notebook scope was frozen, which model it ran
+    // under — comes from here, and none of it was read before: the resumption
+    // rebuilt a request with `conversation_id: None`, `research: None` and no
+    // model, and let each of those be re-derived from whatever the world looked
+    // like at the moment somebody pressed the button.
+    let checkpoint = events
+        .checkpoint(&run_id)
+        .map_err(|refusal| refusal.explain())?
+        .ok_or_else(|| {
+            "This run was never checkpointed, so there is no safe point to continue from."
+                .to_string()
+        })?;
+
+    // A manifest is what makes a continuation a continuation. Without one this
+    // build cannot say which conversation the turn belonged to or what it was
+    // given, and the honest answer is a refusal rather than a plausible
+    // reconstruction.
+    let manifest = match checkpoint.manifest.clone() {
+        Some(manifest) if !manifest.is_intact() => {
+            return Err(
+                "This run's record of what it was working from does not match its own hash, so                  something altered or truncated it. It is not safe to continue from; read what it                  did and start again."
+                    .to_string(),
+            )
+        }
+        Some(manifest) if !manifest.is_known_version() => {
+            return Err(format!(
+                "This run recorded what it was working from in format {}, and this build reads                  {}. Continuing would mean rebuilding its context from a record this build only                  partly understands.",
+                manifest.manifest_version,
+                crate::agent_runtime::context_manifest::MANIFEST_VERSION
+            ))
+        }
+        Some(manifest) => Some(manifest),
+        None => {
+            return Err(
+                "This run was checkpointed by an earlier build that did not record what the turn                  was working from — which conversation it belonged to, which documents it had                  read, which sources were selected. Continuing it would answer in a new thread                  from a different context, so it is refused. Its record is still readable, and a                  new task can be started from the same question."
+                    .to_string(),
+            )
+        }
+    };
+
+    // One attempt id for this attempt, minted here and carried into the driver.
+    //
+    // `Attempt::new` used to mint one for the event, `drive_run` minted another
+    // for its checkpoints, and `assess_resumability` returned a third that was
+    // dropped on the next line. The trace therefore recorded an attempt whose
+    // announcement and whose checkpoints could not be joined to each other.
     let attempt = crate::agent_runtime::resume::Attempt::new(&run_id, &operator_intent, from_seq);
 
     // Recorded before the loop is asked to do anything, and treated as
@@ -5729,6 +6106,34 @@ pub async fn agent_resume_run(
             "This run has no recorded state, so there is nothing to continue from.".to_string()
         })?;
 
+    // What the interrupted attempt was working from. Checked above, so this is
+    // a manifest this build understands whose hash still matches its body.
+    let binding = manifest
+        .as_ref()
+        .expect("a resumption without a manifest was refused above");
+
+    // The frozen selection, put back exactly as it was.
+    //
+    // Reassembled rather than widened: an empty `source_sha256s` is a selection
+    // of no sources, which `ResearchScope::require_explicit_selection` exists to
+    // keep distinct from "every source". A resumption that guessed the wider
+    // reading would answer from documents the person never chose.
+    let resumed_scope = binding.research.as_ref().map(|research| {
+        crate::knowledge::ResearchScope {
+            notebook_id: research.notebook_id.clone(),
+            // The legacy list is filled from the selection for the benefit of
+            // anything still reading it; `sources` is what is authoritative.
+            source_sha256s: research
+                .selection
+                .explicit_list()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            sources: Some(research.selection.clone()),
+            node_ids: research.node_ids.clone(),
+            assertion_ids: research.assertion_ids.clone(),
+        }
+    });
+
     let request = StartRunRequest {
         prompt: snapshot.prompt.clone(),
         classification: snapshot.classification.as_deref().and_then(|label| {
@@ -5739,27 +6144,47 @@ pub async fn agent_resume_run(
         }),
         scenario_instructions: None,
         correlation_id: None,
-        // A resumption is not a turn in a conversation. The original turn is
-        // already in the transcript with the answer the interrupted attempt
-        // never produced, and appending a second assistant cell for the same
-        // question would make the thread read as though it were asked twice.
-        conversation_id: None,
-        message_id: None,
+        // The original turn, continued.
+        //
+        // These were `None`, with a comment arguing that a resumption is not a
+        // turn in a conversation. The intent was right and the effect was the
+        // opposite: `resolve_turn_identity` reads `None` as "the first turn of
+        // a new conversation", so a resumption *created* a thread, titled it
+        // from the first line of the original question, and reserved a cell in
+        // it. And because the reserved id is `a-{run_id}` and the run id
+        // survives a resumption, that new conversation received a cell carrying
+        // the same message id as the original — two threads, one id, and the
+        // original cell left with no answer in it forever.
+        //
+        // Taken from the manifest, which recorded them when the turn was built.
+        conversation_id: Some(binding.conversation_id.clone()),
+        message_id: Some(binding.message_id.clone()),
         // Attachments belong to the request that carried them and are
-        // deliberately not remembered between runs; see `StartRunRequest`. What
-        // the earlier attempt read from them is in its notes.
+        // deliberately not remembered between runs; see `StartRunRequest`. The
+        // documents themselves are content-addressed and still in the store —
+        // the manifest names them by hash, and the conversation's document list
+        // reaches them. What is not replayed is the *upload*.
         attachments: Vec::new(),
         ocr_detent: None,
-        // A resumption is not attached to a conversation (see above), and a
-        // research manifest is keyed by conversation and message. Retrieving
-        // again here would write a manifest no message points at, and the
-        // resumed attempt would answer from passages the original turn never
-        // saw. The original turn's manifest is on disk and stays authoritative.
-        research: None,
+        // The notebook scope the original turn was frozen to, rebuilt from the
+        // manifest rather than dropped.
+        //
+        // This was `None`, so a turn that had answered from five selected
+        // drawings resumed with no sources at all — and the comment explaining
+        // it was reasoning from the new-conversation bug above, which no longer
+        // holds. `notebook_retrieval::resolve` re-checks ownership and
+        // membership as they are *now*, so a source that has since been removed
+        // or revoked produces a refusal rather than a quietly smaller answer.
+        research: resumed_scope,
     };
 
     drive_run(
-        Some(run_id),
+        Some(Continuation {
+            run_id,
+            attempt_id: attempt.attempt_id.clone(),
+            model_id: checkpoint.model_id.clone(),
+            manifest,
+        }),
         app,
         request,
         handle,
@@ -6903,6 +7328,8 @@ mod finalisation_tests {
                 run_id.to_string(),
                 crate::agent_runtime::resume::CheckpointSeed {
                     attempt_id: "attempt-1".to_string(),
+                    committed_notes: Default::default(),
+                    manifest: None,
                     plan_hash: "plan".to_string(),
                     policy_hash: "policy".to_string(),
                     workspace_hash: "workspace".to_string(),

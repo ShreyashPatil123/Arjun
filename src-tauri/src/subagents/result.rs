@@ -127,6 +127,16 @@ pub struct ChildResult {
     pub detail: Option<String>,
     /// How many turns it actually took.
     pub turns_used: u32,
+    /// Items this child committed to the task's shared memory, by id.
+    ///
+    /// The part a sibling can act on. A finding in this payload is something
+    /// the parent read; an id here is something *anybody* on the task can go
+    /// and read for themselves, at a revision — which is what makes one
+    /// worker's output reach another without a transcript passing between them.
+    ///
+    /// Defaulted so a result recorded before this existed still parses.
+    #[serde(default)]
+    pub published: Vec<String>,
     /// SHA-256 over the findings and status, so the parent's record of what
     /// came back can be checked against the child's.
     pub result_hash: String,
@@ -210,6 +220,10 @@ impl ChildResult {
             status,
             schema,
             findings,
+            // Filled in by the worker after it publishes: `sealed` is about the
+            // shape a result must have, and where its findings landed is known
+            // only once they have.
+            published: Vec::new(),
             confidence,
             uncertainty,
             detail,

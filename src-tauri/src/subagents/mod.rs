@@ -54,14 +54,20 @@
 //! shipped profile declares `max-children: 0`.
 
 pub mod certification;
+pub mod child_loop;
+pub mod graph_io;
 pub mod inherit;
 pub mod manager;
 pub mod packet;
 pub mod profile;
 pub mod result;
+pub mod scheduling;
+pub mod worker;
 
 use std::path::Path;
 
+pub use child_loop::{ChildLoop, LoopReport};
+pub use graph_io::{Claim, NotAvailable, Published, Requirement, TaskMemory};
 pub use inherit::{EffectivePolicy, InheritRefusal, InheritedPolicy};
 pub use manager::{ChildWorker, SpawnRefusal, Spawned, SubagentManager, MAX_CONCURRENT_READERS};
 pub use packet::{derive_idempotency_key, ChildTaskPacket, InputRef};
@@ -69,6 +75,8 @@ pub use profile::{
     AgentProfile, Isolation, Limits, MemoryScope, ProfileError, SchemaKind, WritePolicy,
 };
 pub use result::{ChildResult, ChildStatus, EvidenceRef, Finding};
+pub use scheduling::{ModelLease, ModelScheduler, Residency, SchedulingRefusal};
+pub use worker::{SpecialistWorker, WorkerServices};
 
 /// A profile that could not be compiled, kept so it can be reported.
 #[derive(Debug, Clone)]
@@ -148,3 +156,5 @@ pub fn load_profiles(directory: &Path) -> LoadedProfiles {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod worker_tests;

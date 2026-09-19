@@ -951,3 +951,120 @@ mod tests {
         assert!(error.contains("not in the model registry"), "{error}");
     }
 }
+
+/// What a review changed, and what it takes to be in force.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewOutcome {
+    pub model_id: String,
+    pub permitted_classifications: Vec<Classification>,
+    /// True when the running process is still using the pre-review manifest.
+    ///
+    /// Said rather than hidden. The registry is loaded once at start and held
+    /// behind an  with no interior mutability, so a review written now is
+    /// read at the next start. An administrator who clears a model and finds an
+    /// agent still refusing it deserves to have been told why, rather than
+    /// concluding the review did not save.
+    pub restart_required: bool,
+}
+
+/// Records that an administrator has reviewed a model and what material it may
+/// be used on.
+///
+/// ## Why this exists
+///
+/// Discovery registers every model it finds with *no* permitted classification
+/// — "listed but cleared for no classification until an administrator reviews
+/// them". That is the right default: a model nobody has looked at is usable on
+/// nothing rather than on everything.
+///
+/// But nothing in the product could then grant that clearance. The only writes
+/// to  outside tests set it to empty, so every
+/// binding of an agent to a model was refused with "has not been reviewed for
+/// <classification> material", and the agent model-assignment feature was
+/// unreachable on any real installation. This is the review step that was
+/// missing, not a way around the check.
+///
+/// ## Why it writes the manifest rather than the loaded registry
+///
+/// The manifest is the declared record —  says declared
+/// entries win over discovered ones — so writing it is what makes a review
+/// durable. The in-memory registry is immutable behind its ; changing that
+/// is a wider refactor than a review command should carry, and the honest
+/// interim is to say a restart is needed rather than to pretend otherwise.
+#[tauri::command]
+pub async fn registry_review_model(
+    model_id: String,
+    permitted_classifications: Vec<Classification>,
+    session: State<'_, CurrentSession>,
+    registry: State<'_, Arc<ModelRegistry>>,
+    audit: State<'_, Arc<AuditService>>,
+) -> Result<ReviewOutcome, String> {
+    // Clearing a model for a classification is a policy decision, so it needs
+    // the policy permission — not merely the ability to import a model. The
+    // permission check takes the session state, and the refusal it produces is
+    // what a direct IPC call from a non-administrator meets.
+    require_permission(&session, Permission::ModifyPolicy)?;
+    let signed_in = require_session(&session)?;
+
+    if registry.find(&model_id).is_none() {
+        return Err(format!(
+            "{model_id} is not in the model registry on this machine, so there is nothing to review."
+        ));
+    }
+
+    let path = registry.manifest_path().to_path_buf();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("the model manifest could not be read: {error}"))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("the model manifest could not be parsed: {error}"))?;
+
+    // Edited as JSON rather than through , so a field this build
+    // does not know about survives the round trip instead of being dropped.
+    let entries = manifest
+        .get_mut("models")
+        .and_then(|models| models.as_array_mut())
+        .ok_or_else(|| "the model manifest has no models array".to_string())?;
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(model_id.as_str()))
+        .ok_or_else(|| format!("{model_id} is not named in the model manifest"))?;
+    entry["permittedClassifications"] = serde_json::to_value(&permitted_classifications)
+        .map_err(|error| format!("the review could not be encoded: {error}"))?;
+
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("the model manifest could not be serialised: {error}"))?;
+    let temporary = path.with_extension("json.review-tmp");
+    std::fs::write(&temporary, &bytes)
+        .map_err(|error| format!("the model manifest could not be written: {error}"))?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("the model manifest could not be replaced: {error}"))?;
+
+    let _ = audit.record(
+        &signed_in.user.id,
+        AuditKind::PolicyDecision,
+        format!(
+            "reviewed model {model_id}; cleared for {}",
+            if permitted_classifications.is_empty() {
+                "nothing".to_string()
+            } else {
+                permitted_classifications
+                    .iter()
+                    .map(|c| c.label().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        Some(serde_json::json!({
+            "action": "reviewModel",
+            "modelId": model_id,
+            "permittedClassifications": permitted_classifications,
+        })),
+    );
+
+    Ok(ReviewOutcome {
+        model_id,
+        permitted_classifications,
+        restart_required: true,
+    })
+}

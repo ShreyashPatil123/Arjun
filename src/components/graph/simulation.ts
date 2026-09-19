@@ -98,6 +98,43 @@ export interface SimulationOptions {
   velocityDecay?: number;
   /** Relaxation passes for the collide force. More is tidier and slower. */
   collideIterations?: number;
+  /**
+   * Where nodes already are, keyed by id.
+   *
+   * ## Why the layout has to be handed its own past
+   *
+   * A graph that memory is arriving into is rebuilt constantly, and a rebuild
+   * that starts from the ring throws away the arrangement every time. The
+   * person watching sees the whole picture jump on each new fact — which makes
+   * the view unusable for the thing it is for, because nothing stays where it
+   * was long enough to be pointed at.
+   *
+   * Ids are stable across revisions by construction (`MemoryItem::item_id` is
+   * fixed for the life of an item, across every revision of it), so a node that
+   * survives a rebuild keeps its place. Only genuinely new ids are placed.
+   */
+  positions?: ReadonlyMap<string, { x: number; y: number }>;
+  /**
+   * Alpha to start at. One is a cold start; lower is a nudge.
+   *
+   * An incremental update should not re-run three hundred ticks of physics on
+   * an arrangement that was already settled. Starting warm rather than hot lets
+   * the new nodes find room while everything else barely moves.
+   */
+  alpha?: number;
+  /**
+   * Keep every node inside the `width` × `height` box.
+   *
+   * True by default, which is what the notebook graph has always done: it draws
+   * a whole graph into a fixed panel and a node outside the box is a node
+   * nobody can see.
+   *
+   * The memory view turns it off. Separating labelled nodes needs room, and a
+   * clamp applied afterwards pushes them back into contact — reintroducing
+   * exactly the overlaps `labelGeometry.separate` had just removed. That view
+   * lets the world grow and fits the camera to it instead.
+   */
+  clampToViewport?: boolean;
 }
 
 /** Alpha at which the simulation is considered at rest, as in d3-force. */
@@ -133,6 +170,7 @@ export class GraphSimulation {
   private readonly centerStrength: number;
   private readonly velocityDecay: number;
   private readonly collideIterations: number;
+  private readonly clampToViewport: boolean;
   private readonly random: () => number;
 
   constructor(
@@ -147,11 +185,28 @@ export class GraphSimulation {
     this.centerStrength = options.centerStrength ?? 0.05;
     this.velocityDecay = options.velocityDecay ?? 0.4;
     this.collideIterations = options.collideIterations ?? 2;
+    this.clampToViewport = options.clampToViewport ?? true;
 
     // Sorted ids, so the arrangement does not depend on the order rows arrived
     // in — the same rule the previous layout held to.
     const ordered = [...nodes].sort((a, b) => a.id.localeCompare(b.id));
     this.random = seededRandom(seedFrom(ordered.map((node) => node.id)));
+
+    // Who is joined to whom, so a genuinely new node can be dropped beside its
+    // neighbours instead of across the canvas from them. Built before placement
+    // because placement reads it.
+    const adjacent = new Map<string, string[]>();
+    for (const link of links) {
+      const from = adjacent.get(link.source);
+      if (from) from.push(link.target);
+      else adjacent.set(link.source, [link.target]);
+      const to = adjacent.get(link.target);
+      if (to) to.push(link.source);
+      else adjacent.set(link.target, [link.source]);
+    }
+
+    const held = options.positions;
+    this.alpha = options.alpha ?? 1;
 
     // A ring to start on. A ring has no clumps to escape, so the graph opens
     // out instead of exploding, and it gives the settling motion that reads as
@@ -159,10 +214,39 @@ export class GraphSimulation {
     const radius = Math.min(this.width, this.height) * 0.35;
     this.nodes = ordered.map((node, i) => {
       const angle = ordered.length === 1 ? 0 : (2 * Math.PI * i) / ordered.length;
+      // The ring, jittered, is the fallback for a node nothing knows about.
+      // The jitter comes from the seeded generator, so it is reproducible.
+      let x = this.width / 2 + radius * Math.cos(angle) + (this.random() - 0.5) * 8;
+      let y = this.height / 2 + radius * Math.sin(angle) + (this.random() - 0.5) * 8;
+
+      const previous = held?.get(node.id);
+      if (previous) {
+        // It was here before. It stays here.
+        x = previous.x;
+        y = previous.y;
+      } else if (held) {
+        // New, into a graph that already has an arrangement. Dropping it on the
+        // ring would put it across the canvas from whatever it relates to and
+        // then drag it back over the next hundred ticks, which is the "the
+        // whole picture lurches when a fact arrives" that `positions` exists to
+        // stop. Its neighbours' centre is where it is going to end up anyway.
+        const placed = (adjacent.get(node.id) ?? [])
+          .map((neighbour) => held.get(neighbour))
+          .filter((point): point is { x: number; y: number } => point !== undefined);
+        if (placed.length > 0) {
+          x =
+            placed.reduce((total, point) => total + point.x, 0) / placed.length +
+            (this.random() - 0.5) * 12;
+          y =
+            placed.reduce((total, point) => total + point.y, 0) / placed.length +
+            (this.random() - 0.5) * 12;
+        }
+      }
+
       return {
         id: node.id,
-        x: this.width / 2 + radius * Math.cos(angle) + (this.random() - 0.5) * 8,
-        y: this.height / 2 + radius * Math.sin(angle) + (this.random() - 0.5) * 8,
+        x,
+        y,
         vx: 0,
         vy: 0,
         radius: Math.max(1, node.radius),
@@ -225,6 +309,17 @@ export class GraphSimulation {
   }
 
   /**
+   * Where everything currently is, to hand to the next rebuild.
+   *
+   * The other half of `SimulationOptions.positions`. A caller takes this before
+   * replacing the simulation and passes it back in, and every node that
+   * survives keeps its place.
+   */
+  positionsById(): Map<string, { x: number; y: number }> {
+    return new Map(this.nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
+  }
+
+  /**
    * Advances one tick. Returns whether the simulation is still running.
    *
    * The order is d3-force's: age the alpha, let every force write into
@@ -255,7 +350,7 @@ export class GraphSimulation {
     }
 
     this.applyCollision();
-    this.clampToBox();
+    if (this.clampToViewport) this.clampToBox();
     return this.running;
   }
 

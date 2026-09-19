@@ -64,7 +64,7 @@ use tokio::process::{Child, Command};
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 use crate::ai_engine::vram_planner::GpuOffloadPlan;
-use crate::registry::{ModelEntry, RoutingPreference, Runtime};
+use crate::registry::{ModelEntry, Runtime};
 
 pub use probe::{probe, ProbeOutcome};
 
@@ -144,6 +144,8 @@ pub enum ServingError {
     },
     #[error("{model} declares a vision projector at {path}, which is not there. Import the model again — a vision model started without its projector is blind, so ARJUN refuses rather than serving it text-only.")]
     ProjectorMissing { model: String, path: PathBuf },
+    #[error("{0}")]
+    UnsupportedRuntime(String),
     #[error("llama-server could not be started: {0}. Set ARJUN_LLAMA_SERVER to its path, or put it on PATH.")]
     LaunchFailed(String),
     #[error("no free loopback port could be found: {0}")]
@@ -491,6 +493,119 @@ fn llama_server_device() -> Option<String> {
 /// Newer llama-server versions require `--flash-attn [on|off|auto]`, so passing
 /// bare `--flash-attn` consumes the next argument (such as `-ctk`) and aborts.
 /// This probe determines the exact flags supported so the server launches cleanly.
+/// The build number of the managed `llama-server`, when it will say.
+///
+/// `llama-server --version` prints a line like
+/// `version: 0.4.1-dev (build 10970, commit bfdc32183)`. The build number is
+/// the one monotonic figure in it: the semantic version has been `0.x` for
+/// years and the commit is not ordered.
+///
+/// `None` when the binary is missing or prints something this does not
+/// recognise. Callers treat that as "cannot be established" rather than "too
+/// old" — refusing to serve because a probe failed would take a working
+/// deployment offline over a string format.
+pub fn llama_server_build() -> Option<u32> {
+    static BUILD: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *BUILD.get_or_init(|| {
+        let mut cmd = crate::system_analyzer::process_utils::create_hidden_command(
+            llama_server_program(),
+        );
+        cmd.arg("--version");
+        let output = cmd.output().ok()?;
+        // It goes to stderr on some builds and stdout on others.
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_llama_build(&text)
+    })
+}
+
+/// Reads `build <n>` out of a version banner.
+fn parse_llama_build(text: &str) -> Option<u32> {
+    let at = text.find("build ")?;
+    let digits: String = text[at + "build ".len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Why this deployment cannot serve a model, in words an operator can act on.
+///
+/// ## Why this is checked before launch rather than handled after it
+///
+/// Because llama.cpp's own failure for an architecture it does not know arrives
+/// *after* the weights are read — several seconds and several gigabytes in —
+/// and reads as a load error rather than as "this binary is too old". An
+/// operator seeing that goes looking at the model file, which is fine.
+///
+/// The check is a comparison of two numbers the deployment already knows, and
+/// it names both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedRuntime {
+    pub model_id: String,
+    pub required_build: u32,
+    /// `None` when the binary could not be asked.
+    pub found_build: Option<u32>,
+}
+
+impl UnsupportedRuntime {
+    pub fn explain(&self) -> String {
+        match self.found_build {
+            Some(found) => format!(
+                "{} needs llama-server build {} or newer for its architecture, and this machine                  has build {}. It is not substituted with a different model or a different                  quantisation: update llama.cpp, or point ARJUN_LLAMA_SERVER at a newer binary.",
+                self.model_id, self.required_build, found
+            ),
+            None => format!(
+                "{} needs llama-server build {} or newer for its architecture, and this machine's                  llama-server could not be asked which build it is. Check that it is installed and                  runnable, or point ARJUN_LLAMA_SERVER at a known build.",
+                self.model_id, self.required_build
+            ),
+        }
+    }
+}
+
+/// Whether this deployment's `llama-server` is new enough for `entry`.
+///
+/// A model that declares no floor is serveable as far as this check is
+/// concerned — most do not, and inventing one for them would refuse models that
+/// work. A probe that could not read the build refuses only a model that
+/// *declared* a floor, because for that model the answer genuinely is not known
+/// and the failure mode is a wasted load followed by an obscure error.
+pub fn check_runtime_supports(entry: &ModelEntry) -> Result<(), UnsupportedRuntime> {
+    let Some(required) = entry.min_llama_build else {
+        return Ok(());
+    };
+    let found = llama_server_build();
+    match found {
+        Some(build) if build >= required => Ok(()),
+        _ => Err(UnsupportedRuntime {
+            model_id: entry.id.clone(),
+            required_build: required,
+            found_build: found,
+        }),
+    }
+}
+
+pub fn llama_server_kv_precision() -> crate::ai_engine::vram_planner::KvPrecision {
+    use crate::ai_engine::vram_planner::KvPrecision;
+    // The same probe that builds the launch flags, asked the same question.
+    //
+    // The planner used to assume `q8_0` unconditionally while this function
+    // could return `None` and launch the server with no cache-quantisation
+    // flags at all. On such a binary the plan charged half the memory the
+    // server then allocated, and the model loaded before failing on its own KV
+    // cache. One source for both answers is what stops that being possible.
+    match llama_server_flash_attn_flags() {
+        Some(flags) if flags.iter().any(|flag| flag == "-ctk") => KvPrecision::Q8_0,
+        _ => KvPrecision::Fp16,
+    }
+}
+
 fn llama_server_flash_attn_flags() -> Option<Vec<String>> {
     let help = llama_server_help_text()?;
     if !help.contains("-ctk") {
@@ -621,6 +736,18 @@ impl ModelServers {
         // guard never has to cross an `.await` — the future returned by this
         // async function must be `Send` (Tauri's command runtime requires
         // it), and a `std::sync::MutexGuard` is not `Send`.
+        // Asked before anything is loaded.
+        //
+        // llama.cpp's own answer for an architecture it does not know arrives
+        // after the weights have been read — seconds and gigabytes in — and
+        // reads as a load failure rather than as "this binary is too old",
+        // which sends an operator to look at the model file. Two numbers the
+        // deployment already knows can answer it first, and name both.
+        if let Err(unsupported) = check_runtime_supports(entry) {
+            log::error!("[serving] {}", unsupported.explain());
+            return Err(ServingError::UnsupportedRuntime(unsupported.explain()));
+        }
+
         let Spawned {
             endpoint,
             base_url,
@@ -963,6 +1090,82 @@ impl ModelServers {
             }
         }
     }
+
+    /// Asks a running endpoint what it actually is, for a model handoff.
+    ///
+    /// ## Why a handoff cannot use the declared numbers
+    ///
+    /// Because every one of them can be wrong in the direction that hurts. The
+    /// registry's `contextLength` is what the model was trained for, and
+    /// [`crate::ai_engine::vram_planner`] buys GPU layers by walking that
+    /// number *down* — so an entry declaring 32 768 is routinely served at
+    /// 8 192. A handoff that recompiled a task's context against the declared
+    /// figure would hand the new model a turn its own server refuses, and the
+    /// run would fail after the binding had already been committed.
+    ///
+    /// So this asks. `/props` for the window the server came up with, and
+    /// `/tokenize` for what its own vocabulary makes of a fixed probe string —
+    /// which is the only evidence available, short of shipping both
+    /// vocabularies, that two models count tokens differently.
+    ///
+    /// ## What `None` means in each field
+    ///
+    /// Not "the same as before". A server that will not answer `/props` leaves
+    /// the window source at `registryDeclared`, which says out loud that the
+    /// figure is an assumption; a server with no `/tokenize` leaves the
+    /// tokenizer probe at `None`, and the transition record then reports the
+    /// comparison as unknown rather than as unchanged. An external endpoint
+    /// ARJUN did not start is the ordinary case for both.
+    pub async fn health_check(
+        &self,
+        endpoint: &Endpoint,
+        declared_window: u32,
+        supports_toggled_reasoning: bool,
+    ) -> crate::agent_runtime::model_transition::ServedBinding {
+        use crate::agent_runtime::model_transition::{
+            ServedBinding, TokenizerProbe, WindowSource, TOKENIZER_PROBE,
+        };
+
+        // Readiness first. Asking a server that is not up for its window gets a
+        // connection error that reads like a missing feature.
+        let healthy = crate::serving::probe::probe(&endpoint.base_url)
+            .await
+            .is_ready();
+
+        let (served_window, window_source) =
+            match crate::serving::probe::served_context_tokens(&endpoint.base_url).await {
+                // Clamped to the trained window, and not clamped by an
+                // unrecorded zero — `context_length: 0` means nobody wrote it
+                // down, and clamping a measured 8 192 to it would turn the one
+                // solid number in the calculation into the weakest. The same
+                // rule `commands::agent` applies when it budgets a turn.
+                Some(tokens) if declared_window == 0 => (tokens, WindowSource::ServerReported),
+                Some(tokens) => (
+                    tokens.min(declared_window).max(1),
+                    WindowSource::ServerReported,
+                ),
+                None => (declared_window, WindowSource::RegistryDeclared),
+            };
+
+        let tokenizer = crate::serving::probe::count_tokens(&endpoint.base_url, TOKENIZER_PROBE)
+            .await
+            .map(TokenizerProbe::new);
+
+        ServedBinding {
+            model_id: endpoint.served_model_id.clone(),
+            served_model_id: endpoint.served_model_id.clone(),
+            served_window,
+            window_source,
+            // The runtime is the closest thing to a template identity the
+            // serving side can state without reading the GGUF header again;
+            // the header's own answer reaches the record through
+            // `supports_toggled_reasoning`, which the caller has already read.
+            template_id: Some(endpoint.runtime.label().to_string()),
+            tokenizer,
+            supports_toggled_reasoning,
+            healthy,
+        }
+    }
 }
 
 /// How long a model server gets to load its weights and answer.
@@ -994,15 +1197,17 @@ async fn wait_until_ready(base_url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::ModelRole;
+    use crate::registry::{ModelRole, RoutingPreference};
 
-    fn gguf_entry() -> ModelEntry {
+    pub(super) fn gguf_entry() -> ModelEntry {
         ModelEntry {
             id: "qwen2.5-coder-7b".into(),
             name: "Qwen2.5 Coder 7B".into(),
             version: "1.0".into(),
             license: "Apache-2.0".into(),
             sha256: None,
+            revision: None,
+            min_llama_build: None,
             runtime: Runtime::LlamaCpp,
             roles: vec![ModelRole::Coding],
             modalities: vec![crate::registry::Modality::Text],
@@ -1461,5 +1666,78 @@ mod weights_integrity_tests {
     fn bytes_are_reported_in_units_a_person_reads() {
         assert_eq!(human_bytes(8_154_978_784), "7.59 GB");
         assert_eq!(human_bytes(512 * 1024 * 1024), "512 MB");
+    }
+}
+
+#[cfg(test)]
+mod runtime_support_tests {
+    use super::*;
+
+    fn entry_needing(build: Option<u32>) -> ModelEntry {
+        let mut entry = super::tests::gguf_entry();
+        entry.id = "orchestrator.spark-x2-5-4b".to_string();
+        entry.min_llama_build = build;
+        entry
+    }
+
+    #[test]
+    fn a_version_banner_yields_its_build_number() {
+        assert_eq!(
+            parse_llama_build("version: 0.4.1-dev (build 10970, commit bfdc32183)"),
+            Some(10970)
+        );
+        // Some builds print it on stderr with a different prefix.
+        assert_eq!(parse_llama_build("llama-server build 9001 (whatever)"), Some(9001));
+    }
+
+    #[test]
+    fn a_banner_without_a_build_number_is_unknown_rather_than_zero() {
+        assert_eq!(parse_llama_build("version: 0.4.1-dev"), None);
+        assert_eq!(parse_llama_build("build "), None);
+        assert_eq!(parse_llama_build("build abc"), None);
+        assert_eq!(parse_llama_build(""), None);
+    }
+
+    /// Most models declare no floor, and inventing one for them would refuse
+    /// models that work.
+    #[test]
+    fn a_model_that_declares_no_floor_is_not_gated() {
+        assert!(check_runtime_supports(&entry_needing(None)).is_ok());
+    }
+
+    /// The diagnostic names both numbers, the model, and what it did *not* do.
+    #[test]
+    fn an_unsupported_runtime_names_both_builds_and_refuses_to_substitute() {
+        let unsupported = UnsupportedRuntime {
+            model_id: "orchestrator.spark-x2-5-4b".to_string(),
+            required_build: 10_828,
+            found_build: Some(9_000),
+        };
+        let said = unsupported.explain();
+        assert!(said.contains("10828"), "{said}");
+        assert!(said.contains("9000"), "{said}");
+        assert!(said.contains("orchestrator.spark-x2-5-4b"), "{said}");
+        assert!(
+            said.contains("not substituted"),
+            "an operator must be told a different model was not quietly used: {said}"
+        );
+    }
+
+    /// A probe that could not read the build is "not known", and for a model
+    /// that declared a floor that is a refusal — the alternative is a wasted
+    /// load ending in an obscure error.
+    #[test]
+    fn a_runtime_that_cannot_be_asked_is_reported_as_unknown_not_as_old() {
+        let unknown = UnsupportedRuntime {
+            model_id: "orchestrator.spark-x2-5-4b".to_string(),
+            required_build: 10_828,
+            found_build: None,
+        };
+        let said = unknown.explain();
+        assert!(said.contains("could not be asked"), "{said}");
+        assert!(
+            !said.contains("build 0"),
+            "an unknown build must not be reported as an old one: {said}"
+        );
     }
 }

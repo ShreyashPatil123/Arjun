@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Memory graph — acceptance harness</title>
+    <!--
+      A page for photographing the real renderer.
+
+      It imports `MemoryGraphCanvas` and the real projection and colour modules;
+      the only thing it fakes is the data, because the backend half is covered
+      by the Rust tests and what needs photographing is what a browser actually
+      paints. Kept out of `src/` deliberately: a page with no importer inside
+      `src/` would be flagged by `scripts/check-reachable.mjs`, and rightly.
+
+      Scenes are chosen by `?scene=`, sizes by `?w=` and `?h=`, so each
+      acceptance case is one URL.
+    -->
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        background: #0a0a0a;
+        color: #e8e8e8;
+        font: 12px system-ui, sans-serif;
+      }
+      #root { padding: 12px; }
+      .frame { border: 1px solid #333; border-radius: 6px; background: #000; }
+      .caption { margin: 0 0 8px; color: #9a9a9a; }
+      .caption b { color: #e8e8e8; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./harness.tsx"></script>
+  </body>
+</html>

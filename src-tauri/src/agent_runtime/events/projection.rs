@@ -441,6 +441,14 @@ impl TaskSnapshot {
             // source for it would let the two disagree.
             TaskEventType::ModelRequested
             | TaskEventType::ModelResponded
+            // Which model a run is on is answered by the checkpoint and by the
+            // transition ledger, both of which a screen reads directly. Folding
+            // it into the snapshot as well would put the same fact in two
+            // places, and the two would eventually disagree.
+            | TaskEventType::ModelTransitionStarted
+            | TaskEventType::ModelTransitionCommitted
+            | TaskEventType::ModelTransitionFailed
+            | TaskEventType::ModelTransitionRolledBack
             // Paired with `context_compacted`, which is what is counted.
             | TaskEventType::CompactionStarted
             | TaskEventType::WaitStarted

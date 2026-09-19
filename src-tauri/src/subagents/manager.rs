@@ -39,6 +39,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::agent_runtime::events::{EventDraft, TaskEventLog, TaskEventType};
+use crate::orchestrator::tools::ToolName;
 
 use super::certification::Decision;
 use super::inherit::{EffectivePolicy, InheritRefusal, InheritedPolicy};
@@ -142,6 +143,55 @@ impl Spawned {
 /// One idempotency slot: the lock a second caller waits on, and the answer.
 type Slot = Arc<Mutex<Option<ChildResult>>>;
 
+/// Who a child is and what it owes, beyond the policy it runs under.
+///
+/// ## Why this is separate from the policy
+///
+/// The policy decides what a child *may do*; this decides what it *is for*.
+/// Getting the first wrong is a permissions bug and getting the second wrong is
+/// a wasted worker, and keeping them apart is what stops a dispatch site
+/// reaching for a field that widens authority when it meant to name a task.
+///
+/// Every field has a safe default, so a caller with no task identity to carry
+/// gets a child scoped to the run rather than a child with an empty scope key
+/// shared with every other task on the machine.
+#[derive(Debug, Clone, Default)]
+pub struct Dispatch {
+    /// The agent from the deployment's registry. Memory is keyed by it.
+    pub agent_id: String,
+    /// The task the child joins. Empty means the parent's run.
+    pub task_id: String,
+    /// What counts as done, in the parent's words. Read by the parent's
+    /// completion check — see [`crate::agent_runtime::completion`].
+    pub deliverable: String,
+    /// The graph position this child's inputs were authorised at, and therefore
+    /// how it waits for a sibling's result.
+    pub requirement: super::graph_io::Requirement,
+}
+
+impl Dispatch {
+    /// The ordinary case: a child on the parent's own task, with nothing to
+    /// wait for.
+    pub fn for_task(agent_id: impl Into<String>, task_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            task_id: task_id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The same, told to wait until a sibling's result has landed.
+    pub fn after(mut self, graph_revision: i64) -> Self {
+        self.requirement = super::graph_io::Requirement::AtLeast { graph_revision };
+        self
+    }
+
+    pub fn delivering(mut self, deliverable: impl Into<String>) -> Self {
+        self.deliverable = deliverable.into();
+        self
+    }
+}
+
 /// The Rust side of subagents.
 pub struct SubagentManager {
     profiles: BTreeMap<String, AgentProfile>,
@@ -223,13 +273,10 @@ impl SubagentManager {
         objective: &str,
         inputs: Vec<InputRef>,
         model: Decision,
+        dispatch: &Dispatch,
     ) -> Result<Spawned, SpawnRefusal> {
-        let key = super::packet::derive_idempotency_key(
-            &inherited_run_id(inherited),
-            profile_name,
-            objective,
-            &inputs,
-        );
+        let run_id = inherited_run_id(inherited);
+        let key = super::packet::derive_idempotency_key(&run_id, profile_name, objective, &inputs);
 
         // The slot is taken before anything else, so a second attempt at this
         // work waits here rather than starting a second child.
@@ -244,6 +291,21 @@ impl SubagentManager {
         let mut held = slot.lock().await;
         if let Some(existing) = held.as_ref() {
             return Ok(Spawned::Existing(existing.clone()));
+        }
+
+        // The durable half of the same question, and the half that survives the
+        // process.
+        //
+        // The slot above is an in-memory map: it stops two callers in *this*
+        // process both starting a child, and it dies with the process. A run
+        // that was interrupted mid-delegation and picked back up would find an
+        // empty map and dispatch the work a second time — which for a retrieval
+        // is wasteful and for anything with an effect is the duplicate this
+        // ledger exists to prevent. So the intent goes on disk first, keyed the
+        // same way, through the same table every side-effecting tool uses.
+        if let Some(recalled) = self.recall(&run_id, &key, objective) {
+            *held = Some(recalled.clone());
+            return Ok(Spawned::Existing(recalled));
         }
 
         let child_id = uuid::Uuid::new_v4().to_string();
@@ -264,13 +326,27 @@ impl SubagentManager {
 
         let packet = ChildTaskPacket::new(
             &child_id,
-            inherited_run_id(inherited),
+            &run_id,
             &key,
             objective,
             inputs,
             &policy,
             Utc::now(),
-        );
+        )
+        .assigned_to(
+            // An agent id the caller did not supply falls back to the profile
+            // name, which is stable for the life of the deployment and is what
+            // the memory would otherwise be keyed by nothing at all.
+            if dispatch.agent_id.trim().is_empty() {
+                profile.name.clone()
+            } else {
+                dispatch.agent_id.clone()
+            },
+            dispatch.task_id.clone(),
+            dispatch.deliverable.clone(),
+            dispatch.requirement,
+        )
+        .routed_to(Some(model.model_id.clone()).filter(|id| !id.trim().is_empty()));
 
         self.record_start(inherited, &packet, &policy, &model);
 
@@ -331,8 +407,129 @@ impl SubagentManager {
         };
 
         self.record_stop(inherited, &child_id, &result, &model);
+        // Settled on disk as well as in the slot, so the next process to pick
+        // this run up finds the answer rather than the intent. An outcome that
+        // is never settled stays `pending` and is promoted to `unknown` at the
+        // next start — which is the correct answer when nobody can say what
+        // happened, and is how a worker that died mid-flight is reported.
+        self.settle(&run_id, &key, &result);
         *held = Some(result.clone());
         Ok(Spawned::Fresh(result))
+    }
+
+    /// What the durable ledger already knows about this piece of work.
+    ///
+    /// `None` means "go ahead", and the intent has been recorded. `Some` is an
+    /// answer from a previous attempt — a settled result to hand back, or a
+    /// refusal for the two cases where carrying on would be wrong.
+    fn recall(&self, run_id: &str, key: &str, objective: &str) -> Option<ChildResult> {
+        use crate::agent_runtime::events::EffectLookup;
+
+        let fingerprint = crate::agent_runtime::events::args_fingerprint(&json!({
+            "objective": objective,
+        }));
+        match self.events.begin_effect(
+            run_id,
+            key,
+            ToolName::AgentDelegateReadonly.as_str(),
+            &fingerprint,
+            key,
+        ) {
+            // Never seen. The intent is now on disk and the child may start.
+            EffectLookup::Fresh => None,
+            // Done before. The recorded ending, rebuilt as a typed result so
+            // the parent handles it exactly as it would a fresh one.
+            EffectLookup::Settled(recorded) => Some(if recorded.succeeded() {
+                // `ended` is for a child that did not finish, and asserts as
+                // much. A settled success is a *completed* child whose answer
+                // is being reused rather than recomputed.
+                let mut replay = ChildResult::completed(
+                    key,
+                    "",
+                    super::profile::SchemaKind::Retrieval,
+                    Vec::new(),
+                    1.0,
+                    Vec::new(),
+                    0,
+                );
+                replay.detail = Some(format!(
+                    "This work was already done under the same key, and its recorded outcome is \
+                     reused rather than a second child being started: {}",
+                    recorded.result
+                ));
+                replay
+            } else {
+                ChildResult::ended(
+                    key,
+                    "",
+                    ChildStatus::Failed,
+                    super::profile::SchemaKind::Retrieval,
+                    Vec::new(),
+                    format!(
+                        "This work was already attempted under the same key and did not \
+                         succeed, so it was not started again: {}",
+                        recorded.result
+                    ),
+                    0,
+                )
+            }),
+            // Another attempt is running right now. Refused rather than queued:
+            // the in-memory slot above is what serialises two callers in one
+            // process, so reaching here means two *processes*, and the second
+            // should not add a third.
+            EffectLookup::InFlight(recorded) => Some(ChildResult::ended(
+                key,
+                "",
+                ChildStatus::Refused,
+                super::profile::SchemaKind::Retrieval,
+                Vec::new(),
+                format!(
+                    "This exact piece of work is already being done by another attempt at this \
+                     run, begun at {}. Nothing was started.",
+                    recorded.at
+                ),
+                0,
+            )),
+            // Interrupted, and nobody can say whether it finished. The one case
+            // that needs a person; a child restarted here could repeat whatever
+            // the first one had already done.
+            EffectLookup::Unknown(recorded) => Some(ChildResult::ended(
+                key,
+                "",
+                ChildStatus::Failed,
+                super::profile::SchemaKind::Retrieval,
+                Vec::new(),
+                recorded.unknown_refusal(),
+                0,
+            )),
+            EffectLookup::Conflict(conflict) => Some(ChildResult::ended(
+                key,
+                "",
+                ChildStatus::Refused,
+                super::profile::SchemaKind::Retrieval,
+                Vec::new(),
+                conflict.to_string(),
+                0,
+            )),
+        }
+    }
+
+    /// Records how this piece of work ended, durably.
+    fn settle(&self, run_id: &str, key: &str, result: &ChildResult) {
+        let outcome = if result.status.is_complete() {
+            Ok(format!(
+                "{} finding(s) from {}",
+                result.findings.len(),
+                result.profile
+            ))
+        } else {
+            Err(format!(
+                "{} {}",
+                result.profile,
+                result.status.describe()
+            ))
+        };
+        self.events.settle_effect(run_id, key, &outcome);
     }
 
     /// Records that a child began, with everything requirement 7 asks for.
@@ -352,6 +549,14 @@ impl SubagentManager {
         .with(json!({
             "childId": packet.child_id,
             "profile": packet.profile,
+            // The parent/child relationship, durably. This row *is* the record
+            // that this task had this worker on it: the run id is the envelope's,
+            // the task and the agent are here, and a reader joining them back
+            // together needs nothing that lives in memory.
+            "agentId": packet.agent_id,
+            "taskId": packet.task_id,
+            "deliverable": packet.deliverable,
+            "requirement": packet.requirement,
             "idempotencyKey": packet.idempotency_key,
             // The manifest: what this child was permitted, not what it asked for.
             "manifest": {
@@ -407,9 +612,23 @@ impl SubagentManager {
             "status": result.status.as_str(),
             "complete": result.status.is_complete(),
             "findings": result.findings.len(),
+            // How many of those a reader could actually check. The number the
+            // parent's completion criterion turns on: six findings citing
+            // nothing is six sentences, and folding them into an answer would
+            // be citing the worker rather than a source.
+            "evidenced": result
+                .findings
+                .iter()
+                .filter(|finding| !finding.evidence.is_empty())
+                .count(),
             "confidence": result.confidence,
             "uncertainty": result.uncertainty.len(),
             "turnsUsed": result.turns_used,
+            // The ids a sibling or a later step can go and read. Recorded
+            // rather than left in the result alone, because the completion
+            // check runs after a restart and reads this log rather than
+            // anything held in memory.
+            "published": result.published,
             "resultHash": result.result_hash,
             "modelId": model.model_id,
         }));

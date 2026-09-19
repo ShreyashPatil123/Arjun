@@ -1,0 +1,431 @@
+/* Agent administration.
+ *
+ * Follows the product's tokens throughout, with one deliberate exception: the
+ * colour preview is drawn on black, because that is the surface the agent
+ * memory graph actually uses and a swatch on a light panel says nothing useful
+ * about how a colour reads there. */
+
+.page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6) var(--space-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.header { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.title {
+  font-family: var(--font-display);
+  font-weight: var(--font-normal);
+  font-size: var(--text-3xl);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.lede {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.quiet {
+  margin: 0;
+  padding: var(--space-6) 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.hint {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: var(--font-normal);
+  margin-left: var(--space-2);
+}
+
+/* ── Messages ─────────────────────────────────────────────────────────── */
+
+.error,
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: 6px;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.error {
+  border: 1px solid var(--status-error, #f87171);
+  color: var(--status-error, #f87171);
+}
+
+.notice {
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+
+.toolbar { display: flex; gap: var(--space-2); }
+
+.primary,
+.ghost,
+.danger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: 5px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.primary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+.danger { color: var(--status-error, #f87171); }
+
+.primary:hover,
+.ghost:hover,
+.danger:hover { border-color: var(--text-secondary); }
+
+.primary:disabled,
+.ghost:disabled,
+.danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Focus is never removed — this page is operable from the keyboard alone. */
+.primary:focus-visible,
+.ghost:focus-visible,
+.danger:focus-visible,
+.row:focus-visible,
+.rowSelected:focus-visible,
+.swatchOff:focus-visible,
+.swatchOn:focus-visible,
+.input:focus-visible,
+.textarea:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* ── The list ─────────────────────────────────────────────────────────── */
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.headRow,
+.row,
+.rowSelected {
+  display: grid;
+  grid-template-columns: 14px minmax(180px, 2fr) 1fr 1.4fr 0.8fr 0.8fr 0.9fr;
+  gap: var(--space-3);
+  align-items: center;
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  font-size: var(--text-sm);
+}
+
+.headRow {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.row,
+.rowSelected {
+  border: none;
+  border-bottom: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.rowSelected { background: var(--bg-secondary); color: var(--text-primary); }
+.row:hover { background: var(--bg-secondary); }
+
+.swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+.rowMain { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rowName { color: var(--text-primary); }
+
+/* The identity, always visible: it is what survives a rename and what a graph
+ * attribution refers to. */
+.rowId {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rowMeta { color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; }
+
+.rowState { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+.rowState[data-state='enabled'] { color: var(--text-secondary); }
+.rowState[data-state='disabled'] { color: var(--text-tertiary); }
+.rowState[data-state='archived'] { color: var(--text-tertiary); font-style: italic; }
+
+.ready,
+.notReady {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ready { color: var(--status-success, #4ade80); }
+.notReady { color: var(--status-warning, #fbbf24); }
+
+/* ── The editor ───────────────────────────────────────────────────────── */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+}
+
+.editorHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.editorTitle {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--font-normal);
+  color: var(--text-primary);
+}
+
+.identity {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-4);
+}
+
+.field,
+.fieldWide { display: flex; flex-direction: column; gap: var(--space-2); }
+.fieldWide { grid-column: 1 / -1; }
+
+.label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+}
+
+.input,
+.textarea {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: inherit;
+}
+
+.textarea { resize: vertical; line-height: 1.6; }
+
+/* ── Colour ───────────────────────────────────────────────────────────── */
+
+.colors { border: none; margin: 0; padding: 0; }
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.swatchOff,
+.swatchOn {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+
+.swatchOn { border-color: var(--text-primary); }
+
+/* Black, because that is the surface the memory graph draws on. */
+.preview {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: var(--space-3);
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #08090c;
+  border: 1px solid var(--border-default);
+}
+
+.previewDot { width: 12px; height: 12px; border-radius: 50%; }
+.previewEdge { width: 34px; height: 2px; border-radius: 2px; opacity: 0.55; }
+
+/* ── Skills ───────────────────────────────────────────────────────────── */
+
+.skills { border: none; margin: 0; padding: 0; }
+
+.skillList {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.skillItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  font-size: var(--text-sm);
+}
+
+.skillLabel { display: flex; align-items: center; gap: var(--space-2); }
+.skillName { color: var(--text-primary); }
+.skillVersion { color: var(--text-tertiary); font-size: var(--text-xs); }
+
+.skillMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.badge,
+.badgeWarn {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  font-size: var(--text-xs);
+}
+
+.badgeWarn { color: var(--status-warning, #fbbf24); border-color: currentColor; }
+
+.actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+/* ── Dry run ──────────────────────────────────────────────────────────── */
+
+.dryRun {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.previewTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.blocked {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--status-warning, #fbbf24);
+}
+
+.blocked li { display: flex; align-items: flex-start; gap: var(--space-2); line-height: 1.5; }
+
+.ok {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--status-success, #4ade80);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.facts dt { color: var(--text-tertiary); }
+.facts dd { margin: 0; color: var(--text-secondary); }
+
+.refused { display: block; color: var(--status-warning, #fbbf24); font-size: var(--text-xs); }
+
+.skillResolutions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.skillResolutions li[data-status='ok'] { color: var(--text-secondary); }
+.skillResolutions li[data-status='missing'],
+.skillResolutions li[data-status='changed'],
+.skillResolutions li[data-status='quarantined'] { color: var(--status-warning, #fbbf24); }
+
+@media (prefers-reduced-motion: reduce) {
+  .page *,
+  .page *::before,
+  .page *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

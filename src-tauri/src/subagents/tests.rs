@@ -13,6 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::*;
+use super::manager::Dispatch;
 use crate::agent_runtime::events::TaskEventLog;
 use crate::identity::{Role, Session, User};
 use crate::orchestrator::tools::ToolName;
@@ -438,6 +439,7 @@ async fn a_child_receives_only_the_tools_the_parent_and_profile_agree_on() {
             "find the seal wear passages",
             vec![],
             model(),
+            &Dispatch::default(),
         )
         .await
         .expect("spawned");
@@ -607,7 +609,7 @@ async fn a_child_that_hangs_is_stopped_and_reported_as_timed_out() {
     }));
 
     let spawned = manager
-        .spawn("knowledge-retriever", &inherited, "find something", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find something", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -633,7 +635,7 @@ async fn a_worker_that_fails_becomes_a_failure_rather_than_an_error() {
         Behaviour::Fail("the index could not be opened".to_string()),
     );
     let spawned = manager
-        .spawn("knowledge-retriever", &inherited, "find something", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find something", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -650,7 +652,7 @@ async fn a_worker_answering_a_different_question_is_a_failure() {
 
     let manager = manager_with("knowledge-retriever", Behaviour::WrongShape);
     let spawned = manager
-        .spawn("knowledge-retriever", &inherited, "find something", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find something", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -668,7 +670,7 @@ async fn a_role_with_no_worker_says_nothing_ran() {
     let manager = SubagentManager::new(shipped().profiles, events());
 
     let spawned = manager
-        .spawn("artifact-reviewer", &inherited, "check the note", vec![], model())
+        .spawn("artifact-reviewer", &inherited, "check the note", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -738,6 +740,7 @@ async fn several_read_only_children_run_at_once_and_agree() {
                     &format!("objective {index}"),
                     vec![],
                     model(),
+                    &Dispatch::default(),
                 )
                 .await
         }));
@@ -781,11 +784,11 @@ async fn the_same_work_asked_for_twice_produces_one_child() {
     let manager = manager_with("knowledge-retriever", Behaviour::Succeed);
 
     let first = manager
-        .spawn("knowledge-retriever", &inherited, "find the seal wear", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find the seal wear", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
     let second = manager
-        .spawn("knowledge-retriever", &inherited, "find the seal wear", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find the seal wear", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -803,11 +806,11 @@ async fn different_work_under_one_profile_produces_different_children() {
     let manager = manager_with("knowledge-retriever", Behaviour::Succeed);
 
     let first = manager
-        .spawn("knowledge-retriever", &inherited, "seal wear", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "seal wear", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
     let second = manager
-        .spawn("knowledge-retriever", &inherited, "wall thickness", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "wall thickness", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -921,7 +924,7 @@ async fn a_parent_records_the_child_manifest_and_the_result_hash() {
         }));
 
     let spawned = manager
-        .spawn("knowledge-retriever", &inherited, "find something", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find something", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 
@@ -968,7 +971,7 @@ async fn a_timed_out_child_is_recorded_as_incomplete() {
         }));
 
     manager
-        .spawn("knowledge-retriever", &inherited, "find something", vec![], model())
+        .spawn("knowledge-retriever", &inherited, "find something", vec![], model(), &Dispatch::default())
         .await
         .expect("spawned");
 

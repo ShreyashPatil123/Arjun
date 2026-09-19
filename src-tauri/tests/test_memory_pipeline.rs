@@ -6,13 +6,38 @@
 ///   4. Prompt Injection (system prompt constructed with memory)
 ///   5. Cross-Model Persistence (verify after unload/reload)
 
-use std::path::PathBuf;
 use sarathi_lib::ai_engine::traits::ChatMessage;
 use sarathi_lib::memory_engine::MemoryManager;
+use tempfile::TempDir;
 
-fn make_app_data_dir() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| r"C:\Users\lenovo\AppData\Roaming".to_string());
-    PathBuf::from(appdata).join("com.sarathi.app")
+/// A data directory that belongs to this test and nothing else.
+///
+/// ## What this replaces, and why it had to go
+///
+/// It used to be the *live* `com.sarathi.app` profile of whoever ran the suite,
+/// read out of `%APPDATA%`. So `npm run test:integration` — which any
+/// contributor runs, and which a reviewer is told to run — appended a fixture
+/// row to a real person's `memory_nodes` table and re-stamped their
+/// `user_profile.name`, every single time.
+///
+/// That is wrong three ways over. It mutates data nobody consented to hand a
+/// test. It makes the result depend on whatever is already in that database, so
+/// the test can pass on the machine it was written on and nowhere else. And
+/// because the rows accumulate, the pipeline being diagnosed drifts further
+/// from a clean one on every run — a diagnostic that degrades what it measures.
+///
+/// `verify_real_world_model_switching` was moved off the same directory for the
+/// same reason. `common::app_data_dir` still points at it for the native
+/// model-switch gates, which is a separate change.
+///
+/// A `TempDir` is removed when it drops, so each run starts from an empty
+/// database and leaves nothing behind. It is returned rather than a path
+/// because dropping it deletes the files: it has to outlive the managers.
+fn isolated_app_data() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("arjun-memory-pipeline-")
+        .tempdir()
+        .expect("a temporary data directory could be created")
 }
 
 #[tokio::test]
@@ -21,8 +46,13 @@ async fn test_memory_pipeline_end_to_end() {
     println!("   SARATHI P0 MEMORY PIPELINE STAGE-BY-STAGE DIAGNOSTIC                ");
     println!("========================================================================\n");
 
-    let app_data = make_app_data_dir();
-    println!("[SETUP] App Data Directory: {:?}", app_data);
+    // Held for the whole test: dropping it deletes the database underneath.
+    let scratch = isolated_app_data();
+    let app_data = scratch.path().to_path_buf();
+    println!(
+        "[SETUP] App Data Directory (temporary, removed on exit): {:?}",
+        app_data
+    );
 
     // ========== STAGE 0: Initialize MemoryManager ==========
     println!("\n--- STAGE 0: Initialize MemoryManager ---");

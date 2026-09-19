@@ -1,0 +1,19 @@
+check:egress             PASS
+check:no-lora            PASS
+check:deployment         PASS
+check:ipc                PASS
+check:reachable          PASS
+check:lint-budget        FAIL
+
+> arjun@0.2.0 check:lint-budget
+> node scripts/check-lint-budget.mjs
+
+Unused-code budget exceeded: 44 warnings, ceiling is 43.
+
+This change left new dead code behind. Remove it, or — if it is genuinely
+needed and unused for a stated reason — say so at the definition rather than
+raising the number in scripts/lint-budget.json.
+check:whitespace         PASS
+check:bundle:self        PASS
+runtime:audit            PASS
+runtime:typecheck        PASS

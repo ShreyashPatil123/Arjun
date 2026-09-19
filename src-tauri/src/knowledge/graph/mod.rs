@@ -35,6 +35,9 @@ pub mod persist;
 pub mod relations;
 pub mod render;
 pub mod research;
+pub mod runtime_feed;
+pub mod runtime_memory;
+pub mod runtime_store;
 #[cfg(test)]
 mod research_tests;
 pub mod statistical;

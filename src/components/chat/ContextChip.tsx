@@ -106,7 +106,15 @@ export function ContextChip() {
 
   const rows = useMemo(() => {
     const merged = entityRows(ledger, attachments);
-    return merged.map(row => (pinned.has(row.id) ? { ...row, pinned: true } : row));
+    // Two spellings are accepted, because both can be on disk: the typed
+    // `msg:`/`sha256:` form this build writes, and the bare id every pin
+    // written before prefixes existed still carries. Checking only the new one
+    // would draw every existing pin as unpinned while Rust went on honouring it
+    // — the exact mismatch between panel and backend this control was fixed to
+    // stop having.
+    return merged.map(row =>
+      pinned.has(row.pinRef) || pinned.has(row.id) ? { ...row, pinned: true } : row,
+    );
   }, [ledger, attachments, pinned]);
 
   const nextToGo = useMemo(() => firstToGo(rows), [rows]);
@@ -141,10 +149,16 @@ export function ContextChip() {
    * pinning, and a call that could only add would make this a decision nobody
    * could take back.
    */
-  const togglePin = (id: string) => {
+  const togglePin = (row: Pick<EntityRow, 'id' | 'pinRef'>) => {
     const next = new Set(pinned);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
+    // Unpinning has to clear both spellings, or a legacy bare-id pin would be
+    // left on disk and the row would spring back filled on the next read.
+    if (next.has(row.pinRef) || next.has(row.id)) {
+      next.delete(row.pinRef);
+      next.delete(row.id);
+    } else {
+      next.add(row.pinRef);
+    }
     setPinned(next);
     setPinProblem(null);
 
@@ -372,7 +386,39 @@ export function ContextChip() {
               the breakdown as unreliable.
             </p>
           )}
-          {historyTrim && (
+          {/* An unhonoured pin is not a trim, and it does not get a trim's
+              quiet grey line. Somebody pressed a control that says "keep this"
+              and the turn could not — so it is said in the same voice as a
+              failure, names the thing, and says which of the two reasons it
+              was. Before this, it was an increment of `dropped`. */}
+          {(historyTrim?.omittedPins?.length ?? 0) > 0 && (
+            <p className={styles.contextWillNotFit}>
+              {historyTrim!.omittedPins!.length === 1
+                ? 'One pinned item could not be sent to the model:'
+                : `${historyTrim!.omittedPins!.length} pinned items could not be sent to the model:`}{' '}
+              {historyTrim!.omittedPins!.map(omitted => {
+                const name =
+                  rows.find(row => row.pinRef === omitted.pin || row.id === omitted.pin)?.label ??
+                  omitted.pin;
+                const why =
+                  omitted.reason.reason === 'exceedsBudget'
+                    ? `too large for this window on its own (${omitted.reason.costTokens.toLocaleString()} tokens against ${omitted.reason.budgetTokens.toLocaleString()})`
+                    : `there was no room left after the other pinned items (${omitted.reason.costTokens.toLocaleString()} tokens, ${omitted.reason.remainingTokens.toLocaleString()} free)`;
+                return `${name} — ${why}`;
+              }).join('; ')}
+              . Nothing was deleted; it is still in this conversation. A model
+              with a larger window, or unpinning something else, would carry it.
+            </p>
+          )}
+          {historyTrim?.retention?.exceedsLimit && (
+            <p className={styles.contextTrimmedLine}>
+              This conversation now holds about{' '}
+              {historyTrim.retention.retainedTokens.toLocaleString()} tokens, past the{' '}
+              {historyTrim.retention.limitTokens.toLocaleString()} it is documented to keep.
+              Nothing has been deleted.
+            </p>
+          )}
+          {historyTrim && historyTrim.dropped > 0 && (
             <p className={styles.contextTrimmedLine}>
               {historyTrim.dropped} earlier message
               {historyTrim.dropped === 1 ? '' : 's'} did not fit and {historyTrim.dropped === 1 ? 'was' : 'were'}{' '}
@@ -432,7 +478,7 @@ export function ContextChip() {
                       <button
                         type="button"
                         className={styles.contextCardClose}
-                        onClick={() => togglePin(row.id)}
+                        onClick={() => togglePin(row)}
                         aria-pressed={row.pinned}
                         aria-label={
                           row.pinned

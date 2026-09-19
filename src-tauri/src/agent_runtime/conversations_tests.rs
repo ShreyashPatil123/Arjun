@@ -1284,3 +1284,95 @@ fn recent_requests_is_owner_scoped() {
 
     assert!(store.recent_requests(&conv.id, OTHER, 4).expect("read").is_empty());
 }
+
+/// A file damaged the way two files on this machine are damaged must not take
+/// the whole list down, and must not vanish without a word either.
+///
+/// The damage is real and its shape is specific: a shorter document written
+/// over a longer one **in place**, leaving the tail of the previous version
+/// after the new closing brace. `serde_json` calls that "trailing characters".
+/// `ConversationStore::save` cannot produce it any more — it writes a `.tmp`
+/// sibling and renames — but files written before that are still on disk, and
+/// `list` used to drop them with `.ok().flatten()`: the conversation was simply
+/// not in the sidebar, with nothing logged and nothing to search for.
+///
+/// This pins the behaviour that replaced it: the healthy conversations still
+/// come back, and the damaged file is skipped rather than propagated as an
+/// error that would empty the list.
+#[test]
+fn a_file_with_a_trailing_older_copy_does_not_hide_the_healthy_ones() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+
+    let healthy = store
+        .create("Healthy thread".into(), "welcome".into(), OWNER)
+        .expect("create");
+    let second = store
+        .create("Second healthy thread".into(), "welcome".into(), OWNER)
+        .expect("create");
+
+    // Reproduce the damage exactly: valid JSON, then the tail of a longer
+    // earlier version of the same file.
+    let root = dir.join("conversations");
+    let damaged_path = root.join("damaged-conversation.json");
+    let good = std::fs::read_to_string(root.join(format!("{}.json", healthy.id))).expect("read");
+    std::fs::write(
+        &damaged_path,
+        format!("{good}\"live\": true}}\n    ],\n    \"compactions\": 0\n  }}\n}}"),
+    )
+    .expect("write damaged file");
+
+    let listed = store.list(Some(OWNER)).expect("list must not fail");
+    let ids: Vec<&str> = listed.iter().map(|c| c.id.as_str()).collect();
+
+    assert!(
+        ids.contains(&healthy.id.as_str()) && ids.contains(&second.id.as_str()),
+        "one damaged file must not remove the healthy conversations, got {ids:?}"
+    );
+    assert_eq!(
+        listed.len(),
+        2,
+        "the damaged file is skipped, not resurrected as a phantom row"
+    );
+    // The file is still on disk: skipping is not deleting, and an operator can
+    // still recover the transcript by hand.
+    assert!(damaged_path.exists(), "the damaged file must not be removed");
+
+    // The part that matters, and the part the old `.ok().flatten()` could not
+    // express: the loss is *reportable*. Before this, the only difference
+    // between "damaged" and "never existed" was invisible to every caller.
+    let (again, unreadable) = store
+        .list_with_diagnostics(Some(OWNER))
+        .expect("diagnostics list must not fail");
+    assert_eq!(again.len(), 2, "the healthy pair is unchanged");
+    assert_eq!(
+        unreadable,
+        vec![damaged_path],
+        "the damaged file must be named, not merely absent"
+    );
+}
+
+/// Reading a damaged file by path is an error, not an empty success.
+///
+/// `Ok(None)` would mean "no such conversation", which is a different fact and
+/// the one that made the loss invisible. The distinction is what lets `list`
+/// count the file and say so.
+#[test]
+fn a_damaged_file_reads_as_an_error_and_not_as_absent() {
+    let dir = temp_dir();
+    let store = ConversationStore::open(&dir).expect("open");
+    let healthy = store
+        .create("Healthy thread".into(), "welcome".into(), OWNER)
+        .expect("create");
+
+    let path = dir.join("conversations").join(format!("{}.json", healthy.id));
+    let good = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(&path, format!("{good} trailing garbage from an older copy"))
+        .expect("write damaged file");
+
+    let outcome = store.get(&healthy.id, Some(OWNER));
+    assert!(
+        outcome.is_err(),
+        "a damaged file must report as unreadable, not as absent: {outcome:?}"
+    );
+}

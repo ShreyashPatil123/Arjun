@@ -38,7 +38,7 @@ use std::path::Path;
 
 use crate::ai_engine::gguf_meta;
 use crate::ai_engine::gguf_meta::KvCost;
-use crate::ai_engine::vram_planner::{plan_gpu_offload_with, ContextChoice, GpuOffloadPlan};
+use crate::ai_engine::vram_planner::{plan_gpu_offload_at, ContextChoice, GpuOffloadPlan};
 use crate::registry::ModelEntry;
 use crate::serving::{ModelServers, ServingError};
 use crate::system_analyzer::{gpu_collector, memory_collector};
@@ -256,12 +256,17 @@ fn plan_for(
     layers: Option<u32>,
     kv_cost: Option<KvCost>,
 ) -> GpuOffloadPlan {
-    plan_gpu_offload_with(
+    plan_gpu_offload_at(
         budget_bytes,
         entry.weights_bytes,
         ContextChoice::Planned(entry.context_length),
         layers,
         kv_cost,
+        // Asked of the binary that will actually serve this, rather than
+        // assumed. See `KvPrecision`: assuming `q8_0` on a build that does not
+        // accept `-ctk` sizes the window against half the memory the server
+        // goes on to allocate.
+        super::llama_server_kv_precision(),
     )
 }
 

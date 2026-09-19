@@ -155,3 +155,116 @@ describe('seedFrom', () => {
     expect(seedFrom(['a', 'b'])).not.toBe(seedFrom(['a', 'c']));
   });
 });
+
+/**
+ * The property the memory view depends on: a graph that is rebuilt as facts
+ * arrive must not throw away the arrangement each time.
+ *
+ * Without this, every committed memory item makes the whole picture jump, and
+ * nothing stays put long enough for a person to point at it.
+ */
+describe('positions carried across a rebuild', () => {
+  const chain: SimLink[] = [
+    { source: 'n0', target: 'n1' },
+    { source: 'n1', target: 'n2' },
+  ];
+
+  it('leaves surviving nodes exactly where they were', () => {
+    const first = new GraphSimulation(nodes(4), chain, BOX);
+    settle(first);
+    const held = first.positionsById();
+
+    const second = new GraphSimulation(nodes(4), chain, { ...BOX, positions: held });
+    for (const node of second.nodes) {
+      expect(node.x).toBeCloseTo(held.get(node.id)!.x);
+      expect(node.y).toBeCloseTo(held.get(node.id)!.y);
+    }
+  });
+
+  it('keeps them there when a new node arrives', () => {
+    const first = new GraphSimulation(nodes(4), chain, BOX);
+    settle(first);
+    const held = first.positionsById();
+
+    const second = new GraphSimulation(
+      [...nodes(4), { id: 'fresh', radius: 8 }],
+      [...chain, { source: 'n1', target: 'fresh' }],
+      { ...BOX, positions: held, alpha: 0.3 },
+    );
+
+    // Everything that existed is untouched at the moment of the rebuild.
+    for (const id of ['n0', 'n1', 'n2', 'n3']) {
+      expect(second.find(id)!.x).toBeCloseTo(held.get(id)!.x);
+      expect(second.find(id)!.y).toBeCloseTo(held.get(id)!.y);
+    }
+  });
+
+  it('drops a new node beside its neighbour, not across the canvas', () => {
+    const first = new GraphSimulation(nodes(6), chain, BOX);
+    settle(first);
+    const held = first.positionsById();
+
+    const anchor = held.get('n1')!;
+    const second = new GraphSimulation(
+      [...nodes(6), { id: 'fresh', radius: 8 }],
+      [...chain, { source: 'n1', target: 'fresh' }],
+      { ...BOX, positions: held },
+    );
+
+    const fresh = second.find('fresh')!;
+    // Its neighbour's centre plus a small jitter — not the seeding ring, which
+    // would be a third of the canvas away and would drag the picture about as
+    // it flew back.
+    expect(Math.hypot(fresh.x - anchor.x, fresh.y - anchor.y)).toBeLessThan(20);
+  });
+
+  it('falls back to the ring for a new node joined to nothing', () => {
+    const first = new GraphSimulation(nodes(4), chain, BOX);
+    settle(first);
+    const second = new GraphSimulation([...nodes(4), { id: 'orphan', radius: 8 }], chain, {
+      ...BOX,
+      positions: first.positionsById(),
+    });
+    const orphan = second.find('orphan')!;
+    expect(Number.isFinite(orphan.x)).toBe(true);
+    expect(Number.isFinite(orphan.y)).toBe(true);
+  });
+
+  it('starts warm rather than hot when asked, so a settled graph barely stirs', () => {
+    const warm = new GraphSimulation(nodes(4), chain, { ...BOX, alpha: 0.1 });
+    expect(warm.alpha).toBeCloseTo(0.1);
+    const cold = new GraphSimulation(nodes(4), chain, BOX);
+    expect(cold.alpha).toBe(1);
+  });
+
+  it('ignores a remembered position for a node that is no longer present', () => {
+    const held = new Map([['ghost', { x: 5, y: 5 }]]);
+    const simulation = new GraphSimulation(nodes(3), chain, { ...BOX, positions: held });
+    expect(simulation.find('ghost')).toBeUndefined();
+    expect(simulation.nodes).toHaveLength(3);
+  });
+});
+
+describe('the viewport clamp', () => {
+  it('holds nodes inside the box by default, as the notebook graph needs', () => {
+    const simulation = new GraphSimulation(nodes(20), [], BOX);
+    settle(simulation);
+    for (const node of simulation.nodes) {
+      expect(node.x).toBeGreaterThanOrEqual(0);
+      expect(node.x).toBeLessThanOrEqual(BOX.width);
+    }
+  });
+
+  it('lets the world grow when turned off', () => {
+    // Twenty fat nodes cannot fit in a 400×300 box without overlapping. With
+    // the clamp off they spread past its edge instead, which is what leaves
+    // `labelGeometry.separate` a result it does not have to undo.
+    const fat = Array.from({ length: 20 }, (_, i) => ({ id: `n${i}`, radius: 40 }));
+    const simulation = new GraphSimulation(fat, [], { ...BOX, clampToViewport: false });
+    settle(simulation);
+    const escaped = simulation.nodes.some(
+      (node) => node.x < 0 || node.x > BOX.width || node.y < 0 || node.y > BOX.height,
+    );
+    expect(escaped).toBe(true);
+  });
+});

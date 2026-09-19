@@ -262,6 +262,11 @@ pub fn entry_for(gguf: &ScannedGguf) -> ModelEntry {
     // always used — so a file that says nothing behaves exactly as before.
     let context_length = header_context_length(&gguf.path);
     ModelEntry {
+        // A scanned file has no publisher provenance and declares no
+        // runtime floor. Left absent rather than guessed: an invented
+        // revision would be worse than none.
+        revision: None,
+        min_llama_build: None,
         id: file_stem.clone(),
         name,
         version: "1".to_string(),

@@ -198,6 +198,11 @@ pub fn discover(app_data_dir: &Path) -> Vec<ModelEntry> {
                 // PSU and a wrong guess there is worse than an honest gap.
                 license: "unstated".to_string(),
                 sha256: None,
+                // A scanned file carries no publisher provenance and declares
+                // no runtime floor. Left absent rather than guessed: an
+                // invented revision is worse than an honest gap.
+                revision: None,
+                min_llama_build: None,
                 runtime: Runtime::LlamaCpp,
                 roles: infer_roles(&installed.model_name, has_projector),
                 modalities: infer_modalities(&installed.model_name, has_projector),
@@ -302,6 +307,8 @@ mod tests {
             version: "1".into(),
             license: "unstated".into(),
             sha256: None,
+            revision: None,
+            min_llama_build: None,
             runtime: Runtime::LlamaCpp,
             roles: vec![ModelRole::Coding, ModelRole::Reasoning],
             modalities: vec![Modality::Text],
@@ -391,6 +398,8 @@ mod tests {
             version: "Q4_K_M".into(),
             license: "unstated".into(),
             sha256: None,
+            revision: None,
+            min_llama_build: None,
             runtime: Runtime::LlamaCpp,
             roles: infer_roles("Qwen2.5-7B-Instruct", false),
             modalities: vec![Modality::Text],

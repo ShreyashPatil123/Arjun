@@ -478,6 +478,45 @@ pub(super) fn all_with_status(
     rows.collect()
 }
 
+/// Every effect of one run that has not settled.
+///
+/// `Pending` as well as `Unknown`, and the difference matters to the caller
+/// rather than here: a pending effect may be in flight right now, and an unknown
+/// one was in flight when a process went away. Both are reasons a model handoff
+/// waits — neither can be described to a different model as having happened or
+/// not — so both come back from one query.
+pub(super) fn unsettled_for_run(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Vec<RecordedOutcome>> {
+    let mut statement = conn.prepare(
+        "SELECT run_id, idempotency_key, tool, args_fingerprint, status, result, target, at
+           FROM task_tool_effects
+          WHERE run_id = ?1 AND status IN (?2, ?3) ORDER BY at",
+    )?;
+    let rows = statement.query_map(
+        params![
+            run_id,
+            EffectStatus::Pending.as_str(),
+            EffectStatus::Unknown.as_str()
+        ],
+        |row| {
+            let raw: String = row.get(4)?;
+            Ok(RecordedOutcome {
+                run_id: row.get(0)?,
+                idempotency_key: row.get(1)?,
+                tool: row.get(2)?,
+                args_fingerprint: row.get(3)?,
+                status: EffectStatus::from_str(&raw).unwrap_or(EffectStatus::Unknown),
+                result: row.get(5)?,
+                target: row.get(6)?,
+                at: row.get(7)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
 /// Whether a recorded outcome answers the call now being made.
 pub fn matches(
     recorded: &RecordedOutcome,

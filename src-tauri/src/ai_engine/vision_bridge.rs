@@ -434,6 +434,8 @@ mod tests {
             version: "1".into(),
             license: "Apache-2.0".into(),
             sha256: None,
+            revision: None,
+            min_llama_build: None,
             runtime: Runtime::LlamaCpp,
             roles: vec![ModelRole::Vision],
             modalities: vec![Modality::Text, Modality::Image],

@@ -79,6 +79,20 @@ pub struct FittedContext {
     pub dropped: u32,
     /// Estimated tokens the kept turns occupy. An estimate, and named as one.
     pub tokens: u32,
+    /// Protected content this budget could not carry, and why.
+    ///
+    /// Separate from `dropped` because the two mean opposite things to the
+    /// person reading them. `dropped` is an old message ageing out, which is
+    /// what a window is *for*. An entry here is an instruction somebody
+    /// explicitly asked the turn to keep and the turn could not — and the
+    /// previous code reported that as a `+1` on `dropped`, which is to say it
+    /// did not report it at all.
+    #[serde(default)]
+    pub omitted_pins: Vec<super::chat_memory_bus::OmittedPin>,
+    /// What the whole thread costs to keep. `None` from paths that do not
+    /// measure it (see [`fit`], which answers a narrower question).
+    #[serde(default)]
+    pub retention: Option<super::chat_memory_bus::RetentionStatus>,
 }
 
 impl FittedContext {
@@ -88,6 +102,8 @@ impl FittedContext {
             turns: Vec::new(),
             dropped: 0,
             tokens: 0,
+            omitted_pins: Vec::new(),
+            retention: None,
         }
     }
 
@@ -191,7 +207,19 @@ fn neutralise_evidence_markers(text: &str) -> String {
 /// A message with no summary is returned unchanged, which is every user turn,
 /// every turn that called no tool, and every message written before the field
 /// existed.
-fn with_tool_summary(message: &Message) -> String {
+/// ## Why this is `pub(super)` and named `prepare`
+///
+/// Because there are two projection paths and only one of them used to do this.
+/// [`fit`] prepared its messages here; [`super::chat_memory_bus::project`],
+/// which is the path production actually takes, sent `message.content.trim()` —
+/// so the shipped product dropped every tool summary, and neutralised the
+/// evidence markers only *after* it had already decided what fitted.
+///
+/// One function, called by both, is what makes "what the model is sent" a
+/// single definition rather than two that drifted. It is also the text every
+/// token estimate is taken on, so a budget decision is made about the bytes
+/// that actually cross the wire.
+pub(super) fn prepare(message: &Message) -> String {
     // Markers first: they belong to the run that issued them, and this message
     // is from an earlier one. See `neutralise_evidence_markers`.
     let content = neutralise_evidence_markers(message.content.trim());
@@ -226,7 +254,10 @@ fn role_of(message: &Message) -> Option<&'static str> {
 /// A cell that is not in this conversation returns everything, which is the safe
 /// direction: a caller that reserved no cell has no turn in the transcript to
 /// exclude.
-fn history_slice<'a>(conversation: &'a Conversation, cell_message_id: &str) -> &'a [Message] {
+pub(super) fn history_slice<'a>(
+    conversation: &'a Conversation,
+    cell_message_id: &str,
+) -> &'a [Message] {
     let Some(cell) = conversation
         .messages
         .iter()
@@ -265,6 +296,10 @@ pub fn fit(
 ) -> FittedContext {
     let history = history_slice(conversation, cell_message_id);
     let eligible: Vec<&Message> = history.iter().filter(|m| is_eligible(m)).collect();
+    // Read once rather than per message: parsing is cheap but the bound and the
+    // blank-pin guard live in `PinRef::parse`, and doing it here means `fit`
+    // and the memory bus agree on what a stored pin means.
+    let pins = super::pins::PinRef::parse_all(pinned);
 
     let mut kept: Vec<ContextTurn> = Vec::new();
     let mut spent: u32 = 0;
@@ -280,10 +315,10 @@ pub fn fit(
         let Some(role) = role_of(message) else {
             continue;
         };
-        let content = with_tool_summary(message);
+        let content = prepare(message);
         let content = content.as_str();
         let cost = estimate_tokens(content);
-        let held = is_pinned(message, content, pinned);
+        let held = super::pins::any_protects(&pins, message, content);
 
         // Once the budget is gone, only pinned messages are still collected.
         // Everything else is counted as dropped.
@@ -363,6 +398,12 @@ pub fn fit(
         turns: rescued,
         dropped,
         tokens: spent,
+        // `fit` rescues an oversized pin by carrying it past the budget, which
+        // is a different bargain from the one the production path strikes: it
+        // never omits a pin, so it has none to report. See the note on this
+        // function's retirement below.
+        omitted_pins: Vec::new(),
+        retention: None,
     }
 }
 
@@ -400,54 +441,28 @@ pub fn fit_with_memory_bus(
         question,
     );
 
+    // Taken as the bus produced them. The content is already prepared — tool
+    // summary appended, markers neutralised — and already costed against that
+    // preparation, so transforming again here would both waste the work and
+    // reintroduce the bug this function used to have: a second pass changes the
+    // bytes after the budget was decided, and `[E12]` -> `[cited earlier]`
+    // grows them.
     let turns: Vec<ContextTurn> = projection
         .turns
-        .into_iter()
-        .map(|t| ContextTurn {
-            role: t.role,
-            content: neutralise_evidence_markers(&t.content),
+        .iter()
+        .map(|turn| ContextTurn {
+            role: turn.role,
+            content: turn.content.clone(),
         })
         .collect();
-
-    let tokens: u32 = turns
-        .iter()
-        .map(|t| estimate_tokens(&t.content))
-        .sum();
 
     FittedContext {
         turns,
         dropped: projection.retained_not_projected,
-        tokens,
+        tokens: projection.projected_tokens,
+        omitted_pins: projection.omitted_pins,
+        retention: Some(projection.retention),
     }
-}
-
-/// Whether a person asked for this message to be kept.
-///
-/// Matched two ways, because the context meter draws two kinds of row and a pin
-/// has to mean the same thing whichever one it was pressed on:
-///
-/// - **By message id.** A row for a turn.
-/// - **By something the message names.** A document's content hash appears in
-///   the text of the turn that attached it, so pinning the drawing keeps the
-///   turn that carries it.
-///
-/// Case-insensitive, matching `pruneStaleToolResults` in the runtime, so a pin
-/// cannot be honoured by one side and dropped by the other over how an id
-/// happened to be spelled.
-fn is_pinned(message: &Message, content: &str, pinned: &[String]) -> bool {
-    if pinned.is_empty() {
-        return false;
-    }
-    let upper = content.to_uppercase();
-    pinned.iter().any(|id| {
-        let id = id.trim();
-        // An empty id matches everything under `contains`, which would pin the
-        // entire history from one blank string. The store drops these on the
-        // way in; this is the second guard, because the cost of being wrong
-        // here is a window that fills and a turn that fails.
-        !id.is_empty()
-            && (message.id.eq_ignore_ascii_case(id) || upper.contains(&id.to_uppercase()))
-    })
 }
 
 /// The share of a model's window that history may occupy.
@@ -919,7 +934,7 @@ mod tool_summary_tests {
     /// no record of.
     #[test]
     fn a_turns_tools_travel_with_its_words() {
-        let carried = with_tool_summary(&assistant(
+        let carried = prepare(&assistant(
             "I've prepared the note.",
             Some("[this turn used: artifact.create_approval_note]"),
         ));
@@ -940,7 +955,7 @@ mod tool_summary_tests {
     /// would produce a citation that passes checking and is wrong.
     #[test]
     fn an_earlier_turns_citations_cannot_be_reused_by_this_one() {
-        let carried = with_tool_summary(&assistant(
+        let carried = prepare(&assistant(
             "The seal is rated to 65 mm [E2], and the SOP requires annual inspection [E11].",
             None,
         ));
@@ -957,7 +972,7 @@ mod tool_summary_tests {
     #[test]
     fn text_that_merely_looks_like_a_marker_is_left_alone() {
         for text in ["[Every] valve", "[E] alone", "[E2x] not a marker", "an [Edge] case"] {
-            let carried = with_tool_summary(&assistant(text, None));
+            let carried = prepare(&assistant(text, None));
             assert_eq!(carried, text, "rewrote {text:?}");
         }
     }
@@ -969,11 +984,11 @@ mod tool_summary_tests {
     #[test]
     fn a_turn_that_used_no_tool_is_unchanged() {
         assert_eq!(
-            with_tool_summary(&assistant("Yes, that is right.", None)),
+            prepare(&assistant("Yes, that is right.", None)),
             "Yes, that is right."
         );
         assert_eq!(
-            with_tool_summary(&assistant("Yes, that is right.", Some("   "))),
+            prepare(&assistant("Yes, that is right.", Some("   "))),
             "Yes, that is right."
         );
     }
@@ -983,6 +998,411 @@ mod tool_summary_tests {
     fn the_summary_is_added_for_the_model_not_stored_in_the_message() {
         let message = assistant("Done.", Some("[this turn used: sandbox.run_code]"));
         assert_eq!(message.content, "Done.", "the transcript was rewritten");
-        assert!(with_tool_summary(&message).contains("sandbox.run_code"));
+        assert!(prepare(&message).contains("sandbox.run_code"));
+    }
+}
+
+/// What production actually calls, exercised the way production calls it.
+///
+/// ## Why this module exists separately from `tests` above
+///
+/// `tests` covers [`fit`], which has around eighteen assertions and **no
+/// production caller**. Every chat turn goes through [`fit_with_memory_bus`],
+/// which until this module had none at all. So the behaviour that was tested
+/// and the behaviour that shipped were different behaviours, and the difference
+/// — dropped tool summaries, document pins that did nothing, protected turns
+/// vanishing into a count — was invisible precisely because the tested path was
+/// the dead one.
+///
+/// Each test here reproduces the call `commands::agent::drive_run` makes: a
+/// conversation read through the owner filter, a budget from [`budget_for`]
+/// against the *served* window, the stored pin list, and the question as typed.
+#[cfg(test)]
+mod production_projection_tests {
+    use super::*;
+    use crate::agent_runtime::chat_memory_bus::PinOmission;
+
+    const SHA: &str = "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34";
+
+    fn turn(id: &str, role: MessageRole, content: &str, summary: Option<&str>) -> Message {
+        Message {
+            id: id.to_string(),
+            conversation_id: "c1".to_string(),
+            role,
+            content: content.to_string(),
+            status: MessageStatus::Done,
+            run_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            completed_at: None,
+            elapsed_ms: None,
+            error: None,
+            model_name: None,
+            model_role: None,
+            used_fallback: None,
+            tokens_in: None,
+            tokens_out: None,
+            outcome: None,
+            verification: None,
+            tool_summary: summary.map(str::to_string),
+        }
+    }
+
+    fn thread(messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: "c1".to_string(),
+            owner_user_id: "owner-1".to_string(),
+            title: "t".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity_at: "2026-01-01T00:00:00Z".to_string(),
+            messages,
+            runs: Vec::new(),
+            compactions: 0,
+            pinned_context: Vec::new(),
+            routed_role: None,
+            routed_model_id: None,
+        }
+    }
+
+    /// A thread long enough that a small window has to choose.
+    fn long_thread() -> Conversation {
+        let mut messages = Vec::new();
+        messages.push(turn(
+            "u-rule",
+            MessageRole::User,
+            "Standing instruction: every pressure is to be given in bar, never PSI.",
+            None,
+        ));
+        messages.push(turn("a-rule", MessageRole::Assistant, "Understood.", None));
+        messages.push(turn(
+            "u-doc",
+            MessageRole::User,
+            &format!("Here is the vessel drawing, stored as {SHA}."),
+            None,
+        ));
+        messages.push(turn(
+            "a-doc",
+            MessageRole::Assistant,
+            "I have read the drawing. The design pressure is 10 bar. [E1]",
+            Some("[this turn used: knowledge.search_authorized x2]"),
+        ));
+        for i in 0..14 {
+            messages.push(turn(
+                &format!("u{i}"),
+                MessageRole::User,
+                &format!("Filler question {i} about scheduling and unrelated logistics."),
+                None,
+            ));
+            messages.push(turn(
+                &format!("a{i}"),
+                MessageRole::Assistant,
+                &format!("Filler answer {i} about scheduling and unrelated logistics."),
+                None,
+            ));
+        }
+        messages.push(turn(
+            "u-now",
+            MessageRole::User,
+            "What was the design pressure?",
+            None,
+        ));
+        messages.push(turn("cell", MessageRole::Assistant, "", None));
+        thread(messages)
+    }
+
+    /// The production call, with the arguments `drive_run` builds.
+    fn project(
+        conversation: &Conversation,
+        served_window: u32,
+        committed: u32,
+        pinned: &[&str],
+        question: &str,
+    ) -> FittedContext {
+        let stored: Vec<String> = pinned.iter().map(|pin| (*pin).to_string()).collect();
+        fit_with_memory_bus(
+            conversation,
+            "cell",
+            budget_for(served_window, committed),
+            &stored,
+            question,
+        )
+    }
+
+    fn carried(fitted: &FittedContext) -> String {
+        fitted
+            .turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A pin pressed on a transcript row.
+    #[test]
+    fn a_message_pin_is_honoured_on_the_production_path() {
+        let convo = long_thread();
+        let fitted = project(&convo, 2_048, 1_600, &["msg:u-rule"], "design pressure");
+        assert!(
+            carried(&fitted).contains("never PSI"),
+            "the pinned standing instruction was not carried"
+        );
+        assert!(fitted.omitted_pins.is_empty());
+    }
+
+    /// A pin pressed on a *document* row, which is the case the shipped path
+    /// dropped entirely: it compared the sha against message ids and nothing
+    /// else, so pinning a drawing did nothing at all.
+    #[test]
+    fn a_document_pin_keeps_the_turn_that_carries_it() {
+        let convo = long_thread();
+        let stored = format!("sha256:{SHA}");
+        let fitted = project(&convo, 2_048, 1_600, &[stored.as_str()], "scheduling");
+        assert!(
+            carried(&fitted).contains(SHA),
+            "the turn carrying the pinned document was not kept"
+        );
+    }
+
+    /// The same pin as a bare string, which is how every pin already on disk is
+    /// stored. Narrowing this to an exact message-id comparison is the
+    /// regression being undone.
+    #[test]
+    fn a_legacy_document_pin_still_works_and_case_does_not_matter() {
+        let convo = long_thread();
+        for stored in [SHA.to_string(), SHA.to_uppercase()] {
+            let fitted = project(&convo, 2_048, 1_600, &[stored.as_str()], "scheduling");
+            assert!(
+                carried(&fitted).contains(SHA),
+                "legacy pin {stored} was not honoured"
+            );
+        }
+        // And a legacy *message* pin, spelled differently from the stored id.
+        let fitted = project(&convo, 2_048, 1_600, &["U-RULE"], "scheduling");
+        assert!(carried(&fitted).contains("never PSI"));
+    }
+
+    /// A turn's tools travel with its words. The shipped path sent
+    /// `content.trim()` and dropped every summary, so a thread that had created
+    /// a file reached the next turn with no record of the file existing.
+    #[test]
+    fn a_tool_summary_reaches_the_model() {
+        let convo = long_thread();
+        let fitted = project(&convo, 8_192, 1_000, &[], "design pressure");
+        assert!(
+            carried(&fitted).contains("knowledge.search_authorized"),
+            "the tool summary was dropped on the way to the model"
+        );
+    }
+
+    /// An `[E1]` from an earlier run must not arrive looking resolvable.
+    #[test]
+    fn an_earlier_turns_evidence_markers_cannot_become_this_turns_evidence() {
+        let convo = long_thread();
+        let fitted = project(&convo, 8_192, 1_000, &[], "design pressure");
+        let text = carried(&fitted);
+        assert!(text.contains("10 bar"), "the answer itself was not carried");
+        assert!(!text.contains("[E1]"), "a stale marker survived");
+        assert!(text.contains("[cited earlier]"));
+    }
+
+    /// The invariant the costing bug broke: the transformed content fits the
+    /// budget it was measured against, and `tokens` describes that content.
+    #[test]
+    fn the_final_transformed_content_fits_the_budget() {
+        let convo = long_thread();
+        for (window, committed) in [
+            (512u32, 100u32),
+            (1_024, 300),
+            (2_048, 1_600),
+            (4_096, 2_000),
+            (8_192, 1_000),
+            (32_768, 4_000),
+        ] {
+            let budget = budget_for(window, committed);
+            let fitted = project(&convo, window, committed, &[], "design pressure");
+            assert!(
+                fitted.tokens <= budget,
+                "window {window}: {} tokens against a budget of {budget}",
+                fitted.tokens
+            );
+            let rendered: u32 = fitted
+                .turns
+                .iter()
+                .map(|turn| estimate_tokens(&turn.content))
+                .sum();
+            assert_eq!(
+                rendered, fitted.tokens,
+                "window {window}: the reported cost is not the cost of what was rendered"
+            );
+        }
+    }
+
+    /// Relevance, not merely recency: the fact the question is about is fourteen
+    /// exchanges back and behind a wall of unrelated filler.
+    #[test]
+    fn a_relevant_old_fact_survives_a_wall_of_filler() {
+        let convo = long_thread();
+        let fitted = project(&convo, 4_096, 2_000, &[], "What was the design pressure?");
+        assert!(
+            carried(&fitted).contains("10 bar"),
+            "the relevant old answer was not retrieved"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_carries_nothing_and_reports_the_pins_it_could_not_honour() {
+        let convo = long_thread();
+        let fitted = project(&convo, 0, 0, &["msg:u-rule"], "anything");
+        assert!(fitted.turns.is_empty());
+        assert_eq!(fitted.tokens, 0);
+        assert!(fitted.dropped > 0);
+        assert_eq!(fitted.omitted_pins.len(), 1);
+        assert_eq!(fitted.omitted_pins[0].pin, "msg:u-rule");
+    }
+
+    /// Several protected turns, none of which can fit. Each is named; none is
+    /// carried past the budget; the turn does not pretend they were included.
+    #[test]
+    fn several_oversized_pins_are_each_reported_and_none_is_smuggled_in() {
+        let bulk = "padding word ".repeat(400);
+        let convo = thread(vec![
+            turn("p1", MessageRole::User, &format!("first {bulk}"), None),
+            turn("r1", MessageRole::Assistant, "noted", None),
+            turn("p2", MessageRole::User, &format!("second {bulk}"), None),
+            turn("r2", MessageRole::Assistant, "noted", None),
+            turn("p3", MessageRole::User, &format!("third {bulk}"), None),
+            turn("r3", MessageRole::Assistant, "noted", None),
+            turn("u-now", MessageRole::User, "now what", None),
+            turn("cell", MessageRole::Assistant, "", None),
+        ]);
+        let budget = budget_for(1_024, 700);
+        let fitted = project(
+            &convo,
+            1_024,
+            700,
+            &["msg:p1", "msg:p2", "msg:p3"],
+            "now what",
+        );
+        assert_eq!(fitted.omitted_pins.len(), 3);
+        assert!(fitted
+            .omitted_pins
+            .iter()
+            .all(|omitted| matches!(omitted.reason, PinOmission::ExceedsBudget { .. })));
+        assert!(
+            fitted.tokens <= budget,
+            "{} tokens against a budget of {budget}",
+            fitted.tokens
+        );
+        assert!(!carried(&fitted).contains("padding word"));
+    }
+
+    /// A question in Japanese or Hindi retrieves its own earlier answer. The old
+    /// keyword filter counted UTF-8 *bytes*, so which words counted as keywords
+    /// depended on the script rather than on the words.
+    #[test]
+    fn a_question_in_another_script_retrieves_its_own_earlier_answer() {
+        let cases = [
+            (
+                "\u{5727}\u{529B} \u{306F} \u{3069}\u{308C}",
+                "\u{5727}\u{529B} \u{306F} 10 bar",
+            ),
+            (
+                "\u{915}\u{94B}\u{921} \u{915}\u{939}\u{93E}\u{901}",
+                "\u{915}\u{94B}\u{921} \u{92F}\u{939}\u{93E}\u{901} \u{939}\u{948}",
+            ),
+        ];
+        for (question, fact) in cases {
+            let mut messages = vec![
+                turn("u-fact", MessageRole::User, question, None),
+                turn("a-fact", MessageRole::Assistant, fact, None),
+            ];
+            for i in 0..14 {
+                messages.push(turn(
+                    &format!("u{i}"),
+                    MessageRole::User,
+                    &format!("Filler {i} about scheduling and unrelated logistics."),
+                    None,
+                ));
+                messages.push(turn(
+                    &format!("a{i}"),
+                    MessageRole::Assistant,
+                    &format!("Filler answer {i} about scheduling."),
+                    None,
+                ));
+            }
+            messages.push(turn("u-now", MessageRole::User, question, None));
+            messages.push(turn("cell", MessageRole::Assistant, "", None));
+
+            let convo = thread(messages);
+            let fitted = project(&convo, 4_096, 2_000, &[], question);
+            assert!(
+                carried(&fitted).contains(fact),
+                "{question}: the earlier answer was not retrieved"
+            );
+        }
+    }
+
+    /// Projection is a view. Two models with different windows see different
+    /// amounts of the same thread, and neither changes the thread.
+    #[test]
+    fn a_smaller_and_a_larger_model_leave_the_stored_history_untouched() {
+        let convo = long_thread();
+        let before: Vec<(String, String)> = convo
+            .messages
+            .iter()
+            .map(|message| (message.id.clone(), message.content.clone()))
+            .collect();
+
+        let small = project(&convo, 1_024, 300, &[], "design pressure");
+        let large = project(&convo, 32_768, 4_000, &[], "design pressure");
+
+        let after: Vec<(String, String)> = convo
+            .messages
+            .iter()
+            .map(|message| (message.id.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(before, after, "projecting changed the stored conversation");
+
+        assert!(
+            large.turns.len() > small.turns.len(),
+            "a larger window carried no more of the thread"
+        );
+        // Retention is a property of the thread, not of the model looking at it.
+        let small_retained = small.retention.expect("measured").retained_tokens;
+        let large_retained = large.retention.expect("measured").retained_tokens;
+        assert_eq!(small_retained, large_retained);
+        assert!(small_retained > 0);
+    }
+
+    /// Retention is measured against the advertised figure and never enforced
+    /// by deleting anything.
+    #[test]
+    fn retention_is_reported_rather_than_imposed() {
+        let convo = long_thread();
+        let fitted = project(&convo, 1_024, 300, &[], "design pressure");
+        let retention = fitted.retention.expect("the production path measures it");
+        assert_eq!(
+            retention.limit_tokens,
+            crate::agent_runtime::chat_memory_bus::CHAT_RETENTION_LIMIT
+        );
+        assert!(!retention.exceeds_limit);
+        assert!(
+            retention.retained_tokens > fitted.tokens,
+            "a thread this long should retain more than one turn projects"
+        );
+    }
+
+    /// The question being asked right now is never seeded as history — the
+    /// contract the module header states, checked on the production path.
+    #[test]
+    fn this_turns_question_is_not_in_the_history() {
+        let convo = long_thread();
+        let fitted = project(&convo, 32_768, 1_000, &[], "What was the design pressure?");
+        assert!(
+            !fitted
+                .turns
+                .iter()
+                .any(|turn| turn.content.contains("What was the design pressure?")),
+            "the current question was seeded as history"
+        );
     }
 }

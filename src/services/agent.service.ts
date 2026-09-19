@@ -1174,6 +1174,59 @@ export interface HistoryTrim {
   tokens: number;
   /** The served window they were budgeted against. */
   windowTokens: number;
+  /**
+   * Pins the turn could not honour, one entry each.
+   *
+   * Deliberately not folded into `dropped`. An old message ageing out of a
+   * window is the window working; a pin that could not be carried is somebody's
+   * explicit instruction going unmet, and the two need different words on
+   * screen. Absent or empty is the ordinary case.
+   */
+  omittedPins?: OmittedPin[];
+  /** What the whole thread costs to keep, measured. */
+  retention?: RetentionStatus;
+}
+
+/** Why a pinned item could not be carried into a turn. */
+export type PinOmissionReason =
+  | {
+      /**
+       * Larger on its own than the entire history budget. No ordering of pins
+       * would have carried it — a wider window or a shorter turn is the answer.
+       */
+      reason: 'exceedsBudget';
+      budgetTokens: number;
+      costTokens: number;
+    }
+  | {
+      /** It would have fitted alone; earlier pins had spent the budget. */
+      reason: 'budgetSpent';
+      remainingTokens: number;
+      costTokens: number;
+    };
+
+/** One pinned obligation a turn could not meet. */
+export interface OmittedPin {
+  /** The pin as stored, so it can be matched against the panel's own list. */
+  pin: string;
+  /** `message`, `source`, `artifact` or `legacy`. */
+  kind: string;
+  /** The message the pin protected and the turn could not carry. */
+  messageId: string;
+  reason: PinOmissionReason;
+}
+
+/**
+ * What a conversation costs to retain, measured against the advertised figure.
+ *
+ * Nothing is ever deleted to satisfy `limitTokens`. A thread past it is
+ * reported, not trimmed — see `CHAT_RETENTION_LIMIT` in the Rust bus for why
+ * that is the policy rather than a cap.
+ */
+export interface RetentionStatus {
+  retainedTokens: number;
+  limitTokens: number;
+  exceedsLimit: boolean;
 }
 
 /** One time a run's older history was replaced by a summary. */
@@ -1429,6 +1482,10 @@ export type AgentEvent =
       carried: number;
       tokens: number;
       windowTokens: number;
+      /** Pins the turn could not honour. Absent when every pin was carried. */
+      omittedPins?: OmittedPin[];
+      /** What the whole thread costs to keep. Absent on older events. */
+      retention?: RetentionStatus;
     }
   | {
       /**

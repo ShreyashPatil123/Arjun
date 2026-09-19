@@ -340,3 +340,61 @@ describe('merging', () => {
     expect(rows.map(r => r.id)).toEqual(['sha-abc']);
   });
 });
+
+describe('pin references', () => {
+  const SHA = 'ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34';
+
+  /**
+   * The failure this addresses: a pin was the row's bare id, so Rust could not
+   * tell a message id from a document hash and the shipped projection guessed
+   * message — which made pinning a document do nothing at all.
+   */
+  it('names a transcript row as a message', () => {
+    const [row] = mergeAttachments([entity({ id: 'a-7f3c', section: 'transcript' })], []);
+    expect(row.pinRef).toBe('msg:a-7f3c');
+  });
+
+  it('names an attachment as a source', () => {
+    const [row] = mergeAttachments([], [attachment({ sha256: SHA })]);
+    expect(row.pinRef).toBe(`sha256:${SHA}`);
+  });
+
+  it('names an evidence row as a source only when its id really is a hash', () => {
+    const [hashed] = mergeAttachments([entity({ id: SHA, section: 'evidence' })], []);
+    expect(hashed.pinRef).toBe(`sha256:${SHA}`);
+
+    const [named] = mergeAttachments(
+      [entity({ id: 'passage-4', section: 'evidence' })],
+      [],
+    );
+    // Not guessed. A bare id is read by Rust as a legacy pin and matched both
+    // ways, which is wider than needed and the safe direction.
+    expect(named.pinRef).toBe('passage-4');
+  });
+
+  it('leaves a row whose kind is not established untyped', () => {
+    for (const section of ['skill', 'notes', 'toolSchema', 'system'] as const) {
+      const [row] = mergeAttachments([entity({ id: 'x1', section })], []);
+      expect(row.pinRef).toBe('x1');
+    }
+  });
+
+  /**
+   * Every row must offer a pin reference, or the panel would send `undefined`
+   * for some rows and silently protect nothing.
+   */
+  it('gives every row a non-empty reference', () => {
+    const rows = mergeAttachments(
+      [
+        entity({ id: 'a1', section: 'transcript' }),
+        entity({ id: 'p1', section: 'evidence' }),
+        entity({ id: 's1', section: 'skill' }),
+      ],
+      [attachment({ sha256: SHA })],
+    );
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.pinRef.length).toBeGreaterThan(0);
+    }
+  });
+});

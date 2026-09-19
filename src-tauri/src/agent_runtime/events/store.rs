@@ -909,18 +909,52 @@ impl TaskEventLog {
             .lock()
             .map_err(|_| "the task event log is poisoned".to_string())?;
 
-        let held: Option<i64> = conn
+        let held: Option<(i64, String)> = conn
             .query_row(
-                "SELECT last_event_seq FROM run_checkpoints WHERE run_id = ?1",
+                "SELECT last_event_seq, body FROM run_checkpoints WHERE run_id = ?1",
                 [&checkpoint.run_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
 
-        if let Some(held) = held {
-            if held > checkpoint.last_event_seq {
+        if let Some((held_seq, held_body)) = held {
+            // A late write from a dying process cannot move the point backwards.
+            if held_seq > checkpoint.last_event_seq {
                 return Ok(false);
+            }
+
+            // Nor can a *forward* write empty it.
+            //
+            // The sequence guard alone was not enough, and the gap it left is
+            // the one that mattered: an empty checkpoint taken after a complete
+            // one has a *higher* sequence, so it passed the guard and replaced
+            // a record of a run that had done things with a record of a run
+            // that had done nothing. That was the shape of every checkpoint
+            // this code took in production, because `remember_outcome` passed
+            // `RunMemory::default()`.
+            //
+            // The notes now come from what `state_commit` accepted, so this
+            // should never fire. It is kept because "should never" is the
+            // condition under which a resume point is silently destroyed, and
+            // one comparison is cheaper than that.
+            if let Ok(previous) = serde_json::from_str::<RunCheckpoint>(&held_body) {
+                if checkpoint.notes.is_empty() && !previous.notes.is_empty() {
+                    log::warn!(
+                        "[tasks] run {}: a checkpoint carrying no notes was refused because the                          stored one carries some; the resume point was left where it was",
+                        checkpoint.run_id
+                    );
+                    return Ok(false);
+                }
+                // The same rule for the manifest: losing the record of what the
+                // turn was built from makes a resumption unable to rebuild it.
+                if checkpoint.manifest.is_none() && previous.manifest.is_some() {
+                    log::warn!(
+                        "[tasks] run {}: a checkpoint carrying no context manifest was refused                          because the stored one carries one",
+                        checkpoint.run_id
+                    );
+                    return Ok(false);
+                }
             }
         }
 
@@ -1010,6 +1044,258 @@ impl TaskEventLog {
         idempotency::all_with_status(&conn, EffectStatus::Unknown)
             .map_err(|error| error.to_string())
     }
+
+    /// Every effect of one run that has not settled, pending or unknown.
+    ///
+    /// The question a model handoff asks before it will hand anything over. See
+    /// [`crate::agent_runtime::model_transition::drain_for`]: an effect with no
+    /// recorded outcome cannot be described to a different model as having
+    /// happened or not, so it is a question for a person rather than an input to
+    /// a decision.
+    pub fn unsettled_effects_for_run(&self, run_id: &str) -> Result<Vec<RecordedOutcome>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        idempotency::unsettled_for_run(&conn, run_id).map_err(|error| error.to_string())
+    }
+
+    // -- The model-binding transition ledger ------------------------------
+    //
+    // Kept in this database rather than beside the agent registry, and the
+    // reason is the crash window. The ledger row that says "the registry write
+    // is next" has to be durable *before* that write happens, and it has to be
+    // readable by the same recovery path that reads the checkpoints. One store
+    // for both means one write ordering to reason about instead of two.
+
+    /// Writes a transition, opening it or moving it on.
+    ///
+    /// The partial unique index on unsettled rows means a second *open*
+    /// transition for the same agent is refused by SQLite rather than by a check
+    /// here. That is deliberate: two administrators pressing the button on the
+    /// same agent is the ordinary case for a screen that lists agents, and a
+    /// check in Rust would be a check two threads could both pass.
+    pub fn save_transition(
+        &self,
+        record: &crate::agent_runtime::model_transition::TransitionRecord,
+    ) -> Result<(), String> {
+        let body = serde_json::to_string(record)
+            .map_err(|error| format!("the transition could not be written: {error}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+
+        conn.execute(
+            "INSERT INTO agent_model_transitions
+                 (transition_id, agent_id, run_id, phase, outcome, from_model_id, to_model_id,
+                  requested_by, requested_at, settled_at, schema_version, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(transition_id) DO UPDATE SET
+                 run_id = excluded.run_id,
+                 phase = excluded.phase,
+                 outcome = excluded.outcome,
+                 settled_at = excluded.settled_at,
+                 body = excluded.body",
+            rusqlite::params![
+                record.transition_id,
+                record.agent_id,
+                record.run_id,
+                record.phase.as_str(),
+                record.outcome().as_str(),
+                record.from_model.model_id,
+                record.to_model.model_id,
+                record.requested_by,
+                record.requested_at,
+                record.settled_at,
+                record.schema_version,
+                body,
+            ],
+        )
+        .map_err(|error| {
+            // Named specifically, because the generic message would send an
+            // administrator to look at their disk when what actually happened
+            // is that somebody else is already moving this agent.
+            if error.to_string().contains("agent_model_transitions_one_open") {
+                format!(
+                    "{} already has a model change under way. Two handoffs of one agent would \
+                     race over the same record, so the second is refused. Wait for the first to \
+                     settle, or roll it back.",
+                    record.agent_id
+                )
+            } else {
+                format!("the transition could not be saved: {error}")
+            }
+        })?;
+        Ok(())
+    }
+
+    /// One transition by id.
+    pub fn transition(
+        &self,
+        transition_id: &str,
+    ) -> Result<Option<crate::agent_runtime::model_transition::TransitionRecord>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT body FROM agent_model_transitions WHERE transition_id = ?1",
+                [transition_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        body.map(|body| parse_transition(&body)).transpose()
+    }
+
+    /// The transition this agent has under way, if any.
+    pub fn open_transition_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::agent_runtime::model_transition::TransitionRecord>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT body FROM agent_model_transitions
+                  WHERE agent_id = ?1 AND settled_at IS NULL",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        body.map(|body| parse_transition(&body)).transpose()
+    }
+
+    /// This agent's transitions, newest first.
+    pub fn transitions_for_agent(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::agent_runtime::model_transition::TransitionRecord>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT body FROM agent_model_transitions
+                  WHERE agent_id = ?1 ORDER BY requested_at DESC, rowid DESC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![agent_id, limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let body = row.map_err(|error| error.to_string())?;
+            // One unreadable row does not hide the rest. A record written by a
+            // newer build is reported where it is asked for by id, and skipped
+            // with a log line in a list: a history screen that refuses to draw
+            // at all is less useful than one with a gap in it.
+            match parse_transition(&body) {
+                Ok(record) => out.push(record),
+                Err(detail) => {
+                    log::warn!("[agents] a transition record was not readable: {detail}")
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The most recent model change that touched one run.
+    ///
+    /// Read by the resumption path, which continues a run under the model its
+    /// saved state was written with. When those two disagree — the binding
+    /// moved and the run has not checkpointed since — this is what lets the log
+    /// line say *why* rather than reporting a model nobody asked for.
+    pub fn latest_transition_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::agent_runtime::model_transition::TransitionRecord>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT body FROM agent_model_transitions
+                  WHERE run_id = ?1 ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        body.map(|body| parse_transition(&body)).transpose()
+    }
+
+    /// Every transition that has not settled, for the reconciliation at
+    /// start-up.
+    ///
+    /// A row still open at start-up is a handoff the process died in the middle
+    /// of. See
+    /// [`crate::agent_runtime::model_transition::PendingCommit::reconcile`] for
+    /// what is then read off the registry, and why the answer is three-valued.
+    pub fn open_transitions(
+        &self,
+    ) -> Result<Vec<crate::agent_runtime::model_transition::TransitionRecord>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT body FROM agent_model_transitions
+                  WHERE settled_at IS NULL ORDER BY requested_at",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let body = row.map_err(|error| error.to_string())?;
+            match parse_transition(&body) {
+                Ok(record) => out.push(record),
+                Err(detail) => log::warn!(
+                    "[agents] an unsettled transition could not be read, so it was not \
+                     reconciled: {detail}"
+                ),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Reads a stored transition, refusing one this build only partly understands.
+///
+/// The same rule a checkpoint is read under: a record that decides which model
+/// an agent is bound to is not worth half-reading.
+fn parse_transition(
+    body: &str,
+) -> Result<crate::agent_runtime::model_transition::TransitionRecord, String> {
+    use crate::agent_runtime::model_transition::TRANSITION_SCHEMA_VERSION;
+
+    let record: crate::agent_runtime::model_transition::TransitionRecord =
+        serde_json::from_str(body)
+            .map_err(|error| format!("a stored model transition could not be parsed: {error}"))?;
+    if record.schema_version != TRANSITION_SCHEMA_VERSION {
+        return Err(format!(
+            "a model transition was recorded in format {} and this build reads {}; it has not \
+             been acted on, because a record that says which model an agent is bound to is not \
+             worth half-understanding",
+            record.schema_version, TRANSITION_SCHEMA_VERSION
+        ));
+    }
+    Ok(record)
 }
 
 /// The endings a run can have. Kept next to the query that uses them so a new

@@ -23,6 +23,7 @@ fn at_seq(run_id: &str, attempt: &str, seq: i64) -> RunCheckpoint {
         seq,
         RunMemory::default(),
         None,
+        None,
         "plan-hash",
         "policy-hash",
         "workspace-hash",

@@ -35,6 +35,8 @@ pub mod audit_health;
 pub mod cancellation;
 pub mod chat_memory_bus;
 pub mod completion;
+pub mod context_compiler;
+pub mod context_manifest;
 pub mod conversations;
 pub mod doc_pipeline;
 pub mod documents;
@@ -42,13 +44,17 @@ pub mod events;
 pub mod grants;
 pub mod memory;
 pub mod memory_api;
+pub mod model_handoff;
+pub mod model_transition;
 pub mod outcome;
+pub mod pins;
 pub mod planning;
 pub mod protocol;
 pub mod recording;
 pub mod resume;
 pub mod retrieval;
 pub mod stages;
+pub mod state_commit;
 pub mod tasks;
 pub mod tool_policy;
 pub mod turn_context;
@@ -104,6 +110,12 @@ pub const AGENT_DURABLE_EVENT: &str = "agent://durable";
 /// Held rather than reached for so the handlers stay testable without a Tauri
 /// app: the tests at the bottom build one of these directly.
 pub struct RuntimeDeps {
+    /// The authoritative runtime-memory graph, when this deployment has one.
+    ///
+    /// `None` only where the graph could not be opened — the run still works,
+    /// and `context.refresh` says plainly that it cannot compile context rather
+    /// than returning an empty set that reads as "the graph is empty".
+    pub memory_graph: Option<Arc<crate::knowledge::graph::runtime_store::MemoryGraph>>,
     pub index: Arc<KnowledgeIndex>,
     pub session: Arc<std::sync::RwLock<Option<Session>>>,
     /// Where a run's files live, keyed by run id.
@@ -208,6 +220,13 @@ pub struct RuntimeDeps {
     /// the runner was constructed with `subagents: None` on the agent path, so
     /// the manager the application had built was never handed to it.
     pub subagents: Arc<crate::subagents::SubagentManager>,
+    /// The models this machine has.
+    ///
+    /// Held so a delegated worker's model is chosen by
+    /// `subagents::certification::choose` against real registry entries rather
+    /// than asserted. `None` on a path with no registry in reach, and the
+    /// delegation then refuses by name instead of inventing a model id.
+    pub registry: Option<Arc<crate::registry::ModelRegistry>>,
     /// The page-region and table half of the knowledge index.
     ///
     /// Backs `knowledge.multimodal_retrieve`. Never constructed outside tests
@@ -631,11 +650,234 @@ async fn handle(
         // from the caller. See [`memory_api`].
         "memory.recall_authorized" => memory_api::recall_authorized(params, deps),
         "memory.promote_approved" => memory_api::promote_approved(params, deps),
+        // The loop's account of itself, checked against the record before any
+        // of it is written. See `state_commit` for which claims are checked and
+        // why each one is. This is the only way notes reach a checkpoint.
+        "state.commit" => state_commit_handler(params, deps),
+        // The boundary before every model round. See `context_refresh_handler`
+        // for why run-start injection alone is not enough.
+        "context.refresh" => context_refresh_handler(params, deps),
         other => Err(WireError::new(
             code::UNKNOWN_METHOD,
             format!("no handler for {other}"),
         )),
     }
+}
+
+/// Accepts one state commit from the loop.
+///
+/// ## Why this is a request and not a notification
+///
+/// Because the answer matters to the loop. Rust drops claims it cannot
+/// corroborate, and a loop that never learned which ones were dropped would
+/// propose them again on every commit and go on believing a completed effect
+/// that Rust does not hold. The outcome carries the notes as written, so the
+/// two copies converge.
+///
+/// ## Why a refusal is an error and a correction is not
+///
+/// A refusal means the commit was not considered at all — a version this build
+/// cannot read, or an attempt that is not the one running. That is a fault the
+/// loop should see as one. A correction means the commit *was* applied, with
+/// something dropped; the run continues, and the record says what changed.
+fn state_commit_handler(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+    let proposal: crate::agent_runtime::state_commit::StateProposal =
+        serde_json::from_value(params).map_err(|error| {
+            WireError::new(
+                code::BAD_PARAMS,
+                format!("state.commit needs a typed proposal: {error}"),
+            )
+        })?;
+
+    // The same gate every other method here passes: a run id this side has not
+    // issued has no authority to write anything under that id. `commit_state`
+    // checks the attempt as well, which is the narrower question.
+    if !has_registered_plan(deps, &proposal.run_id) {
+        return Err(no_plan_error(&proposal.run_id));
+    }
+
+    let outcome = deps.commit_state(&proposal);
+    if !outcome.accepted {
+        return Err(WireError::new(
+            code::REFUSED,
+            outcome
+                .refused_because
+                .unwrap_or_else(|| "the state commit was refused".to_string()),
+        ));
+    }
+    serde_json::to_value(outcome).map_err(|error| {
+        WireError::new(
+            code::INTERNAL,
+            format!("the commit outcome could not be encoded: {error}"),
+        )
+    })
+}
+
+/// Recompiles context for the round the loop is about to make.
+///
+/// ## Why this exists at all
+///
+/// Because run-start injection is insufficient, and the way it fails is quiet.
+/// A run that makes twelve tool calls used to send the model the context
+/// compiled before the first one. An operator recording a correction at call
+/// three reached the model at call four only if the model happened to re-read
+/// it — and a fact another agent committed to the same task never arrived at
+/// all. The loop looked like it was working with current information because
+/// nothing said otherwise.
+///
+/// So the loop asks, here, before each round: after a tool, after a compaction,
+/// on a retry and on recovery. Rust answers with a freshly authorised set at a
+/// freshly read cursor.
+///
+/// ## Why the loop cannot do this for itself
+///
+/// The three things that decide the answer all live on this side. The session
+/// is here, so authorisation is here. The graph revision is here, so the cursor
+/// is here. And the admission rules — which claims count as established and
+/// which are only proposals — are here. A loop that assembled its own context
+/// would be assembling it without any of them.
+fn context_refresh_handler(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireError> {
+    use crate::agent_runtime::context_compiler::{ContextCompiler, FrozenScope, Reserves,
+        RetrievalMode};
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Request {
+        run_id: String,
+        task_id: String,
+        agent_id: String,
+        #[serde(default)]
+        definition_version: u64,
+        model_id: String,
+        served_window: u32,
+        #[serde(default)]
+        question: String,
+        /// Content hashes the round already carries. A block whose hash is here
+        /// is not injected a second time.
+        #[serde(default)]
+        already_carried: Vec<String>,
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        template_id: Option<String>,
+        #[serde(default)]
+        reserved_tool_schemas: u32,
+        #[serde(default)]
+        reserved_output: u32,
+        #[serde(default)]
+        reserved_framing: u32,
+    }
+
+    let request: Request = serde_json::from_value(params).map_err(|error| {
+        WireError::new(
+            code::BAD_PARAMS,
+            format!("context.refresh needs a typed request: {error}"),
+        )
+    })?;
+
+    // The same gate every other method here passes.
+    if !has_registered_plan(deps, &request.run_id) {
+        return Err(no_plan_error(&request.run_id));
+    }
+
+    let Some(graph) = deps.memory_graph.as_ref() else {
+        // Said plainly rather than answered with an empty set. "There is no
+        // graph on this deployment" and "the graph holds nothing for this task"
+        // are different facts, and a loop told the second when the first is true
+        // would report a working memory feature that is not running.
+        return Err(WireError::new(
+            code::REFUSED,
+            "this deployment has no runtime memory graph, so context cannot be recompiled for              this round"
+                .to_string(),
+        ));
+    };
+
+    let session = {
+        let held = deps.session.read().map_err(|_| {
+            WireError::new(code::INTERNAL, "the session lock is poisoned".to_string())
+        })?;
+        held.clone().ok_or_else(|| {
+            WireError::new(
+                code::REFUSED,
+                "nobody is signed in, so no context may be authorised".to_string(),
+            )
+        })?
+    };
+
+    // Read fresh. A cached cursor is a cursor that can describe a state the
+    // graph has already moved past.
+    let graph_revision = graph.graph_revision().map_err(|error| {
+        WireError::new(code::INTERNAL, error.explain())
+    })?;
+
+    let scope = FrozenScope {
+        task_id: request.task_id,
+        agent_id: request.agent_id,
+        definition_version: request.definition_version,
+        graph_revision,
+        model_id: request.model_id.clone(),
+        template_id: request.template_id,
+        served_window: request.served_window,
+        project_id: request.project_id,
+    };
+
+    // A base manifest for this round. The conversation-level half was settled
+    // when the turn was composed; what this call adds is the graph half.
+    let base = crate::agent_runtime::context_manifest::ContextManifest::new(
+        &request.run_id,
+        "",
+        "",
+        "",
+        &request.model_id,
+        request.served_window,
+        Vec::new(),
+        None,
+        crate::agent_runtime::context_manifest::HistoryBinding {
+            carried: 0,
+            dropped: 0,
+            tokens: 0,
+            pinned: Vec::new(),
+            omitted_pins: Vec::new(),
+        },
+    );
+
+    let compiled = ContextCompiler::new(graph)
+        .compile(
+            &session,
+            &scope,
+            base,
+            &request.question,
+            &request.already_carried.into_iter().collect(),
+            Reserves {
+                tool_schemas: request.reserved_tool_schemas,
+                output: request.reserved_output,
+                framing: request.reserved_framing,
+                // Nothing here consults the model's own tokenizer, and saying
+                // `tokenizer` when an estimate was used is how a turn overruns
+                // a window it was told it fitted.
+                counted_by: "estimate".to_string(),
+                mode: RetrievalMode::Lexical,
+            },
+        )
+        .map_err(|error| WireError::new(code::INTERNAL, error.explain()))?;
+
+    if compiled.mandatory_overflowed {
+        log::warn!(
+            "[context] run {}: the mandatory context for this round needs more than the window              affords; it was not trimmed",
+            request.run_id
+        );
+    }
+
+    Ok(serde_json::json!({
+        "graphRevision": compiled.manifest.graph.as_ref().map(|g| g.graph_revision),
+        "manifestHash": compiled.manifest.manifest_hash,
+        "mandatoryOverflowed": compiled.mandatory_overflowed,
+        "blocks": compiled.blocks,
+        "contentHashes": compiled.manifest.content_hashes,
+        "omissions": compiled.manifest.omissions,
+        "retrieval": compiled.manifest.retrieval,
+        "budget": compiled.manifest.budget,
+    }))
 }
 
 /// The tools a registered plan permits, or `None` when there is no such plan.
@@ -1923,7 +2165,23 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
             let workspace = deps.root_for(&call.run_id);
             let inherited =
                 inherited_policy_for(deps, &session, &call.run_id, workspace.as_deref());
-            let runner = runner_for(deps, &session, inherited.as_ref(), workspace.as_deref());
+            // The model this run is on, read off its checkpoint seed — the
+            // same field `model_transition` moves when a binding changes, so a
+            // child routed after a handoff is routed against the model the run
+            // is *now* on.
+            let parent_model = deps
+                .checkpoints
+                .lock()
+                .ok()
+                .and_then(|seeds| seeds.get(&call.run_id).map(|seed| seed.model_id.clone()));
+            let runner = runner_for(
+                deps,
+                &session,
+                inherited.as_ref(),
+                workspace.as_deref(),
+                &call.run_id,
+                parent_model.as_deref(),
+            );
             let result = runner.run(tool, &tool_call, resolved_path.as_deref()).await;
             // A successful calculation is kept, so the workbook can show the
             // working rather than the model's memory of it.
@@ -2257,6 +2515,8 @@ fn runner_for<'a>(
     session: &'a Session,
     inherited: Option<&'a InheritedPolicy>,
     workspace: Option<&'a std::path::Path>,
+    run_id: &'a str,
+    parent_model: Option<&'a str>,
 ) -> LocalToolRunner<'a> {
     let mut runner = LocalToolRunner::with_multimodal(
         deps.index.as_ref(),
@@ -2266,6 +2526,13 @@ fn runner_for<'a>(
     runner.subagents = Some(deps.subagents.as_ref());
     runner.inherited = inherited;
     runner.run_workspace = workspace;
+    // The three a delegation needs and nothing else does: which models exist,
+    // which one this run is on, and which task a child would join. Without them
+    // `agent.delegate_readonly` could not choose a model and would be back to
+    // asserting one.
+    runner.models = deps.registry.as_deref();
+    runner.parent_model = parent_model;
+    runner.task_id = Some(run_id);
     runner
 }
 
@@ -3908,6 +4175,10 @@ mod journey_tests;
 mod large_document_tests;
 #[cfg(test)]
 mod memory_boundary_tests;
+#[cfg(test)]
+mod model_transition_tests;
+#[cfg(test)]
+mod recovery_tests;
 #[cfg(test)]
 mod tests;
 

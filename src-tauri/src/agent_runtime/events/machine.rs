@@ -394,6 +394,16 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         // the run into a state for it would make every turn a transition.
         | E::ModelRequested
         | E::ModelResponded
+        // A model change is a fact about what the run is running on, not about
+        // where it has got to. The handoff only ever happens at a boundary the
+        // run was already at — `model_transition::boundary_of` refuses any
+        // other — so the run's position is unchanged by definition, and a state
+        // of its own here would make "the model was swapped" read as "the work
+        // moved on".
+        | E::ModelTransitionStarted
+        | E::ModelTransitionCommitted
+        | E::ModelTransitionFailed
+        | E::ModelTransitionRolledBack
         // The completion check reports; the ending event that follows decides.
         // Keeping these apart is what stops "it was checked" being read as "it
         // passed".

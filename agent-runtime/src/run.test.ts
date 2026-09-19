@@ -139,7 +139,13 @@ function coreStub(handlers: Record<string, (params: unknown) => unknown>) {
      * and says nothing about whether authorisation preceded execution.
      */
     get toolMethods() {
-      return calls.map((call) => call.method).filter((method) => method !== "tool.catalogue");
+      // `context.refresh` is filtered for the same reason as the catalogue: it
+      // fires before *every* model round, so it appears between any two tool
+      // methods and would make a sequence assertion a statement about how many
+      // rounds the model happened to take rather than about the order
+      // authorisation and execution occur in.
+      const notAboutTools = new Set(["tool.catalogue", "context.refresh"]);
+      return calls.map((call) => call.method).filter((method) => !notAboutTools.has(method));
     },
   };
 }

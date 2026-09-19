@@ -63,6 +63,70 @@ fn short_sha(sha256: &str) -> String {
     sha256.chars().take(8).collect()
 }
 
+/// What a delegation call points its worker at.
+///
+/// ## References, and nothing else
+///
+/// Every variant produced here is a name: a content hash, a workspace-relative
+/// path, an artifact id, an expression. The child resolves each one itself,
+/// under its own clearance, and may legitimately get less than the parent did —
+/// which is the property `subagents::packet` exists to hold and the reason there
+/// is no branch here that copies text into a packet.
+///
+/// Unknown keys are ignored rather than refused. A model that passed `pages`
+/// when it meant `files` gets the refusal from the worker, which can say what
+/// *that role* needed; a refusal here would only be able to say what this
+/// function understands.
+fn delegation_inputs(call: &ToolCall) -> Vec<crate::subagents::InputRef> {
+    use crate::subagents::InputRef;
+
+    let strings = |key: &str| -> Vec<String> {
+        call.arguments
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| text.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut inputs: Vec<InputRef> = Vec::new();
+    for sha256 in strings("documents") {
+        inputs.push(InputRef::Document { sha256, page: None });
+    }
+    for path in strings("files") {
+        inputs.push(InputRef::WorkspaceFile { path });
+    }
+    for expression in strings("expressions") {
+        inputs.push(InputRef::Expression { expression });
+    }
+    // Artifacts carry a revision and a hash, so they arrive as objects rather
+    // than as bare names: "the approval note" is not a reference that can be
+    // checked afterwards, and `{id, revision, sha256}` is.
+    if let Some(items) = call.arguments.get("artifacts").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(artifact_id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            inputs.push(InputRef::Artifact {
+                artifact_id: artifact_id.to_string(),
+                revision: item.get("revision").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                sha256: item
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+    }
+    inputs
+}
+
 /// A file's name, without the directory it happens to live in.
 ///
 /// The model wrote a relative name and can only use a relative name; echoing
@@ -145,6 +209,28 @@ pub struct LocalToolRunner<'a> {
     /// Where the run is writing. Workers inherit this as their workspace
     /// root, so a child cannot reach files outside the run.
     pub run_workspace: Option<&'a std::path::Path>,
+    /// The models this machine has, so a child's model is *chosen* rather than
+    /// asserted.
+    ///
+    /// Before this, `delegate_to_subagent` built a `Decision` naming
+    /// `"parent-inherited"` — a string that is not a model id, that no registry
+    /// resolves, and that therefore could not be reserved, loaded or recorded
+    /// against anything. The certification check in
+    /// [`crate::subagents::certification::choose`] existed the whole time and
+    /// had no caller. `None` here means no registry is in reach, and the
+    /// delegation then refuses rather than inventing a model again.
+    pub models: Option<&'a crate::registry::ModelRegistry>,
+    /// The model the parent run is itself using.
+    ///
+    /// Always a legal answer for a child, and the answer whenever a cheaper one
+    /// is refused — see `certification::choose`, which never leaves a child
+    /// without a model because a smaller one was not certified.
+    pub parent_model: Option<&'a str>,
+    /// The task a child joins, which is what its shared memory is scoped by.
+    ///
+    /// `None` falls back to the run, which is this product's task identity for
+    /// a run that is one task.
+    pub task_id: Option<&'a str>,
 }
 
 impl<'a> LocalToolRunner<'a> {
@@ -158,6 +244,9 @@ impl<'a> LocalToolRunner<'a> {
             subagents: None,
             inherited: None,
             run_workspace: None,
+            models: None,
+            parent_model: None,
+            task_id: None,
         }
     }
 
@@ -177,6 +266,9 @@ impl<'a> LocalToolRunner<'a> {
             subagents: None,
             inherited: None,
             run_workspace: None,
+            models: None,
+            parent_model: None,
+            task_id: None,
         }
     }
 
@@ -199,6 +291,9 @@ impl<'a> LocalToolRunner<'a> {
             subagents: Some(subagents),
             inherited: Some(inherited),
             run_workspace: Some(run_workspace),
+            models: None,
+            parent_model: None,
+            task_id: None,
         }
     }
 
@@ -909,20 +1004,81 @@ impl<'a> LocalToolRunner<'a> {
         let profile_owned = profile.to_string();
         let task_owned = task.to_string();
         let inherited_clone = inherited.clone();
-        // The child uses the parent's model rather than picking a fresh
-        // one: requirement 4 says a child inherits the parent's policy,
-        // and the model is part of that. The routing decision here is
-        // the parent's own — recorded for the audit trail.
-        let decision = crate::subagents::certification::Decision {
-            model_id: String::from("parent-inherited"),
-            role: crate::registry::ModelRole::Reasoning,
-            cheaper_than_parent: true,
-            reason: "subagent inherits the parent's model and routing".to_string(),
-            tier: None,
-            score: None,
-        };
+
+        // What the child is pointed at.
+        //
+        // References, never contents — see `subagents::packet`. This used to be
+        // `Vec::new()` unconditionally, so every worker was started with
+        // nothing to work on and three of the four roles had no way to know
+        // what they were meant to read.
+        let inputs = delegation_inputs(call);
+        if inputs.is_empty() && profile != "knowledge-retriever" {
+            return Err(format!(
+                "The {profile} worker is pointed at things rather than asked a question, and \
+                 this call named none. Pass `files` (workspace paths), `artifacts` (files this \
+                 run produced) or `expressions` (figures to re-derive), depending on the role. \
+                 Nothing was started."
+            ));
+        }
+
+        // The model the child will actually use.
+        //
+        // Chosen here rather than asserted: `certification::choose` decides
+        // whether a smaller model is permitted for this role on the strength of
+        // its certification, and falls back to the run's own model whenever it
+        // is not. What was here before named `"parent-inherited"`, which no
+        // registry resolves — so nothing could reserve it, load it, or record a
+        // run against it.
+        let parent_model = self.parent_model.ok_or(
+            "This run has no model recorded, so a child cannot be routed to one. Nothing was \
+             started.",
+        )?;
+        let registry = self.models.ok_or(
+            "The model registry is not in reach on this path, so a child's model cannot be \
+             chosen. Nothing was started.",
+        )?;
+        let declared = subagents
+            .profile(&profile_owned)
+            .ok_or_else(|| format!("There is no subagent profile called {profile_owned:?}."))?;
+        let role = declared.model_role;
+        let candidates: Vec<(&crate::registry::ModelEntry, Option<&crate::model_recommendation::certified_catalog::PackageCertification>)> =
+            registry
+                .all()
+                .iter()
+                .filter(|entry| entry.enabled && entry.serves(role))
+                .map(|entry| (entry, None))
+                .collect();
+        let decision = crate::subagents::certification::choose(role, parent_model, &candidates);
+
+        // Who the child is, what it owes, and what it must see before it starts.
+        //
+        // `after` is how one worker is made to wait for another: a model that
+        // has just been told "Published … at graph revision 12" passes 12 here,
+        // and this child does not begin until the shared memory holds it. That
+        // is the whole of the handoff — no transcript moves between them.
+        let mut dispatch = crate::subagents::manager::Dispatch::for_task(
+            // The agent is the profile: stable for the life of the deployment,
+            // and what this worker's memory is attributed to across every task.
+            &profile_owned,
+            self.task_id.unwrap_or_default(),
+        )
+        .delivering(
+            call.text("deliverable")
+                .unwrap_or("findings with a citation for each"),
+        );
+        if let Some(after) = call.integer("after_revision") {
+            dispatch = dispatch.after(after as i64);
+        }
+
         let result = subagents
-            .spawn(&profile_owned, &inherited_clone, &task_owned, Vec::new(), decision)
+            .spawn(
+                &profile_owned,
+                &inherited_clone,
+                &task_owned,
+                inputs,
+                decision,
+                &dispatch,
+            )
             .await
             .map_err(|refusal| refusal.explain())?;
 
@@ -1112,6 +1268,9 @@ mod tests {
             subagents: None,
             inherited: None,
             run_workspace: None,
+            models: None,
+            parent_model: None,
+            task_id: None,
         }
     }
 

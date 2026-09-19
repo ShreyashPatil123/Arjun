@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  ChevronDown, BookOpen, NotebookPen, Boxes, ShieldCheck, Activity, HeartPulse, Cpu, Settings, UserRound, LogOut, MessageSquare, ListTodo, Plus,
+  ChevronDown, BookOpen, NotebookPen, Bot, Boxes, ShieldCheck, Activity, HeartPulse, Cpu, Settings, UserRound, LogOut, MessageSquare, ListTodo, Plus,
 } from 'lucide-react';
 import {
   governanceService,
@@ -9,6 +9,7 @@ import {
   isActiveRole,
   type Session,
 } from '../../services/governance.service';
+import { useConversation } from '../run/useConversation';
 import styles from './AppMenu.module.css';
 
 interface MenuItem {
@@ -53,6 +54,7 @@ const SECTIONS: Section[] = [
     label: 'Administration',
     icon: <Settings size={11} />,
     items: [
+      { label: 'Agents',          icon: <Bot size={15} />,         path: '/agents',       shortcut: 'E', requires: 'administrator' },
       { label: 'Models',          icon: <Boxes size={15} />,       path: '/models',       shortcut: 'M', requires: 'administrator' },
       { label: 'Approvals',       icon: <ShieldCheck size={15} />, path: '/approvals',    shortcut: 'R', requires: 'administrator' },
       { label: 'Audit & Network', icon: <Activity size={15} />,     path: '/audit',        shortcut: 'L', requires: 'administrator' },
@@ -68,9 +70,12 @@ const MOD_LABEL = IS_MAC ? '\u2318' : 'Ctrl';
 
 export const AppMenu = () => {
   const navigate = useNavigate();
+  const { newConversation, isStreaming } = useConversation();
   const [open, setOpen] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  /** Prevents two rapid "New conversation" clicks from creating two conversations. */
+  const creatingRef = useRef(false);
 
   useEffect(() => {
     void (async () => {
@@ -100,10 +105,33 @@ export const AppMenu = () => {
     }
   };
 
+  /**
+   * Create a fresh conversation and navigate to the workbench.
+   *
+   * The ref-based lock prevents two rapid clicks from creating two
+   * conversations. `isStreaming` is checked so a generation in flight
+   * is not abandoned mid-stream; the person can start a new thread
+   * once the current one finishes (or after they stop it).
+   */
+  const startNewConversation = useCallback(async () => {
+    if (creatingRef.current || isStreaming) return;
+    creatingRef.current = true;
+    try {
+      await newConversation();
+      navigate('/');
+    } finally {
+      creatingRef.current = false;
+    }
+  }, [newConversation, isStreaming, navigate]);
+
   const go = useCallback((path: string) => {
     setOpen(false);
-    navigate(path);
-  }, [navigate]);
+    if (path === '/') {
+      void startNewConversation();
+    } else {
+      navigate(path);
+    }
+  }, [navigate, startNewConversation]);
 
   // Close on Escape, and on a click landing outside the menu.
   useEffect(() => {

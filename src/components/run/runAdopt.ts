@@ -502,6 +502,8 @@ export function useContextLedger(
             carried: event.carried,
             tokens: event.tokens,
             windowTokens: event.windowTokens,
+            omittedPins: event.omittedPins ?? [],
+            retention: event.retention,
           });
           // Deliberately does not set `status`: a trim is not a reading of the
           // window, and a turn can be trimmed before it has made a model call

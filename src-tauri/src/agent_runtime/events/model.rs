@@ -171,6 +171,25 @@ pub enum TaskEventType {
     /// The model answered. Same rule: how much came back, not what it said.
     ModelResponded,
 
+    // -- Model binding ----------------------------------------------------
+    //
+    // A model change is an observation about what the run is *running on*,
+    // never about where it has got to — see `machine::advance`, where all four
+    // of these are `Stays` for the same reason `model_requested` is.
+    /// A handoff to a different model reached a safe boundary and was
+    /// checkpointed. The point in the run's own history where it stopped being
+    /// on the model the earlier events were produced by.
+    ModelTransitionStarted,
+    /// The new binding is in force. Carries both model digests, both definition
+    /// versions and both context manifest hashes.
+    ModelTransitionCommitted,
+    /// The handoff was refused or abandoned. The run is still on the model it
+    /// was on, and the payload says why.
+    ModelTransitionFailed,
+    /// The handoff was undone. Carries whether the source model came back, so a
+    /// reader can tell a clean undo from one that needs a person.
+    ModelTransitionRolledBack,
+
     // -- Compaction -------------------------------------------------------
     /// Compaction is beginning. Paired with `context_compacted`, which reports
     /// that it finished — before this existed only the finish was recorded, so
@@ -274,6 +293,10 @@ impl TaskEventType {
             TaskEventType::HookEvaluated => "hook_evaluated",
             TaskEventType::ModelRequested => "model_requested",
             TaskEventType::ModelResponded => "model_responded",
+            TaskEventType::ModelTransitionStarted => "model_transition_started",
+            TaskEventType::ModelTransitionCommitted => "model_transition_committed",
+            TaskEventType::ModelTransitionFailed => "model_transition_failed",
+            TaskEventType::ModelTransitionRolledBack => "model_transition_rolled_back",
             TaskEventType::CompactionStarted => "compaction_started",
             TaskEventType::WaitStarted => "wait_started",
             TaskEventType::WaitCompleted => "wait_completed",
@@ -331,6 +354,10 @@ impl TaskEventType {
             "hook_evaluated" => TaskEventType::HookEvaluated,
             "model_requested" => TaskEventType::ModelRequested,
             "model_responded" => TaskEventType::ModelResponded,
+            "model_transition_started" => TaskEventType::ModelTransitionStarted,
+            "model_transition_committed" => TaskEventType::ModelTransitionCommitted,
+            "model_transition_failed" => TaskEventType::ModelTransitionFailed,
+            "model_transition_rolled_back" => TaskEventType::ModelTransitionRolledBack,
             "compaction_started" => TaskEventType::CompactionStarted,
             "wait_started" => TaskEventType::WaitStarted,
             "wait_completed" => TaskEventType::WaitCompleted,

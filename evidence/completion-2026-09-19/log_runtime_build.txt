@@ -1,0 +1,15 @@
+
+> arjun@0.2.0 runtime:build
+> npm --prefix agent-runtime run build
+
+
+> @arjun/agent-runtime@0.1.0 build
+> node scripts/build.mjs
+
+
+  dist\arjun-agent-runtime.mjs      1.7mb
+  dist\arjun-agent-runtime.mjs.map  6.1mb
+
+Done in 1667ms
+bundled 1096 modules -> dist/arjun-agent-runtime.mjs (1748 KiB)
+sha256 f91fa25a52064f8b856f7eddf2f5630226d69940889f72f6083ac7092de56eaf

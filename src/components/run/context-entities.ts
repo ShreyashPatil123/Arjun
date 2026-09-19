@@ -44,6 +44,21 @@ const IMMOVABLE = new Set(['system', 'toolSchema', 'notes', 'reserve', 'compacti
  */
 export interface EntityRow {
   id: string;
+  /**
+   * How this row is pinned, in the form Rust stores.
+   *
+   * A pin used to be the row's bare `id`, and Rust had to guess whether it had
+   * been handed a message id or a document hash. The two projection paths
+   * guessed differently and the shipped one guessed wrong for documents, so
+   * pinning a drawing did nothing.
+   *
+   * The prefix says which. It is only set where this side actually *knows*:
+   * an attachment is a `sha256:`, a transcript entity is a `msg:`. Anything
+   * else keeps its bare id and is matched the old wide way, because inventing
+   * a type for a row whose kind we have not established would be the same
+   * guess moved one layer up.
+   */
+  pinRef: string;
   label: string;
   section: string;
   tokens: number | null;
@@ -57,6 +72,25 @@ export interface EntityRow {
   note?: string;
   /** False for rows the compactor cannot touch. */
   evictable: boolean;
+}
+
+/** A 64-character hex string, which is how a document is named here. */
+const SHA256 = /^[0-9a-f]{64}$/i;
+
+/**
+ * How a ledger entity is pinned.
+ *
+ * Only the cases this side can establish are typed. A `transcript` entity is a
+ * message; an `evidence` entity whose id is a sha256 is a document. Everything
+ * else — a skill, a note, a tool schema, an evidence row named something other
+ * than a hash — keeps its bare id, which Rust reads as a legacy pin and matches
+ * both ways. That is wider than necessary and it is the safe direction: the
+ * narrow reading is what dropped document pins in the first place.
+ */
+function pinRefFor(entity: ContextEntity): string {
+  if (entity.section === 'transcript') return `msg:${entity.id}`;
+  if (entity.section === 'evidence' && SHA256.test(entity.id)) return `sha256:${entity.id}`;
+  return entity.id;
 }
 
 /**
@@ -81,6 +115,7 @@ export function mergeAttachments(
     const partial = attachment.strategy !== 'full';
     rows.push({
       id: attachment.sha256,
+      pinRef: `sha256:${attachment.sha256}`,
       label: attachment.name,
       section: existing?.section ?? 'evidence',
       // The ledger's number when it has one; otherwise what the composer
@@ -104,6 +139,7 @@ export function mergeAttachments(
     if (claimed.has(entity.id)) continue;
     rows.push({
       id: entity.id,
+      pinRef: pinRefFor(entity),
       label: entity.label,
       section: entity.section,
       tokens: entity.status === 'pending' ? null : entity.tokens,

@@ -184,6 +184,31 @@ pub struct ModelEntry {
     pub license: String,
     /// SHA-256 of the weights, checked at import.
     pub sha256: Option<String>,
+    /// The publisher's immutable revision the weights were taken from.
+    ///
+    /// A commit on the model repository, not a branch or a tag. Recorded
+    /// because a download alias moves: "the Q8_0 from XHToken/Spark-X2.5-4B-GGUF"
+    /// named a different file last month and will name a different one again,
+    /// and evidence that cites an alias cites nothing. The sha256 proves *these*
+    /// bytes; this says where they came from.
+    ///
+    /// `None` for an entry imported before this existed, and for weights a
+    /// person put on the machine themselves — which is honest, and better than
+    /// a fabricated provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// The lowest `llama-server` build this model's architecture needs.
+    ///
+    /// llama.cpp adds architectures over time, and a build older than the one
+    /// that added this model's does not fail gracefully — it reports an unknown
+    /// architecture after loading the file, or worse, loads something it
+    /// misreads. Spark's `spark2_5` arrived in b10828.
+    ///
+    /// Declared per entry rather than hard-coded, because it is a fact about
+    /// the model, and checked before launch so the diagnostic names the build
+    /// and the architecture instead of surfacing as a load failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_llama_build: Option<u32>,
     pub runtime: Runtime,
     pub roles: Vec<ModelRole>,
     /// Modalities this model supports (text, image, audio, video).
@@ -876,6 +901,8 @@ pub(crate) mod tests {
             version: "1".into(),
             license: "apache-2.0".into(),
             sha256: None,
+            revision: None,
+            min_llama_build: None,
             runtime: Runtime::LlamaCpp,
             roles,
             modalities: vec![Modality::Text],

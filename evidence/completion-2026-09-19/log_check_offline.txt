@@ -1,0 +1,9 @@
+
+> arjun@0.2.0 check:offline
+> node scripts/check-offline-build.mjs
+
+  Rust dependencies resolve from the local registry … ok
+  Node dependencies resolve from the npm cache … ok
+  TypeScript compiles … ok
+
+offline gate: pass — the build needs no network

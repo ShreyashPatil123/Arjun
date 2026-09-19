@@ -1,0 +1,28 @@
+
+> arjun@0.2.0 test:sidecar
+> npm run test:sidecar:document && npm run test:sidecar:graph
+
+
+> arjun@0.2.0 test:sidecar:document
+> python -m unittest discover -s sidecars/document_sidecar/tests
+
+........................................................................................................................invalid pdf header: b'"""In'
+EOF marker not found
+..invalid pdf header: b'"""In'
+EOF marker not found
+..invalid pdf header: b'"""In'
+EOF marker not found
+.
+----------------------------------------------------------------------
+Ran 125 tests in 10.824s
+
+OK
+
+> arjun@0.2.0 test:sidecar:graph
+> python -m unittest discover -s sidecars/graph_sidecar/tests
+
+........
+----------------------------------------------------------------------
+Ran 8 tests in 0.000s
+
+OK

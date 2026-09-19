@@ -1,0 +1,5 @@
+
+> arjun@0.2.0 check:bundle
+> node scripts/check-bundle.mjs
+
+bundle gate: pass — 1.7 MiB, adapters: openai-completions, 6 reviewed vendor hostname(s), all defences present

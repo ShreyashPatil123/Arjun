@@ -48,6 +48,7 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
 
     (
         Arc::new(RuntimeDeps {
+            memory_graph: None,
             // A real artifact store, in the harness's own directory: the
             // cross-model channel is part of the runtime under test.
             conversation_artifacts: Arc::new(
@@ -56,7 +57,10 @@ fn deps() -> (Arc<RuntimeDeps>, tempfile::TempDir) {
                 )
                 .expect("the artifact store opens"),
             ),
-            index: Arc::new(index),
+            // No registry in these tests: a delegation then refuses by name
+        // rather than inventing a model, which is the behaviour under test.
+        registry: None,
+        index: Arc::new(index),
             session,
             workspaces,
             approvals: Arc::new(ApprovalQueue::new()),

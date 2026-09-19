@@ -256,6 +256,60 @@ export class WorkingNotes {
     );
   }
 
+  /**
+   * Adopts what Rust wrote, in place.
+   *
+   * ## Why in place, and why at all
+   *
+   * `state.commit` is checked on the other side: a claimed side effect the
+   * durable log does not corroborate is dropped, an evidence marker no search
+   * handed out is dropped, and a completed effect this side had forgotten is
+   * put back. The outcome carries the notes as written, and this is how they
+   * are adopted.
+   *
+   * Without it the two copies diverge and stay diverged: this side would go on
+   * holding a dropped claim, propose it again on the next commit, and — worse —
+   * render it to the model, which would then be reading a note the record does
+   * not support. The corrections would repeat in the log forever and nothing
+   * would converge.
+   *
+   * In place rather than by replacement because the run, the compactor and the
+   * note-taker all hold this same instance; handing back a new one would leave
+   * two of the three writing into an object nobody reads.
+   *
+   * Applied through the same setters as `from`, so the caps bound what is
+   * adopted exactly as they bound what was proposed.
+   */
+  replaceWith(state: Partial<WorkingNotesState>): void {
+    this.#goal = "";
+    this.#stage = { ordinal: 0, intent: "" };
+    this.#decisions = [];
+    this.#evidenceIds = [];
+    this.#calculationIds = [];
+    this.#artifactIds = [];
+    this.#openQuestions = [];
+    this.#nextAction = "";
+    this.#completed = [];
+    this.#dropped = {};
+
+    this.setGoal(state.goal ?? "");
+    if (state.stage) this.atStage(state.stage.ordinal, state.stage.intent);
+    this.setNextAction(state.nextAction ?? "");
+    for (const [key, count] of Object.entries(state.dropped ?? {})) {
+      this.#dropped[key] = count;
+    }
+    for (const decision of state.decisions ?? []) {
+      this.decided(decision.what, decision.because, decision.at);
+    }
+    for (const id of state.evidenceIds ?? []) this.sawEvidence(id);
+    for (const id of state.calculationIds ?? []) this.calculated(id);
+    for (const id of state.artifactIds ?? []) this.produced(id);
+    for (const question of state.openQuestions ?? []) this.asked(question);
+    for (const effect of state.completed ?? []) {
+      this.didEffect(effect.tool, effect.target, effect.at);
+    }
+  }
+
   get state(): WorkingNotesState {
     return {
       goal: this.#goal,

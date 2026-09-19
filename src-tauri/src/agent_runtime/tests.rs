@@ -43,7 +43,11 @@ pub(super) fn deps_with(
             .expect("the artifact store opens"),
     );
     let deps = Arc::new(RuntimeDeps {
+        memory_graph: None,
         conversation_artifacts,
+        // No registry in these tests: a delegation then refuses by name
+        // rather than inventing a model, which is the behaviour under test.
+        registry: None,
         index: Arc::new(KnowledgeIndex::open(dir.path()).expect("index opens")),
         session,
         workspaces,
@@ -2290,7 +2294,7 @@ mod runtime_wiring {
         let session = deps.session().expect("signed in");
         let workspace = deps.root_for("r");
         let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
-        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref());
+        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None);
 
         assert!(runner.subagents.is_some(), "no subagent manager");
         assert!(runner.multimodal.is_some(), "no multimodal index");
@@ -2369,7 +2373,7 @@ mod runtime_wiring {
         let session = deps.session().expect("signed in");
         let workspace = deps.root_for("r");
         let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
-        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref());
+        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None);
 
         let call = crate::orchestrator::tools::ToolCall::new(
             "agent.delegate_readonly",
@@ -2397,7 +2401,7 @@ mod runtime_wiring {
         // say it found nothing rather than that the tool has no index.
         let (deps, _dir) = deps_with(signed_in_user());
         let session = deps.session().expect("signed in");
-        let runner = runner_for(&deps, &session, None, None);
+        let runner = runner_for(&deps, &session, None, None, "r", None);
 
         let call = crate::orchestrator::tools::ToolCall::new(
             "knowledge.multimodal_retrieve",

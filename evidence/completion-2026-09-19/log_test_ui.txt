@@ -1,0 +1,56 @@
+
+> arjun@0.2.0 test:ui
+> tsc -p tsconfig.test.json && node agent-runtime/node_modules/vitest/vitest.mjs run --config vitest.config.mjs
+
+
+[1m[46m RUN [49m[22m [36mv3.2.7 [39m[90mC:/Users/lenovo/Desktop/Arjun-1[39m
+
+ [32m✓[39m src/utils/relativeTime.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 29[2mms[22m[39m
+ [32m✓[39m src/components/chat/mermaidTheme.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 25[2mms[22m[39m
+ [32m✓[39m src/components/run/context-ledger.test.ts [2m([22m[2m27 tests[22m[2m)[22m[32m 36[2mms[22m[39m
+ [32m✓[39m src/components/graph/memoryModel.test.ts [2m([22m[2m34 tests[22m[2m)[22m[32m 59[2mms[22m[39m
+ [32m✓[39m src/components/graph/simulation.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 96[2mms[22m[39m
+ [32m✓[39m src/components/graph/labelGeometry.test.ts [2m([22m[2m22 tests[22m[2m)[22m[32m 135[2mms[22m[39m
+ [32m✓[39m src/services/artifactKind.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 16[2mms[22m[39m
+ [32m✓[39m src/components/chat/mermaidDiagram.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m src/components/run/context-entities.test.ts [2m([22m[2m25 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+ [32m✓[39m src/components/chat/runProgress.test.ts [2m([22m[2m33 tests[22m[2m)[22m[32m 19[2mms[22m[39m
+ [32m✓[39m src/components/run/recovery.test.ts [2m([22m[2m39 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m src/services/runOutcome.test.ts [2m([22m[2m42 tests[22m[2m)[22m[32m 49[2mms[22m[39m
+ [32m✓[39m src/contexts/activeRun.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 36[2mms[22m[39m
+ [32m✓[39m src/components/chat/CodeBlock.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 33[2mms[22m[39m
+ [32m✓[39m src/contexts/__tests__/RunReducer.test.ts [2m([22m[2m26 tests[22m[2m)[22m[33m 308[2mms[22m[39m
+ [32m✓[39m src/components/graph/memoryFeed.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+ [32m✓[39m src/contexts/conversationStartup.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+ [32m✓[39m src/services/artifactPreview.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+ [32m✓[39m src/components/graph/agentColor.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m src/components/chat/markdownFence.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+ [32m✓[39m src/components/chat/notebookScope.test.ts [2m([22m[2m30 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m src/components/graph/flow.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m src/components/chat/widgetDocument.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m src/contexts/__tests__/runIdPublication.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/components/chat/mermaidParse.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 11[2mms[22m[39m
+ [32m✓[39m src/components/chat/assistantFooter.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/contexts/PermissionsContext.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/services/ocr.service.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/services/reading.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/components/chat/notebookHandoff.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/components/chat/parseThinking.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m src/components/run/MilestoneGate.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/components/notebook/addOutcomes.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/pages/auditNetwork.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/components/chat/useTokenMetrics.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/components/graph/typingOutcome.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/components/chat/composerStop.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m src/components/chat/inspectorStop.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 20[2mms[22m[39m
+ [32m✓[39m src/components/graph/edgeLabel.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/components/graph/claimLabel.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/contexts/__tests__/ConversationContext.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/components/graph/layout.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/components/chat/TaskPanel.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m43 passed[39m[22m[90m (43)[39m
+[2m      Tests [22m [1m[32m618 passed[39m[22m[90m (618)[39m
+[2m   Start at [22m 11:26:55
+[2m   Duration [22m 5.37s[2m (transform 6.99s, setup 0ms, collect 14.18s, tests 1.18s, environment 12ms, prepare 13.65s)[22m
+

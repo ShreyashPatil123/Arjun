@@ -70,11 +70,29 @@ const SEEDED_ACCOUNT_IDS: &[&str] = &[
 ];
 
 const ACTOR_ID: &str = "modeladmin";
-const PASSWORD: &str = "Shreyash@123";
+
+/// The password to seed, read from the environment and never from source.
+///
+/// It used to be a `const` holding a real administrator password in plain
+/// text, which put a live credential into git history where rotating it later
+/// cannot reach. A seeder that carries a default is worse than one that
+/// refuses: the default is what actually ends up on the machine, and nobody
+/// remembers it was there.
+///
+/// Absent means stop. This deliberately does not fall back to anything.
+fn seed_password() -> String {
+    match std::env::var("ARJUN_SEED_PASSWORD") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => panic!(
+            "ARJUN_SEED_PASSWORD is not set. This seeder writes to the live credential              store and will not invent a password. Set it for this one command, e.g.              `ARJUN_SEED_PASSWORD=... cargo test --test seed_local_accounts -- --ignored`."
+        ),
+    }
+}
 
 #[test]
 #[ignore = "writes to the live credential store. Run with `cargo test --test seed_local_accounts -- --ignored --nocapture`."]
 fn seed_local_accounts_sets_password_for_every_seeded_account_except_modeladmin() {
+    let password = seed_password();
     let app_data_dir = PathBuf::from(APP_DATA_DIR);
     let db_path = app_data_dir.join("sarathi.db");
     assert!(
@@ -134,7 +152,7 @@ fn seed_local_accounts_sets_password_for_every_seeded_account_except_modeladmin(
         // password that the policy rejects, we want the rejection
         // to surface rather than silently storing a hash the rest
         // of the system would later refuse.
-        if let Err(err) = credentials.set_password(user_id, PASSWORD) {
+        if let Err(err) = credentials.set_password(user_id, &password) {
             policy_rejection = Some(format!("{user_id}: {err}"));
         }
         if let Some(rejection) = policy_rejection.as_ref() {
@@ -178,7 +196,7 @@ fn seed_local_accounts_sets_password_for_every_seeded_account_except_modeladmin(
     );
 
     eprintln!(
-        "[seed_local_accounts] done.\n  password: {PASSWORD:?}\n  newly set: {set_accounts:?}\n  overwritten: {overwritten_accounts:?}\n  new audit rows: {new_audit_rows:?}\n  chain: intact ({} -> {})",
+        "[seed_local_accounts] done.\n  password: (from ARJUN_SEED_PASSWORD, not echoed)\n  newly set: {set_accounts:?}\n  overwritten: {overwritten_accounts:?}\n  new audit rows: {new_audit_rows:?}\n  chain: intact ({} -> {})",
         starting_seq,
         new_audit_rows.last().copied().unwrap_or(starting_seq)
     );

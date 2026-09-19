@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use super::machine::RunState;
 use super::model::digest;
+use crate::agent_runtime::context_manifest::ContextManifest;
 use crate::agent_runtime::memory::RunMemory;
 use crate::agent_runtime::tasks::ContextLedgerRecord;
 
@@ -48,7 +49,7 @@ use crate::agent_runtime::tasks::ContextLedgerRecord;
 /// this build does not know is refused rather than guessed at: continuing a run
 /// from a record you cannot fully read is exactly the case where being wrong is
 /// silent.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 /// Why a run cannot be safely continued.
 ///
@@ -180,6 +181,17 @@ pub struct RunCheckpoint {
     pub notes: RunMemory,
     /// Where the context window stood. Absent before the first measurement.
     pub ledger: Option<ContextLedgerRecord>,
+    /// Exactly what this turn was built from — the conversation and cell it
+    /// belongs to, the documents at the versions it read, the notebook scope it
+    /// was frozen to.
+    ///
+    /// Absent on a checkpoint written before the context was assembled, and on
+    /// every checkpoint written by a build older than schema 2. A resumption
+    /// without one cannot rebuild the original context and says so, rather
+    /// than continuing from whatever the router picks today. See
+    /// [`crate::agent_runtime::context_manifest`].
+    #[serde(default)]
+    pub manifest: Option<ContextManifest>,
     /// The plan the run is held to, hashed. A different plan is a different run.
     pub plan_hash: String,
     /// The person's roles, the material's classification and the machine's mode,
@@ -213,6 +225,7 @@ impl RunCheckpoint {
         last_event_seq: i64,
         notes: RunMemory,
         ledger: Option<ContextLedgerRecord>,
+        manifest: Option<ContextManifest>,
         plan_hash: impl Into<String>,
         policy_hash: impl Into<String>,
         workspace_hash: impl Into<String>,
@@ -226,6 +239,7 @@ impl RunCheckpoint {
             last_event_seq,
             notes,
             ledger,
+            manifest,
             plan_hash: plan_hash.into(),
             policy_hash: policy_hash.into(),
             workspace_hash: workspace_hash.into(),
@@ -248,8 +262,15 @@ impl RunCheckpoint {
     pub fn compute_hash(&self) -> String {
         let notes = serde_json::to_string(&self.notes).unwrap_or_default();
         let ledger = serde_json::to_string(&self.ledger).unwrap_or_default();
+        // The manifest's own hash, not its body: it seals itself, and hashing
+        // the seal means this hash changes exactly when that one does.
+        let manifest = self
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.manifest_hash.clone())
+            .unwrap_or_default();
         digest(&format!(
-            "v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.schema_version,
             self.run_id,
             self.attempt_id,
@@ -257,6 +278,7 @@ impl RunCheckpoint {
             self.last_event_seq,
             digest(&notes),
             digest(&ledger),
+            manifest,
             self.plan_hash,
             self.policy_hash,
             self.workspace_hash,
@@ -412,6 +434,7 @@ mod tests {
             12,
             RunMemory::default(),
             None,
+            None,
             "plan-hash",
             "policy-hash",
             "workspace-hash",
@@ -481,6 +504,7 @@ mod tests {
             12,
             RunMemory::default(),
             None,
+            None,
             "plan-hash",
             "policy-hash",
             "workspace-hash",
@@ -510,6 +534,7 @@ mod tests {
             RunState::ExecutingTool,
             12,
             RunMemory::default(),
+            None,
             None,
             "plan-hash",
             "policy-hash",

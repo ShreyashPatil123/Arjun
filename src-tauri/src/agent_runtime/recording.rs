@@ -88,11 +88,23 @@ impl RuntimeDeps {
     /// existed, or never fully started. That is not a failure: there is nothing
     /// to checkpoint against, and inventing a world to record would be worse
     /// than recording nothing.
+    /// ## Why this no longer takes the notes
+    ///
+    /// It used to, and every production caller passed `RunMemory::default()` —
+    /// not out of carelessness but because the tool path genuinely has no way
+    /// to reach the loop's notes: they live in the child process. So the one
+    /// record a recovery reads said the run had no goal, no evidence and no
+    /// completed effects, and a resumption started the work again.
+    ///
+    /// The notes now come from the seed, where
+    /// [`crate::agent_runtime::state_commit`] puts them after checking every
+    /// claim that could excuse work. A checkpoint therefore carries the last
+    /// state Rust actually agreed to, and there is no parameter through which a
+    /// caller can accidentally write an empty one.
     pub(super) fn checkpoint(
         &self,
         run_id: &str,
         state: events::RunState,
-        notes: crate::agent_runtime::memory::RunMemory,
     ) -> Result<bool, String> {
         let seed = {
             let Ok(seeds) = self.checkpoints.lock() else {
@@ -103,6 +115,8 @@ impl RuntimeDeps {
                 None => return Ok(false),
             }
         };
+        let notes = seed.committed_notes.clone();
+        let manifest = seed.manifest.clone();
 
         // The sequence this checkpoint is taken after, read from the history
         // rather than counted here: a local counter and the durable log
@@ -125,7 +139,7 @@ impl RuntimeDeps {
             .map(|effect| effect.idempotency_key.clone())
             .collect();
 
-        let checkpoint = seed.checkpoint(run_id, state, last_seq, notes, None, unknown);
+        let checkpoint = seed.checkpoint(run_id, state, last_seq, notes, None, manifest, unknown);
         crate::agent_runtime::resume::checkpoint_now(&self.events, &checkpoint)
     }
 
@@ -135,13 +149,8 @@ impl RuntimeDeps {
     /// silently continuing is not either: the failure becomes a durable event,
     /// so a later reader sees the gap rather than inferring it from a resume
     /// point further back than it should be.
-    pub(super) fn checkpoint_or_note(
-        &self,
-        run_id: &str,
-        state: events::RunState,
-        notes: crate::agent_runtime::memory::RunMemory,
-    ) {
-        if let Err(error) = self.checkpoint(run_id, state, notes) {
+    pub(super) fn checkpoint_or_note(&self, run_id: &str, state: events::RunState) {
+        if let Err(error) = self.checkpoint(run_id, state) {
             log::error!("[tasks] run {run_id}: the checkpoint could not be written: {error}");
             self.remember(
                 run_id,
@@ -261,11 +270,7 @@ pub(super) fn remember_outcome(
     // Checkpointed after the outcome is recorded and before the loop is told,
     // so the resume point never claims a tool settled that the history does not
     // also show settling.
-    deps.checkpoint_or_note(
-        &call.run_id,
-        events::RunState::ToolResultRecorded,
-        crate::agent_runtime::memory::RunMemory::default(),
-    );
+    deps.checkpoint_or_note(&call.run_id, events::RunState::ToolResultRecorded);
 
     // The file is a reference: its name, so the Tasks screen can list what a
     // run produced without opening anything.
@@ -371,4 +376,191 @@ fn ledger_counts(ledger: Option<&Value>) -> Value {
         "window": top("window"),
         "headroom": top("headroom"),
     })
+}
+
+impl RuntimeDeps {
+    /// What Rust itself recorded about this run, for checking a proposal.
+    ///
+    /// Read fresh on every commit. A cached copy is a copy that can say a tool
+    /// succeeded when the row saying so was never written.
+    pub(super) fn rust_facts(
+        &self,
+        run_id: &str,
+    ) -> crate::agent_runtime::state_commit::RustFacts {
+        use crate::agent_runtime::state_commit::RustFacts;
+
+        let mut facts = RustFacts::default();
+
+        // Tool receipts, from the durable log. This is the half a proposal
+        // cannot forge: the row was written by `remember_outcome` after the
+        // gateway and the tool had both agreed.
+        if let Ok(page) = self.events.events_since(run_id, 0) {
+            for event in &page.events {
+                match event.event_type {
+                    events::TaskEventType::ToolSucceeded => {
+                        if let Some(tool) =
+                            event.payload.get("tool").and_then(serde_json::Value::as_str)
+                        {
+                            *facts.succeeded_tools.entry(tool.to_string()).or_default() += 1;
+                        }
+                    }
+                    events::TaskEventType::ArtifactProduced => {
+                        let name = event.payload.get("name").and_then(serde_json::Value::as_str);
+                        let tool = event.payload.get("tool").and_then(serde_json::Value::as_str);
+                        if let (Some(name), Some(tool)) = (name, tool) {
+                            facts
+                                .produced_artifacts
+                                .push((name.to_string(), tool.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // The markers this run's searches actually handed out. `retrieval`
+        // numbers them from one against this table, so its length is the
+        // highest marker that can mean anything.
+        facts.evidence_count =
+            crate::agent_runtime::retrieval::for_run(&self.passages, run_id).len() as u32;
+
+        facts.calculation_count = self
+            .calculations
+            .lock()
+            .ok()
+            .and_then(|table| table.get(run_id).map(|rows| rows.len() as u32))
+            .unwrap_or(0);
+
+        facts.artifact_names = crate::agent_runtime::artifacts::for_run(&self.produced, run_id)
+            .into_iter()
+            .map(|produced| produced.name)
+            .collect();
+
+        // Milestones are a person's signature, written by
+        // `agent_acknowledge_milestone`. They are carried on the accepted notes
+        // and are never taken from a proposal.
+        facts.milestones = self
+            .checkpoints
+            .lock()
+            .ok()
+            .and_then(|seeds| seeds.get(run_id).map(|seed| seed.committed_notes.milestones.clone()))
+            .unwrap_or_default();
+
+        facts
+    }
+
+    /// Accepts a state proposal from the loop, or explains why it cannot.
+    ///
+    /// The safe-boundary commit. Everything the loop knows and Rust does not —
+    /// the goal, where the plan has reached, what it intends next — arrives
+    /// here; everything Rust knows and the loop could be wrong about is checked
+    /// against the record before any of it is written. See
+    /// [`crate::agent_runtime::state_commit`] for the rules and why each one is
+    /// there.
+    ///
+    /// The checkpoint is written *after* the notes are accepted and in the same
+    /// call, so a run cannot be left having agreed state that its resume point
+    /// does not carry.
+    pub(super) fn commit_state(
+        &self,
+        proposal: &crate::agent_runtime::state_commit::StateProposal,
+    ) -> crate::agent_runtime::state_commit::CommitOutcome {
+        use crate::agent_runtime::state_commit::{self, CommitOutcome};
+
+        let last_event_seq = self
+            .events
+            .events_since(&proposal.run_id, 0)
+            .map(|page| page.last_seq())
+            .unwrap_or(0);
+
+        let refuse = |because: String| CommitOutcome {
+            accepted: false,
+            refused_because: Some(because),
+            last_event_seq,
+            corrections: Vec::new(),
+            notes: crate::agent_runtime::memory::RunMemory::default(),
+        };
+
+        if proposal.commit_version != state_commit::STATE_COMMIT_VERSION {
+            return refuse(format!(
+                "this build writes state commits at version {}, and the proposal is version {}; \
+                 applying half a record it does not understand is how a resumption acts on a \
+                 state nobody wrote",
+                state_commit::STATE_COMMIT_VERSION,
+                proposal.commit_version
+            ));
+        }
+
+        // The seed is the attempt. A commit naming a different one is a
+        // straggler from a worker that outlived a restart, and letting it write
+        // would move the resume point of the attempt now running back to a
+        // state a dead process believed.
+        let seed = {
+            let Ok(seeds) = self.checkpoints.lock() else {
+                return refuse(
+                    "the checkpoint table was left locked by a failed write".to_string(),
+                );
+            };
+            match seeds.get(&proposal.run_id) {
+                Some(seed) => seed.clone(),
+                None => {
+                    return refuse(format!(
+                        "run {} has no checkpoint seed on this side, so there is no attempt for \
+                         this commit to belong to",
+                        proposal.run_id
+                    ))
+                }
+            }
+        };
+        if seed.attempt_id != proposal.attempt_id {
+            return refuse(format!(
+                "this commit belongs to attempt {}, and the attempt running is {}; a commit from \
+                 an earlier attempt cannot move this one's resume point",
+                proposal.attempt_id, seed.attempt_id
+            ));
+        }
+
+        let facts = self.rust_facts(&proposal.run_id);
+        let (notes, corrections) = state_commit::validate(proposal, &facts, &seed.committed_notes);
+
+        // Said out loud, one line each. A correction is the record disagreeing
+        // with the run's own account of itself, and the serious ones are the
+        // cases that would have caused duplicate work.
+        for correction in &corrections {
+            if correction.is_serious() {
+                log::warn!(
+                    "[state] run {}: {}",
+                    proposal.run_id,
+                    correction.explain()
+                );
+            } else {
+                log::info!(
+                    "[state] run {}: {}",
+                    proposal.run_id,
+                    correction.explain()
+                );
+            }
+        }
+
+        if let Ok(mut seeds) = self.checkpoints.lock() {
+            if let Some(held) = seeds.get_mut(&proposal.run_id) {
+                // Re-checked under the lock. Between the read above and here a
+                // resumption could have replaced the seed, and writing this
+                // attempt's notes onto that one is the race this guards.
+                if held.attempt_id == proposal.attempt_id {
+                    held.committed_notes = notes.clone();
+                }
+            }
+        }
+
+        self.checkpoint_or_note(&proposal.run_id, proposal.state);
+
+        CommitOutcome {
+            accepted: true,
+            refused_because: None,
+            last_event_seq,
+            corrections,
+            notes,
+        }
+    }
 }

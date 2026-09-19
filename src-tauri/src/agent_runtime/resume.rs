@@ -199,13 +199,35 @@ impl Attempt {
 /// Everything here is a hash or an identifier, for the same reason the
 /// checkpoint itself is: it is held in memory next to a run and written into a
 /// record read before sign-in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CheckpointSeed {
     pub attempt_id: String,
     pub plan_hash: String,
     pub policy_hash: String,
     pub workspace_hash: String,
     pub model_id: String,
+    /// The last notes Rust accepted for this run.
+    ///
+    /// ## Why the seed holds them
+    ///
+    /// Because the alternative is what was here before: `remember_outcome`
+    /// checkpointed after every tool result with `RunMemory::default()`, since
+    /// the tool path has no way to reach the loop's notes — they live in the
+    /// child process and arrived only in the final result. So the record a
+    /// recovery reads said the run had done nothing.
+    ///
+    /// The seed is already the per-run record both the command and the tool
+    /// path can reach, so it is where the accepted state belongs. Updated only
+    /// by [`crate::agent_runtime::state_commit`], which checks every claim that
+    /// could excuse work before it is written here.
+    ///
+    /// Seeded from the record on a resumption, so an attempt that is continuing
+    /// one starts from what the previous attempt established rather than from
+    /// nothing.
+    pub committed_notes: crate::agent_runtime::memory::RunMemory,
+    /// What this attempt's context was built from. See
+    /// [`crate::agent_runtime::context_manifest`].
+    pub manifest: Option<crate::agent_runtime::context_manifest::ContextManifest>,
 }
 
 impl CheckpointSeed {
@@ -221,6 +243,7 @@ impl CheckpointSeed {
         last_event_seq: i64,
         notes: crate::agent_runtime::memory::RunMemory,
         ledger: Option<crate::agent_runtime::tasks::ContextLedgerRecord>,
+        manifest: Option<crate::agent_runtime::context_manifest::ContextManifest>,
         unknown_effects: Vec<String>,
     ) -> super::events::RunCheckpoint {
         super::events::RunCheckpoint::new(
@@ -230,6 +253,7 @@ impl CheckpointSeed {
             last_event_seq,
             notes,
             ledger,
+            manifest,
             &self.plan_hash,
             &self.policy_hash,
             &self.workspace_hash,

@@ -700,6 +700,33 @@ impl PlanRun {
 
 #[cfg(test)]
 mod tests {
+
+/// An `Instant` `seconds` in the past, or the earliest one this machine can
+/// represent.
+///
+/// `Instant` is monotonic from boot, so `now() - 3700s` has no answer on a
+/// machine that has been up for twenty minutes. Subtracting directly panicked
+/// there, which made these tests pass on a long-running machine and fail on a
+/// freshly booted one — a flake that looks exactly like a real regression on
+/// the machines people use to check a fresh clone.
+///
+/// Halving until it fits keeps the meaning ("longer ago than the budget under
+/// test") at any uptime, and every assertion here is about crossing a
+/// threshold rather than about an exact age.
+fn ago(seconds: u64) -> Instant {
+    let now = Instant::now();
+    let mut back = seconds;
+    loop {
+        if let Some(then) = now.checked_sub(Duration::from_secs(back)) {
+            return then;
+        }
+        if back == 0 {
+            return now;
+        }
+        back /= 2;
+    }
+}
+
     use super::*;
     use serde_json::json;
 
@@ -768,7 +795,7 @@ mod tests {
             },
         );
         // Pretend the task started well over an hour ago.
-        run.started_at(Instant::now() - Duration::from_secs(3700));
+        run.started_at(ago(3700));
 
         assert!(matches!(
             run.may_call(&search("anything")),

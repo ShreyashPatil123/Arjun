@@ -23,6 +23,7 @@ import { SystemInfo } from './pages/SystemInfo';
 import { Storage } from './pages/Storage';
 import { Health } from './pages/Health';
 import { ModelHealth } from './pages/ModelHealth';
+import { Agents } from './pages/Agents';
 import { Approvals } from './pages/Approvals';
 import { Demo } from './pages/Demo';
 import { SIHDashboard } from './pages/SIHDashboard';
@@ -105,6 +106,20 @@ function App() {
                       element={
                         <RequirePermission permission="approveOutput">
                           <Approvals />
+                        </RequirePermission>
+                      }
+                    />
+                    {/* Agent administration. Gated on `modifyPolicy`, which is
+                      * what changing what an agent may do amounts to.
+                      *
+                      * The gate is a courtesy, not the control: every mutation
+                      * is refused again in `agents::store`, which is what a
+                      * direct IPC call meets. */}
+                    <Route
+                      path="agents"
+                      element={
+                        <RequirePermission permission="modifyPolicy">
+                          <Agents />
                         </RequirePermission>
                       }
                     />

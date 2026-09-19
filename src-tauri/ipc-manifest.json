@@ -57,6 +57,11 @@
       "consumer": "frontend",
       "note": "Called from src/."
     },
+    "agent_dependents": {
+      "owner": "agent-admin",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
     "agent_export_artifact": {
       "owner": "agent",
       "consumer": "frontend",
@@ -77,8 +82,33 @@
       "consumer": "frontend",
       "note": "Called from src/."
     },
+    "agent_model_transition_begin": {
+      "owner": "agents",
+      "consumer": "frontend-pending",
+      "note": "Moves an agent to a different model as a handoff with states: drains its run at a safe boundary, settles or classifies what is in flight, checkpoints, freezes the source graph revision, validates the target's policy, role, classification ceiling, tools, runtime, tokenizer and serving admission, loads and health-checks it, recompiles the task's context for the window the server actually came up with, and only then commits the binding. Deliberately not a field on agent_registry_update, which refuses a submitted model binding outright. Returns the record whatever the outcome; Err only when the handoff could not be opened at all. The Agents screen control that would call it is still to be built."
+    },
+    "agent_model_transition_reconcile": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Settles every model change the process died in the middle of, by reading the registry to find out whether the binding write landed. Run automatically at start-up; reachable here so an operator can ask for it after a crash without restarting. Administrator only, checked in Rust."
+    },
+    "agent_model_transition_rollback": {
+      "owner": "agents",
+      "consumer": "frontend-pending",
+      "note": "Undoes a handoff that has not settled: puts the binding back and, if something was released to make room, serves the source model again. Bounded on purpose — it does not unwind the work, and a receipt for a document already written stays in the run's notes so a resumption does not write it twice."
+    },
+    "agent_model_transition_status": {
+      "owner": "agents",
+      "consumer": "frontend-pending",
+      "note": "Where an agent stands with respect to its model: the model it is on, the definition version to send back with a change, the handoff under way if there is one, and the last 25 with their outcomes. Read-only and visibility-checked, so an employee cannot use it to enumerate disabled agents."
+    },
     "agent_pin_context": {
       "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_preview": {
+      "owner": "agent-admin",
       "consumer": "frontend",
       "note": "Called from src/."
     },
@@ -86,6 +116,41 @@
       "owner": "agent",
       "consumer": "frontend",
       "note": "Called from src/."
+    },
+    "agent_registry_clone": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Copies an agent's configuration under a new identity. Memory is keyed by agent id, so the clone starts empty by construction rather than by a deletion somebody has to remember."
+    },
+    "agent_registry_create": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Creates an agent. Administrator only, checked in Rust. The agent id is minted by the registry and never taken from the caller, so a form cannot choose an id that collides with an existing agent's history."
+    },
+    "agent_registry_get": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "One agent, with the models and skills it names that do not resolve on this machine. The two are reported separately so an agent is never presented as ready because its record parsed."
+    },
+    "agent_registry_list": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Every agent the caller may see. An administrator sees the deployment's configuration including disabled and archived agents; anyone else sees only agents that can actually be given work, because one that cannot is deployment configuration rather than a choice. Filtered in Rust, not by hiding a control."
+    },
+    "agent_registry_palette": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "The colours an agent may be given, so a picker does not restate a list that has to match the one the graph draws with."
+    },
+    "agent_registry_set_state": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Enables, disables or archives an agent. Version-checked like an update. An archived agent stays resolvable for history — the graph and the audit log name it — and cannot be given new work."
+    },
+    "agent_registry_update": {
+      "owner": "agents",
+      "consumer": "admin",
+      "note": "Replaces an agent's mutable fields. Takes the version the form was opened at and refuses if anything changed in between, naming both versions — last-writer-wins on a record that decides what a model may do loses one administrator's restriction without either of them seeing it. The id, creation time and import origin are taken from the stored record, not the caller."
     },
     "agent_resume_run": {
       "owner": "agent",
@@ -109,6 +174,11 @@
     },
     "agent_runtime_health": {
       "owner": "agent",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "agent_skill_catalog": {
+      "owner": "agent-admin",
       "consumer": "frontend",
       "note": "Called from src/."
     },
@@ -156,6 +226,11 @@
       "owner": "telemetry",
       "consumer": "admin",
       "note": "Proves the telemetry chain without writing to it. Replaces the synthetic <startup> model call; a diagnostic, deliberately not on a page."
+    },
+    "agent_test_run": {
+      "owner": "agent-admin",
+      "consumer": "frontend",
+      "note": "Called from src/."
     },
     "agent_unknown_effects": {
       "owner": "agent",
@@ -381,6 +456,16 @@
       "owner": "platform",
       "consumer": "external",
       "note": "Lets an embedding host write an attributed line into the audit chain."
+    },
+    "memory_graph_changes": {
+      "owner": "memory-graph",
+      "consumer": "frontend",
+      "note": "Called from src/."
+    },
+    "memory_graph_snapshot": {
+      "owner": "memory-graph",
+      "consumer": "frontend",
+      "note": "Called from src/."
     },
     "model_health_snapshot": {
       "owner": "telemetry",
@@ -616,6 +701,11 @@
       "owner": "telemetry",
       "consumer": "frontend",
       "note": "Called from src/."
+    },
+    "registry_review_model": {
+      "owner": "registry",
+      "consumer": "frontend-pending",
+      "note": "The model review step. Backend half exists; the Models screen has not been given a control for it yet."
     },
     "reload_certification_packs": {
       "owner": "models",

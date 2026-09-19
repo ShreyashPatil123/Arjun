@@ -135,10 +135,34 @@ impl Residency {
 mod tests {
     use super::*;
 
+    /// An `Instant` `seconds` in the past, or the earliest one this machine can
+    /// represent.
+    ///
+    /// ## Why the fallback is not a panic
+    ///
+    /// `Instant` is monotonic from boot, so `now() - 3600s` has no answer on a
+    /// machine that has been up for twenty minutes. These tests used to
+    /// `.expect(...)` on that and therefore failed for a reason that has
+    /// nothing to do with what they test: they passed on a long-running
+    /// machine and failed on a freshly booted one, which is the worst kind of
+    /// flake because it looks like a real regression on exactly the machines
+    /// people use to check a fresh clone.
+    ///
+    /// Halving until it fits keeps the meaning — "longer ago than the timeout
+    /// under test" — on any uptime, and the assertions below are all about
+    /// crossing a threshold rather than about an exact age.
     fn ago(seconds: u64) -> Instant {
-        Instant::now()
-            .checked_sub(Duration::from_secs(seconds))
-            .expect("the test clock should support going back")
+        let now = Instant::now();
+        let mut back = seconds;
+        loop {
+            if let Some(then) = now.checked_sub(Duration::from_secs(back)) {
+                return then;
+            }
+            if back == 0 {
+                return now;
+            }
+            back /= 2;
+        }
     }
 
     #[test]

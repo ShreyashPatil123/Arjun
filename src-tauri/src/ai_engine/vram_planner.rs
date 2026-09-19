@@ -46,15 +46,51 @@ const ASSUMED_LAYERS_FALLBACK: u32 = 32;
 /// Value meaning "offload everything" to llama.cpp.
 pub const FULL_OFFLOAD: u32 = 999;
 
-/// Factor by which `q8_0` KV cache quantisation reduces memory compared to FP16.
+/// The precision the KV cache will actually be allocated at.
 ///
-/// `llama-server` is now launched with `-ctk q8_0 -ctv q8_0`, so the actual
-/// cache costs half what the FP16 formula gives. The planner must agree: a
-/// planner that still charges FP16 while the server allocates `q8_0` walks down
-/// to 8 192 tokens and leaves the server holding a 32 768-token buffer that was
-/// already paid for — the reverse of the over-commit this module exists to
-/// prevent.
-const KV_QUANT_FACTOR: f64 = 0.5;
+/// ## Why this is an argument and not a constant
+///
+/// It was a constant — `KV_QUANT_FACTOR = 0.5` — applied unconditionally,
+/// justified by the comment "`llama-server` is now launched with `-ctk q8_0
+/// -ctv q8_0`". That is true only when the binary accepts those flags.
+/// [`crate::serving`] probes `--help` for `-ctk` and, when it is absent,
+/// launches **without** them: the cache is then FP16 and costs twice what the
+/// planner charged for it.
+///
+/// So the planner sized a window against half the memory the server was about
+/// to allocate, on exactly the deployments least able to afford the mistake —
+/// an older or differently-built `llama-server` — and the failure surfaces as
+/// `failed to allocate buffer for kv cache` after the model has already loaded.
+///
+/// Making it an argument means the figure comes from the same probe that builds
+/// the launch flags, so the two cannot disagree. A caller that does not know
+/// passes [`KvPrecision::Fp16`], which is the safe direction: it charges the
+/// full cost and picks a smaller window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvPrecision {
+    /// No cache-quantisation flags were accepted. Full FP16 cost.
+    Fp16,
+    /// `-ctk q8_0 -ctv q8_0` were accepted, so the cache costs half.
+    Q8_0,
+}
+
+impl KvPrecision {
+    /// What this precision multiplies the FP16 cost by.
+    pub fn factor(self) -> f64 {
+        match self {
+            KvPrecision::Fp16 => 1.0,
+            KvPrecision::Q8_0 => 0.5,
+        }
+    }
+
+    /// How a plan's reasoning names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            KvPrecision::Fp16 => "f16",
+            KvPrecision::Q8_0 => "q8_0",
+        }
+    }
+}
 
 /// The offload decision, with the reasoning that produced it.
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +254,33 @@ pub fn plan_gpu_offload_with(
     total_layers: Option<u32>,
     kv_cost: Option<KvCost>,
 ) -> GpuOffloadPlan {
+    // The conservative reading, for callers that have not probed the binary.
+    // Charging the full FP16 cost can only choose a *smaller* window than the
+    // server will hold, which is the direction that does not crash.
+    plan_gpu_offload_at(
+        vram_total_bytes,
+        model_bytes,
+        context,
+        total_layers,
+        kv_cost,
+        KvPrecision::Fp16,
+    )
+}
+
+/// As [`plan_gpu_offload_with`], told what precision the cache will be at.
+///
+/// The caller that knows is [`crate::serving`], because it is the one that
+/// probes `llama-server --help` and builds the launch flags. Passing the result
+/// of that probe here is what keeps the plan and the launch describing the same
+/// allocation.
+pub fn plan_gpu_offload_at(
+    vram_total_bytes: u64,
+    model_bytes: u64,
+    context: ContextChoice,
+    total_layers: Option<u32>,
+    kv_cost: Option<KvCost>,
+    kv_precision: KvPrecision,
+) -> GpuOffloadPlan {
     let ladder = match context {
         // One rung, because the answer is already decided.
         ContextChoice::Fixed(window) => vec![window.max(1)],
@@ -237,6 +300,7 @@ pub fn plan_gpu_offload_with(
             *rung,
             total_layers,
             kv_cost,
+            kv_precision,
         );
         if plan.full_offload {
             return plan;
@@ -254,6 +318,7 @@ pub fn plan_gpu_offload_with(
         smallest,
         total_layers,
         kv_cost,
+        kv_precision,
     )
 }
 
@@ -264,6 +329,7 @@ fn plan_at_context(
     context_length: u32,
     total_layers: Option<u32>,
     kv_cost: Option<KvCost>,
+    kv_precision: KvPrecision,
 ) -> GpuOffloadPlan {
     if vram_total_bytes == 0 {
         return GpuOffloadPlan::cpu_only(context_length, "No GPU VRAM detected");
@@ -287,14 +353,12 @@ fn plan_at_context(
     // nobody did. The band errs high on purpose; measured beats conservative
     // whenever the measurement exists.
     //
-    // Apply the KV cache quantisation factor so the planner agrees with the
-    // server's actual allocation.  Without this, the per-token cost is the
-    // FP16 figure while the server runs `q8_0`, and the planner walks the
-    // context ladder down to a window the server's cache already fits in.
+    // Charged at the precision the server will actually allocate at — see
+    // [`KvPrecision`] for why that is an argument rather than an assumption.
     let kv_cost = kv_cost
         .filter(|cost| cost.per_token > 0)
         .unwrap_or_else(|| KvCost::dense(estimate_kv_bytes_per_token(model_bytes)));
-    let kv_bytes = kv_cost.bytes_for(context_length, KV_QUANT_FACTOR);
+    let kv_bytes = kv_cost.bytes_for(context_length, kv_precision.factor());
 
     // KV cache and compute buffers are charged before any weights.
     let after_kv = usable.saturating_sub(kv_bytes);
@@ -648,7 +712,14 @@ mod tests {
         let vram = 8151 * 1024 * 1024;
         let model = 5 * GB;
 
-        let plan = plan_gpu_offload(vram, model, 32_768, Some(40));
+        let plan = plan_gpu_offload_at(
+            vram,
+            model,
+            ContextChoice::Planned(32_768),
+            Some(40),
+            None,
+            KvPrecision::Q8_0,
+        );
 
         assert!(
             plan.full_offload,
@@ -729,19 +800,27 @@ mod tests {
 
         // With q8_0 KV quantisation, the banded estimate is halved too, so
         // the model now fits fully even with the conservative size band.
-        let banded = plan_gpu_offload(VRAM, WEIGHTS, 8192, Some(32));
+        let banded = plan_gpu_offload_at(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(8192),
+            Some(32),
+            None,
+            KvPrecision::Q8_0,
+        );
         assert!(
             banded.full_offload,
             "with q8_0, the halved banded KV cost lets the model fit fully: {}",
             banded.reason
         );
 
-        let measured = plan_gpu_offload_with(
+        let measured = plan_gpu_offload_at(
             VRAM,
             WEIGHTS,
             ContextChoice::Planned(8192),
             Some(32),
             Some(KvCost::dense(REAL_KV)),
+            KvPrecision::Q8_0,
         );
         assert!(
             measured.full_offload,
@@ -768,13 +847,21 @@ mod tests {
             fixed: 27 * 4 * (256 + 256) * 2 * 512,
         };
 
-        let banded = plan_gpu_offload(VRAM, WEIGHTS, TRAINED_WINDOW, Some(36));
-        let measured = plan_gpu_offload_with(
+        let banded = plan_gpu_offload_at(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(TRAINED_WINDOW),
+            Some(36),
+            None,
+            KvPrecision::Q8_0,
+        );
+        let measured = plan_gpu_offload_at(
             VRAM,
             WEIGHTS,
             ContextChoice::Planned(TRAINED_WINDOW),
             Some(36),
             Some(spark),
+            KvPrecision::Q8_0,
         );
 
         assert!(banded.full_offload, "{}", banded.reason);
@@ -815,12 +902,13 @@ mod tests {
             fixed: 27 * 4 * (256 + 256) * 2 * 512,
         };
         let plan_on = |vram: u64| {
-            plan_gpu_offload_with(
+            plan_gpu_offload_at(
                 vram,
                 WEIGHTS,
                 ContextChoice::Planned(TRAINED),
                 Some(36),
                 Some(spark),
+                KvPrecision::Q8_0,
             )
         };
 
@@ -848,12 +936,13 @@ mod tests {
 
         // The ladder never invents a rung above what was asked for, however
         // much memory there is to spare.
-        let modest = plan_gpu_offload_with(
+        let modest = plan_gpu_offload_at(
             24 * GB,
             WEIGHTS,
             ContextChoice::Planned(32_768),
             Some(36),
             Some(spark),
+            KvPrecision::Q8_0,
         );
         assert_eq!(modest.context_length, 32_768);
     }
@@ -876,12 +965,13 @@ mod tests {
             "unchosen, the ladder walks down to buy layers"
         );
 
-        let fixed = plan_gpu_offload_with(
+        let fixed = plan_gpu_offload_at(
             VRAM,
             WEIGHTS,
             ContextChoice::Fixed(32_768),
             Some(32),
             None,
+            KvPrecision::Q8_0,
         );
         assert_eq!(
             fixed.context_length, 32_768,
@@ -1274,5 +1364,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The bug this argument exists to remove, stated as a comparison.
+    ///
+    /// A binary that does not accept `-ctk` allocates an FP16 cache. The
+    /// planner used to charge `q8_0` regardless, so it sized a window against
+    /// half the memory the server was about to take — and the model loaded
+    /// before dying on its own KV cache.
+    #[test]
+    fn a_binary_without_cache_quantisation_is_planned_a_smaller_window() {
+        const VRAM: u64 = 8151 * 1024 * 1024;
+        const WEIGHTS: u64 = 4_375_021_152;
+        // Spark's real geometry: 9 of 36 blocks attend to the whole context,
+        // the other 27 to a 512-token window. The same figures the header test
+        // in `tests/spark_orchestrator.rs` reads off the file itself.
+        let spark = KvCost {
+            per_token: 9 * 4 * (256 + 256) * 2,
+            fixed: 27 * 4 * (256 + 256) * 2 * 512,
+        };
+
+        let quantised = plan_gpu_offload_at(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(1_048_576),
+            Some(36),
+            Some(spark),
+            KvPrecision::Q8_0,
+        );
+        let full_precision = plan_gpu_offload_at(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(1_048_576),
+            Some(36),
+            Some(spark),
+            KvPrecision::Fp16,
+        );
+
+        assert!(
+            full_precision.context_length < quantised.context_length,
+            "an f16 cache costs twice as much and must buy a smaller window; got {} against {}",
+            full_precision.context_length,
+            quantised.context_length
+        );
+        assert!(
+            full_precision.context_length >= MIN_SERVING_CONTEXT,
+            "it must still be a usable window, not a collapse to nothing: {}",
+            full_precision.context_length
+        );
+    }
+
+    /// The default is the safe direction. A caller that has not probed the
+    /// binary must not be handed the optimistic answer.
+    #[test]
+    fn the_unprobed_default_charges_the_full_cache() {
+        const VRAM: u64 = 8151 * 1024 * 1024;
+        const WEIGHTS: u64 = 4_375_021_152;
+        // Spark's real geometry: 9 of 36 blocks attend to the whole context,
+        // the other 27 to a 512-token window. The same figures the header test
+        // in `tests/spark_orchestrator.rs` reads off the file itself.
+        let spark = KvCost {
+            per_token: 9 * 4 * (256 + 256) * 2,
+            fixed: 27 * 4 * (256 + 256) * 2 * 512,
+        };
+
+        let unprobed = plan_gpu_offload_with(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(1_048_576),
+            Some(36),
+            Some(spark),
+        );
+        let explicit = plan_gpu_offload_at(
+            VRAM,
+            WEIGHTS,
+            ContextChoice::Planned(1_048_576),
+            Some(36),
+            Some(spark),
+            KvPrecision::Fp16,
+        );
+        assert_eq!(unprobed.context_length, explicit.context_length);
+    }
+
+    #[test]
+    fn a_precision_names_its_own_factor() {
+        assert_eq!(KvPrecision::Fp16.factor(), 1.0);
+        assert_eq!(KvPrecision::Q8_0.factor(), 0.5);
+        assert_eq!(KvPrecision::Fp16.label(), "f16");
+        assert_eq!(KvPrecision::Q8_0.label(), "q8_0");
     }
 }

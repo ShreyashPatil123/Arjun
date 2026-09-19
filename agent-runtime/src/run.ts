@@ -21,6 +21,8 @@ import { RunCompactor, settingsForWindow, type PreservedState } from "./compacti
 import { estimateTextTokens, fitToolsToBudget } from "./tool-budget.js";
 import { ContextLedger } from "./context-ledger.js";
 import { WorkingNotes, type WorkingNotesState } from "./working-notes.js";
+import { commitState } from "./state-commit.js";
+import { withContextRefresh } from "./context-refresh.js";
 import { payloadPolicy } from "./providers.js";
 import { withToolCallRepair } from "./repair.js";
 import { withCallTiming } from "./timing.js";
@@ -30,6 +32,29 @@ import { observeToolResult } from "./note-taking.js";
 /** What Rust sends with `run.start`. */
 export interface RunRequest {
   runId: string;
+  /**
+   * The attempt this run is. Stable for the whole of it.
+   *
+   * Every state commit carries it, and Rust refuses one that names a different
+   * attempt than the one it started — which is what stops a straggler from a
+   * worker that outlived a restart moving the live attempt's resume point back
+   * to a state a dead process believed.
+   *
+   * Optional only so a caller written before this existed still type-checks;
+   * a run without one cannot commit state, and says so once rather than
+   * failing quietly on every boundary.
+   */
+  attemptId?: string;
+  /**
+   * The agent this run is, for the per-round context boundary.
+   *
+   * Optional only so a caller written before agents had identities still type
+   * checks. A run without one compiles no task memory — which is the honest
+   * answer, because memory is keyed by agent and there is no agent to key on.
+   */
+  agentId?: string;
+  /** The agent definition this run pinned. See `agents::PinnedDefinition`. */
+  definitionVersion?: number;
   /**
    * The id of the assistant `Message` row the chat surface reserved for this
    * turn via `agent_append_turn`. Attached to every `message_start`,
@@ -517,6 +542,12 @@ export async function startRun(
   register: (run: ActiveRun) => void,
 ): Promise<RunOutcome> {
   const { runId } = request;
+  const attemptId = request.attemptId ?? "";
+  // Who this run is, for the context boundary. Absent on a caller written
+  // before agents had identities; an empty id compiles no task memory, which
+  // is the honest answer rather than somebody else's.
+  const agentId = request.agentId ?? "";
+  const definitionVersion = request.definitionVersion ?? 0;
   const ledger = new GrantLedger();
   const runtime = createLlmRuntime();
   registerBuiltInApiProviders(runtime.registry);
@@ -527,6 +558,12 @@ export async function startRun(
   // resumption it is the record of what already happened, including the side
   // effects that must not happen twice.
   const notes = WorkingNotes.from(request.notes);
+  // Content hashes this run has already put in front of the model.
+  //
+  // Kept for the whole run rather than per round: a constraint injected on
+  // round one is still in the transcript on round four, and injecting it again
+  // costs the window and teaches the model that repetition is emphasis.
+  const carriedHashes = new Set<string>();
   let preserved: PreservedState = { ...(request.preserved ?? {}) };
 
   // The notes are kept from what the tools returned rather than from what the
@@ -559,7 +596,20 @@ export async function startRun(
     ledger,
     runId,
     request.model.id,
-    (observation) => observeToolResult(notes, observation),
+    async (observation) => {
+      observeToolResult(notes, observation);
+      // The safe boundary. The tool has settled and its receipt is in Rust's
+      // durable log, so this is the first moment the run's state can be written
+      // down without either claiming an effect that has not happened or
+      // forgetting one that has. Rust checks every claim before writing it —
+      // see `state-commit.ts` — and the notes converge on what it wrote.
+      await commitState(peer, {
+        runId,
+        attemptId,
+        notes,
+        state: "toolResultRecorded",
+      });
+    },
     catalogue.tools,
   );
 
@@ -671,6 +721,20 @@ export async function startRun(
       // the compaction frame so a consumer folding both in order ends on the
       // post-compaction reading rather than the one that triggered it.
       publishLedger("compaction");
+      // The other safe boundary.
+      //
+      // Compaction is the point at which this side deliberately forgets part of
+      // the transcript, and `RunState::Compacting` exists on the Rust side
+      // precisely so a run that dies here can be told from one that dies
+      // mid-tool. Committing now means the resume point survives the forgetting
+      // — and the notes are what survives it, so they are worth writing down at
+      // exactly the moment the thing they summarise is discarded.
+      //
+      // Not awaited: `onCompacted` is called from inside the compactor and
+      // returns void, and blocking it would hold the loop across an IPC round
+      // trip in the middle of rebuilding its own context. The commit after the
+      // next tool result covers the same ground if this one is still in flight.
+      void commitState(peer, { runId, attemptId, notes, state: "compacting" });
     },
   });
 
@@ -679,12 +743,48 @@ export async function startRun(
     // re-issues is counted as the second call it is. Counting them together
     // would report one very slow model instead of two ordinary ones, which is
     // the distinction the measurement exists to make.
-    streamFn: withCallTiming(
-      withToolCallRepair(
-        runtime.streamSimple,
-        tools.map((tool) => tool.name),
+    // The Rust-mediated boundary, on the outside of everything.
+    //
+    // Wrapped here rather than called once before the loop, because *every*
+    // model round goes through `streamFn` — the first one, the one after each
+    // tool result, the one after a compaction, and the ones the repair layer
+    // re-issues on a retry. Putting the refresh at run start would have covered
+    // exactly one of those, which is what this replaces.
+    //
+    // Outside `withCallTiming` so the refresh is not counted as model latency:
+    // it is an IPC round trip to this process's own parent, and folding it into
+    // the model's time would misreport both.
+    streamFn: withContextRefresh(
+      withCallTiming(
+        withToolCallRepair(
+          runtime.streamSimple,
+          tools.map((tool) => tool.name),
+        ),
+        runId,
       ),
-      runId,
+      () => ({
+        peer,
+        request: {
+          runId,
+          // Until a task registry exists, the run *is* the task. Named
+          // separately so the two can diverge without this having to change.
+          taskId: request.runId,
+          agentId,
+          definitionVersion,
+          modelId: request.model.id,
+          servedWindow: request.model.contextWindow ?? 0,
+          question: request.prompt,
+          // What the round already carries, so nothing is injected twice.
+          alreadyCarried: [...carriedHashes],
+          templateId: undefined,
+          reservedToolSchemas: 0,
+          reservedOutput: 0,
+          reservedFraming: 0,
+        },
+        remember: (hashes: readonly string[]) => {
+          for (const hash of hashes) carriedHashes.add(hash);
+        },
+      }),
     ),
     /**
      * The harness converter, not the default.

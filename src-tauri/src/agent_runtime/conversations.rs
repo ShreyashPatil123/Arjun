@@ -480,19 +480,50 @@ impl ConversationStore {
     /// conversations. `None` is the unrestricted form, used by the
     /// administrator's "all conversations" view and by tests.
     pub fn list(&self, owner_user_id: Option<&str>) -> std::io::Result<Vec<Conversation>> {
+        Ok(self.list_with_diagnostics(owner_user_id)?.0)
+    }
+
+    /// `list`, plus the files it could not parse.
+    ///
+    /// The second half of the pair is the whole point. A damaged transcript is
+    /// skipped either way -- one bad file must not empty somebody's sidebar --
+    /// but "skipped" and "never existed" are different facts, and only this
+    /// signature can tell them apart. A caller that wants to say "2
+    /// conversations on this machine could not be read" has something to say it
+    /// with; `list` keeps the simple shape for the callers that do not.
+    pub fn list_with_diagnostics(
+        &self,
+        owner_user_id: Option<&str>,
+    ) -> std::io::Result<(Vec<Conversation>, Vec<PathBuf>)> {
         let mut out = Vec::new();
+        let mut unreadable: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Some(mut conversation) = self
-                .read_path(&path)
-                .ok()
-                .flatten()
-            else {
-                continue;
+            // An unreadable file is reported and skipped, never skipped
+            // silently. Two files on the machine this was written on are
+            // trailed by the tail of a longer earlier version -- damage from
+            // the build that wrote conversations in place, before `save`
+            // gained the tmp/fsync/rename dance above. `.ok().flatten()`
+            // turned each of them into a conversation that was simply absent
+            // from the sidebar: no error, no log, nothing to search for. The
+            // file is still there and still skipped, because one damaged
+            // transcript must not take the list down with it -- but now it
+            // says so, and `unreadable` below counts it.
+            let mut conversation = match self.read_path(&path) {
+                Ok(Some(conversation)) => conversation,
+                Ok(None) => continue,
+                Err(error) => {
+                    log::warn!(
+                        "[conversations] {} could not be read and is missing from the list: {error}",
+                        path.display()
+                    );
+                    unreadable.push(path.clone());
+                    continue;
+                }
             };
             if let Some(owner) = owner_user_id {
                 if conversation.owner_user_id != owner {
@@ -501,8 +532,16 @@ impl ConversationStore {
             }
             out.push(conversation);
         }
+        if !unreadable.is_empty() {
+            log::warn!(
+                "[conversations] {} conversation file(s) in {} could not be parsed and are not in                  this list",
+                unreadable.len(),
+                self.root.display()
+            );
+        }
         out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
-        Ok(out)
+        unreadable.sort();
+        Ok((out, unreadable))
     }
 
     /// Read a single file by full path, applying the v1→v2 migration

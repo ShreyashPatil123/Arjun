@@ -293,6 +293,33 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+
+/// An `Instant` `seconds` in the past, or the earliest one this machine can
+/// represent.
+///
+/// `Instant` is monotonic from boot, so `now() - 3700s` has no answer on a
+/// machine that has been up for twenty minutes. Subtracting directly panicked
+/// there, which made these tests pass on a long-running machine and fail on a
+/// freshly booted one — a flake that looks exactly like a real regression on
+/// the machines people use to check a fresh clone.
+///
+/// Halving until it fits keeps the meaning ("longer ago than the budget under
+/// test") at any uptime, and every assertion here is about crossing a
+/// threshold rather than about an exact age.
+fn ago(seconds: u64) -> Instant {
+    let now = Instant::now();
+    let mut back = seconds;
+    loop {
+        if let Some(then) = now.checked_sub(Duration::from_secs(back)) {
+            return then;
+        }
+        if back == 0 {
+            return now;
+        }
+        back /= 2;
+    }
+}
+
     use super::*;
 
     /// The property the whole module exists for.
@@ -317,7 +344,7 @@ mod tests {
     fn silence_past_the_phase_window_is_a_stall() {
         let mut tracker = Tracker::new(Phase::Repairing, 1);
         // Repairing allows ten seconds. Reach back past it.
-        tracker.last_advance = Instant::now() - Duration::from_secs(11);
+        tracker.last_advance = ago(11);
 
         match tracker.should_stop() {
             Some(Stop::Stalled { phase, .. }) => assert_eq!(phase, Phase::Repairing),
@@ -330,21 +357,21 @@ mod tests {
     #[test]
     fn the_same_silence_means_different_things_in_different_phases() {
         let mut composing = Tracker::new(Phase::Composing, 1);
-        composing.last_advance = Instant::now() - Duration::from_secs(11);
+        composing.last_advance = ago(11);
         assert!(
             composing.should_stop().is_none(),
             "a model may be quiet for eleven seconds without being stuck"
         );
 
         let mut rendering = Tracker::new(Phase::Rendering, 1);
-        rendering.last_advance = Instant::now() - Duration::from_secs(31);
+        rendering.last_advance = ago(31);
         assert!(rendering.should_stop().is_some(), "a writer may not");
     }
 
     #[test]
     fn entering_a_phase_restarts_the_silence_clock() {
         let mut tracker = Tracker::new(Phase::Repairing, 1);
-        tracker.last_advance = Instant::now() - Duration::from_secs(11);
+        tracker.last_advance = ago(11);
         assert!(tracker.should_stop().is_some());
 
         tracker.enter(Phase::Validating);
@@ -384,7 +411,7 @@ mod tests {
         let mut tracker = Tracker::new(Phase::Rendering, 1);
         // Advancing right now, so it is not silent; but started long ago.
         tracker.advance(Advance::Bytes(1));
-        tracker.started = Instant::now() - Duration::from_secs(10_000);
+        tracker.started = ago(10_000);
 
         match tracker.should_stop() {
             Some(Stop::OverBudget { budget, .. }) => assert_eq!(budget, budget_for(1)),
