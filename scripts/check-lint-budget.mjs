@@ -57,13 +57,52 @@ function unusedWarnings() {
   }
 
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-  return output.split('\n').filter((line) => UNUSED.test(line.trim())).length;
+  const count = output.split('\n').filter((line) => UNUSED.test(line.trim())).length;
+
+  // Did cargo actually look at the crate, or did it decide there was nothing
+  // to do and print nothing?
+  //
+  // This is the difference between a measurement and the absence of one, and
+  // they are indistinguishable in `count` alone — both are a small number. A
+  // fully cached `cargo check` re-emits no diagnostics, so the count comes
+  // back 0, and `main` would then ratchet the ceiling down to 0 and write it
+  // to a tracked file. Every honest run afterwards fails a gate that no change
+  // to the code can satisfy.
+  //
+  // Observed rather than theorised: on this tree the same source produced 0
+  // and then 40 across consecutive runs, the only difference being what cargo
+  // had already done.
+  const recompiled = /^\s*(Checking|Compiling) sarathi\b/m.test(output);
+  return { count, recompiled };
 }
 
 function main() {
   const budget = JSON.parse(readFileSync(BUDGET, 'utf8'));
   const ceiling = budget.unusedWarnings;
-  const actual = unusedWarnings();
+  const { count: actual, recompiled } = unusedWarnings();
+
+  // A run that recompiled nothing *and* saw nothing is the dangerous case, and
+  // the only one worth refusing.
+  //
+  // Cargo usually replays cached diagnostics, so a warm run still reports the
+  // real count — and `verify` always leaves it warm, because `check:targets`
+  // runs first. Refusing every warm run would fail the whole suite for no
+  // reason. But the replay is not guaranteed: on this tree a warm run returned
+  // 0 once and 40 immediately afterwards, with no change to the source. Zero
+  // from a run that compiled nothing is therefore not evidence of clean code,
+  // it is the absence of evidence — and `main` would write it into the budget
+  // as a new ceiling that no honest run could ever meet again.
+  if (!recompiled && actual === 0) {
+    console.error(
+      'The unused-code budget could not be measured: cargo re-checked nothing\n' +
+        'and emitted no diagnostics, so the count of 0 is a reading of the build\n' +
+        'cache rather than of the code. Recording it would ratchet the ceiling to\n' +
+        '0 and fail every honest run afterwards.\n\n' +
+        'Force the crate to be looked at again, then re-run:\n\n' +
+        '  touch src-tauri/src/lib.rs && npm run check:lint-budget\n',
+    );
+    process.exit(1);
+  }
 
   if (actual > ceiling) {
     console.error(
@@ -78,6 +117,20 @@ function main() {
   if (actual < ceiling) {
     // Lowered automatically. A ratchet somebody has to remember to tighten is a
     // ratchet that stays where it was.
+    //
+    // Only on a run that actually re-checked the crate, though. Tightening the
+    // ceiling is the one action here that is written down and outlives the
+    // run, so it is the one that must not be taken on a replayed count — a
+    // warm run that happens to report fewer warnings than it would have
+    // measured leaves behind a permanently unsatisfiable gate.
+    if (!recompiled) {
+      console.log(
+        `Unused-code budget OK: ${actual} warnings (ceiling ${ceiling}). Not lowering the\n` +
+          'ceiling: cargo re-checked nothing, so this count was replayed rather than\n' +
+          'measured. Run after a real check to tighten it.',
+      );
+      return;
+    }
     budget.unusedWarnings = actual;
     writeFileSync(BUDGET, `${JSON.stringify(budget, null, 2)}\n`);
     console.log(

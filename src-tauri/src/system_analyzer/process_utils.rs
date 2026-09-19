@@ -30,6 +30,21 @@ pub fn create_hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
 pub fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
     let (tx, rx) = mpsc::channel();
 
+    // Piped, not inherited. `wait_with_output` can only collect a stream it was
+    // given a pipe for: spawned with the default stdio the child writes
+    // straight to *our* console and `Output.stdout` comes back empty every
+    // time.
+    //
+    // That was not theoretical. Every line the software detector logged read
+    // `version=""` — for Rust, Node, npm, Git, all of them — because the
+    // version string it parsed was always an empty buffer, while the real
+    // output appeared in ARJUN's own stdout. The same emptiness is why Python
+    // was reported missing on a machine with three copies of it: the condition
+    // that would have rescued a non-zero exit (`!stdout.is_empty()`) could
+    // never be true, so the Windows Store alias's refusal was the whole answer.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
     let child = cmd.spawn().map_err(|e| format!("Failed to spawn process: {}", e))?;
     let child_id = child.id();
 
@@ -85,4 +100,63 @@ pub fn resolve_binary_path_natively(bin: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The output of a command that ran must actually come back.
+    ///
+    /// This is the regression that mattered: `run_command_with_timeout` spawned
+    /// with the default stdio, so `wait_with_output` had no pipe to read and
+    /// returned empty buffers every time. Nothing failed loudly. The software
+    /// panel simply reported `version=""` for every tool on the machine, and
+    /// Python — whose probe depends on reading the output when the Windows
+    /// Store alias answers first — was reported missing on a machine with three
+    /// interpreters installed.
+    #[test]
+    fn a_commands_stdout_is_captured_rather_than_inherited() {
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        if cfg!(windows) {
+            cmd.args(["/C", "echo captured-marker"]);
+        } else {
+            cmd.args(["-c", "echo captured-marker"]);
+        }
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(10))
+            .expect("the command runs");
+
+        assert!(output.status.success(), "the command should have succeeded");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("captured-marker"),
+            "stdout must be captured, not written to this process console. Got {text:?}"
+        );
+    }
+
+    /// stderr is captured too, and separately.
+    ///
+    /// Both halves are needed: some tools print their version to stderr, and the
+    /// Store alias's refusal arrives there as well.
+    #[test]
+    fn a_commands_stderr_is_captured_separately_from_stdout() {
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        if cfg!(windows) {
+            cmd.args(["/C", "echo err-marker 1>&2"]);
+        } else {
+            cmd.args(["-c", "echo err-marker 1>&2"]);
+        }
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(10))
+            .expect("the command runs");
+
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(err.contains("err-marker"), "stderr must be captured, got {err:?}");
+        assert!(
+            !out.contains("err-marker"),
+            "stderr must not be folded into stdout, got {out:?}"
+        );
+    }
 }

@@ -30,6 +30,9 @@
 pub mod assertions;
 #[cfg(test)]
 mod journey_tests;
+pub mod migration;
+#[cfg(test)]
+mod migration_tests;
 pub mod notes;
 pub mod persist;
 pub mod relations;

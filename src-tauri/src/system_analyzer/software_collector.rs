@@ -54,7 +54,18 @@ fn check_executable(display_name: &str, binary_names: &[&str], version_args: &[&
             cmd.args(version_args);
 
             if let Ok(output) = run_command_with_timeout(cmd, Duration::from_secs(2)) {
-                if output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+                // Success, and nothing weaker.
+                //
+                // This used to also accept "wrote something to either stream",
+                // which was unreachable while the streams were never captured
+                // (see `run_command_with_timeout`). Now that they are, that arm
+                // would be actively wrong on Windows: `python` on PATH is
+                // usually the Microsoft Store *alias*, which exits non-zero and
+                // writes "Python was not found; run without arguments to
+                // install from the Microsoft Store" — to stderr. Accepting a
+                // non-empty stream would report that refusal as an installed
+                // interpreter and parse its first line as a version string.
+                if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let raw_out = if !stdout.trim().is_empty() { stdout } else { stderr };
