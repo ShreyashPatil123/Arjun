@@ -39,7 +39,7 @@ use std::path::Path;
 use crate::ai_engine::gguf_meta;
 use crate::ai_engine::gguf_meta::KvCost;
 use crate::ai_engine::vram_planner::{plan_gpu_offload_at, ContextChoice, GpuOffloadPlan};
-use crate::registry::ModelEntry;
+use crate::registry::{ModelEntry, ModelRegistry};
 use crate::serving::{ModelServers, ServingError};
 use crate::system_analyzer::{gpu_collector, memory_collector};
 
@@ -286,5 +286,149 @@ pub fn measure_budget(installed: u64) -> VramBudget {
     match gpu_collector::free_vram_bytes() {
         Some(free) => VramBudget::Free(free),
         None => VramBudget::InstalledOnly(installed),
+    }
+}
+
+/// VRAM that ARJUN is holding and [`admit`] would release to make room.
+///
+/// ## Why routing needs this and free VRAM alone is not enough
+///
+/// Routing and loading have to answer to the same number, and an earlier fix
+/// got them halfway there: routing used to plan against the *installed* total
+/// while admission measured what was free, so the router picked the largest
+/// model that "fits in 8 GB" and admission then partially offloaded it. Passing
+/// free VRAM fixed that direction.
+///
+/// It opened the opposite one. Admission does not merely *measure* free VRAM —
+/// it reclaims, unloading the in-process model and then servers until the model
+/// fits. Free VRAM therefore understates what admission can actually offer, by
+/// exactly the amount ARJUN is already using.
+///
+/// The visible failure is a feedback loop. Measured on an 8 GB laptop card:
+/// with nothing loaded, 7.4 GB is free and a 4.07 GB model plans as a full
+/// offload. Once it is resident, 2.3 GB is free — so the *next* turn plans the
+/// same model, already sitting on the GPU, as not fitting, marks the decision
+/// `used_fallback`, and the panel reports "partly on CPU" for a model that is
+/// entirely on the card. Worse than a wrong label: the clamp in
+/// `ai_engine::manager` then lowers the layer count to match the shrunken
+/// budget, so the next load genuinely is partly on the CPU. The mislabel makes
+/// itself true.
+///
+/// So the budget a router plans against is what ARJUN can *make* available:
+/// what is free, plus what it would give back.
+///
+/// Counted from the registry's recorded `weights_bytes` rather than by asking
+/// the driver, because the driver reports a total for the process and cannot
+/// say which model an allocation belongs to. A model with no recorded size
+/// contributes nothing, which errs toward the smaller budget.
+pub fn reclaimable_bytes(registry: &ModelRegistry, servers: &ModelServers) -> u64 {
+    let weights_of = |model_id: &str| -> u64 {
+        registry
+            .all()
+            .iter()
+            .find(|entry| entry.id == model_id)
+            .map(|entry| entry.weights_bytes)
+            .unwrap_or(0)
+    };
+
+    let in_process = crate::ai_engine::manager::global()
+        .and_then(|inference| inference.resident_model_id())
+        .map(|id| weights_of(&id))
+        .unwrap_or(0);
+
+    let in_servers: u64 = servers
+        .running_model_ids()
+        .iter()
+        .map(|id| weights_of(id))
+        .sum();
+
+    in_process.saturating_add(in_servers)
+}
+
+/// The budget a routing decision should be planned against.
+///
+/// [`measure_budget`] plus [`reclaimable_bytes`], capped at the card — ARJUN
+/// giving memory back cannot produce more VRAM than the GPU has. When the
+/// driver reports no free figure the installed total is used unchanged, which
+/// is what [`VramBudget::InstalledOnly`] already means.
+pub fn routable_budget(
+    installed: u64,
+    registry: &ModelRegistry,
+    servers: &ModelServers,
+) -> VramBudget {
+    match measure_budget(installed) {
+        VramBudget::Free(free) => {
+            VramBudget::Free(widen(free, reclaimable_bytes(registry, servers), installed))
+        }
+        installed_only => installed_only,
+    }
+}
+
+/// Free plus reclaimable, bounded by the card.
+///
+/// Separated from [`routable_budget`] because this is the part with edge cases
+/// and the rest needs a GPU and a running server to exercise.
+///
+/// The ceiling is `installed.max(free)` rather than `installed`: a driver that
+/// reports more free than this build recorded as installed is describing a
+/// machine this function should not silently contradict, and clamping to a
+/// stale smaller total would throw away real memory. Whichever is larger is the
+/// honest ceiling.
+fn widen(free: u64, reclaimable: u64, installed: u64) -> u64 {
+    free.saturating_add(reclaimable).min(installed.max(free))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    /// The feedback loop, in numbers taken from the machine that showed it.
+    ///
+    /// 8 GB card, a 4.07 GB model resident. Free VRAM alone says 2.3 GB and the
+    /// model that is *already on the card* does not fit in it. Adding back what
+    /// ARJUN would release restores the budget it actually has.
+    #[test]
+    fn a_resident_model_is_added_back_to_the_budget() {
+        let installed = 8 * GB;
+        let resident = 4 * GB + GB / 10;
+        let free = 2 * GB + GB / 3;
+
+        assert!(
+            free < resident,
+            "the premise: free VRAM alone cannot hold the model already loaded"
+        );
+        assert!(
+            widen(free, resident, installed) >= resident,
+            "the budget must cover a model ARJUN could reload after reclaiming"
+        );
+    }
+
+    /// Giving memory back cannot produce more than the card holds.
+    #[test]
+    fn the_budget_never_exceeds_the_card() {
+        let installed = 8 * GB;
+        assert_eq!(widen(7 * GB, 6 * GB, installed), installed);
+        assert_eq!(widen(installed, 4 * GB, installed), installed);
+    }
+
+    /// Nothing resident means nothing to add: the old behaviour, unchanged.
+    #[test]
+    fn with_nothing_loaded_the_budget_is_what_is_free() {
+        assert_eq!(widen(7 * GB, 0, 8 * GB), 7 * GB);
+    }
+
+    /// A driver reporting more free than the recorded total is not clamped
+    /// down to the stale figure.
+    #[test]
+    fn a_free_figure_above_the_recorded_total_is_not_thrown_away() {
+        assert_eq!(widen(9 * GB, 0, 8 * GB), 9 * GB);
+    }
+
+    /// Absurd inputs saturate rather than wrap.
+    #[test]
+    fn the_arithmetic_saturates() {
+        assert_eq!(widen(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
     }
 }

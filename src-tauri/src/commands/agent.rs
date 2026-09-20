@@ -1872,7 +1872,16 @@ async fn drive_run(
     // `InstalledOnly` is the honest fallback for a driver that reports no free
     // figure — an AMD card, a headless box without `nvidia-smi` — and it puts
     // routing back exactly where it was rather than refusing to route at all.
-    let vram = crate::serving::admission::measure_budget(installed).bytes();
+    // Plus what ARJUN itself is holding, because `admit` will give it back.
+    //
+    // Free VRAM alone made this a feedback loop: once the chosen model was
+    // resident it consumed most of the card, so the next turn planned that same
+    // model as not fitting and the panel reported "partly on CPU" for something
+    // entirely on the GPU — then the layer clamp made it so. See
+    // `admission::reclaimable_bytes`.
+    let vram =
+        crate::serving::admission::routable_budget(installed, registry.inner(), servers.inner())
+            .bytes();
 
     // The chat model an administrator chose, read fresh rather than cached: the
     // choice can change while the app is open, and a run starting a second later
@@ -3652,7 +3661,36 @@ async fn drive_run(
                 params["prompt"] = json!(resumption_prompt);
                 continue;
             }
-            crate::ai_engine::continuation::ContinuationDecision::Finished => break attempt,
+            crate::ai_engine::continuation::ContinuationDecision::Finished => {
+                // The checkpoint found nothing outstanding, so the task is
+                // done — even if the generation that finished it ran into the
+                // output cap on its closing words.
+                //
+                // This arm used to `break attempt`, handing back whatever the
+                // last generation said. A run that completed every step and
+                // was clipped mid-sentence therefore surfaced as
+                // `LengthLimited`, and the screen showed "Stopped: the answer
+                // reached the output limit for one turn" above four files that
+                // had been written and verified. The verdict contradicted the
+                // evidence directly underneath it.
+                //
+                // `LengthLimited` is kept for the `Stop` arm below, where it is
+                // true: there the work really is unfinished. Here the only
+                // thing truncated is prose, and the distinction that ending
+                // exists to preserve — "you are looking at a fragment of the
+                // work" — does not apply.
+                match attempt.1 {
+                    RunOutcome::LengthLimited { detail } => {
+                        log::info!(
+                            "[continuation] run {run_id}: the checkpoint reports no outstanding \
+                             work, so the task is complete; the closing text was cut off at the \
+                             output cap ({detail})"
+                        );
+                        break (attempt.0, RunOutcome::Completed);
+                    }
+                    other => break (attempt.0, other),
+                }
+            }
             crate::ai_engine::continuation::ContinuationDecision::Stop { detail, escalate } => {
                 log::info!(
                     "[continuation] run {run_id}: stopping after {generation} generation(s):                      {detail} (escalate={escalate})"
@@ -4633,7 +4671,8 @@ fn describe_plan(plan: &PlanRun) -> String {
         "This task has a plan, fixed before you were asked and not extendable:\n\n{}\n\n\
          You may use these tools and no others: {}. You have {} tool calls and {} minutes for \
          the whole task, and making the same call more than {} times is treated as going in \
-         circles and stops the task. If you run out, say what you completed and what you did not.",
+         circles and stops the task. If you run out, say what you completed and what you did \
+         not.{}",
         steps.join("\n"),
         tools.join(", "),
         plan.budget.max_steps,
@@ -4644,7 +4683,148 @@ fn describe_plan(plan: &PlanRun) -> String {
         // task, which told the model the third identical call would stop it when
         // in fact the fourth does.
         plan.budget.repeat_limit,
+        describe_working_method(plan),
     )
+}
+
+/// The tools that put something on disk, as opposed to reading or searching.
+///
+/// [`describe_working_method`] is addressed to a run that is *producing*
+/// something, and this is the test for whether that is what is happening. A run
+/// permitted only to search and read has nothing to interleave, and telling it
+/// about a working method it cannot follow is the kind of unconditional
+/// instruction `SYSTEM_PROMPT`'s scope clause exists to avoid — the same
+/// mistake that once had a small model answer "hi" with "no source was found".
+const PRODUCING_TOOLS: &[crate::orchestrator::tools::ToolName] = {
+    use crate::orchestrator::tools::ToolName;
+    &[
+        ToolName::WriteScopedFile,
+        ToolName::CreateDocx,
+        ToolName::CreateXlsx,
+        ToolName::CreatePptx,
+        ToolName::CreatePdf,
+        ToolName::CreateChart,
+        ToolName::CreateDiagram,
+        ToolName::CreateTable,
+    ]
+};
+
+/// How to work, for a run that is going to produce files.
+///
+/// ## The behaviour this exists to correct
+///
+/// Reported as: "it keeps thinking when asked to create anything and codes
+/// entirely in thinking and then writes inside file". That is exactly what was
+/// observed — a reasoning model asked for a small application spent minutes
+/// composing every file, in full, inside one private reasoning block, and only
+/// then began calling the writer. `agent-runtime/src/run.ts` documents the
+/// extreme form of the same habit, where the turn ends still inside the
+/// reasoning block and the visible answer is empty.
+///
+/// Nothing in the prompt caused it and nothing in the prompt prevented it. The
+/// instructions said what to answer and said nothing whatever about *how to
+/// work*, and a model with no stated method falls back to the one its training
+/// rewards: think the whole thing through, then emit it. Three things go wrong
+/// when it does.
+///
+/// - **Every file is at risk of the same interruption.** Work held in reasoning
+///   is not on disk. A turn that is stopped, or that hits the output cap, or
+///   that runs out of tool calls, loses all of it at once — where a turn that
+///   wrote each file as it finished it loses only the file it was on.
+/// - **The output cap is spent twice.** The contents are produced once as
+///   reasoning and again as a tool argument, and on a local model with a modest
+///   window that is frequently the difference between four files and two.
+/// - **Nothing can be seen while it happens.** A person watching a task that
+///   has produced no file for four minutes cannot tell work from a loop.
+///
+/// ## Why the instruction is shaped the way it is
+///
+/// Each clause blocks a specific way the model slips back into the old habit.
+/// "One file per call" stops the batching that reintroduces the same problem at
+/// a smaller scale. "Decide, then call" names the boundary between what
+/// reasoning is for and what it is not. "Do not draft contents in reasoning" is
+/// stated in the negative as well as the positive because the positive form
+/// alone was read as "also write a tool call afterwards", which is precisely the
+/// behaviour being removed. The closing clause connects the method to the
+/// interruption it protects against, which is the reason a model has to follow
+/// it even when holding everything in reasoning would feel tidier.
+fn describe_working_method(plan: &PlanRun) -> String {
+    let produces = PRODUCING_TOOLS
+        .iter()
+        .any(|tool| plan.budget.permitted_tools.contains(tool));
+    if !produces {
+        return String::new();
+    }
+
+    let mut note = String::new();
+
+    // Said before the model reaches for the sandbox, not after it is refused.
+    //
+    // `sandbox::assess` refuses every tier below `Container`, so on a machine
+    // with WSL2 but no Docker or Podman — the ordinary case — `sandbox.run_code`
+    // always answers "code is not run". A model that is offered the tool spends
+    // a step finding that out, and then has to decide what to do about it
+    // mid-task. A real run did exactly that, and then began writing a mock
+    // `document` and a mock `localStorage` into its reasoning so it could trace
+    // the program by hand.
+    //
+    // The tool stays in the catalogue — the plan is derived deterministically
+    // from the prompt and must not vary with what is installed, which is what
+    // `agent_runtime::resume` depends on. What varies is what the model is
+    // *told*, and telling it plainly costs nothing and saves a step.
+    //
+    // The last clause is the one that matters most: it names what to do
+    // instead. "You cannot run code" on its own invites the model to simulate
+    // running it, which is the behaviour being removed.
+    if plan
+        .budget
+        .permitted_tools
+        .contains(&crate::orchestrator::tools::ToolName::ExecuteCode)
+        && crate::orchestrator::sandbox::detect_tier()
+            != crate::orchestrator::sandbox::SandboxTier::Container
+    {
+        note.push_str(
+            "\n\nTHIS MACHINE CANNOT RUN CODE. There is no container runtime here, so \
+             sandbox.run_code will refuse every call. Do not call it, and do not try to make up \
+             for it by tracing your program in your head or writing mock objects to test \
+             against — a hand-traced run is not evidence and must never be reported as one. \
+             Write the files, prefer something the person can open and check for themselves \
+             (a self-contained page needs no build step), and say plainly at the end that you \
+             could not run it here and what they should check when they do.",
+        );
+    }
+
+    note.push_str(
+        "\n\nHOW TO WORK WHEN YOU ARE PRODUCING FILES.\n\
+     Work one file at a time, and put each one on disk before you start the next.\n\
+     - Decide what a single file should contain, then immediately call the tool that writes \
+     it, with the complete contents in that call. Write the contents in the tool call and \
+     nowhere else.\n\
+     - Do not draft or compose file contents in your private reasoning. Reasoning is for \
+     deciding what to do next — which file, what it must contain, what it depends on — not \
+     for holding the work. A file you have written out in reasoning but not yet saved does \
+     not exist.\n\
+     - One file per tool call. Do not plan every file first and then write them in a batch at \
+     the end.\n\
+     - After each write, say in one short line what you wrote, then move on to the next file.\n\
+     - Before writing a file, check whether it has already been written earlier in this \
+     conversation. If it has, do not write it again unless you are changing it.\n\
+     This is not a style preference. A turn can be stopped at any moment, and everything that \
+     is on disk survives while everything that is only in your reasoning is lost. Writing as \
+     you go is what lets the work be continued instead of started over.\n\
+     \n\
+     GET THESE RIGHT THE FIRST TIME. A write that fails costs a whole step and has to be \
+     approved again, so these are checked before anything is saved and the file is refused if \
+     they are not met:\n\
+     - .html: one <html lang=\"...\"> element, a <title>, exactly one <h1>, an alt attribute on \
+     every <img>, and a <label> or aria-label for every <input>, <select> and <textarea>.\n\
+     - .json, .csv, .yaml, .xml: must parse, with every CSV row the same width as its header.\n\
+     - .md and .html must be more than a token stub, and no file may contain placeholder text \
+     such as TODO, TBD or lorem ipsum. Write the real content.\n\
+     Files whose extension is not in that list — .js, .css, .py, .txt and the rest — are saved \
+     exactly as you write them.",
+    );
+    note
 }
 
 // `DEFAULT_MAX_TOKENS` lived here: a single 4 096-token cap on every turn's
@@ -7796,5 +7976,111 @@ mod tool_summary_tests {
         // One line. This rides in the context window of every later turn, so
         // its size is a cost paid for the life of the conversation.
         assert!(!summary.contains('\n'), "{summary}");
+    }
+}
+
+#[cfg(test)]
+mod working_method_tests {
+    //! How the model is told to work, and when it is told at all.
+    //!
+    //! ## The defect
+    //!
+    //! Reported as: "it keeps thinking when asked to create anything and codes
+    //! entirely in thinking and then writes inside file instead it should think
+    //! and then write that file then again think for new one and write and so
+    //! on."
+    //!
+    //! The prompt described what to answer and said nothing about how to work,
+    //! so a reasoning model fell back to the habit its training rewards:
+    //! compose everything privately, then emit it. Work held in reasoning is
+    //! not on disk, so an interruption lost all of it at once — which is also
+    //! why this and `turn_context`'s resumption marker are one repair and not
+    //! two.
+
+    use super::*;
+    use crate::orchestrator::tools::ToolName;
+
+    fn plan_with(tools: Vec<ToolName>) -> PlanRun {
+        PlanRun::new(
+            "run-1",
+            vec!["Answer the question.".to_string()],
+            crate::orchestrator::plan::Budget::standard(tools),
+        )
+    }
+
+    #[test]
+    fn a_run_that_writes_files_is_told_to_write_them_one_at_a_time() {
+        let note = describe_plan(&plan_with(vec![
+            ToolName::SearchDocuments,
+            ToolName::WriteScopedFile,
+        ]));
+
+        assert!(note.contains("HOW TO WORK WHEN YOU ARE PRODUCING FILES"), "{note}");
+        assert!(note.contains("One file per tool call"), "{note}");
+        assert!(
+            note.contains("Do not draft or compose file contents in your private reasoning"),
+            "the negative form is the clause that removes the behaviour: {note}",
+        );
+    }
+
+    /// The other half of the interruption repair, stated where the model reads
+    /// it. `turn_context::prepare` labels what survived; this is what decides
+    /// how much survives in the first place.
+    #[test]
+    fn the_reason_for_writing_as_you_go_is_the_interruption_it_survives() {
+        let note = describe_plan(&plan_with(vec![ToolName::CreateDocx]));
+        assert!(note.contains("A turn can be stopped at any moment"), "{note}");
+        assert!(note.contains("continued instead of started over"), "{note}");
+    }
+
+    /// The rules a write is actually judged against, told before the write.
+    ///
+    /// `artifacts::text_formats::check` refuses an `.html` file with no
+    /// `<title>`, no `<h1>` or an unlabelled `<input>` — which is most first
+    /// drafts of a form. A real run had three writes refused in a row, and each
+    /// refusal costs a step *and* another approval prompt for the person
+    /// watching. The rules are cheap to state and expensive to discover.
+    #[test]
+    fn the_rules_a_write_is_judged_against_are_stated_before_the_write() {
+        let note = describe_plan(&plan_with(vec![ToolName::WriteScopedFile]));
+
+        assert!(note.contains("GET THESE RIGHT THE FIRST TIME"), "{note}");
+        assert!(note.contains("exactly one <h1>"), "{note}");
+        assert!(note.contains("aria-label"), "{note}");
+        assert!(
+            note.contains("are saved"),
+            "a model told only about the checked formats would think every file is              validated: {note}",
+        );
+    }
+
+    /// The scope clause, applied to this section for `SYSTEM_PROMPT`'s reason.
+    ///
+    /// A run permitted only to search and read has nothing to interleave, and
+    /// a small local model reads an unconditional instruction as applying to
+    /// every turn — which is how an earlier unconditional rule had "hi" come
+    /// back as "no source was found for the query".
+    #[test]
+    fn a_run_that_produces_nothing_is_not_told_how_to_produce_it() {
+        let note = describe_plan(&plan_with(vec![
+            ToolName::SearchDocuments,
+            ToolName::ReadScopedFile,
+            ToolName::MemoryRecallAuthorized,
+        ]));
+
+        assert!(
+            !note.contains("HOW TO WORK WHEN YOU ARE PRODUCING FILES"),
+            "a read-only run was given a method it cannot follow: {note}",
+        );
+    }
+
+    /// The budget and tool list still reach the model unchanged. This section
+    /// is appended to the plan note, and an append that displaced what was
+    /// already there would cost the run its step budget.
+    #[test]
+    fn the_plan_itself_still_reaches_the_model() {
+        let note = describe_plan(&plan_with(vec![ToolName::WriteScopedFile]));
+        assert!(note.contains("This task has a plan"), "{note}");
+        assert!(note.contains("workspace.write_text"), "{note}");
+        assert!(note.contains("Answer the question."), "{note}");
     }
 }

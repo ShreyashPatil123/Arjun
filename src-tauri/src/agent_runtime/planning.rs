@@ -80,7 +80,32 @@ const DELIVERABLE_WORDS: &[&str] = &[
 ];
 
 /// Words that mean a workbook showing the working is wanted.
-const WORKBOOK_WORDS: &[&str] = &["workbook", "spreadsheet", "excel", "xlsx", "working"];
+///
+/// `"working"` used to be here as a bare token, and it is the wrong shape for
+/// what it was reaching for. The sense wanted is the British one — "show the
+/// working", the steps behind a figure — and as a single token it also matches
+/// the adjective, which is far commoner: "the final working project", "a
+/// working example", "is the pump working". A real request read
+///
+/// > Build a simple local To-Do List application … provide the final **working**
+/// > project with run instructions
+///
+/// and planned `artifact.create_calculation_workbook` off that one word, so a
+/// run asked for an application was told its deliverable was a spreadsheet.
+///
+/// The phrases keep the sense and drop the adjective: each contains a space, so
+/// `mentions` matches them with `contains` rather than as a token.
+const WORKBOOK_WORDS: &[&str] = &[
+    "workbook",
+    "spreadsheet",
+    "excel",
+    "xlsx",
+    "show the working",
+    "show your working",
+    "showing the working",
+    "with the working",
+    "the working out",
+];
 
 /// Words that mean somebody expects slides.
 ///
@@ -102,12 +127,33 @@ const DECK_WORDS: &[&str] = &[
 ];
 
 /// Words that mean a sandbox is wanted, and cannot mean anything else here.
+///
+/// The additions are the vocabulary of building something that runs, chosen
+/// under the same test as the words that were already here: a token that a
+/// standards clause, a maintenance record or a drawing note cannot produce.
+/// `html`, `css` and `npm` name nothing in a plant; `frontend`, `backend` and
+/// `webapp` are one word only in software.
+///
+/// Words deliberately left out, because they have a plain plant reading:
+/// `react` ("how does the catalyst react"), `node` (a node on a network or a
+/// graph), `application` on its own ("application of the primer", "a job
+/// application"), and `app` (too short to be safe against the abbreviations
+/// that appear in drawing titles). `application` is reached through
+/// [`CODE_PHRASES`] instead, where the verb in front of it settles the sense.
 const CODE_WORDS: &[&str] = &[
     "script",
     "python",
     "javascript",
     "typescript",
     "sandbox",
+    "html",
+    "css",
+    "npm",
+    "frontend",
+    "backend",
+    "webapp",
+    "gui",
+    "localstorage",
 ];
 
 /// Ways of saying "code" that mean source rather than a standard.
@@ -134,6 +180,44 @@ const CODE_PHRASES: &[&str] = &[
     "run the code",
     "write a program",
     "write a small program",
+    // Asking for something that *runs*, which is the case this list missed.
+    //
+    // The prompt that exposed it began "Build a simple local To-Do List
+    // application" and ended "Run the application and test adding, completing,
+    // deleting". Not one word of it was in either list, so `writes_code` was
+    // false: the plan carried no step for writing the code, `sandbox.run_code`
+    // was not permitted, and the only deliverable step it did carry was a
+    // workbook (see [`WORKBOOK_WORDS`]). The run was handed a plan describing a
+    // different task from the one it had been given, spent the whole turn
+    // reasoning about the contradiction, and called no tool at all.
+    //
+    // Each of these puts a verb or a qualifier in front of the noun, which is
+    // what keeps "application of the primer" and "a job application" out.
+    "build an app",
+    "build a app",
+    "build an application",
+    "build the application",
+    "create an app",
+    "create an application",
+    "make an app",
+    "make an application",
+    "write an app",
+    "write an application",
+    "run the app",
+    "run the application",
+    "web app",
+    "web application",
+    "desktop app",
+    "desktop application",
+    "mobile app",
+    "mobile application",
+    "single-page",
+    "user interface",
+    "source code",
+    "front-end",
+    "back-end",
+    "to-do",
+    "todo list",
 ];
 
 /// Words that mean the person wants something to outlast this run.
@@ -310,9 +394,36 @@ pub fn derive(prompt: &str) -> DerivedPlan {
     }
 
     if writes_code {
+        // Satisfied by the code being *written*, not by it being run.
+        //
+        // This step used to be "Write the code and run it in the sandbox",
+        // settled by `ExecuteCode` — a step most machines cannot satisfy.
+        // `sandbox::assess` refuses every tier below `Container`, so on a
+        // workstation with WSL2 but no Docker or Podman — which is the ordinary
+        // case — `sandbox.run_code` always answers "code is not run".
+        //
+        // The damage was not only the unsatisfiable step. A model told to run
+        // its code, and refused, does the next best thing it can think of: it
+        // runs the code *in its head*. A real run reached for the sandbox,
+        // was refused, and spent the rest of the turn writing a mock `document`
+        // and a mock `localStorage` into its reasoning so it could trace the
+        // program by hand — twenty thousand characters of it, and not one file
+        // on disk.
+        //
+        // Writing the files is the deliverable and is always possible. Running
+        // them is a check that some machines can do, and `ExecuteCode` stays
+        // permitted below for the ones that can — a tool that is offered and
+        // refuses clearly costs a turn; a *step* that can never be satisfied
+        // reports the whole run unfinished.
+        //
+        // The intent names the tool and the one-file-per-call rule because the
+        // plan is in the prompt: this is the same instruction
+        // `commands::agent::describe_working_method` gives, said where the
+        // model reads its steps.
         steps.push(step(
-            "Write the code and run it in the sandbox.",
-            Satisfies::Tool(ToolName::ExecuteCode),
+            "Write the code into the workspace with workspace.write_text, one file per call, \
+             saving each file before starting the next.",
+            Satisfies::Tool(ToolName::WriteScopedFile),
         ));
     }
 
@@ -603,10 +714,12 @@ mod tests {
             &derive("calculate the flow rate through the 8 inch line"),
             ToolName::RunCalculation
         ));
-        assert!(plans(
-            &derive("write a python script to tabulate these readings"),
-            ToolName::ExecuteCode
-        ));
+        // Settled by the code being written. Running it is a check only a
+        // machine with a container runtime can do, so it is permitted rather
+        // than planned -- see the step in `derive`.
+        let script = derive("write a python script to tabulate these readings");
+        assert!(plans(&script, ToolName::WriteScopedFile));
+        assert!(script.budget.permits(ToolName::ExecuteCode));
         assert!(derive("draft a note approving the seal replacement")
             .steps
             .iter()
@@ -879,6 +992,110 @@ mod tests {
         // Reading memory stays available: the question may well be one the
         // project has already answered.
         assert!(plan.budget.permits(ToolName::MemoryRecallAuthorized));
+    }
+
+    /// The prompt that exposed both misfires, kept verbatim.
+    ///
+    /// Reported as "it keeps thinking when asked to create anything". The run
+    /// record showed why: `turns: 1`, `toolCalls: []`, an empty answer, and a
+    /// plan whose only deliverable step was
+    /// `artifact.create_calculation_workbook` — for a to-do list application.
+    ///
+    /// Two independent bugs produced that. `"working"` in `WORKBOOK_WORDS`
+    /// matched "the final working project", and nothing in `CODE_WORDS` or
+    /// `CODE_PHRASES` matched a request to build and run an application. So the
+    /// model was told to search the collections, cite passages and produce a
+    /// spreadsheet, and was given no tool for running anything.
+    const TODO_APP_REQUEST: &str = "Build a simple local To-Do List application with a clean, minimal UI.
+Allow users to add new tasks through a text input and Add button.
+Prevent empty tasks from being added.
+Persist tasks locally so they remain after restarting the application.
+Run the application and test adding, completing, deleting, and persisting tasks.
+Fix any errors found and provide the final working project with run instructions.";
+
+    #[test]
+    fn asking_for_an_application_plans_to_write_and_run_it() {
+        let plan = derive(TODO_APP_REQUEST);
+
+        // The step is settled by the files being written, which every machine
+        // can do. `sandbox::assess` refuses every tier below `Container`, so a
+        // step settled by `ExecuteCode` is unsatisfiable on any workstation
+        // without Docker or Podman -- and a model refused the sandbox falls
+        // back to tracing its own program in its reasoning.
+        assert!(
+            plans(&plan, ToolName::WriteScopedFile),
+            "a request to build an application planned no step for writing it: {:?}",
+            plan.steps.iter().map(|s| &s.intent).collect::<Vec<_>>()
+        );
+        assert!(
+            !plans(&plan, ToolName::ExecuteCode),
+            "the plan required a sandbox run, which most machines cannot satisfy"
+        );
+        // Still offered, for the machines that can run it.
+        assert!(plan.budget.permits(ToolName::ExecuteCode));
+        assert!(plan.budget.permits(ToolName::WriteScopedFile));
+    }
+
+    #[test]
+    fn a_working_project_is_not_a_request_for_a_spreadsheet() {
+        let plan = derive(TODO_APP_REQUEST);
+
+        assert!(
+            !plans(&plan, ToolName::CreateXlsx),
+            "\"the final working project\" planned a workbook: {:?}",
+            plan.steps.iter().map(|s| &s.intent).collect::<Vec<_>>()
+        );
+        assert!(!plan.budget.permits(ToolName::CreateXlsx));
+    }
+
+    /// The adjective, in the places it ordinarily turns up. None of these is a
+    /// request to show anybody's working.
+    #[test]
+    fn the_adjective_working_never_plans_a_workbook() {
+        for prompt in [
+            "is the standby pump working?",
+            "give me a working example of the interlock logic",
+            "provide the final working project",
+            "the working pressure is 12 bar",
+        ] {
+            assert!(
+                !plans(&derive(prompt), ToolName::CreateXlsx),
+                "{prompt:?} planned a workbook"
+            );
+        }
+    }
+
+    /// And the noun still does, which is the sense the list is for.
+    #[test]
+    fn asking_to_see_the_working_still_plans_a_workbook() {
+        for prompt in [
+            "calculate the relief load and show the working",
+            "what is the wall loss rate, showing the working",
+        ] {
+            assert!(
+                plans(&derive(prompt), ToolName::CreateXlsx),
+                "{prompt:?} did not plan a workbook"
+            );
+        }
+    }
+
+    /// The words added for applications must not fire on plant English. Each of
+    /// these planned nothing before and must plan nothing now.
+    #[test]
+    fn plant_english_still_plans_no_sandbox() {
+        for prompt in [
+            "what is the correct application of the primer coat?",
+            "how does the catalyst react with the feed?",
+            "as per the code, what is the minimum shell thickness?",
+            "which node on the P&ID feeds the flare header?",
+            "summarise the inspection report",
+            "describe the workflow for raising a permit",
+        ] {
+            assert!(
+                !derive(prompt).budget.permits(ToolName::ExecuteCode),
+                "{prompt:?} planned a sandbox run"
+            );
+        }
     }
 
     #[test]

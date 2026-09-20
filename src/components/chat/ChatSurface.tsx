@@ -1,4 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { ApprovalPrompt } from './ApprovalPrompt';
+import type { ApprovalItem } from '../../services/approvals.service';
+import { approvalsService } from '../../services/approvals.service';
 import { useNavigate } from 'react-router-dom';
 import { ArrowDown } from 'lucide-react';
 import { useConversation } from '../run/useConversation';
@@ -131,6 +135,73 @@ function useShareActiveRun(activeRunId: string | null): void {
   }, [activeRunId, follow]);
 }
 
+/**
+ * The approvals this run is blocked on, polled while it is live.
+ *
+ * Polled rather than pushed because the approval queue has no changefeed: it
+ * is an in-process queue rehydrated from `run_approvals` at startup, and the
+ * only way to learn of a new request today is to ask. Two seconds is chosen
+ * against what it costs — one in-process IPC call returning a short list — and
+ * against what it saves, which is a person staring at a spinner that will
+ * never move on its own.
+ *
+ * It keeps polling for a moment after streaming stops. A run that ends
+ * *because* it is awaiting approval stops streaming first, and a poll that
+ * quit at the same instant would hide the very request that ended it.
+ */
+function usePendingApprovals(
+  activeRunId: string | null,
+  isStreaming: boolean,
+): { pending: ApprovalItem[]; refresh: () => void } {
+  const [pending, setPending] = useState<ApprovalItem[]>([]);
+  const [nonce, setNonce] = useState(0);
+  const refresh = useCallback(() => setNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    let alive = true;
+
+    const read = async () => {
+      try {
+        const all = await approvalsService.list();
+        if (!alive) return;
+        const undecided = all.filter((item) => item.decision === null);
+        // Scoped to the live run while there is one. With no live run, every
+        // undecided request is shown instead.
+        //
+        // `activeRunId` is cleared the moment a run ends, and a run that ends
+        // *because* it is awaiting approval is exactly the case this component
+        // exists for — scoping strictly would hide the request that caused the
+        // stop. Erring the other way costs an occasional card from another
+        // conversation; erring this way is what let three approvals sit
+        // unnoticed for eight days.
+        const mine = activeRunId
+          ? undecided.filter((item) => item.request.taskId === activeRunId)
+          : undecided;
+        setPending(
+          // Oldest first: the run consumes them in the order it asked.
+          [...mine].sort((a, b) =>
+            a.request.requestedAt.localeCompare(b.request.requestedAt),
+          ),
+        );
+      } catch {
+        // A failed poll is not an empty queue. Leaving the last known list in
+        // place keeps a visible request on screen through a transient error;
+        // clearing it here would make the card flicker out and strand the run
+        // again, which is the whole failure this component exists to end.
+      }
+    };
+
+    void read();
+    const timer = window.setInterval(() => void read(), 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [activeRunId, isStreaming, nonce]);
+
+  return { pending, refresh };
+}
+
 export function ChatSurface({
   classification,
   showSidebar: _showSidebar = false,
@@ -149,6 +220,12 @@ export function ChatSurface({
 
   // Every surface follows the run the chat started, not one of its own.
   useShareActiveRun(activeRunId);
+
+  // What this run is waiting on a person for. Rendered above the composer.
+  const { pending: pendingApprovals, refresh: refreshApprovals } = usePendingApprovals(
+    activeRunId,
+    isStreaming,
+  );
 
   const navigate = useNavigate();
 
@@ -731,6 +808,7 @@ export function ChatSurface({
         </div>
 
         <div className={styles.composerWrap}>
+          <ApprovalPrompt pending={pendingApprovals} onDecided={refreshApprovals} />
           <OcrReadout pages={ocrPages} live={isStreaming || flushing} />
           {reading && (
             <div className={styles.readingStatus} role="status" aria-live="polite">

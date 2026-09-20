@@ -114,29 +114,77 @@ impl FittedContext {
 
 /// Whether a stored message belongs in a later turn's context.
 ///
-/// Four rules, each removing a specific way a transcript lies:
+/// Three rules, each removing a specific way a transcript lies:
 ///
 /// - **System messages are excluded.** The only ones written are the surface's
 ///   own greeting ("Arjun is ready…"), seeded by `ConversationStore::create`.
 ///   Feeding a model its own product's welcome banner as conversation is noise,
 ///   and the real system prompt is composed separately and sent every turn.
-/// - **A streaming message is excluded.** Its content is whatever had arrived
-///   when the file was last written, which is a sentence that stops mid-word.
-///   That is a fragment presented as a finished answer.
-/// - **A failed message is excluded.** It holds no answer — the run that owned
-///   it did not produce one — and its `content` is either empty or a partial
-///   stream. What went wrong is on the screen for the person; the model has no
-///   use for a turn where nothing was said.
 /// - **An empty message is excluded.** A blank turn in a transcript teaches a
-///   model that blank turns are acceptable output.
+///   model that blank turns are acceptable output. This is the rule that still
+///   removes most unfinished turns: a run that died before writing anything has
+///   nothing to carry, whatever its status says.
+/// - **The live cell is excluded**, by position rather than by status —
+///   [`history_slice`] cuts the transcript before the cell this turn is
+///   streaming into, so the turn in flight is never its own history.
+///
+/// ## Why an unfinished turn is no longer excluded outright
+///
+/// It used to be: `status != Done` returned `false`, so a stopped, failed or
+/// cut-off turn left the transcript entirely. The consequence was the bug this
+/// change exists to remove. Somebody watching a long piece of work get halfway
+/// through four files and then stop would type "continue" — and the next turn
+/// was handed a conversation in which *the work had never happened*. The only
+/// thing it could do was start again from the first file, which is exactly what
+/// it did, every time.
+///
+/// The reasoning behind the old rule was not wrong, it was aimed at the wrong
+/// hazard: a fragment that stops mid-word must not be presented to the model as
+/// a finished answer. That is a question about how the turn is *labelled*, not
+/// about whether it is carried — and [`prepare`] now labels it, with the
+/// ending, the fragment's boundaries, and the instruction to resume rather than
+/// restart. A partial answer the model is told is partial is the single most
+/// useful thing a continuation can be given; the same text unlabelled is the
+/// hazard, and silence is neither.
+///
+/// `Streaming` is admitted on the same terms. Past the live cell it does not
+/// mean "in flight", it means a run whose ending was never written — the app
+/// was closed, or it crashed mid-answer. That is an interruption like any
+/// other, and the person's next word is going to be "continue".
 pub fn is_eligible(message: &Message) -> bool {
     if message.role == MessageRole::System {
         return false;
     }
-    if message.status != MessageStatus::Done {
-        return false;
-    }
     !message.content.trim().is_empty()
+}
+
+/// Whether this message is a turn that stopped before it was finished.
+///
+/// Drives the resumption marker in [`prepare`]. Status rather than `outcome`,
+/// because status is the field every writer sets and `outcome` is `None` on
+/// messages written before it existed — a build upgrade must not silently turn
+/// labelled fragments back into unlabelled ones.
+fn is_unfinished(message: &Message) -> bool {
+    message.role == MessageRole::Assistant && message.status != MessageStatus::Done
+}
+
+/// How an unfinished turn ended, in words meant for the model rather than for a
+/// person reading the screen.
+///
+/// Taken from [`Message::outcome`], which spells the endings the way
+/// [`crate::agent_runtime::outcome::RunOutcome::kind`] does. An unrecognised or
+/// absent value yields the neutral phrasing: the turn was interrupted, which is
+/// the one thing every arm here has in common and the only thing a message from
+/// an older build can be relied on to mean.
+fn ending_phrase(message: &Message) -> &'static str {
+    match message.outcome.as_deref() {
+        Some("aborted") => "it was stopped by the person before it finished",
+        Some("lengthLimited") => "it reached the limit on how much one turn may write",
+        Some("budgetStopped") => "it ran out of the time or tool calls allowed for that turn",
+        Some("policyStopped") => "it was stopped by a policy rule",
+        Some("failed") => "it failed before finishing",
+        _ => "it was interrupted before finishing",
+    }
 }
 
 /// Rewrites this-run-only evidence markers so a later turn cannot reuse them.
@@ -223,11 +271,49 @@ pub(super) fn prepare(message: &Message) -> String {
     // Markers first: they belong to the run that issued them, and this message
     // is from an earlier one. See `neutralise_evidence_markers`.
     let content = neutralise_evidence_markers(message.content.trim());
-    match message.tool_summary.as_deref().map(str::trim) {
-        Some(summary) if !summary.is_empty() => format!("{content}
-{summary}"),
+    let body = match message.tool_summary.as_deref().map(str::trim) {
+        Some(summary) if !summary.is_empty() => format!("{content}\n{summary}"),
         _ => content,
+    };
+    if is_unfinished(message) {
+        wrap_as_unfinished(&body, ending_phrase(message))
+    } else {
+        body
     }
+}
+
+/// Labels a fragment as a fragment, and says what to do with it.
+///
+/// ## Why the label is this explicit
+///
+/// [`is_eligible`] now carries an interrupted turn into the next turn's
+/// history, and unlabelled that is worse than dropping it was: a model handed a
+/// sentence that stops mid-word, with nothing to say it stopped, reads it as
+/// the finished answer and writes the *next* thing. Then "continue" produces
+/// the section after the one that was never written.
+///
+/// Three clauses, and each closes a way the continuation goes wrong:
+///
+/// - **The ending.** "Stopped by the person" and "ran out of tool calls" call
+///   for the same resumption but not the same tone, and a model told only
+///   "this is incomplete" invents a reason.
+/// - **The boundary.** A fragment needs an end marker as much as a start one,
+///   or the model cannot tell where the cut-off text stops and the rest of the
+///   conversation resumes — which is the difference between resuming at the
+///   right point and resuming three paragraphs early.
+/// - **Resume, do not restart**, stated directly, including the part that is
+///   easy to get wrong on its own: work already finished is finished, and files
+///   already written are not to be written again. That last clause is what the
+///   tool summary above is for — it names them — and without the instruction a
+///   model reads the list as a plan rather than as a record.
+fn wrap_as_unfinished(body: &str, ending: &str) -> String {
+    format!(
+        "[UNFINISHED REPLY — {ending}. What follows is how far it got, not a finished answer.]\n\
+         {body}\n\
+         [END OF THE UNFINISHED REPLY. If you are asked to continue, carry on from exactly where \
+         that text stops — the next word, the next file, the next step. Do not start the task \
+         again, do not repeat what is above, and do not write again any file it already wrote.]"
+    )
 }
 
 /// The wire role for a message that passed [`is_eligible`].
@@ -612,8 +698,14 @@ mod tests {
         assert_eq!(fitted.turns.len(), 2);
     }
 
+    /// The bug this module's admission rule used to cause, stated as a test.
+    ///
+    /// A turn cut off mid-word is carried, because the turn after it is the one
+    /// somebody typed "continue" into. Dropping it is what made "continue"
+    /// start the task again from the beginning: the next turn was handed a
+    /// conversation in which the half-written work had never happened.
     #[test]
-    fn a_streaming_message_is_not_history() {
+    fn an_interrupted_turn_is_carried_so_continue_can_resume_it() {
         let convo = conversation(vec![
             message("u1", MessageRole::User, "Q", MessageStatus::Done),
             message(
@@ -622,21 +714,67 @@ mod tests {
                 "half a sen",
                 MessageStatus::Streaming,
             ),
-            message("u2", MessageRole::User, "Q2", MessageStatus::Done),
+            message("u2", MessageRole::User, "continue", MessageStatus::Done),
             message("a2", MessageRole::Assistant, "", MessageStatus::Streaming),
         ]);
         let fitted = fit(&convo, "a2", 10_000, &[]);
-        assert_eq!(
-            fitted.turns,
-            vec![ContextTurn {
-                role: "user",
-                content: "Q".into()
-            }]
+        let assistant = fitted
+            .turns
+            .iter()
+            .find(|turn| turn.role == "assistant")
+            .expect("the interrupted turn reaches the next one");
+        assert!(
+            assistant.content.contains("half a sen"),
+            "the fragment itself has to be carried: {assistant:?}",
         );
     }
 
+    /// Carried is not the same as presented as finished.
+    ///
+    /// Without the label the fragment reads as the completed answer, and the
+    /// continuation writes the section *after* the one that was never written —
+    /// which is a worse failure than the one dropping it caused.
     #[test]
-    fn a_failed_turn_is_not_history() {
+    fn an_interrupted_turn_is_labelled_as_unfinished_and_says_how_it_ended() {
+        let mut stopped = message(
+            "a1",
+            MessageRole::Assistant,
+            "fn main() {",
+            MessageStatus::Failed,
+        );
+        stopped.outcome = Some("aborted".to_string());
+        let prepared = prepare(&stopped);
+
+        assert!(prepared.contains("UNFINISHED REPLY"), "{prepared}");
+        assert!(
+            prepared.contains("stopped by the person"),
+            "the ending has to be named, not left for the model to infer: {prepared}",
+        );
+        assert!(
+            prepared.contains("END OF THE UNFINISHED REPLY"),
+            "the fragment needs an end boundary as much as a start one: {prepared}",
+        );
+        assert!(
+            prepared.contains("carry on from exactly where"),
+            "the instruction to resume rather than restart is the point: {prepared}",
+        );
+        assert!(prepared.contains("fn main() {"), "{prepared}");
+    }
+
+    /// A finished answer is passed through untouched. The label belongs only on
+    /// the turns that earned it — putting it on every turn would teach the model
+    /// that every answer in the thread was a fragment.
+    #[test]
+    fn a_finished_turn_carries_no_resumption_label() {
+        let done = message("a1", MessageRole::Assistant, "Class 300.", MessageStatus::Done);
+        assert_eq!(prepare(&done), "Class 300.");
+    }
+
+    /// The rule that still removes most unfinished turns. A run that died
+    /// before writing anything has nothing to resume from, and a labelled
+    /// empty fragment is noise with a header on it.
+    #[test]
+    fn an_interrupted_turn_that_wrote_nothing_is_not_history() {
         let convo = conversation(vec![
             message("u1", MessageRole::User, "Q", MessageStatus::Done),
             message("a1", MessageRole::Assistant, "", MessageStatus::Failed),
@@ -646,6 +784,29 @@ mod tests {
         let fitted = fit(&convo, "a2", 10_000, &[]);
         assert_eq!(fitted.turns.len(), 1);
         assert_eq!(fitted.turns[0].role, "user");
+    }
+
+    /// The files an interrupted turn already wrote are named to the turn that
+    /// resumes it. Without this the continuation writes file one again, which
+    /// is the same restart in a smaller form.
+    #[test]
+    fn an_interrupted_turn_still_reports_what_its_tools_did() {
+        let mut stopped = message(
+            "a1",
+            MessageRole::Assistant,
+            "Wrote the first two files.",
+            MessageStatus::Failed,
+        );
+        stopped.outcome = Some("budgetStopped".to_string());
+        stopped.tool_summary = Some("[this turn used: workspace.write_file ×2]".to_string());
+        let prepared = prepare(&stopped);
+
+        assert!(prepared.contains("workspace.write_file ×2"), "{prepared}");
+        assert!(
+            prepared.contains("do not write again any file it already wrote"),
+            "naming the files is only half of it — the instruction not to redo \
+             them is the other half: {prepared}",
+        );
     }
 
     #[test]

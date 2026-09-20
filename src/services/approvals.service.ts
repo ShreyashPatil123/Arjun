@@ -50,7 +50,23 @@ export const approvalsService = {
    * when a rejection carries no reason, or when the request was already
    * settled — a decision is final by design.
    */
-  decide(id: string, approve: boolean, because?: string): Promise<Decision> {
-    return getBackendService().invoke<Decision>('decide_approval', { id, approve, because });
+  /**
+   * `always` is the third button: approve this, and stop asking for the same
+   * tool for the rest of this conversation. Omitted rather than sent as false
+   * by the two ordinary buttons, so the backend's `Option<bool>` sees exactly
+   * what the person chose.
+   */
+  decide(
+    id: string,
+    approve: boolean,
+    because?: string,
+    always?: boolean,
+  ): Promise<Decision> {
+    return getBackendService().invoke<Decision>('decide_approval', {
+      id,
+      approve,
+      because,
+      always,
+    });
   },
 };

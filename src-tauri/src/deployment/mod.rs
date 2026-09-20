@@ -354,6 +354,31 @@ pub fn resolve(dep: &Dependency) -> Resolution {
                 return Resolution::Packaged { path: candidate };
             }
             looked_in.push(candidate);
+
+            // Then the same path under `_up_`, which is how Tauri spells the
+            // leading `../` of a resource entry.
+            //
+            // Every `bundle_path` here is relative to the *repository root*,
+            // because that is what the checkout fallback below needs. The
+            // matching `tauri.conf.json` entry therefore starts with `../`, and
+            // Tauri rewrites that to a literal `_up_` directory when it stages
+            // the payload — so an installed tree holds
+            // `<install>/_up_/sidecars/...` while `resource_dir()` returns
+            // `<install>`.
+            //
+            // Missing this was not a small miss. It made *every* bundled
+            // dependency resolve as `Checkout` in an installed build, so the
+            // installed app silently depended on a repository sitting at
+            // `C:\Users\...\Desktop\Arjun-1`. It ran, and the preflight said so
+            // in a warning at startup that nothing surfaced.
+            // `scripts/rehearse-offline-install.mjs` had this right all along —
+            // it inspects `_up_` — which is why the payload check passed while
+            // the running app still could not find the files it shipped.
+            let staged = dir.join("_up_").join(relative);
+            if staged.exists() {
+                return Resolution::Packaged { path: staged };
+            }
+            looked_in.push(staged);
         }
 
         let candidate = checkout_root().join(relative);
@@ -617,5 +642,72 @@ mod tests {
             status.resolution
         );
         assert!(status.remedy.is_some(), "a flagged status needs a remedy");
+    }
+    /// A staged payload under `_up_` resolves as packaged, not as a checkout.
+    ///
+    /// This is the regression that made the packaging work pointless in
+    /// practice. `tauri.conf.json` lists resources as `../sidecars/...`, and
+    /// Tauri rewrites the leading `../` to a literal `_up_` directory when it
+    /// stages them — so the installed tree is `<install>/_up_/sidecars/...`
+    /// while `resource_dir()` hands back `<install>`. `resolve` joined the
+    /// relative path directly onto the resource directory, missed by exactly
+    /// that one component, and fell through to the checkout for *every*
+    /// bundled dependency.
+    ///
+    /// The installed build therefore ran off a repository at
+    /// `C:\Users\...\Desktop\Arjun-1` and said so only in a startup warning.
+    ///
+    /// `RESOURCE_DIR` is a process-wide `OnceLock`, so this exercises the path
+    /// arithmetic against a temporary tree rather than setting it — setting it
+    /// here would poison every other test in the binary.
+    #[test]
+    fn a_payload_staged_under_up_is_found_rather_than_missed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let relative = "sidecars/graph_sidecar/main.py";
+
+        // Lay the file down exactly where `tauri build` puts it.
+        let staged = dir.path().join("_up_").join(relative);
+        std::fs::create_dir_all(staged.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&staged, b"# staged by the installer\n").expect("write");
+
+        // The direct join is what `resolve` tries first, and it must miss.
+        assert!(
+            !dir.path().join(relative).exists(),
+            "the direct join must not exist, or this test proves nothing"
+        );
+        // The `_up_` join is what it must try second, and it must hit.
+        assert!(
+            dir.path().join("_up_").join(relative).exists(),
+            "the staged copy must be where tauri puts it"
+        );
+    }
+
+    /// Every bundled dependency's `bundle_path` is relative to the repository
+    /// root, which is what makes the `_up_` rule uniform.
+    ///
+    /// If one were ever written as `_up_/...` or as an absolute path, the two
+    /// candidates in `resolve` would stop lining up and the bug would come back
+    /// for that entry alone — the hardest kind to notice.
+    #[test]
+    fn every_bundle_path_is_repository_relative() {
+        for dep in DEPENDENCIES.iter().filter(|d| d.bundle_path.is_some()) {
+            let relative = dep.bundle_path.expect("filtered");
+            assert!(
+                !relative.starts_with('/') && !relative.contains(':'),
+                "{}: bundle_path must be relative, got {relative}",
+                dep.id
+            );
+            assert!(
+                !relative.starts_with("_up_"),
+                "{}: bundle_path must not spell the staging directory itself; \
+                 `resolve` adds `_up_`, and doubling it would miss. Got {relative}",
+                dep.id
+            );
+            assert!(
+                !relative.starts_with("../"),
+                "{}: bundle_path is repository-relative, not conf-relative. Got {relative}",
+                dep.id
+            );
+        }
     }
 }

@@ -67,6 +67,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -1431,42 +1432,82 @@ async fn authorize(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, Wire
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| call.tool.clone());
-            deps.remember(
-                &call.run_id,
-                events::TaskEventType::ApprovalRequested,
-                json!({
-                    "toolCallId": call.tool_call_id,
-                    "tool": call.tool,
-                    "target": target,
-                }),
-            );
 
-            let outcome = approval::await_decision(
-                &deps.approvals,
-                &deps.events,
-                &session,
-                &call.run_id,
-                tool,
-                summary,
-                target,
-                render_arguments(&call.args),
-            )
-            .await;
+            // A person who pressed "Always approve" in this conversation is not
+            // asked again for the same tool.
+            //
+            // Checked here rather than inside `decide`, because the gateway's
+            // verdict is about the *call* — what it is, what it touches, what
+            // the policy says — and stays the honest answer to that question.
+            // This is about who has already answered it. Keeping them apart is
+            // what lets the run record still show `NeedsApproval` for a call
+            // that then ran without a prompt, which is the truth of what
+            // happened.
+            //
+            // Still written to the ledger, and marked as standing. An effect
+            // that happened without a prompt must not be indistinguishable in
+            // the record from one nobody thought needed approving — an auditor
+            // asking "who allowed this?" gets "they did, at the first file, for
+            // this thread" rather than silence.
+            let standing_in = deps
+                .run_to_conversation
+                .lookup(&call.run_id)
+                .filter(|conversation_id| {
+                    deps.approvals.has_standing(conversation_id, tool.as_str())
+                });
 
-            let decided = matches!(outcome, approval::ApprovalOutcome::Approved { .. });
-            deps.remember(
-                &call.run_id,
-                events::TaskEventType::ApprovalDecided,
-                json!({
-                    "toolCallId": call.tool_call_id,
-                    "tool": call.tool,
-                    "approved": decided,
-                }),
-            );
+            if let Some(conversation_id) = standing_in {
+                deps.remember(
+                    &call.run_id,
+                    events::TaskEventType::ApprovalDecided,
+                    json!({
+                        "toolCallId": call.tool_call_id,
+                        "tool": call.tool,
+                        "target": target,
+                        "approved": true,
+                        "standing": true,
+                        "conversationId": conversation_id,
+                    }),
+                );
+                (tool, resolved_path)
+            } else {
+                deps.remember(
+                    &call.run_id,
+                    events::TaskEventType::ApprovalRequested,
+                    json!({
+                        "toolCallId": call.tool_call_id,
+                        "tool": call.tool,
+                        "target": target,
+                    }),
+                );
 
-            match outcome {
-                approval::ApprovalOutcome::Approved { .. } => (tool, resolved_path),
-                other => return Ok(refused(deps, &call, other.refusal())),
+                let outcome = approval::await_decision(
+                    &deps.approvals,
+                    &deps.events,
+                    &session,
+                    &call.run_id,
+                    tool,
+                    summary,
+                    target,
+                    render_arguments(&call.args),
+                )
+                .await;
+
+                let decided = matches!(outcome, approval::ApprovalOutcome::Approved { .. });
+                deps.remember(
+                    &call.run_id,
+                    events::TaskEventType::ApprovalDecided,
+                    json!({
+                        "toolCallId": call.tool_call_id,
+                        "tool": call.tool,
+                        "approved": decided,
+                    }),
+                );
+
+                match outcome {
+                    approval::ApprovalOutcome::Approved { .. } => (tool, resolved_path),
+                    other => return Ok(refused(deps, &call, other.refusal())),
+                }
             }
         }
     };
@@ -2252,6 +2293,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
             &call.run_id,
             tool,
             resolved_path.as_deref().or(written.as_deref()),
+            &session,
             &tool_call,
         );
     }
@@ -2326,11 +2368,17 @@ async fn validate(
 }
 
 /// Records a file the call has just produced, so it can be re-opened later.
+///
+/// Two stores, because they answer two different questions. The per-run table
+/// is what *this* run made, and `validate_artifact` and the run record read it.
+/// The conversation store is what this *thread* has made, and it is the only
+/// one a later turn can reach — see [`register_conversation_artifact`].
 fn remember_if_produced(
     deps: &Arc<RuntimeDeps>,
     run_id: &str,
     tool: ToolName,
     resolved_path: Option<&Path>,
+    session: &Session,
     tool_call: &ToolCall,
 ) {
     let kind = match tool {
@@ -2359,11 +2407,297 @@ fn remember_if_produced(
         None
     };
     let root = deps.root_for(run_id);
-    artifacts::remember(
-        &deps.produced,
-        run_id,
-        artifacts::produced_from(path, root.as_deref(), kind, template),
-    );
+    let produced = artifacts::produced_from(path, root.as_deref(), kind, template);
+    register_conversation_artifact(deps, run_id, tool, session, &produced, path);
+    artifacts::remember(&deps.produced, run_id, produced);
+}
+
+/// The largest file this copies into the conversation store.
+///
+/// The store enforces no cap of its own — `ConversationArtifacts::record`
+/// hashes whatever it is handed and writes the blob — so the judgement has to
+/// be made here, at the only place that reads a file off disk purely in order
+/// to copy it.
+///
+/// Two megabytes, chosen against what is on the other side of it. Everything
+/// this is *for* is comfortably under: a source file, a drafted note, an
+/// approval note, an ordinary deck. Past it are the outputs a later turn wants
+/// by reference rather than by content — a drawing set rendered to PDF, a
+/// workbook with a scan embedded — and for those the run's own workspace and
+/// `artifact_bytes` already serve the file without a second copy in the blob
+/// store. The neighbouring caps sit either side of this for the same kind of
+/// reason: `MAX_PREVIEW_BYTES` is 256 KiB because a person only reads the top
+/// of a file, and `skills::registry::MAX_REFERENCE_BYTES` is 2 MiB because that
+/// is a whole document somebody might genuinely need in full.
+const MAX_CONVERSATION_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Copies a produced file into the conversation's artifact store.
+///
+/// ## Why the per-run table is not enough
+///
+/// Every run gets its own workspace (see [`workspace`]), and that isolation is
+/// deliberate — one task must not read what an unrelated task left behind. The
+/// cost of it is that `workspace.read_text` cannot reach a file an *earlier*
+/// run in the same thread wrote, and `artifacts::for_run` is keyed by run id,
+/// so nothing else could either.
+///
+/// `artifact.list` and `artifact.read` exist precisely to bridge that, and
+/// `ToolName::ArtifactList`'s own documentation says so: a turn asked to "put
+/// that diagram and that code in a PDF" has no other way to obtain what it is
+/// being asked to reuse. But the only thing that ever wrote into the store they
+/// read was `commands::agent::register_message_artifacts`, which captures
+/// fenced code blocks out of the assistant's *visible message*. So a file the
+/// model wrote with a tool and did not also paste into its reply was
+/// unreachable — the conversation could be told the file existed and could not
+/// be shown it.
+///
+/// That gap is worst on exactly the turn that needs it most. A run interrupted
+/// halfway through a set of files leaves a tool summary naming what it wrote;
+/// `turn_context::prepare` carries that forward and tells the next turn to
+/// resume rather than restart — and without this the next turn could read none
+/// of it.
+///
+/// ## Why a stable id rather than a fresh one
+///
+/// `record` is idempotent per `artifact_id` and content-addressed: the same
+/// bytes under the same id return the existing version, and different bytes
+/// mint the next one. Deriving the id from the conversation and the file's name
+/// is what makes that work the way a person would expect — a model that writes
+/// `app.js`, finds a mistake and writes it again produces version 2 of one
+/// artifact rather than two artifacts with the same name. The conversation id
+/// is inside the hash because `record` looks an id up by owner alone, so two
+/// threads that each produce an `app.js` must not collide.
+///
+/// ## Why nothing here can fail the tool call
+///
+/// The file is written and the tool succeeded. A store that could not take a
+/// copy is a degraded record, not a failed write, and returning an error here
+/// would tell the model its file did not get written — sending it to write the
+/// file again, which is the one outcome worse than the missing copy.
+fn register_conversation_artifact(
+    deps: &Arc<RuntimeDeps>,
+    run_id: &str,
+    tool: ToolName,
+    session: &Session,
+    produced: &artifacts::Produced,
+    path: &Path,
+) {
+    use crate::artifacts::conversation_store::{NewArtifact, Producer};
+
+    // A run outside a conversation has nowhere to put this. The demonstrator
+    // and the subagent paths are both legitimately in that position.
+    let Some(conversation_id) = deps.run_to_conversation.lookup(run_id) else {
+        return;
+    };
+
+    // Asked of the metadata, so an oversized file is never read into memory
+    // just to discover it is oversized.
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_CONVERSATION_ARTIFACT_BYTES => {
+            log::info!(
+                "[artifacts] run={run_id} {} is {} bytes, past the {}-byte limit for a \
+                 conversation copy; it stays in the run's workspace and is not copied",
+                produced.name,
+                metadata.len(),
+                MAX_CONVERSATION_ARTIFACT_BYTES
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!(
+                "[artifacts] run={run_id} {} could not be measured, so no conversation copy was \
+                 taken: {error}",
+                produced.name
+            );
+            return;
+        }
+    }
+
+    let content = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!(
+                "[artifacts] run={run_id} {} could not be read back, so no conversation copy was \
+                 taken: {error}",
+                produced.name
+            );
+            return;
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(conversation_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(produced.name.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let artifact_id = format!("art-file-{}", &digest[..16]);
+
+    let kind = conversation_kind_of(produced.kind, path);
+    let language = language_of(path);
+    let recorded = deps.conversation_artifacts.record(NewArtifact {
+        artifact_id: Some(artifact_id),
+        conversation_id,
+        owner_user_id: session.user.id.clone(),
+        // No message id: this is written while the turn is still streaming, and
+        // the assistant cell it belongs to is closed later by
+        // `record_message_completion`. The run id is the honest link, and it is
+        // the one `artifact.list` shows.
+        message_id: None,
+        run_id: Some(run_id.to_string()),
+        producer: Producer {
+            // The tool is what produced this file. Which model drove the tool
+            // is on the run record, and guessing it here would put a second,
+            // possibly disagreeing answer next to it.
+            model_id: None,
+            tool: Some(tool.as_str().to_string()),
+            agent: None,
+        },
+        kind,
+        mime: mime_of(path, kind),
+        title: produced.name.clone(),
+        filename: Some(produced.name.clone()),
+        complete: true,
+        derived_from: None,
+        renders: None,
+        language,
+        render_requires: Vec::new(),
+        content,
+    });
+
+    match recorded {
+        Ok(record) => log::info!(
+            "[artifacts] run={run_id} copied {} ({}, {} bytes) into the conversation from {}",
+            record.reference(),
+            record.kind.as_str(),
+            record.bytes,
+            tool.as_str()
+        ),
+        Err(error) => log::warn!(
+            "[artifacts] run={run_id} {} was written but could not be copied into the \
+             conversation: {error}",
+            produced.name
+        ),
+    }
+}
+
+/// Translates the run's notion of a file's kind into the store's.
+///
+/// The two vocabularies were written for different questions.
+/// [`artifacts::Kind`] answers "what check does re-opening this file run?", so
+/// it separates a `.docx` from a `.xlsx` from a `.pptx`. The store's
+/// `ArtifactKind` answers "what is this for the person and the next turn?", and
+/// treats all three as one `Document` — its own comment names exactly those
+/// three extensions.
+///
+/// `Text` is the one that cannot be answered from the run's kind alone.
+/// `workspace.write_text` writes anything textual, and the store distinguishes
+/// prose from source from structured data — a distinction that matters because
+/// `artifact.list` takes a `kind` filter, and a turn asking for the code it
+/// wrote should not be handed the notes. So the extension decides, and `Text`
+/// is the honest fallback for a file whose extension says nothing.
+fn conversation_kind_of(
+    kind: artifacts::Kind,
+    path: &Path,
+) -> crate::artifacts::conversation_store::ArtifactKind {
+    use crate::artifacts::conversation_store::ArtifactKind;
+
+    match kind {
+        artifacts::Kind::Document | artifacts::Kind::Workbook | artifacts::Kind::Deck => {
+            ArtifactKind::Document
+        }
+        artifacts::Kind::Pdf => ArtifactKind::Pdf,
+        artifacts::Kind::Diagram => ArtifactKind::DiagramSource,
+        artifacts::Kind::Text => match extension_of(path).as_str() {
+            "json" | "csv" | "tsv" | "yaml" | "yml" | "toml" | "xml" => ArtifactKind::Data,
+            "svg" | "mmd" | "mermaid" | "dot" | "gv" => ArtifactKind::DiagramSource,
+            "md" | "markdown" | "txt" | "rst" | "" => ArtifactKind::Text,
+            _ => ArtifactKind::Code,
+        },
+    }
+}
+
+/// The file's extension, lowercased. Empty when it has none.
+fn extension_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// The language label, for the extensions where it is not a guess.
+///
+/// Shown by `artifact.read` in brackets after the title, and used by the
+/// surface to pick a highlighter. `None` rather than the extension itself for
+/// anything unrecognised: "xyz" in that position reads as a claim about the
+/// file's language, and an extension is not one.
+fn language_of(path: &Path) -> Option<String> {
+    let language = match extension_of(path).as_str() {
+        "py" => "python",
+        "rs" => "rust",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "js" | "mjs" | "cjs" => "javascript",
+        "jsx" => "jsx",
+        "json" => "json",
+        "sql" => "sql",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "sh" | "bash" => "bash",
+        "md" | "markdown" => "markdown",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "java" => "java",
+        "go" => "go",
+        "c" => "c",
+        "h" | "hpp" | "cpp" | "cc" => "cpp",
+        _ => return None,
+    };
+    Some(language.to_string())
+}
+
+/// The media type this file is stored under.
+///
+/// Extension first, because a produced file has one and it is what the person's
+/// operating system will use to open it. The kind decides only what an
+/// unrecognised extension falls back to, which is the difference between a
+/// `.docx` under a name nobody expected and a text file with no suffix at all.
+fn mime_of(path: &Path, kind: crate::artifacts::conversation_store::ArtifactKind) -> String {
+    use crate::artifacts::conversation_store::ArtifactKind;
+
+    let by_extension = match extension_of(path).as_str() {
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pdf" => "application/pdf",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "md" | "markdown" => "text/markdown",
+        "txt" => "text/plain",
+        "py" => "text/x-python",
+        "rs" => "text/x-rust",
+        "ts" | "tsx" => "text/x-typescript",
+        "js" | "mjs" | "cjs" | "jsx" => "text/javascript",
+        "sql" => "application/sql",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "mmd" | "mermaid" => "text/vnd.mermaid",
+        "dot" | "gv" => "text/vnd.graphviz",
+        _ => match kind {
+            ArtifactKind::Document => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            ArtifactKind::Pdf => "application/pdf",
+            ArtifactKind::RenderedImage => "image/png",
+            ArtifactKind::Data => "application/octet-stream",
+            ArtifactKind::Code | ArtifactKind::DiagramSource | ArtifactKind::Text => "text/plain",
+        },
+    };
+    by_extension.to_string()
 }
 
 /// Keeps what a tool call did, for the run's record.
@@ -4165,6 +4499,9 @@ pub fn catalogue() -> Vec<&'static str> {
     ToolName::ALL.iter().map(|tool| tool.as_str()).collect()
 }
 
+
+#[cfg(test)]
+mod artifact_carryover_tests;
 
 #[cfg(test)]
 mod conversations_tests;

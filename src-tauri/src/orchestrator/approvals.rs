@@ -117,6 +117,40 @@ pub struct ApprovalQueue {
     /// has it, and so does the loop that waits on an answer. A run id landing
     /// here is how the waiter learns there is no longer anybody to wait for.
     cancelled_runs: Mutex<std::collections::HashSet<String>>,
+    /// Standing approvals: `(conversation id, tool)` a person said "always" to.
+    ///
+    /// ## Why this exists
+    ///
+    /// Every write stops for a person, which is right for one write and wrong
+    /// for twelve. Building a small application means a dozen files, and the
+    /// person watching was asked to approve each one separately — twelve modal
+    /// prompts for a decision they had already made at the first.
+    ///
+    /// ## Why the scope is the conversation
+    ///
+    /// Narrower than the account and wider than the run, and both halves are
+    /// deliberate.
+    ///
+    /// Not the account, because "yes, write the files for this to-do app" is
+    /// not "yes, write files whenever you like from now on". A standing
+    /// approval that outlived the thread it was given in would be a permission
+    /// nobody remembers granting.
+    ///
+    /// Not the run, because a task that is stopped and continued is one piece
+    /// of work to the person doing it. Scoping to the run would ask again on
+    /// every "continue", which is the case this is most needed in.
+    ///
+    /// ## Why it is not persisted
+    ///
+    /// It lives and dies with the process, like the rest of this queue — see
+    /// the type comment. A standing approval restored from disk is one granted
+    /// in a session the person may not remember, reapplied to a conversation
+    /// they have reopened weeks later. Asking once more after a restart is the
+    /// cheaper mistake.
+    ///
+    /// Keyed by tool as well as conversation, so "always" on a file write is
+    /// not also "always" on something else the same thread happens to need.
+    standing: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl ApprovalQueue {
@@ -148,6 +182,51 @@ impl ApprovalQueue {
     pub fn forget_run(&self, run_id: &str) {
         if let Ok(mut cancelled) = self.cancelled_runs.lock() {
             cancelled.remove(run_id);
+        }
+    }
+
+    /// Records that this conversation may run this tool without asking again.
+    ///
+    /// Granted only from a decision a person actually made — see
+    /// [`commands::approvals::decide_approval`], which calls this when they
+    /// press "Always approve" and never on its own initiative. An empty
+    /// conversation id is ignored rather than stored: a run outside any
+    /// conversation has no scope to hold the grant, and a blank key would be
+    /// one every such run matched.
+    pub fn grant_standing(&self, conversation_id: &str, tool: &str) {
+        if conversation_id.trim().is_empty() || tool.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut standing) = self.standing.lock() {
+            standing.insert((conversation_id.to_string(), tool.to_string()));
+        }
+    }
+
+    /// Whether this conversation has already said "always" to this tool.
+    ///
+    /// Returns `false` for a blank conversation id, which is what
+    /// [`Self::grant_standing`] refuses to store — so the two agree that a run
+    /// with no conversation can neither grant nor inherit one.
+    pub fn has_standing(&self, conversation_id: &str, tool: &str) -> bool {
+        if conversation_id.trim().is_empty() {
+            return false;
+        }
+        self.standing
+            .lock()
+            .map(|standing| {
+                standing.contains(&(conversation_id.to_string(), tool.to_string()))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Drops every standing approval a conversation holds.
+    ///
+    /// For deleting a conversation: the thread the person granted it in is
+    /// gone, so the grant should go with it rather than linger against an id
+    /// that could be reissued.
+    pub fn forget_conversation(&self, conversation_id: &str) {
+        if let Ok(mut standing) = self.standing.lock() {
+            standing.retain(|(held, _)| held != conversation_id);
         }
     }
 
@@ -449,5 +528,55 @@ mod tests {
 
         assert_eq!(queue.pending().len(), 1);
         assert_eq!(queue.all().len(), 2, "a decision is history, not a deletion");
+    }
+    /// The point of the third button: asked once, not once per file.
+    #[test]
+    fn a_standing_approval_covers_later_calls_in_the_same_conversation() {
+        let queue = ApprovalQueue::new();
+        assert!(!queue.has_standing("c-1", "workspace.write_text"));
+
+        queue.grant_standing("c-1", "workspace.write_text");
+
+        assert!(queue.has_standing("c-1", "workspace.write_text"));
+    }
+
+    /// The scope, stated as the two things it must not leak across.
+    #[test]
+    fn a_standing_approval_does_not_leak_to_another_conversation_or_tool() {
+        let queue = ApprovalQueue::new();
+        queue.grant_standing("c-1", "workspace.write_text");
+
+        // Another thread of the same person. "Yes, write the files for this"
+        // is not "yes, write files whenever you like".
+        assert!(!queue.has_standing("c-2", "workspace.write_text"));
+        // Another tool in the same thread. Approving file writes is not
+        // approving everything else the thread happens to need.
+        assert!(!queue.has_standing("c-1", "artifact.create_approval_note"));
+    }
+
+    /// A run outside any conversation has no scope to hold a grant, and a blank
+    /// key would be one every such run matched.
+    #[test]
+    fn a_blank_conversation_can_neither_grant_nor_inherit() {
+        let queue = ApprovalQueue::new();
+        queue.grant_standing("", "workspace.write_text");
+        queue.grant_standing("   ", "workspace.write_text");
+
+        assert!(!queue.has_standing("", "workspace.write_text"));
+        assert!(!queue.has_standing("   ", "workspace.write_text"));
+    }
+
+    /// Deleting a conversation takes its standing approvals with it, rather
+    /// than leaving them against an id that could be reissued.
+    #[test]
+    fn forgetting_a_conversation_drops_what_it_had_standing() {
+        let queue = ApprovalQueue::new();
+        queue.grant_standing("c-1", "workspace.write_text");
+        queue.grant_standing("c-2", "workspace.write_text");
+
+        queue.forget_conversation("c-1");
+
+        assert!(!queue.has_standing("c-1", "workspace.write_text"));
+        assert!(queue.has_standing("c-2", "workspace.write_text"), "the wrong one was dropped");
     }
 }

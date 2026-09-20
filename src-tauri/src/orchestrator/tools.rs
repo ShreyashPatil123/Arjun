@@ -677,18 +677,34 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         // prompt: a later turn cannot read an earlier run's workspace, so the
         // artifacts have to be reachable by id through a call the backend
         // authorises.
+        // Both of these had their *optional* argument in `arguments`, which is
+        // the required list — see `ToolGateway::check_arguments`, where the two
+        // lists differ in exactly that. The effect was that neither tool could
+        // be called in the form its own implementation documents:
+        //
+        // - `agent_runtime::artifact_list` calls `kind` "an optional
+        //   narrowing", and a model asking what the conversation has produced
+        //   does not know a kind to narrow by — that is the question. The
+        //   gateway answered every such call with "artifact.list needs a
+        //   \"kind\" argument, which was missing."
+        // - `agent_runtime::artifact_read` says outright that "omitting the
+        //   version is allowed and the answer says which one was read", and
+        //   accepts `id@3` in the id itself for the model that writes it that
+        //   way. A required `version` refused both.
+        //
+        // So the cross-model channel the comment above describes was reachable
+        // only by a model that guessed a kind and a version. Moving them makes
+        // the specs say what the code does.
         ToolName::ArtifactList => ToolSpec {
             permission: SearchKnowledge,
-            arguments: &[ArgumentSpec { name: "kind", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "kind", kind: Text }],
             network: NetworkUse::None,
             ..defaults(name)
         },
         ToolName::ArtifactRead => ToolSpec {
             permission: SearchKnowledge,
-            arguments: &[
-                ArgumentSpec { name: "artifact", kind: Text },
-                ArgumentSpec { name: "version", kind: Text },
-            ],
+            arguments: &[ArgumentSpec { name: "artifact", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "version", kind: Text }],
             network: NetworkUse::None,
             ..defaults(name)
         },
@@ -1907,5 +1923,32 @@ mod approval_shape_tests {
         ] {
             assert!(!spec_for(tool).needs_approval, "{}", tool.as_str());
         }
+    }
+    /// The cross-model channel is callable in the form its own code documents.
+    ///
+    /// Both specs had their optional argument in `arguments`, which
+    /// `ToolGateway::check_arguments` treats as the *required* list. So
+    /// `artifact.list` with no `kind` — the call a model makes when asking what
+    /// the conversation has produced, which is the whole question — was refused
+    /// with "needs a \"kind\" argument, which was missing", and `artifact.read`
+    /// was refused unless a version was named even though `artifact_read` says
+    /// omitting it is allowed.
+    #[test]
+    fn listing_and_reading_artifacts_need_only_what_the_model_can_know() {
+        let list = spec_for(ToolName::ArtifactList);
+        assert!(
+            list.arguments.is_empty(),
+            "artifact.list must be callable with no arguments: {:?}",
+            list.arguments.iter().map(|a| a.name).collect::<Vec<_>>()
+        );
+        assert!(list.optional_arguments.iter().any(|a| a.name == "kind"));
+
+        let read = spec_for(ToolName::ArtifactRead);
+        assert_eq!(
+            read.arguments.iter().map(|a| a.name).collect::<Vec<_>>(),
+            vec!["artifact"],
+            "only the artifact itself is required to read one"
+        );
+        assert!(read.optional_arguments.iter().any(|a| a.name == "version"));
     }
 }

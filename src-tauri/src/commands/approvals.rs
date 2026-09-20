@@ -35,9 +35,13 @@ pub async fn decide_approval(
     session: State<'_, CurrentSession>,
     audit: State<'_, Arc<AuditService>>,
     events: State<'_, crate::commands::agent::TaskEvents>,
+    run_to_conversation: State<'_, crate::commands::conversations::RunToConversationState>,
     id: String,
     approve: bool,
     because: Option<String>,
+    // `always` is "Always approve", from the third button. An `Option` because
+    // every older caller omits it, and `None` means "just this one".
+    always: Option<bool>,
 ) -> Result<Decision, String> {
     let signed_in = require_session(&session)?;
 
@@ -56,6 +60,56 @@ pub async fn decide_approval(
         })?;
 
     let item = queue.find(&id);
+
+    // "Always approve" is recorded only when the answer was actually yes.
+    //
+    // `always: true` with `approve: false` is not a state the buttons can
+    // produce, and treating it as a standing grant would turn a rejection into
+    // a blanket permission. Read as a conjunction rather than trusted.
+    //
+    // The conversation is resolved here rather than sent by the caller. The
+    // request carries the run id in `task_id`, and the index from run to
+    // conversation is authoritative on this side — a scope supplied by the
+    // caller would be a permission boundary named by the thing being bounded.
+    let standing = approve && always.unwrap_or(false);
+    if standing {
+        match item.as_ref() {
+            Some(held) => match run_to_conversation.0.lookup(&held.request.task_id) {
+                Some(conversation_id) => {
+                    queue.grant_standing(&conversation_id, &held.request.tool);
+                    let _ = audit.record(
+                        &signed_in.user.id,
+                        AuditKind::Approval,
+                        format!(
+                            "Standing approval granted for {} in this conversation",
+                            held.request.tool
+                        ),
+                        Some(serde_json::json!({
+                            "approvalId": id,
+                            "taskId": held.request.task_id,
+                            "conversationId": conversation_id,
+                            "tool": held.request.tool,
+                            "scope": "conversation",
+                        })),
+                    );
+                }
+                // A run outside any conversation has no scope to hold the
+                // grant. The single approval above still stands; only the
+                // "always" part is dropped, and saying so beats a silent
+                // no-op that looks to the person like it worked.
+                None => log::warn!(
+                    "[approvals] {id}: \"always\" was asked for but run {} is not in a \
+                     conversation, so only this one call was approved",
+                    held.request.task_id
+                ),
+            },
+            None => log::warn!(
+                "[approvals] {id}: \"always\" was asked for but the request could not be \
+                 found, so only this one call was approved"
+            ),
+        }
+    }
+
     let _ = audit.record(
         &signed_in.user.id,
         AuditKind::Approval,

@@ -700,8 +700,63 @@ impl<'a> LocalToolRunner<'a> {
 
         if !path.exists() {
             return Err(format!(
-                "{} does not exist. List what is in the workspace before reading from it.",
+                "{} does not exist. Read the workspace directory itself to see what is in it.",
                 path.display()
+            ));
+        }
+
+        // A directory is answered with its contents rather than an error.
+        //
+        // "What is in my workspace?" is the first thing a model asks when it is
+        // told it has one, and there is no listing tool to ask it with — so it
+        // does the only thing available and reads the directory. That used to
+        // fall through to `fs::read`, which on Windows returns
+        // `Access is denied. (os error 5)`: an error that names a permission
+        // problem for what is really a wrong-kind-of-path, on a directory the
+        // run owns. A real run spent a step on exactly that and learned
+        // nothing.
+        //
+        // The old `does not exist` message made it worse by advising the model
+        // to "list what is in the workspace" — naming a capability that has
+        // never existed. Answering the read is the smaller and more honest fix
+        // than adding a tool: the question is already being asked, in the only
+        // way the catalogue allows, and it has a correct answer.
+        if path.is_dir() {
+            let mut entries: Vec<String> = match std::fs::read_dir(path) {
+                Ok(listing) => listing
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        match entry.metadata() {
+                            Ok(meta) if meta.is_dir() => format!("{name}/"),
+                            Ok(meta) => format!("{name} ({} bytes)", meta.len()),
+                            Err(_) => name,
+                        }
+                    })
+                    .collect(),
+                Err(error) => {
+                    return Err(format!(
+                        "{} is a directory and could not be listed: {error}",
+                        path.display()
+                    ))
+                }
+            };
+            entries.sort();
+
+            if entries.is_empty() {
+                return Ok(format!(
+                    "{} is the task workspace and it is empty. Nothing has been written yet.",
+                    path.display()
+                ));
+            }
+            return Ok(format!(
+                "{} is a directory, not a file. It holds:\n{}",
+                path.display(),
+                entries
+                    .iter()
+                    .map(|entry| format!("- {entry}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
 
@@ -1330,7 +1385,63 @@ mod tests {
             .run(ToolName::ReadScopedFile, &ToolCall::new("read_scoped_file", json!({})), Some(&missing)).await.unwrap_err();
 
         assert!(error.contains("does not exist"));
-        assert!(error.contains("List what is in the workspace"));
+        // The advice has to name something the model can actually do. It used
+        // to say "list what is in the workspace", and no listing tool exists —
+        // so the remedy offered was unreachable. Reading the directory is the
+        // one that works, and `reading_the_workspace_directory_lists_it` below
+        // is the other half of that promise.
+        assert!(error.contains("Read the workspace directory itself"));
+    }
+
+    /// The model's first move, answered instead of refused.
+    ///
+    /// A model told it has a workspace asks what is in it, and the catalogue
+    /// gives it no listing tool — so it reads the directory. That used to reach
+    /// `fs::read` and come back `Access is denied. (os error 5)`: a permission
+    /// error, on a directory the run owns, for what is really a
+    /// wrong-kind-of-path. A real run spent a step on it and learned nothing.
+    #[tokio::test]
+    async fn reading_the_workspace_directory_lists_it() {
+        let f = fixture();
+        std::fs::write(f.root.join("index.html"), "<html lang=\"en\"></html>").unwrap();
+        std::fs::create_dir_all(f.root.join("assets")).unwrap();
+
+        let out = runner(&f)
+            .run(
+                ToolName::ReadScopedFile,
+                &ToolCall::new("read_scoped_file", json!({})),
+                Some(f.root.as_path()),
+            )
+            .await
+            .expect("a directory read is answered, not refused");
+
+        assert!(out.contains("index.html"), "{out}");
+        assert!(out.contains("assets/"), "the directory entry is marked as one: {out}");
+        assert!(out.contains("is a directory, not a file"), "{out}");
+        assert!(!out.contains("Access is denied"), "{out}");
+    }
+
+    /// An empty workspace says so rather than returning a bare heading. "It
+    /// holds:" followed by nothing reads as a listing that failed.
+    #[tokio::test]
+    async fn reading_an_empty_workspace_says_it_is_empty() {
+        let f = fixture();
+        // A directory of its own: the fixture's root is shared with the store
+        // and already holds `sarathi.db`, so it is never empty.
+        let empty = f.root.join("nothing-here");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let out = runner(&f)
+            .run(
+                ToolName::ReadScopedFile,
+                &ToolCall::new("read_scoped_file", json!({})),
+                Some(empty.as_path()),
+            )
+            .await
+            .expect("answered");
+
+        assert!(out.contains("empty"), "{out}");
+        assert!(out.contains("Nothing has been written yet"), "{out}");
     }
 
     /// A model that believes it has the whole file will confidently answer from
