@@ -827,6 +827,22 @@ pub fn run() {
                 );
             }
 
+            // The deployment's own record of its agents, opened here -- before the
+            // manager is handed over -- because the manager has to be given it.
+            //
+            // Delegation reads each child's definition from the registry at the
+            // moment it is dispatched (see `subagents::definitions`). Before this,
+            // the manager held only the start-up profiles, so an agent edited on
+            // the Agents screen was edited in a file no dispatch ever read.
+            let agent_registry = commands::agents::open(&app.handle().clone());
+            if let Some(agents) = agent_registry.as_ref() {
+                commands::agents::import_bundled_profiles(agents, &loaded_profiles.profiles);
+                subagent_manager = subagent_manager.with_definitions(
+                    std::sync::Arc::clone(agents)
+                        as std::sync::Arc<dyn subagents::DefinitionSource>,
+                );
+            }
+
             app.manage(std::sync::Arc::new(subagent_manager) as commands::agent::Subagents);
 
             // The deployment's own record of its agents.
@@ -840,8 +856,8 @@ pub fn run() {
             // only the fields the profile owns and leaves the colour, the
             // model binding and the enabled state exactly as somebody set
             // them. See `agents::store::AgentRegistry::import_bundled`.
-            if let Some(agents) = commands::agents::open(&app.handle().clone()) {
-                commands::agents::import_bundled_profiles(&agents, &loaded_profiles.profiles);
+            if let Some(agents) = agent_registry {
+                // Imported above, before the manager took its handle.
                 app.manage(agents);
 
                 // Settle any model change the last run of this process died in

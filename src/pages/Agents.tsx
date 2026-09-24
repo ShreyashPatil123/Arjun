@@ -20,6 +20,7 @@ import {
   type AgentView,
   type MemoryScope,
   type OutputSchema,
+  RUNNABLE_SCHEMAS,
   type SkillOption,
   type TestRunOutcome,
 } from '../services/agentRegistry.service';
@@ -66,6 +67,9 @@ const SCHEMAS: OutputSchema[] = [
   'calculation',
   'review',
   'code',
+  'document',
+  'deck',
+  'workbook',
 ];
 
 const MEMORY_SCOPES: MemoryScope[] = ['none', 'task', 'run'];
@@ -633,7 +637,10 @@ export const Agents: React.FC = () => {
               >
                 {SCHEMAS.map((schema) => (
                   <option key={schema} value={schema}>
-                    {schema}
+                    {/* Said in the option itself: an administrator choosing a
+                        contract no worker produces should know before saving,
+                        not when the first dispatch is refused. */}
+                    {RUNNABLE_SCHEMAS.has(schema) ? schema : `${schema} (no worker yet)`}
                   </option>
                 ))}
               </select>

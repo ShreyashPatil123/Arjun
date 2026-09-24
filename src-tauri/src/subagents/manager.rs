@@ -88,6 +88,23 @@ pub enum SpawnRefusal {
     /// A separate refusal from an unknown profile on purpose: the role exists
     /// and is correctly declared, and this build simply cannot perform it.
     NoWorker { profile: String },
+    /// The registry had no runnable definition for this key.
+    ///
+    /// Distinct from `UnknownProfile` because the registry was consulted and
+    /// answered: the agent may exist and be disabled, or ask for a capability no
+    /// worker implements. `detail` says which.
+    Unresolved { key: String, detail: String },
+    /// A read-only delegation named a role that writes.
+    ///
+    /// `agent.delegate_readonly` promises the model -- in its name, its
+    /// description and its approval class -- that the child it starts cannot
+    /// write, produce a document or run code. Until this refusal existed, only
+    /// the TypeScript schema kept that promise; the Rust side, which is where
+    /// authority is decided, would start `code-worker` through it and hand the
+    /// child `workspace.write_text` and `sandbox.run_code` whenever the parent
+    /// held them. The effects were still approved call by call, but the
+    /// delegation was not, and a tool called read-only was not.
+    NeedsWriterDelegation { key: String, isolation: String },
 }
 
 impl SpawnRefusal {
@@ -100,6 +117,14 @@ impl SpawnRefusal {
             SpawnRefusal::NoWorker { profile } => format!(
                 "The {profile} role is declared but this build has no worker for it, so nothing \
                  was started. Nothing was done and no result exists."
+            ),
+            SpawnRefusal::Unresolved { key, detail } => {
+                format!("Nothing was started for {key:?}. {detail}")
+            }
+            SpawnRefusal::NeedsWriterDelegation { key, isolation } => format!(
+                "{key} is declared {isolation}: it writes files or runs code, so a read-only \
+                 delegation cannot start it. Writer delegation needs a person's approval and \
+                 is not offered to the model in this build. Nothing was started."
             ),
         }
     }
@@ -143,6 +168,41 @@ impl Spawned {
 /// One idempotency slot: the lock a second caller waits on, and the answer.
 type Slot = Arc<Mutex<Option<ChildResult>>>;
 
+/// Applies a dispatch's mode to a policy the narrowing already produced.
+///
+/// Read-only does two things, in this order. A role *declared* as writing is
+/// refused, because starting it without its tools would produce a worker that
+/// fails for a reason nobody asked it about. Then any tool that is not read-only
+/// is removed from what remains and recorded as refused -- so a read-only role
+/// an administrator edited to hold a write tool still reaches its worker, still
+/// cannot write, and the trace says which tool was withheld and why.
+fn enforce_mode(
+    resolved: &super::definitions::ResolvedDefinition,
+    mut policy: EffectivePolicy,
+    mode: DelegationMode,
+) -> Result<EffectivePolicy, SpawnRefusal> {
+    if mode == DelegationMode::Writer {
+        return Ok(policy);
+    }
+    if resolved.profile.isolation != super::profile::Isolation::ReadOnly {
+        return Err(SpawnRefusal::NeedsWriterDelegation {
+            key: resolved.agent_id.clone(),
+            isolation: resolved.profile.isolation.as_str().to_string(),
+        });
+    }
+    let (kept, withheld): (Vec<ToolName>, Vec<ToolName>) =
+        policy.tools.into_iter().partition(|tool| tool.is_read_only());
+    policy.tools = kept;
+    policy.refused_tools.extend(withheld);
+    if policy.tools.is_empty() {
+        return Err(SpawnRefusal::NeedsWriterDelegation {
+            key: resolved.agent_id.clone(),
+            isolation: "with no read-only tool".to_string(),
+        });
+    }
+    Ok(policy)
+}
+
 /// Who a child is and what it owes, beyond the policy it runs under.
 ///
 /// ## Why this is separate from the policy
@@ -167,6 +227,65 @@ pub struct Dispatch {
     /// The graph position this child's inputs were authorised at, and therefore
     /// how it waits for a sibling's result.
     pub requirement: super::graph_io::Requirement,
+    /// Whether the child may write. Read-only unless a caller says otherwise.
+    pub mode: DelegationMode,
+    /// Which attempt at the parent run is sending this child. Empty when the
+    /// parent has no checkpoint yet.
+    pub attempt_id: String,
+}
+
+/// What a delegation lets a child do to the world.
+///
+/// ## Why this is on the dispatch and not only on the definition
+///
+/// A definition says what a role *can* do; the mode says what *this* dispatch
+/// permits. `agent.delegate_readonly` sends `ReadOnly`, and that is enforced
+/// here in Rust whatever the definition declares, because the tool's name and
+/// its approval class (automatic -- nobody is asked) are a promise to the model
+/// and to the person reading the audit line. A definition an administrator
+/// edited to grant a write tool does not get to break that promise through a
+/// read-only call.
+///
+/// `Writer` exists as a contract and is not offered to any model in this
+/// build. Plan P01 asks for writer semantics without widening the read-only
+/// tool; the model-facing writer delegation belongs to the phases that build
+/// the writer roles (P05, P11), and offering it before then would expose a
+/// capability nothing has qualified.
+///
+/// ## What `Writer` permits, and what it never does
+///
+/// 1. **It never widens.** The narrowing against the parent's grant runs first
+///    and is the same call in both modes: a writer child holds at most the
+///    write tools its parent holds, and a definition asking for more has them
+///    refused and recorded.
+/// 2. **Every effect is still approved.** The child's calls go through the
+///    same gateway as the parent's; a tool that asks a person asks a person.
+/// 3. **Writers do not overlap.** A child left holding any tool that is not
+///    read-only runs in the exclusive lane, whatever its declared isolation --
+///    so a read-only role an administrator edited to hold a write tool cannot
+///    write beside another writer through the reader lane.
+/// 4. **Only one constructor.** [`Dispatch::writing`] is the only way to ask
+///    for it, and `agent.delegate_readonly` never calls it: the tool's runner
+///    builds `ReadOnly` unconditionally, so no argument a model writes can turn
+///    a read-only delegation into a writer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DelegationMode {
+    /// The child keeps only read-only tools, and a role declared as writing is
+    /// refused outright rather than started without its tools.
+    #[default]
+    ReadOnly,
+    /// The child keeps what the narrowing left it. Every effectful call it
+    /// makes still goes through the gateway's approval, as the parent's do.
+    Writer,
+}
+
+impl DelegationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DelegationMode::ReadOnly => "readOnly",
+            DelegationMode::Writer => "writer",
+        }
+    }
 }
 
 impl Dispatch {
@@ -190,11 +309,31 @@ impl Dispatch {
         self.deliverable = deliverable.into();
         self
     }
+
+    /// Permits the child to write. See [`DelegationMode::Writer`].
+    pub fn writing(mut self) -> Self {
+        self.mode = DelegationMode::Writer;
+        self
+    }
+
+    /// Names the attempt at the parent run that is sending this child.
+    pub fn in_attempt(mut self, attempt_id: impl Into<String>) -> Self {
+        self.attempt_id = attempt_id.into();
+        self
+    }
 }
 
 /// The Rust side of subagents.
 pub struct SubagentManager {
     profiles: BTreeMap<String, AgentProfile>,
+    /// Where a dispatch reads the definition it runs under.
+    ///
+    /// `None` is a deployment with no registry, and then the bundled profiles
+    /// above are the definitions -- exactly the behaviour before this existed.
+    /// With a registry, it is consulted on every dispatch and not cached here,
+    /// which is what makes an administrator's edit reach the next child. See
+    /// [`super::definitions`].
+    definitions: Option<Arc<dyn super::definitions::DefinitionSource>>,
     workers: BTreeMap<String, Arc<dyn ChildWorker>>,
     events: Arc<TaskEventLog>,
     /// The read-only lane.
@@ -212,11 +351,60 @@ impl SubagentManager {
                 .into_iter()
                 .map(|profile| (profile.name.clone(), profile))
                 .collect(),
+            definitions: None,
             workers: BTreeMap::new(),
             events,
             readers: Arc::new(Semaphore::new(MAX_CONCURRENT_READERS)),
             exclusive: Arc::new(Mutex::new(())),
             slots: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Reads each dispatch's definition from `source` rather than from the
+    /// profiles this manager was built with.
+    pub fn with_definitions(
+        mut self,
+        source: Arc<dyn super::definitions::DefinitionSource>,
+    ) -> Self {
+        self.definitions = Some(source);
+        self
+    }
+
+    /// The definition a new dispatch for `key` runs under, read now.
+    ///
+    /// The registry decides when there is one. A key it does not know falls
+    /// back to the bundled profile of that name, marked as such, so a role whose
+    /// import failed is still performable and the trace says where its
+    /// definition came from. Any other refusal -- an agent an administrator
+    /// disabled, a capability nothing implements -- stands: falling back in
+    /// those cases would be the setting having no effect.
+    pub fn resolve(
+        &self,
+        key: &str,
+    ) -> Result<super::definitions::ResolvedDefinition, SpawnRefusal> {
+        use super::definitions::{ResolvedDefinition, Unresolved};
+
+        let bundled = || {
+            self.profiles
+                .get(key)
+                .map(ResolvedDefinition::from_bundled)
+                .ok_or_else(|| SpawnRefusal::UnknownProfile {
+                    name: key.to_string(),
+                })
+        };
+
+        match &self.definitions {
+            None => bundled(),
+            Some(source) => match source.resolve(key) {
+                Ok(resolved) => Ok(resolved),
+                Err(Unresolved::NoDefinition { .. }) if self.profiles.contains_key(key) => {
+                    bundled()
+                }
+                Err(unresolved) => Err(SpawnRefusal::Unresolved {
+                    key: key.to_string(),
+                    detail: unresolved.explain(),
+                }),
+            },
         }
     }
 
@@ -249,16 +437,27 @@ impl SubagentManager {
         inherited: &InheritedPolicy,
         child_id: &str,
     ) -> Result<(AgentProfile, EffectivePolicy), SpawnRefusal> {
-        let profile = self
-            .profiles
-            .get(profile_name)
-            .ok_or_else(|| SpawnRefusal::UnknownProfile {
-                name: profile_name.to_string(),
-            })?;
-        let policy = inherited
-            .narrow_for(profile, child_id)
-            .map_err(|refusal| SpawnRefusal::Policy { refusal })?;
-        Ok((profile.clone(), policy))
+        let resolved = self.resolve(profile_name)?;
+        let policy = self.narrow(&resolved, inherited, child_id)?;
+        Ok((resolved.profile, policy))
+    }
+
+    /// The narrowing, over a definition already resolved.
+    ///
+    /// The one call that decides authority, and it is the same call whether the
+    /// definition came from the registry or a bundled file:
+    /// [`InheritedPolicy::narrow_for`] intersects with the parent's grant, so a
+    /// definition -- however an administrator edited it -- can only ever be
+    /// narrower than the run that dispatched it.
+    fn narrow(
+        &self,
+        resolved: &super::definitions::ResolvedDefinition,
+        inherited: &InheritedPolicy,
+        child_id: &str,
+    ) -> Result<EffectivePolicy, SpawnRefusal> {
+        inherited
+            .narrow_for(&resolved.profile, child_id)
+            .map_err(|refusal| SpawnRefusal::Policy { refusal })
     }
 
     /// Starts a child and waits for it.
@@ -303,15 +502,38 @@ impl SubagentManager {
         // is wasteful and for anything with an effect is the duplicate this
         // ledger exists to prevent. So the intent goes on disk first, keyed the
         // same way, through the same table every side-effecting tool uses.
+        let child_id = uuid::Uuid::new_v4().to_string();
+        // Resolved exactly once for this child, and what is resolved is copied
+        // into the packet below. Nothing after this line reads the registry, so
+        // an edit saved while this child runs cannot change what it runs under.
+        //
+        // And resolved *before* the durable intent below is written. A refusal
+        // here -- an agent an administrator disabled, a key nothing answers to,
+        // a narrowing the parent's grant will not permit -- means nothing was
+        // attempted, and recording an intent for it would leave a pending row
+        // that a later retry, after the agent was re-enabled, would trip over
+        // as "already under way". The ledger records work, not refusals of it.
+        let resolved = self.resolve(profile_name)?;
+        let policy = self.narrow(&resolved, inherited, &child_id)?;
+        let policy = enforce_mode(&resolved, policy, dispatch.mode)?;
+        let profile = resolved.profile.clone();
+
         if let Some(recalled) = self.recall(&run_id, &key, objective) {
             *held = Some(recalled.clone());
             return Ok(Spawned::Existing(recalled));
         }
 
-        let child_id = uuid::Uuid::new_v4().to_string();
-        let (profile, policy) = self.plan(profile_name, inherited, &child_id)?;
-
-        let Some(worker) = self.workers.get(&profile.name).cloned() else {
+        // The worker is found by capability -- derived from the definition's
+        // output schema -- and not by its name. A registry agent's name is its
+        // `ag-` id, which no worker is registered under; a bundled profile's
+        // name is also its capability, which is why the second lookup keeps
+        // every deployment without a registry working exactly as before.
+        let worker = self
+            .workers
+            .get(&resolved.capability)
+            .or_else(|| self.workers.get(&profile.name))
+            .cloned();
+        let Some(worker) = worker else {
             let refusal = SpawnRefusal::NoWorker {
                 profile: profile.name.clone(),
             };
@@ -346,15 +568,23 @@ impl SubagentManager {
             dispatch.deliverable.clone(),
             dispatch.requirement,
         )
+        .pinned_to(&resolved)
+        .attempted_in(dispatch.attempt_id.clone())
+        .governed_by(resolved.model_policy(&model))
         .routed_to(Some(model.model_id.clone()).filter(|id| !id.trim().is_empty()));
 
-        self.record_start(inherited, &packet, &policy, &model);
+        self.record_start(inherited, &packet, &policy, &model, dispatch.mode);
 
         // The lane. Held for exactly as long as the work, and released before
         // the stop is recorded so a slow event write does not hold the lane.
+        //
+        // Concurrent only if the isolation says so *and* nothing the child was
+        // left holding writes. The second half is what keeps writers from
+        // overlapping when a read-only-declared role was edited to hold a write
+        // tool and dispatched as a writer -- see `DelegationMode`.
         let _reader;
         let _writer;
-        if policy.is_concurrent() {
+        if policy.is_concurrent() && policy.tools.iter().all(|tool| tool.is_read_only()) {
             _reader = self.readers.clone().acquire_owned().await.ok();
         } else {
             _writer = Some(self.exclusive.clone().lock_owned().await);
@@ -539,6 +769,7 @@ impl SubagentManager {
         packet: &ChildTaskPacket,
         policy: &EffectivePolicy,
         model: &Decision,
+        mode: DelegationMode,
     ) {
         let draft = EventDraft::idempotent(
             inherited_run_id(inherited),
@@ -554,6 +785,22 @@ impl SubagentManager {
             // the task and the agent are here, and a reader joining them back
             // together needs nothing that lives in memory.
             "agentId": packet.agent_id,
+            // Which definition, exactly. The version and the instructions' hash
+            // rather than the text: enough to tell two children apart when an
+            // administrator edited the agent between them, and nothing a reader
+            // of the trace should not see.
+            "definitionVersion": packet.definition_version,
+            "definitionOrigin": packet.definition_origin,
+            "capability": packet.capability,
+            "instructionsSha256": packet.instructions_sha256,
+            "sharedWithTask": packet.shared_with_task,
+            // The skills the definition was bound to, by hash; and which
+            // attempt at which job this child is.
+            "skills": packet.skills,
+            "attemptId": packet.attempt_id,
+            "jobId": packet.job_id(),
+            "delegationMode": mode.as_str(),
+            "modelPolicy": packet.model_policy,
             "taskId": packet.task_id,
             "deliverable": packet.deliverable,
             "requirement": packet.requirement,

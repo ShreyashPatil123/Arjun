@@ -93,8 +93,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       "Limits: at most 6 passages per call, and a long result is cut deterministically with a " +
       "line saying so — the same input always produces the same cut, byte for byte. " +
       'Set detail to "citations" to see only sources and pages, which is much cheaper when you ' +
-      "are deciding which passages you want. Use page to fetch the next batch when a result " +
-      "says it was truncated. " +
+      "are deciding which passages you want. There is no second page of results: when a " +
+      "result is cut, search again with a narrower query. " +
       "If it finds nothing: search again with the specific technical term rather than a " +
       "paraphrase, and if that also finds nothing say no source was found rather than " +
       "answering the document question anyway. That applies to the document question you " +
@@ -119,14 +119,10 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           description: "How many passages to return. Defaults to 6.",
         }),
       ),
-      page: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          description:
-            "Which page of results to return, 1-based. Defaults to 1. Use when a previous " +
-            "call said its result was truncated and you need the next batch.",
-        }),
-      ),
+      // `page` was offered here, described as "fetch the next batch", and no
+      // Rust path ever read it: page 2 came back as page 1 again, which a model
+      // would cite as new evidence. Removed rather than kept as a promise
+      // nothing keeps. See `orchestrator::contract` for the published schema.
     }),
   },
 
@@ -794,6 +790,113 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           "The one thing this worker should establish, in a sentence. It cannot see your conversation.",
         minLength: 1,
       }),
+      // What the worker is pointed at. References only -- the worker reads each
+      // itself, under its own clearance. The retriever is asked a question and
+      // needs none of these; every other role needs at least one.
+      documents: Type.Optional(
+        Type.Array(Type.String({ minLength: 1 }), {
+          description: "Documents to read, by the documentSha256 a passage you retrieved gave.",
+        }),
+      ),
+      files: Type.Optional(
+        Type.Array(Type.String({ minLength: 1 }), {
+          description: "Files in this task's workspace, by relative path.",
+        }),
+      ),
+      expressions: Type.Optional(
+        Type.Array(Type.String({ minLength: 1 }), {
+          description: "Figures for the calculation checker to re-derive, with their units.",
+        }),
+      ),
+      artifacts: Type.Optional(
+        Type.Array(
+          Type.Object(
+            {
+              id: Type.String({
+                minLength: 1,
+                description: 'The artifact id, as artifact.list shows it — "art-7@4" names revision 4.',
+              }),
+              revision: Type.Optional(
+                Type.Integer({
+                  minimum: 1,
+                  description: "The revision, when the id does not carry it. One of the two is required.",
+                }),
+              ),
+              sha256: Type.Optional(Type.String({ description: "Its hash, if you have it." })),
+            },
+            { additionalProperties: false },
+          ),
+          { description: "Files this conversation produced, each at an exact revision." },
+        ),
+      ),
+      deliverable: Type.Optional(
+        Type.String({
+          description: 'What counts as done. Defaults to "findings with a citation for each".',
+        }),
+      ),
+      after_revision: Type.Optional(
+        Type.Integer({
+          minimum: 0,
+          description:
+            "Wait until the task's shared memory reaches this graph revision — the one another " +
+            "worker's result was published at — before starting.",
+        }),
+      ),
+    }),
+  },
+
+  {
+    name: "artifact.list",
+    label: "List this conversation's artifacts",
+    readOnly: true,
+    description:
+      "Lists the files this conversation has produced — documents, code, diagrams, tables — by " +
+      "id and version, across every turn and every model that worked in it. " +
+      "Use it when asked to reuse, revise or refer to something made earlier in this " +
+      "conversation, before reading one with artifact.read. " +
+      "Do not use it to find the organisation's documents — knowledge.search_authorized does " +
+      "that — or to look for files outside this conversation, which it cannot see. " +
+      "Effects: none. It only reads, needs nobody's approval, and touches no network. " +
+      'Limits: this conversation only. Narrow it with kind — one of code, diagramSource, ' +
+      "renderedImage, document, pdf, text, data. " +
+      "If it lists nothing: this conversation has produced nothing yet; say so rather than " +
+      "describing a file that does not exist.",
+    parameters: closed({
+      kind: Type.Optional(
+        Type.String({
+          description:
+            "Only artifacts of this kind: code, diagramSource, renderedImage, document, pdf, text or data.",
+        }),
+      ),
+    }),
+  },
+
+  {
+    name: "artifact.read",
+    label: "Read one of this conversation's artifacts",
+    readOnly: true,
+    description:
+      "Reads one exact version of a file this conversation produced, by the id artifact.list " +
+      "gave. " +
+      "Use it to reuse or revise earlier work — the code from two turns ago, the note another " +
+      "model drafted — instead of writing it again from memory. " +
+      "Do not use it to read workspace files by path — workspace.read_text does that — and do " +
+      "not guess an id: list first. " +
+      "Effects: none. It only reads, needs nobody's approval, and touches no network. " +
+      "Limits: a long artifact is cut deterministically with a line saying so; what you see is " +
+      "then the beginning, not the whole. " +
+      "If it is refused: the id belongs to another conversation or does not exist. List again " +
+      "and use an id from this conversation.",
+    parameters: closed({
+      artifact: Type.String({
+        minLength: 1,
+        description: 'The id from artifact.list. "art-7@4" reads version 4.',
+      }),
+      version: Type.Optional(
+        Type.String({
+          description: "The version to read, when the id does not carry it. Omit for the latest.",
+        }),
+      ),
     }),
   },
 

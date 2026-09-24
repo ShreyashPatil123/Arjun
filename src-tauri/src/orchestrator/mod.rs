@@ -21,9 +21,13 @@
 //! - [`sandbox_exec`]: the container it actually runs in, when it may.
 //! - [`executor`]: the loop, one step at a time, pausing when a person is needed.
 //! - [`runner`]: the tools themselves, running only what the gateway permitted.
+//! - [`contract`]: one registration contract per tool — route, prerequisite,
+//!   output, cancellation and idempotency beside the spec — published for the
+//!   runtime's conformance test.
 
 pub mod approvals;
 pub mod calculation;
+pub mod contract;
 pub mod executor;
 pub mod gateway;
 pub mod grammar;

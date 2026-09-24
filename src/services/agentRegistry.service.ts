@@ -27,13 +27,35 @@ export type AgentState = 'enabled' | 'disabled' | 'archived';
 /** How long anything an agent records survives. */
 export type MemoryScope = 'none' | 'task' | 'run';
 
-/** The shape an agent's output must take. */
+/**
+ * The shape an agent's output must take. Mirrors `subagents::profile::SchemaKind`.
+ *
+ * `document`, `deck` and `workbook` are registered contracts with no worker yet:
+ * an agent may declare one, and dispatching it is refused as "registered and
+ * cannot yet be run" until its writer lands. See `RUNNABLE_SCHEMAS`.
+ */
 export type OutputSchema =
   | 'extraction'
   | 'retrieval'
   | 'calculation'
   | 'review'
-  | 'code';
+  | 'code'
+  | 'document'
+  | 'deck'
+  | 'workbook';
+
+/**
+ * The schemas a worker in this build can actually produce. Mirrors
+ * `subagents::definitions::capability_for`, and exists so the Agents screen can
+ * say which contracts are runnable instead of offering all eight as equal.
+ */
+export const RUNNABLE_SCHEMAS: ReadonlySet<OutputSchema> = new Set<OutputSchema>([
+  'extraction',
+  'retrieval',
+  'calculation',
+  'review',
+  'code',
+]);
 
 /** Whether an agent may run beside others. */
 export type Isolation = 'readOnly' | 'writer' | 'approvalSensitive';

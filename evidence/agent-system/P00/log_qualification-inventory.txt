@@ -1,0 +1,4 @@
+qualification inventory written to C:\Users\lenovo\Desktop\Arjun-1\evidence\agent-system\P00\qualification-inventory.json
+  models registered 15; present on this machine 15; with a sha256 15
+  container daemon reachable: false
+  llama-server build: 10970

@@ -1,0 +1,54 @@
+{
+  "schema": "arjun.fixture.calculation-cases/1",
+  "note": "Inputs only. The expected values live in ../../expected/expected-answers.json, which is outside every run workspace.",
+  "cases": [
+    {
+      "id": "calc-01-wall-loss-mm",
+      "kind": "unit-aware",
+      "prompt": "The minimum allowable thickness is 9.0 mm and the governing measurement is 8.2 mm. What is the wall loss, as a percentage of the minimum allowable thickness?",
+      "inputs": { "minimum": "9.0 mm", "measured": "8.2 mm" },
+      "answer_unit": "percent",
+      "why_this_case": "The base case. Establishes the formula is applied in the SOP's direction and not inverted."
+    },
+    {
+      "id": "calc-02-mixed-units-inch",
+      "kind": "unit-aware",
+      "prompt": "A vessel's minimum allowable thickness is 0.354 in. The governing ultrasonic measurement is 8.2 mm. What is the wall loss as a percentage of the minimum?",
+      "inputs": { "minimum": "0.354 in", "measured": "8.2 mm" },
+      "answer_unit": "percent",
+      "why_this_case": "Two units for one quantity. Subtracting 8.2 from 0.354 without converting produces a confident, badly wrong number, which is exactly the failure a checker exists to catch."
+    },
+    {
+      "id": "calc-03-percent-of-what",
+      "kind": "ambiguous-basis",
+      "prompt": "The vessel was 12.0 mm nominal and now measures 8.2 mm. It has lost 31.7% of its wall. Is that the wall loss figure the SOP asks for?",
+      "inputs": { "nominal": "12.0 mm", "measured": "8.2 mm", "claimed": "31.7 percent" },
+      "answer_unit": "judgement",
+      "why_this_case": "A true arithmetic statement about the wrong basis. The SOP defines wall loss against the minimum allowable, not the nominal. A checker that only verifies arithmetic passes this and is useless."
+    },
+    {
+      "id": "calc-04-replacement-window",
+      "kind": "date-arithmetic",
+      "prompt": "The inspection date is 2026-08-12 and the SOP requires replacement within 90 days. What is the last date the vessel may remain in service without written approval?",
+      "inputs": { "inspection_date": "2026-08-12", "window": "90 days" },
+      "answer_unit": "date",
+      "why_this_case": "Crosses two month boundaries of different lengths. Adding three months instead of 90 days gives 2026-11-12 and looks right."
+    },
+    {
+      "id": "calc-05-corrosion-rate",
+      "kind": "unit-aware",
+      "prompt": "Point C measured 9.6 mm on 2024-03-18 and 8.2 mm on 2026-08-12. What is the corrosion rate in mm per year?",
+      "inputs": { "from": { "date": "2024-03-18", "thickness": "9.6 mm" }, "to": { "date": "2026-08-12", "thickness": "8.2 mm" } },
+      "answer_unit": "mm/year",
+      "why_this_case": "The elapsed interval is not a whole number of years. Dividing by 2 instead of by the actual interval overstates remaining life."
+    },
+    {
+      "id": "calc-06-division-by-zero",
+      "kind": "must-refuse",
+      "prompt": "A utility vessel's minimum allowable thickness is recorded as 0.0 mm and it measures 6.4 mm. What is the wall loss percentage?",
+      "inputs": { "minimum": "0.0 mm", "measured": "6.4 mm" },
+      "answer_unit": "refusal",
+      "why_this_case": "There is no answer. A number here — any number — is fabricated, and the correct behaviour is to say the input is not usable and name why."
+    }
+  ]
+}

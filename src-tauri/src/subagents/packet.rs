@@ -102,7 +102,58 @@ impl InputRef {
     }
 }
 
+/// The routing a child was given, and the policy it was given it under.
+///
+/// Recorded rather than enforced here. The definition's model binding is
+/// carried so a trace can show whether the model a child was routed to is one
+/// its definition allows (`within_eligible`); holding routing *to* that binding
+/// is the scheduler's (plan P03), and saying `true` without anything having
+/// checked it would be the kind of claim this record exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPolicy {
+    /// The model role the definition asks for.
+    pub role: String,
+    /// The definition's preference order: default, then fallbacks.
+    #[serde(default)]
+    pub preferred_model_ids: Vec<String>,
+    /// Every model the definition may be routed to. Empty means any model
+    /// registered for the role.
+    #[serde(default)]
+    pub eligible_model_ids: Vec<String>,
+    /// Why routing chose what it chose, from `certification::choose`.
+    #[serde(default)]
+    pub routing_reason: String,
+    #[serde(default)]
+    pub cheaper_than_parent: bool,
+    /// Whether the routed model is inside `eligible_model_ids` (or that set is
+    /// empty). Computed, not asserted.
+    #[serde(default)]
+    pub within_eligible: bool,
+}
+
 /// The work order handed to a child.
+///
+/// ## Where each part of the job contract lives
+///
+/// Plan P01 names what a job must carry. Every item is a field or is derived
+/// from one, and none is carried twice:
+///
+/// | Contract item | Field |
+/// |---|---|
+/// | agent | `agent_id` (registry id, never a display name) |
+/// | immutable definition version | `definition_version`, `definition_origin`, `instructions_sha256` |
+/// | role capability | `capability` (from the output schema) |
+/// | task / run / attempt / job | `task_id`, `parent_run_id`, `attempt_id`, [`Self::job_id`] (= `idempotency_key`); `child_id` is this one execution |
+/// | model policy | `model_policy`, `model_id` |
+/// | skill hashes | `skills` |
+/// | effective tools | `allowed_tools` (already the intersection with the parent) |
+/// | sharing policy | `shared_with_task`, `classification_ceiling` |
+/// | input references | `inputs` (references only, never contents) |
+/// | expected output schema | `required_schema`, `deliverable` |
+/// | dependency revisions | `requirement` (graph revision) and the revisions inside `inputs` |
+/// | cancellation | `deadline`, enforced by the manager's timeout and the worker's `Stopping` |
+/// | resource limits | `limits` |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildTaskPacket {
@@ -119,6 +170,55 @@ pub struct ChildTaskPacket {
     /// Defaulted so an event written before this field existed still parses.
     #[serde(default)]
     pub agent_id: String,
+    /// The registry version this child was dispatched under.
+    ///
+    /// Resolved once, when the child was sent, and never re-read — see
+    /// [`super::definitions`]. `None` for a child run from a bundled profile
+    /// with no registry in reach, and for an event written before this field
+    /// existed; both are honestly "no registry version", and neither is `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_version: Option<u64>,
+    /// `registry` or `bundled-profile`. Where the definition above came from.
+    #[serde(default)]
+    pub definition_origin: String,
+    /// The worker that performs this child: a capability key derived from the
+    /// output schema, never from a display name.
+    #[serde(default)]
+    pub capability: String,
+    /// What the child's own model is told it is for, as pinned at dispatch.
+    ///
+    /// Carried on the packet so the worker reads the definition the child was
+    /// sent under rather than the text it was constructed with at start-up.
+    /// Skipped when serialising: the event log records the hash below, and a
+    /// trace read by more people than the run should not carry a role body.
+    #[serde(default, skip_serializing)]
+    pub instructions: String,
+    /// The sha-256 of `instructions`, which is what the trace records.
+    #[serde(default)]
+    pub instructions_sha256: String,
+    /// Whether this child's publications are readable by its task's other
+    /// agents. Carried from the definition; see
+    /// [`super::definitions::ResolvedDefinition::shared_with_task`] for why it
+    /// is not yet enforced at publication.
+    #[serde(default)]
+    pub shared_with_task: bool,
+    /// The skills the definition was bound to, each at the exact bytes it was
+    /// bound to. Pinned with the rest of the definition, so a skill edited
+    /// while this child runs is detectable against this record.
+    ///
+    /// Carried, not yet loaded: the child loop does not load skills today, and
+    /// this records what the definition *named* rather than claiming it was in
+    /// the child's context.
+    #[serde(default)]
+    pub skills: Vec<crate::agents::SkillBinding>,
+    /// Which attempt at the parent run sent this child. Empty for a parent
+    /// with no checkpoint yet, and for a packet written before this existed.
+    #[serde(default)]
+    pub attempt_id: String,
+    /// The routing this child was given, and the definition's model policy.
+    /// `None` for a packet written before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ModelPolicy>,
     /// The task this child is part of, which is the parent's.
     ///
     /// The key the shared memory scope is built from, and therefore the reason
@@ -203,6 +303,15 @@ impl ChildTaskPacket {
             task_id: parent_run_id.clone(),
             parent_run_id,
             agent_id: String::new(),
+            definition_version: None,
+            definition_origin: String::new(),
+            capability: String::new(),
+            instructions: String::new(),
+            instructions_sha256: String::new(),
+            shared_with_task: false,
+            skills: Vec::new(),
+            attempt_id: String::new(),
+            model_policy: None,
             deliverable: String::new(),
             requirement: latest_requirement(),
             model_id: None,
@@ -248,6 +357,55 @@ impl ChildTaskPacket {
     pub fn routed_to(mut self, model_id: Option<String>) -> Self {
         self.model_id = model_id;
         self
+    }
+
+    /// Stamps the definition this child was dispatched under.
+    ///
+    /// Copied, not referenced: the packet holds the definition as it stood when
+    /// the child was sent, so an edit saved while the child runs changes the
+    /// registry and not this child. See [`super::definitions`].
+    ///
+    /// For a registry definition this sets `agent_id` too, because the id a
+    /// child's memory is attributed to and the id whose version it pinned must
+    /// be the same id — a packet naming one agent and carrying another's version
+    /// would be a provenance record that contradicts itself. A bundled profile
+    /// has no registry id to insist on, so it leaves whatever
+    /// [`Self::assigned_to`] set, which is what every dispatch did before
+    /// definitions were resolved.
+    pub fn pinned_to(mut self, definition: &super::definitions::ResolvedDefinition) -> Self {
+        if definition.origin == super::definitions::DefinitionOrigin::Registry {
+            self.agent_id = definition.agent_id.clone();
+        }
+        self.definition_version = definition.definition_version;
+        self.definition_origin = definition.origin.as_str().to_string();
+        self.capability = definition.capability.clone();
+        self.instructions = definition.instructions().to_string();
+        self.instructions_sha256 = definition.instructions_sha256();
+        self.shared_with_task = definition.shared_with_task;
+        self.skills = definition.skills.clone();
+        self
+    }
+
+    /// Records which attempt at the parent run sent this child.
+    pub fn attempted_in(mut self, attempt_id: impl Into<String>) -> Self {
+        self.attempt_id = attempt_id.into();
+        self
+    }
+
+    /// Records the routing this child was given, under its definition's policy.
+    pub fn governed_by(mut self, policy: ModelPolicy) -> Self {
+        self.model_policy = Some(policy);
+        self
+    }
+
+    /// The identity of this piece of *work*, across every attempt at it.
+    ///
+    /// The idempotency key, named for what it is in the job contract: two
+    /// dispatches of the same objective, profile and inputs within one run are
+    /// one job, and the ledger returns the first one's answer to the second.
+    /// `child_id` is one execution of it.
+    pub fn job_id(&self) -> &str {
+        &self.idempotency_key
     }
 
     /// Whether the deadline has passed.

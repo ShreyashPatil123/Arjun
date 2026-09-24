@@ -117,18 +117,40 @@ struct Installed {
 /// entirely broken. That is the same lie as reporting a broken agent as ready,
 /// just in the direction that is easier to miss.
 ///
-/// An agent imported from a bundled profile records which one in
-/// `imported_from`; that is the authoritative link. An agent somebody created
-/// in the editor has no profile behind it and therefore genuinely has no
-/// worker, and the display name is tried only because the import sets the two
-/// equal — it costs one map lookup and covers a registry written by an older
-/// build that did not record the origin.
-pub(crate) fn worker_key(definition: &AgentDefinition) -> String {
-    definition
-        .imported_from
-        .as_ref()
-        .map(|origin| origin.profile_name.clone())
-        .unwrap_or_else(|| definition.display_name.clone())
+/// ## Why this is not a name either
+///
+/// It used to be the imported profile's name, falling back to the display
+/// name. Dispatch no longer works that way -- the manager finds a worker by the
+/// capability the definition's output schema resolves to (plan P01; see
+/// `subagents::definitions::capability_for`) -- so a name-keyed answer here
+/// disagreed with what actually runs: a clone of the retriever, performed by
+/// the retriever's worker, was shown as having no worker and never ready; and
+/// an agent typed into the editor as "code-worker" was shown as ready for a
+/// role its schema did not ask for.
+///
+/// `None` is a schema with a registered contract and no worker in this build
+/// (document, deck, workbook). Such an agent is never reported ready.
+pub(crate) fn worker_key(definition: &AgentDefinition) -> Option<&'static str> {
+    crate::subagents::capability_for(definition.output_schema)
+}
+
+/// Whether a worker in this deployment performs `definition`.
+pub(crate) fn has_worker_for(subagents: &Subagents, definition: &AgentDefinition) -> bool {
+    worker_key(definition).is_some_and(|capability| subagents.has_worker(capability))
+}
+
+/// The names a child of this agent can carry in a `subagent_started` event.
+///
+/// Its registry id, which every child dispatched through the registry records
+/// as `agentId` and `profile`; and, for an agent imported from a bundled
+/// profile, that profile's name, which is what children dispatched before the
+/// registry was consulted recorded. Never the display name.
+pub(crate) fn trace_keys(definition: &AgentDefinition) -> Vec<String> {
+    let mut keys = vec![definition.agent_id.clone()];
+    if let Some(origin) = &definition.imported_from {
+        keys.push(origin.profile_name.clone());
+    }
+    keys
 }
 
 fn installed(models: &Arc<crate::registry::ModelRegistry>, skills: &Skills) -> Installed {
@@ -164,7 +186,7 @@ pub async fn agent_registry_list(
             found
                 .into_iter()
                 .map(|definition| {
-                    let worker = subagents.has_worker(&worker_key(&definition));
+                    let worker = has_worker_for(&subagents, &definition);
                     view(definition, &have.models, &have.skills, worker)
                 })
                 .collect()
@@ -187,7 +209,7 @@ pub async fn agent_registry_get(
     agents
         .get(&agent_id, Visibility::of(&signed_in))
         .map(|definition| {
-            let worker = subagents.has_worker(&worker_key(&definition));
+            let worker = has_worker_for(&subagents, &definition);
             view(definition, &have.models, &have.skills, worker)
         })
         .map_err(refused)
@@ -769,7 +791,7 @@ mod tests {
     use super::*;
     use crate::agents::ImportOrigin;
 
-    /// The lookup key is the profile name, not the role.
+    /// The lookup key is the worker's capability, not the role.
     ///
     /// This is pinned because the first version asked
     /// `has_worker("reasoning")`, which is never a registered key — workers
@@ -787,19 +809,63 @@ mod tests {
             profile_sha256: "a".repeat(64),
         });
 
+        imported.output_schema = crate::subagents::SchemaKind::Review;
+
         // Not "reasoning", and not the display name either: a rename must not
         // change which worker performs the work.
-        assert_eq!(worker_key(&imported), "artifact-reviewer");
-        assert_ne!(worker_key(&imported), imported.role.label());
+        assert_eq!(worker_key(&imported), Some("artifact-reviewer"));
+        assert_ne!(worker_key(&imported), Some(imported.role.label()));
     }
 
-    /// An agent somebody typed into the editor has no profile behind it, so the
-    /// display name is the only thing left to try.
+    /// Plan P01: which worker performs an agent is decided by what it
+    /// produces, never by what it is called -- the same rule dispatch uses.
+    ///
+    /// This replaced a test that pinned the opposite: an agent with no import
+    /// origin fell back to its display name, so one *named* "code-worker" was
+    /// reported as having the code worker, and a clone of the retriever was
+    /// reported as having none.
     #[test]
-    fn an_agent_with_no_origin_falls_back_to_its_name() {
-        let mut fresh = crate::agents::tests::definition("ag-2");
-        fresh.imported_from = None;
-        fresh.display_name = "code-worker".into();
-        assert_eq!(worker_key(&fresh), "code-worker");
+    fn the_worker_is_the_capability_of_the_output_and_not_a_name() {
+        // A clone: no origin, a new name, the retriever's schema.
+        let mut clone = crate::agents::tests::definition("ag-clone");
+        clone.imported_from = None;
+        clone.display_name = "Seal-wear retriever".into();
+        clone.output_schema = crate::subagents::SchemaKind::Retrieval;
+        assert_eq!(worker_key(&clone), Some("knowledge-retriever"));
+
+        // A name that happens to be a worker's is not that worker.
+        let mut named = crate::agents::tests::definition("ag-named");
+        named.imported_from = None;
+        named.display_name = "code-worker".into();
+        named.output_schema = crate::subagents::SchemaKind::Retrieval;
+        assert_eq!(worker_key(&named), Some("knowledge-retriever"));
+
+        // A registered contract with no worker yet has no worker key at all,
+        // so it can never be reported ready.
+        for schema in [
+            crate::subagents::SchemaKind::Document,
+            crate::subagents::SchemaKind::Deck,
+            crate::subagents::SchemaKind::Workbook,
+        ] {
+            let mut writer = crate::agents::tests::definition("ag-writer");
+            writer.output_schema = schema;
+            assert_eq!(worker_key(&writer), None, "{schema:?} claims a worker");
+        }
+    }
+
+    /// A child of this agent is found in the trace by its id, and -- for an
+    /// imported agent -- by the bundled role name older events recorded.
+    #[test]
+    fn a_childs_trace_names_its_agent_by_id_and_never_by_display_name() {
+        let mut imported = crate::agents::tests::definition("ag-3");
+        imported.display_name = "Passage Finder".into();
+        imported.imported_from = Some(ImportOrigin {
+            source: "bundle".into(),
+            profile_name: "knowledge-retriever".into(),
+            profile_sha256: "b".repeat(64),
+        });
+        let keys = trace_keys(&imported);
+        assert_eq!(keys, vec!["ag-3".to_string(), "knowledge-retriever".to_string()]);
+        assert!(!keys.contains(&"Passage Finder".to_string()));
     }
 }

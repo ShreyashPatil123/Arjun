@@ -1,0 +1,1623 @@
+{
+  "schema": "arjun.qualification-inventory/1",
+  "generated_at": "2026-09-21T11:19:10.021Z",
+  "generated_by": "scripts/qualification-inventory.mjs",
+  "hashes_computed": true,
+  "reading_rule": "Every value is {value, source}. source is one of: measured (a command ran here), declared (a file on this machine asserts it, unchecked), unknown (nothing established it; unknown_because says what would). A null value is never a compatible default.",
+  "repository": {
+    "head": {
+      "value": "b9ff7fbcbab3c610dffd541b674ec04706710561",
+      "source": "measured",
+      "measured_by": "git rev-parse HEAD"
+    },
+    "branch": {
+      "value": "main",
+      "source": "measured",
+      "measured_by": "git rev-parse --abbrev-ref HEAD"
+    },
+    "dirty_paths": {
+      "value": 3,
+      "source": "measured",
+      "measured_by": "git status --porcelain"
+    },
+    "plan_baseline_sha": {
+      "value": "4164fc26bbdc86eeed61fcf6513f0b97f2cc7e0e",
+      "source": "declared",
+      "declared_in": "build plan header"
+    },
+    "agent_runtime_bundle": {
+      "value": {
+        "path": "C:\\Users\\lenovo\\Desktop\\Arjun-1\\agent-runtime\\dist\\arjun-agent-runtime.mjs",
+        "bytes": 1790233,
+        "mtime": "2026-09-19T23:04:01.252Z"
+      },
+      "source": "measured",
+      "measured_by": "fs.statSync"
+    }
+  },
+  "target_machine": {
+    "described_in": "docs/plans/2026-09-20-agent-system-build-plan.md §4",
+    "gpu": {
+      "value": "RTX 5060, 8 GB VRAM",
+      "source": "declared",
+      "declared_in": "build plan preamble and §4"
+    },
+    "gpu_sku_resolved": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "the plan does not say desktop or laptop, and the two differ in power envelope and memory bandwidth"
+    },
+    "vram_bytes": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "not measured on the target machine by this process"
+    },
+    "system_ram_bytes": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "the plan states target system RAM is not yet known"
+    },
+    "observed_served_context": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "no model has been served on the target machine by this process"
+    }
+  },
+  "current_machine": {
+    "is_the_target_machine": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "not established. This host reports an \"RTX 5060 Laptop GPU\"; the plan targets an \"RTX 5060\". Only the hardware owner can confirm whether they are the same deployment target."
+    },
+    "os": {
+      "value": "Microsoft Windows 11 Home Single Language 10.0.26200",
+      "source": "measured",
+      "measured_by": "Win32_OperatingSystem"
+    },
+    "cpu": {
+      "value": "AMD Ryzen 7 250 w/ Radeon 780M Graphics",
+      "source": "measured",
+      "measured_by": "Win32_Processor"
+    },
+    "cpu_cores": {
+      "value": 8,
+      "source": "measured",
+      "measured_by": "Win32_Processor"
+    },
+    "cpu_threads": {
+      "value": 16,
+      "source": "measured",
+      "measured_by": "Win32_Processor"
+    },
+    "system_ram_bytes": {
+      "value": 25025695744,
+      "source": "measured",
+      "measured_by": "Win32_ComputerSystem.TotalPhysicalMemory"
+    },
+    "system_ram_free_bytes_at_scan": {
+      "value": 7522390016,
+      "source": "measured",
+      "measured_by": "Win32_OperatingSystem.FreePhysicalMemory"
+    },
+    "gpus": {
+      "value": [
+        {
+          "index": 0,
+          "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
+          "vram_total_bytes": 8546942976,
+          "vram_free_bytes_at_scan": 8134852608,
+          "driver_version": "595.95",
+          "compute_capability": "12.0"
+        }
+      ],
+      "source": "measured",
+      "measured_by": "nvidia-smi --query-gpu"
+    }
+  },
+  "runtime": {
+    "program": {
+      "value": "C:\\Users\\lenovo\\AppData\\Local\\Microsoft\\WinGet\\Packages\\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\\llama-server.exe",
+      "source": "measured",
+      "measured_by": "Get-Command llama-server"
+    },
+    "build_number": {
+      "value": 10970,
+      "source": "measured",
+      "measured_by": "llama-server --version"
+    },
+    "commit": {
+      "value": "bfdc32183",
+      "source": "measured",
+      "measured_by": "llama-server --version"
+    },
+    "version_string": {
+      "value": "0.4.1-dev",
+      "source": "measured",
+      "measured_by": "llama-server --version"
+    },
+    "minimum_build_required_by_registry": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "no registry row on this machine carries a minLlamaBuild field. src-tauri/src/registry/mod.rs documents b10828 for Spark's spark2_5 architecture, but with the field absent the launch gate cannot fire."
+    }
+  },
+  "containers": {
+    "docker_cli": {
+      "value": "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      "source": "measured",
+      "measured_by": "Get-Command docker"
+    },
+    "podman_cli": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "podman is not on PATH"
+    },
+    "daemon_reachable": {
+      "value": false,
+      "source": "measured",
+      "measured_by": "docker info"
+    },
+    "daemon_error": {
+      "value": "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.",
+      "source": "measured",
+      "measured_by": "docker info stderr"
+    },
+    "server_version": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "the container daemon did not answer"
+    },
+    "images": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "the container daemon did not answer, so its image list is not known"
+    },
+    "unblock_command": "Start Docker Desktop (or `podman machine start`), then re-run this script."
+  },
+  "renderers": {
+    "soffice": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "soffice is not on PATH"
+    },
+    "libreoffice": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "libreoffice is not on PATH"
+    },
+    "python_document_libraries": {
+      "value": {
+        "PIL": "12.3.0",
+        "fitz": "1.28.0",
+        "docx": "1.2.0",
+        "pptx": "1.0.2",
+        "openpyxl": null,
+        "reportlab": "5.0.0"
+      },
+      "source": "measured",
+      "measured_by": "python -c import"
+    },
+    "note": "Word, PowerPoint and Excel files are written by Rust directly as OOXML (src-tauri/Cargo.toml: `zip`), so no renderer is needed to PRODUCE them. A renderer is needed to RASTERISE a page or slide for visual review (plan §5.9) and to reopen a workbook with a real recalculation engine (plan §5.6)."
+  },
+  "ocr": {
+    "source_of_truth": "src-tauri/src/ai_engine/ocr_profile.rs",
+    "weight_files_per_tier": {
+      "value": [
+        {
+          "tier": "High",
+          "file": "Unlimited-OCR-Q6_K.gguf"
+        },
+        {
+          "tier": "Fast",
+          "file": "Unlimited-OCR-Q4_K_M.gguf"
+        }
+      ],
+      "source": "measured",
+      "measured_by": "parsed from OcrTier::weights_file in ocr_profile.rs"
+    },
+    "max_image_tokens_wired": {
+      "value": false,
+      "source": "measured",
+      "measured_by": "ocr_profile.rs module documentation: server_args builds --image-max-tokens and nothing but its own unit test calls it; serving::plan_launch does not emit it and the request body has no field for it."
+    },
+    "decode_cap_wired": {
+      "value": true,
+      "source": "measured",
+      "measured_by": "ocr_profile.rs: max_decode_tokens is sent per request as max_tokens"
+    },
+    "repetition_control": {
+      "value": "DRY settings approximating Baidu's no_repeat_ngram_size=35 over a 128-token window. An approximation, not a reproduction; ocr_profile.rs says so and says it must be measured.",
+      "source": "measured",
+      "measured_by": "ocr_profile.rs module documentation"
+    },
+    "observed_page_accuracy": {
+      "value": null,
+      "source": "unknown",
+      "unknown_because": "no OCR page was run by this inventory"
+    }
+  },
+  "models": {
+    "app_identifier": {
+      "value": "com.arjun.workbench",
+      "source": "measured",
+      "measured_by": "src-tauri/tauri.conf.json identifier"
+    },
+    "registry_path": {
+      "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\registry.json",
+      "source": "measured",
+      "measured_by": "file exists on this machine"
+    },
+    "qualification_state_note": "Nothing in this inventory loads a model, so no row can be higher than `discovered`. Advancing to `compatible runtime` needs a real load; `task-qualified` needs the fixture pack run against it.",
+    "entries": [
+      {
+        "id": "unlimited-ocr-q6-k",
+        "name": "Unlimited-OCR (Q6_K)",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Local\\com.arjun.workbench\\models\\OCR\\Unlimited-OCR\\Unlimited-OCR-Q6_K.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 2613275904,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 2613275904,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "a9994800e005190197a4cc5c0b54a88db5c6aba6f6dca48a27992ea2e1c0b3b3",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_declared": {
+          "value": "Q6_K",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q6_K",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "deepseek2-ocr",
+            "name": "Unlimited OCR",
+            "size_label": "64x550M",
+            "file_type": 18
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 32768,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "177c96be4ec3c3c9d9c48b7876b58a72bfec71092e23811ef03b3f30a777f7f3"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Local\\com.arjun.workbench\\models\\OCR\\Unlimited-OCR\\mmproj-Unlimited-OCR-F16-patched.gguf",
+            "bytes": 811876512
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "mit",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "unlimited-ocr-q4-k-m",
+        "name": "Unlimited-OCR (Q4_K_M)",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Local\\com.arjun.workbench\\models\\OCR\\Unlimited-OCR\\Unlimited-OCR-Q4_K_M.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 1950326784,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 1950326784,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "c8461bded976eac709a33f6b26e1414efcd2124a203f2ee93ee984a4c9e9265b",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_M",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q4_K_M",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "deepseek2-ocr",
+            "name": "Unlimited OCR",
+            "size_label": "64x550M",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 32768,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "177c96be4ec3c3c9d9c48b7876b58a72bfec71092e23811ef03b3f30a777f7f3"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Local\\com.arjun.workbench\\models\\OCR\\Unlimited-OCR\\mmproj-Unlimited-OCR-F16-patched.gguf",
+            "bytes": 811876512
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "mit",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "babelscape-rebel-large",
+        "name": "REBEL Large (relation extraction)",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Babelscape_rebel-large\\base\\pytorch_model.bin",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 1625590959,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 1625590959,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "407feb8d55cae8ee077aa032a4aab5577a5503f910d090593626ebd6fccb6cff",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_declared": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row records no quantization"
+        },
+        "quantization_from_filename": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "not a GGUF file; the filename carries no quantization suffix"
+        },
+        "variant_from_header": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "not a GGUF file on this machine"
+        },
+        "trained_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no <arch>.context_length key was read from the GGUF header"
+        },
+        "configured_context": {
+          "value": 1024,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "GGUF header not read"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "relationExtraction"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "cc-by-nc-sa-4.0",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+        "name": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen3.6-35B-A3B\\base\\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 22134528992,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 22134528992,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_M",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "UD-Q4_K_M",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "qwen35moe",
+            "name": "Qwen3.6-35B-A3B",
+            "size_label": "35B-A3B",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 262144,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "reasoning",
+          "coding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "Qwen3.5-9B-Q4_K_S",
+        "name": "Qwen3.5-9B-Q4_K_S",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen3.5-9B\\base\\Qwen3.5-9B-Q4_K_S.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 5394097376,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 5394097376,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "023713a5240bf58a84d2890a30deb2e0485abb5b9b9c33ba67596e9248b35f80",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_S",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q4_K_S",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "qwen35",
+            "name": "Qwen3.5-9B",
+            "size_label": "9B",
+            "file_type": 14
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 262144,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "reasoning",
+          "coding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "Qwen3-Embedding-0.6B-Q8_0",
+        "name": "Qwen3-Embedding-0.6B-Q8_0",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen3-Embedding-0.6B\\Qwen3-Embedding-0.6B-Q8_0.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 639150592,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 639150592,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q8_0",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q8_0",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "qwen3",
+            "name": "Qwen3 Embedding 0.6b",
+            "size_label": "0.6B",
+            "file_type": 7
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 32768,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "embedding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "Qwen2.5-VL-3B-Instruct-Q4_K_M",
+        "name": "Qwen2.5-VL-3B-Instruct-Q4_K_M",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen2.5-VL-3B-Instruct\\Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 1929901056,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 1929901056,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "d02fe9b69ad8cadbbd228e387667af66612c44bed29ffc8eb1e7caf9ac486c12",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_M",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q4_K_M",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "qwen2vl",
+            "name": "Qwen2.5 VL 3B Instruct",
+            "size_label": "3B",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 128000,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen2.5-VL-3B-Instruct\\mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+            "bytes": 1338428128
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "reasoning",
+          "coding",
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "NVIDIA-Nemotron3-Nano-4B-Q4_K_M",
+        "name": "NVIDIA-Nemotron3-Nano-4B-Q4_K_M",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\NVIDIA_Nemotron3-Nano-4B\\base\\NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 2837072864,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 2837072864,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "be5d9a656a51922f24f1f09a759cebb694e1f5d9728bf0ef9f8c972c5a0b5ef2",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_M",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q4_K_M",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "nemotron_h",
+            "name": "Hf",
+            "size_label": "4.0B",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 1048576,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "reasoning",
+          "coding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "nomic-embed-text-v2-moe.Q8_0",
+        "name": "nomic-embed-text-v2-moe.Q8_0",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\nomic-ai_nomic-embed-text-v2-moe\\nomic-embed-text-v2-moe.Q8_0.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 512225120,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 512225120,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "06e7a7e594a26985523c18383aba4aad39fe6e14f08ffc6ab5b554e1ccdc3cff",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q8_0",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q8_0",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "nomic-bert-moe",
+            "name": "nomic-embed-text-v2-moe",
+            "size_label": "8x277M",
+            "file_type": 7
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 512,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 512,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": false,
+            "sha256": null
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "embedding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+        "name": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-E4B-it\\base\\gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 4215695776,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 4215695776,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "unknown",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "UD-Q4_K_XL",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "gemma4",
+            "name": "Gemma-4 E4B IT (smart Q4_0, QAT-lossless)",
+            "size_label": "7.5B",
+            "file_type": 2
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 131072,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "241c50d86bdfe5e43307da87f559cd2416aacd67a8de46c15acc0105ef2200b7"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "reasoning",
+          "coding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "gemma-4-12b-it-UD-Q4_K_XL",
+        "name": "gemma-4-12b-it-UD-Q4_K_XL",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\gemma-4-12b-it-UD-Q4_K_XL.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 7366423360,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 7366423360,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "90fd944d227e9d9b68e7e2c7d5b57b79d4c66ed521b0919fbbd932cf834f6f8e",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "unknown",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "UD-Q4_K_XL",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "gemma4",
+            "name": "Gemma-4-12B-It",
+            "size_label": "12B",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 262144,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "845f1ee48e39fc942fe190da9df6a1c5db229e17a96ea08966ad1c9274e73d1b"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\mmproj-F16.gguf",
+            "bytes": 175115840
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "reasoning",
+          "coding",
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "mtp-gemma-4-12b-it-BF16",
+        "name": "mtp-gemma-4-12b-it-BF16",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\mtp-gemma-4-12b-it-BF16.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 861520128,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 861520128,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "20b0e5caf9152e816a56f92c702528bffc7a7c930f20c33cf6616ac216998037",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "F16",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "BF16",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "gemma4-assistant",
+            "name": "Gemma 4 12B It Assistant",
+            "size_label": "423M",
+            "file_type": 32
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 262144,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": false,
+            "sha256": null
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\mmproj-F16.gguf",
+            "bytes": 175115840
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "reasoning",
+          "coding",
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "mtp-gemma-4-12b-it",
+        "name": "mtp-gemma-4-12b-it",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\mtp-gemma-4-12b-it.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 465109248,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 465109248,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "145db9094bc0f85f1701e255a2ed216dcc9800fc8bc8631ad00905b456bd451b",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "unknown",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the GGUF filename carries no recognised quantization suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "gemma4-assistant",
+            "name": "Gemma 4 12B It Assistant",
+            "size_label": "423M",
+            "file_type": 7
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 262144,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": false,
+            "sha256": null
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-4-12b-it\\base\\mmproj-F16.gguf",
+            "bytes": 175115840
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "reasoning",
+          "coding",
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "gemma-3-12b-it-Q4_K_M",
+        "name": "gemma-3-12b-it-Q4_K_M",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-3-12b-it\\base\\gemma-3-12b-it-Q4_K_M.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 7300778336,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 7300778336,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "dc63e42acd765e6bfadc39670f791942b0df04639ab6ab46f8b8d31b1ce45364",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q4_K_M",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q4_K_M",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "gemma3",
+            "name": "Gemma-3-12B-It",
+            "size_label": "12B",
+            "file_type": 15
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 131072,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 32768,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": {
+            "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\google_gemma-3-12b-it\\base\\mmproj-F16.gguf",
+            "bytes": 854200448
+          },
+          "source": "measured",
+          "measured_by": "registry `projector` field, file present"
+        },
+        "roles": [
+          "reasoning",
+          "coding",
+          "vision",
+          "documentOcr"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      },
+      {
+        "id": "Spark-X2.5-4B-Q8_0",
+        "name": "Spark-X2.5-4B-Q8_0",
+        "enabled": true,
+        "path": {
+          "value": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Spark_Spark-X2.5-4B\\base\\Spark-X2.5-4B-Q8_0.gguf",
+          "source": "measured",
+          "measured_by": "file exists on this machine"
+        },
+        "bytes_on_disk": {
+          "value": 4375021152,
+          "source": "measured",
+          "measured_by": "fs.statSync"
+        },
+        "bytes_declared": 4375021152,
+        "bytes_agree": true,
+        "sha256": {
+          "value": "5c2c3c190e4337e1016b8593ca8e26e8b18c972200b107385d4ec61a25d9dea2",
+          "source": "measured",
+          "measured_by": "sha256 of the file on disk"
+        },
+        "quantization_declared": {
+          "value": "Q8_0",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "quantization_from_filename": {
+          "value": "Q8_0",
+          "source": "measured",
+          "measured_by": "GGUF filename suffix"
+        },
+        "variant_from_header": {
+          "value": {
+            "architecture": "spark2_5",
+            "name": "Hf_Format",
+            "size_label": "4.1B",
+            "file_type": 7
+          },
+          "source": "measured",
+          "measured_by": "GGUF key-value header"
+        },
+        "trained_context": {
+          "value": 1048576,
+          "source": "measured",
+          "measured_by": "GGUF header"
+        },
+        "configured_context": {
+          "value": 1048576,
+          "source": "declared",
+          "declared_in": "models/registry.json contextLength"
+        },
+        "observed_served_context": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "no llama-server was started by this inventory. Run the baseline harness with --serve to have a real server report its n_ctx, then re-run this script."
+        },
+        "chat_template": {
+          "value": {
+            "embedded": true,
+            "sha256": "705345721970da40e6aa56db548a46ecd1d8d94a5418808fa180ac19ee77a9ba"
+          },
+          "source": "measured",
+          "measured_by": "GGUF tokenizer.chat_template"
+        },
+        "projector": {
+          "value": null,
+          "source": "not-applicable",
+          "note": "text-only row"
+        },
+        "roles": [
+          "reasoning",
+          "coding"
+        ],
+        "modalities": [
+          "text"
+        ],
+        "license": {
+          "value": "unstated",
+          "source": "declared",
+          "declared_in": "models/registry.json"
+        },
+        "min_llama_build": {
+          "value": null,
+          "source": "unknown",
+          "unknown_because": "the registry row carries no minLlamaBuild, so the launch gate cannot check this architecture against the installed llama-server"
+        },
+        "qualification_state": "discovered"
+      }
+    ]
+  },
+  "embedding": {
+    "registered": [
+      {
+        "id": "Qwen3-Embedding-0.6B-Q8_0",
+        "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Qwen_Qwen3-Embedding-0.6B\\Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "bytes": 639150592,
+        "configured_context": 32768
+      },
+      {
+        "id": "nomic-embed-text-v2-moe.Q8_0",
+        "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\nomic-ai_nomic-embed-text-v2-moe\\nomic-embed-text-v2-moe.Q8_0.gguf",
+        "bytes": 512225120,
+        "configured_context": 512
+      }
+    ],
+    "wired_into_retrieval": {
+      "value": false,
+      "source": "measured",
+      "measured_by": "LocalEmbedder is declared in knowledge/embedding.rs, re-exported from knowledge/mod.rs and referenced in hybrid.rs documentation — and constructed by no production caller. context_compiler.rs reports its own retrieval mode as \"lexical\" for this reason."
+    },
+    "consequence": "Plan §3 finding 3 is a code gap, not a weights gap: an embedding model is installed and registered on this machine and retrieval still does not use one."
+  }
+}

@@ -1,0 +1,77 @@
+# P01 checks — 2026-09-23T23:54:01Z — HEAD b9ff7fbcbab3c610dffd541b674ec04706710561 (working tree carries P00+P01, uncommitted)
+
+## cargo test --manifest-path src-tauri/Cargo.toml --lib --no-fail-fast   (before the grammar fix)
+test orchestrator::grammar::tests::a_tool_that_takes_arguments_can_be_sent_them ... FAILED
+test result: FAILED. 2675 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 31.04s
+
+## cargo test --lib -- orchestrator:: subagents:: commands::agents commands::agent_admin agent_runtime::tool_policy agent_runtime::tests   (after)
+test result: ok. 421 passed; 0 failed; 0 ignored; 0 measured; 2257 filtered out; finished in 21.01s
+
+## cargo test --lib -- agent_runtime::tests::tool_contract_path
+test agent_runtime::tests::tool_contract_path::an_undeclared_argument_is_refused_on_the_production_path ... ok
+test agent_runtime::tests::tool_contract_path::a_page_read_without_its_optional_end_page_is_not_refused_by_the_gateway ... ok
+test agent_runtime::tests::tool_contract_path::a_delegation_the_schema_allows_reaches_the_delegation_handler ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2678 filtered out; finished in 1.45s
+
+## mutation check: writer-lane rule and undeclared-argument refusal reverted
+test orchestrator::gateway::tests::a_tool_with_no_arguments_refuses_any ... FAILED
+test orchestrator::gateway::tests::an_undeclared_argument_is_refused_and_the_real_ones_are_named ... FAILED
+test subagents::definitions_tests::two_writers_never_share_the_reader_lane ... FAILED
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2675 filtered out; finished in 0.02s
+
+## ARJUN_WRITE_TOOL_CONTRACT=1 cargo test --lib orchestrator::contract
+test orchestrator::contract::tests::a_workspace_prerequisite_is_exactly_a_workspace_scoped_tool ... ok
+test orchestrator::contract::tests::a_contract_never_contradicts_itself ... ok
+test orchestrator::contract::tests::every_listed_alias_resolves_to_its_own_tool_and_to_no_other ... ok
+test orchestrator::contract::tests::the_published_contract_covers_every_tool ... ok
+test orchestrator::contract::tests::the_published_contract_is_current ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2673 filtered out; finished in 0.02s
+
+## npm run check:targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 59.96s
+
+## npm run runtime:typecheck  -> exit 0
+
+## npm run runtime:test
+ Test Files  131 passed (131)
+      Tests  2291 passed (2291)
+
+## npx tsc --noEmit -p tsconfig.json  -> exit 0
+
+## npm run test:ui
+ Test Files  43 passed (43)
+      Tests  618 passed (618)
+
+## npm run runtime:build
+bundled 1096 modules -> dist/arjun-agent-runtime.mjs (1754 KiB)
+sha256 7eafd6f0083facd39a2763dc87c6549891ab928e52af64ddefc1b5f8b3eb20d1
+
+## npm run check:bundle:self
+bundle gate self-test: pass — the gate refuses every regression it claims to catch
+
+## node scripts/check-ipc.mjs
+IPC contract OK: 172 commands (18 admin, 3 external, 135 frontend, 16 frontend-pending).
+
+## node scripts/check-reachable.mjs
+Reachability OK: 196 module(s) reachable from the entry points, 1 reached only by tests.
+
+## node scripts/check-egress.mjs
+egress gate: pass — one chokepoint, no unapproved hosts
+
+## node scripts/check-no-lora.mjs
+LoRA removal gate passed across 591 product files.
+
+## node scripts/agent-baseline.mjs --out evidence/agent-system/P01/baseline.json
+
+agent-system baseline — P00
+  cases      39
+  executed   8
+  passed     8
+  failed     0
+  blocked    31
+  skipped    0
+
+  written to evidence/agent-system/P01/baseline.json
+
+## cargo test --manifest-path src-tauri/Cargo.toml --lib --no-fail-fast   (after every fix)
+test result: ok. 2679 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 31.83s

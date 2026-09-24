@@ -321,23 +321,68 @@ async fn the_production_delegation_tool_reaches_a_registered_worker() {
     );
 }
 
-/// A role that needs a model, asked for on a machine with no runtime started,
-/// refuses by name rather than doing a fraction of the work.
+/// A read-only delegation cannot start a role that writes.
 ///
-/// These tests build their services with `child_loop: None`, which is what a
-/// deployment looks like before any run has started. The four mechanical roles
-/// carry on; writing a program is not mechanical, so this one stops.
+/// `agent.delegate_readonly` is automatic -- nobody is asked -- because the
+/// child it starts cannot write. `code-worker` writes files and runs code. Until
+/// plan P01 this test sent `code-worker` through the read-only tool and
+/// expected it to *start*, which is the widening P01 names; the Rust side now
+/// refuses it before anything is recorded or run.
 #[tokio::test]
-async fn a_role_that_needs_a_model_refuses_when_there_is_none() {
+async fn a_read_only_delegation_cannot_start_a_role_that_writes() {
     let world = World::new();
-    let out = world
+    let refused = world
         .delegate(json!({
             "profile": "code-worker",
             "task": "write a script",
             "files": ["main.py"],
         }))
         .await
-        .expect("the tool answers");
+        .expect_err("a writer was started through the read-only tool");
+
+    assert!(refused.contains("read-only"), "{refused}");
+    assert!(refused.contains("Nothing was started"), "{refused}");
+}
+
+/// A role that needs a model, asked for on a machine with no runtime started,
+/// refuses by name rather than doing a fraction of the work.
+///
+/// These tests build their services with `child_loop: None`, which is what a
+/// deployment looks like before any run has started. The four mechanical roles
+/// carry on; writing a program is not mechanical, so this one stops.
+///
+/// Dispatched in writer mode through the manager, because that is now the only
+/// way `code-worker` starts at all -- see the test above.
+#[tokio::test]
+async fn a_role_that_needs_a_model_refuses_when_there_is_none() {
+    let world = World::new();
+    let spawned = world
+        .manager
+        .spawn(
+            "code-worker",
+            &world.inherited,
+            "write a script",
+            vec![crate::subagents::InputRef::WorkspaceFile {
+                path: "main.py".to_string(),
+            }],
+            crate::subagents::certification::Decision {
+                model_id: "model-parent".to_string(),
+                role: crate::registry::ModelRole::Coding,
+                cheaper_than_parent: false,
+                reason: "the run's own model".to_string(),
+                tier: None,
+                score: None,
+            },
+            &crate::subagents::manager::Dispatch::for_task("code-worker", RUN).writing(),
+        )
+        .await
+        .expect("a writer dispatch is accepted");
+    let result = spawned.result();
+    let out = format!(
+        "status: {} {}",
+        result.status.as_str(),
+        result.detail.clone().unwrap_or_default()
+    );
 
     assert!(out.contains("status: failed"), "{out}");
     assert!(

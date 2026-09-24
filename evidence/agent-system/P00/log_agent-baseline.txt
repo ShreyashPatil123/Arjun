@@ -1,0 +1,22 @@
+
+agent-system baseline — P00
+  cases      39
+  executed   9
+  passed     9
+  failed     0
+  blocked    30
+  skipped    0
+
+  written to evidence/agent-system/P00/baseline.json
+
+blocked, and what would unblock each:
+    3x  Implement P06 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    2x  Implement P07 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    6x  Implement P08 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    3x  Implement P09 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    1x  Implement P11 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    2x  Implement P12 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    2x  Implement P13 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    2x  Implement P02 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    1x  Implement P04 of docs/plans/2026-09-20-agent-system-build-plan.md, then re-run this harness.
+    8x  Implement the owning phase, then re-run this harness.

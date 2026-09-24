@@ -976,9 +976,30 @@ fn tool_catalogue(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireE
         .profiles()
         .any(|profile| deps.subagents.has_worker(&profile.name));
 
+    // Which prerequisites the catalogue itself can settle, asked of the tool
+    // contract rather than of a tool name. Exhaustive, so a prerequisite added
+    // later as catalogue-checked cannot be forgotten here; the others are held
+    // where the contract says they are -- the gateway or the handler, each of
+    // which refuses and says what is missing.
+    let offered = |prerequisite: &crate::orchestrator::contract::Prerequisite| {
+        use crate::orchestrator::contract::Prerequisite;
+        match prerequisite {
+            Prerequisite::SubagentWorker => delegation_possible,
+            Prerequisite::WorkspaceRoot
+            | Prerequisite::ModelRegistry
+            | Prerequisite::ContainerSandbox
+            | Prerequisite::MultimodalIndex
+            | Prerequisite::RunCalculations => true,
+        }
+    };
+
     let eligible: Vec<ToolName> = planned
         .into_iter()
-        .filter(|tool| *tool != ToolName::AgentDelegateReadonly || delegation_possible)
+        .filter(|tool| {
+            crate::orchestrator::contract::prerequisites_of(*tool)
+                .iter()
+                .all(offered)
+        })
     // Applied again here even though the plan was already filtered when it was
     // made. The two are not the same check: a plan is fixed at the start of a
     // run, and this is asked whenever the runtime starts a loop — including
@@ -2192,6 +2213,20 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
         ToolName::CreateDiagram => create_diagram(deps, &call, &tool_call, &mut written),
         ToolName::CreatePdf => create_pdf(deps, &call, &tool_call, &mut written),
         ToolName::CreateTable => create_table(deps, &call, &tool_call, &mut written),
+        // Registered for this path and not answered by an arm above. The
+        // runner would refuse it as "served on the agent path", which reads
+        // like a routing decision when it is a missing handler; saying so is
+        // what lets the contract and this `match` be kept in step.
+        _ if crate::orchestrator::contract::route_of(tool).0
+            == crate::orchestrator::contract::Route::AgentPath =>
+        {
+            Err(format!(
+                "{} is registered to be answered here ({}), and this build has no handler for \
+                 it on this path. Nothing was done.",
+                tool.as_str(),
+                crate::orchestrator::contract::route_of(tool).1
+            ))
+        }
         _ => {
             // Built with everything the run has, rather than with the index
             // alone.
@@ -2210,11 +2245,20 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
             // same field `model_transition` moves when a binding changes, so a
             // child routed after a handoff is routed against the model the run
             // is *now* on.
-            let parent_model = deps
+            //
+            // The attempt comes off the same seed: a resumption gets a new
+            // attempt id, and a child dispatched after one should say which
+            // attempt at the task sent it.
+            let (parent_model, attempt_id) = deps
                 .checkpoints
                 .lock()
                 .ok()
-                .and_then(|seeds| seeds.get(&call.run_id).map(|seed| seed.model_id.clone()));
+                .and_then(|seeds| {
+                    seeds
+                        .get(&call.run_id)
+                        .map(|seed| (Some(seed.model_id.clone()), Some(seed.attempt_id.clone())))
+                })
+                .unwrap_or((None, None));
             let runner = runner_for(
                 deps,
                 &session,
@@ -2222,6 +2266,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
                 workspace.as_deref(),
                 &call.run_id,
                 parent_model.as_deref(),
+                attempt_id.as_deref(),
             );
             let result = runner.run(tool, &tool_call, resolved_path.as_deref()).await;
             // A successful calculation is kept, so the workbook can show the
@@ -2851,6 +2896,7 @@ fn runner_for<'a>(
     workspace: Option<&'a std::path::Path>,
     run_id: &'a str,
     parent_model: Option<&'a str>,
+    attempt_id: Option<&'a str>,
 ) -> LocalToolRunner<'a> {
     let mut runner = LocalToolRunner::with_multimodal(
         deps.index.as_ref(),
@@ -2867,6 +2913,7 @@ fn runner_for<'a>(
     runner.models = deps.registry.as_deref();
     runner.parent_model = parent_model;
     runner.task_id = Some(run_id);
+    runner.attempt_id = attempt_id;
     runner
 }
 

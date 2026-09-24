@@ -84,6 +84,7 @@ fn value_rule(kind: ArgumentKind) -> &'static str {
         ArgumentKind::Text | ArgumentKind::Path => "string",
         ArgumentKind::Integer => "integer",
         ArgumentKind::Object => "object",
+        ArgumentKind::List => "array",
     }
 }
 
@@ -149,21 +150,45 @@ pub fn build(tools: &[ToolName]) -> Option<ToolGrammar> {
             tool.as_str()
         );
 
-        if spec.arguments.is_empty() {
-            rule.push_str(" \"}\" ws \"}\"\n");
+        // Required arguments in their declared order, then each optional one
+        // as a member that may be left out. Optional arguments used to be
+        // inexpressible here, which is why several were declared *required*
+        // and the gateway then refused the runtime's calls that omitted them;
+        // now that the gateway holds the two lists apart, so does this.
+        let member = |argument: &super::tools::ArgumentSpec| {
+            format!(
+                " \"\\\"{}\\\"\" ws \":\" ws {} ws",
+                argument.name,
+                value_rule(argument.kind)
+            )
+        };
+        let optional_after = |from: usize| {
+            spec.optional_arguments[from..]
+                .iter()
+                .map(|argument| format!(" (\",\" ws{})?", member(argument)))
+                .collect::<String>()
+        };
+
+        if spec.arguments.is_empty() && !spec.optional_arguments.is_empty() {
+            // Any subset, in declared order: whichever optional comes first
+            // carries no comma, and each later one is optional after it.
+            let alternatives: Vec<String> = spec
+                .optional_arguments
+                .iter()
+                .enumerate()
+                .map(|(i, argument)| format!("{}{}", member(argument), optional_after(i + 1)))
+                .collect();
+            rule.push_str(&format!(" ({} )?", alternatives.join(" |")));
         } else {
             for (i, argument) in spec.arguments.iter().enumerate() {
                 if i > 0 {
                     rule.push_str(" \",\" ws");
                 }
-                rule.push_str(&format!(
-                    " \"\\\"{}\\\"\" ws \":\" ws {} ws",
-                    argument.name,
-                    value_rule(argument.kind)
-                ));
+                rule.push_str(&member(argument));
             }
-            rule.push_str(" \"}\" ws \"}\"\n");
+            rule.push_str(&optional_after(0));
         }
+        rule.push_str(" \"}\" ws \"}\"\n");
 
         rules.push_str(&rule);
     }

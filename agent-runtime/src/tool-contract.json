@@ -1,0 +1,1253 @@
+{
+  "contractVersion": 1,
+  "generatedBy": "src-tauri/src/orchestrator/contract.rs -- regenerate with ARJUN_WRITE_TOOL_CONTRACT=1 cargo test --lib orchestrator::contract",
+  "tools": [
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "rustDeadline",
+      "effect": "reversible",
+      "handler": "LocalToolRunner::delegate_to_subagent, then SubagentManager::spawn",
+      "maxResponseBytes": 16384,
+      "name": "agent.delegate_readonly",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "list",
+          "name": "documents"
+        },
+        {
+          "kind": "list",
+          "name": "files"
+        },
+        {
+          "kind": "list",
+          "name": "expressions"
+        },
+        {
+          "kind": "list",
+          "name": "artifacts"
+        },
+        {
+          "kind": "text",
+          "name": "deliverable"
+        },
+        {
+          "kind": "integer",
+          "name": "after_revision"
+        }
+      ],
+      "output": "childResult",
+      "permission": "searchKnowledge",
+      "prerequisites": [
+        {
+          "checkedAt": "catalogue",
+          "requires": "subagentWorker"
+        },
+        {
+          "checkedAt": "handler",
+          "requires": "modelRegistry"
+        }
+      ],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "profile"
+        },
+        {
+          "kind": "text",
+          "name": "task"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_docx"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::artifacts::create_docx_with_evidence",
+      "maxResponseBytes": 16384,
+      "name": "artifact.create_approval_note",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "template"
+        },
+        {
+          "kind": "object",
+          "name": "content"
+        },
+        {
+          "kind": "object",
+          "name": "sections"
+        },
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "classification"
+        }
+      ],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        }
+      ],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_pptx"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::artifacts::create_pptx",
+      "maxResponseBytes": 16384,
+      "name": "artifact.create_briefing_deck",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        }
+      ],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        },
+        {
+          "kind": "object",
+          "name": "content"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_xlsx"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::artifacts::create_xlsx",
+      "maxResponseBytes": 16384,
+      "name": "artifact.create_calculation_workbook",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "object",
+          "name": "sheets"
+        },
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "classification"
+        }
+      ],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        },
+        {
+          "checkedAt": "handler",
+          "requires": "runCalculations"
+        }
+      ],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_chart"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::create_chart",
+      "maxResponseBytes": 65536,
+      "name": "artifact.create_chart",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "kind"
+        },
+        {
+          "kind": "text",
+          "name": "categories"
+        },
+        {
+          "kind": "text",
+          "name": "series"
+        },
+        {
+          "kind": "text",
+          "name": "valueLabel"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_diagram",
+        "create_flowchart",
+        "artifact.create_flowchart"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::create_diagram",
+      "maxResponseBytes": 65536,
+      "name": "artifact.create_diagram",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "direction"
+        },
+        {
+          "kind": "text",
+          "name": "blocks"
+        },
+        {
+          "kind": "text",
+          "name": "connections"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_pdf"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::create_pdf",
+      "maxResponseBytes": 4096,
+      "name": "artifact.create_pdf",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "classification"
+        },
+        {
+          "kind": "text",
+          "name": "body"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [
+        "create_table"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "agent_runtime::create_table",
+      "maxResponseBytes": 32768,
+      "name": "artifact.create_table",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "title"
+        },
+        {
+          "kind": "text",
+          "name": "header"
+        },
+        {
+          "kind": "text",
+          "name": "rows"
+        },
+        {
+          "kind": "text",
+          "name": "classification"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::artifact_list",
+      "maxResponseBytes": 16384,
+      "name": "artifact.list",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "kind"
+        }
+      ],
+      "output": "text",
+      "permission": "searchKnowledge",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 30
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::artifact_read",
+      "maxResponseBytes": 16384,
+      "name": "artifact.read",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "version"
+        }
+      ],
+      "output": "text",
+      "permission": "searchKnowledge",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "artifact"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 30
+    },
+    {
+      "aliases": [
+        "validate_artifact"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::validate",
+      "maxResponseBytes": 16384,
+      "name": "artifact.verify_docx",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "generateArtifact",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        }
+      ],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 60
+    },
+    {
+      "aliases": [
+        "run_calculation"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "LocalToolRunner::calculate, then the run's calculation table",
+      "maxResponseBytes": 16384,
+      "name": "calculation.evaluate_with_units",
+      "network": "none",
+      "optional": [],
+      "output": "calculation",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "expression"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 5
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::capability_search",
+      "maxResponseBytes": 8192,
+      "name": "capability.search",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "query"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 5
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::read_attached_pages",
+      "maxResponseBytes": 32768,
+      "name": "document.read_pages",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "integer",
+          "name": "toPage"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "documentSha256"
+        },
+        {
+          "kind": "integer",
+          "name": "fromPage"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::search_attached_documents",
+      "maxResponseBytes": 32768,
+      "name": "document.search",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "query"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::build_document_graph",
+      "maxResponseBytes": 24576,
+      "name": "knowledge.build_graph",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        },
+        {
+          "kind": "text",
+          "name": "documentSha256"
+        },
+        {
+          "kind": "text",
+          "name": "focus"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 15
+    },
+    {
+      "aliases": [
+        "load_more_evidence"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::region_hits, then agent_runtime::retrieval::record_region",
+      "maxResponseBytes": 16384,
+      "name": "knowledge.load_evidence_region",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "integer",
+          "name": "toPage"
+        }
+      ],
+      "output": "evidence",
+      "permission": "searchKnowledge",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "documentSha256"
+        },
+        {
+          "kind": "integer",
+          "name": "fromPage"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 30
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::multimodal_retrieve",
+      "maxResponseBytes": 32768,
+      "name": "knowledge.multimodal_retrieve",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "documentType"
+        },
+        {
+          "kind": "text",
+          "name": "documentSha256"
+        },
+        {
+          "kind": "integer",
+          "name": "maxResults"
+        }
+      ],
+      "output": "evidence",
+      "permission": "searchKnowledge",
+      "prerequisites": [
+        {
+          "checkedAt": "handler",
+          "requires": "multimodalIndex"
+        }
+      ],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "query"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 45
+    },
+    {
+      "aliases": [
+        "search_documents"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::search_hits, then agent_runtime::retrieval::record",
+      "maxResponseBytes": 16384,
+      "name": "knowledge.search_authorized",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "detail"
+        },
+        {
+          "kind": "integer",
+          "name": "maxResults"
+        }
+      ],
+      "output": "evidence",
+      "permission": "searchKnowledge",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "query"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 30
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::extract_findings",
+      "maxResponseBytes": 16384,
+      "name": "media.extract_findings",
+      "network": "loopback",
+      "optional": [
+        {
+          "kind": "integer",
+          "name": "toPage"
+        }
+      ],
+      "output": "evidence",
+      "permission": "searchKnowledge",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "documentSha256"
+        },
+        {
+          "kind": "integer",
+          "name": "fromPage"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 90
+    },
+    {
+      "aliases": [
+        "memory_promote_approved"
+      ],
+      "approvalClass": "preApprovedValue",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "agent_runtime::memory_api::promote_approved",
+      "maxResponseBytes": 16384,
+      "name": "memory.promote_approved",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "generateArtifact",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "key"
+        },
+        {
+          "kind": "text",
+          "name": "approvalId"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [
+        "memory_recall_authorized"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::memory_api::recall_authorized",
+      "maxResponseBytes": 16384,
+      "name": "memory.recall_authorized",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "text",
+          "name": "scope"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "agent_runtime::notebook_add_source",
+      "maxResponseBytes": 4096,
+      "name": "notebook.add_source",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "document"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "agent_runtime::notebook_create",
+      "maxResponseBytes": 4096,
+      "name": "notebook.create",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "name"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "personBeforeEffect",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "irreversible",
+      "handler": "agent_runtime::notebook_delete",
+      "maxResponseBytes": 4096,
+      "name": "notebook.delete",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "askAPerson",
+        "safeToRetry": false
+      },
+      "route": "agentPath",
+      "sideEffecting": true,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::notebook_list",
+      "maxResponseBytes": 16384,
+      "name": "notebook.list",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "agent_runtime::notebook_sources",
+      "maxResponseBytes": 16384,
+      "name": "notebook.list_sources",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "agent_runtime::notebook_remove_source",
+      "maxResponseBytes": 4096,
+      "name": "notebook.remove_source",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "document"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "reversible",
+      "handler": "agent_runtime::notebook_rename",
+      "maxResponseBytes": 4096,
+      "name": "notebook.rename",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "text",
+          "name": "notebook"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "name"
+        }
+      ],
+      "retry": {
+        "maxRetries": 1,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "agentPath",
+      "sideEffecting": false,
+      "timeoutSeconds": 10
+    },
+    {
+      "aliases": [
+        "execute_code"
+      ],
+      "approvalClass": "personBeforeEffect",
+      "cancellation": "rustDeadline",
+      "effect": "irreversible",
+      "handler": "LocalToolRunner::execute_code",
+      "maxResponseBytes": 16384,
+      "name": "sandbox.run_code",
+      "network": "none",
+      "optional": [],
+      "output": "execution",
+      "permission": "executeCode",
+      "prerequisites": [
+        {
+          "checkedAt": "handler",
+          "requires": "containerSandbox"
+        }
+      ],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "text",
+          "name": "language"
+        },
+        {
+          "kind": "text",
+          "name": "source"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "askAPerson",
+        "safeToRetry": false
+      },
+      "route": "runner",
+      "sideEffecting": true,
+      "timeoutSeconds": 60
+    },
+    {
+      "aliases": [],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::sovereignty_evidence",
+      "maxResponseBytes": 16384,
+      "name": "sovereignty.get_evidence",
+      "network": "none",
+      "optional": [],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [],
+      "readOnly": true,
+      "required": [],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 5
+    },
+    {
+      "aliases": [
+        "read_scoped_file"
+      ],
+      "approvalClass": "automatic",
+      "cancellation": "abandonWait",
+      "effect": "read_only",
+      "handler": "LocalToolRunner::read",
+      "maxResponseBytes": 16384,
+      "name": "workspace.read_text",
+      "network": "none",
+      "optional": [
+        {
+          "kind": "integer",
+          "name": "fromLine"
+        },
+        {
+          "kind": "integer",
+          "name": "maxLines"
+        }
+      ],
+      "output": "text",
+      "permission": "useModel",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        }
+      ],
+      "readOnly": true,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        }
+      ],
+      "retry": {
+        "maxRetries": 2,
+        "reconciliation": "notNeeded",
+        "safeToRetry": true
+      },
+      "route": "runner",
+      "sideEffecting": false,
+      "timeoutSeconds": 15
+    },
+    {
+      "aliases": [
+        "write_scoped_file"
+      ],
+      "approvalClass": "personBeforeEffect",
+      "cancellation": "abandonWaitWithIntent",
+      "effect": "side_effecting",
+      "handler": "LocalToolRunner::write",
+      "maxResponseBytes": 16384,
+      "name": "workspace.write_text",
+      "network": "none",
+      "optional": [],
+      "output": "artifact",
+      "permission": "generateArtifact",
+      "prerequisites": [
+        {
+          "checkedAt": "gateway",
+          "requires": "workspaceRoot"
+        }
+      ],
+      "readOnly": false,
+      "required": [
+        {
+          "kind": "path",
+          "name": "path"
+        },
+        {
+          "kind": "text",
+          "name": "content"
+        }
+      ],
+      "retry": {
+        "maxRetries": 0,
+        "reconciliation": "inspectArtifact",
+        "safeToRetry": false
+      },
+      "route": "runner",
+      "sideEffecting": true,
+      "timeoutSeconds": 30
+    }
+  ]
+}

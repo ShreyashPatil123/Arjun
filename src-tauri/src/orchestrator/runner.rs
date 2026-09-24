@@ -73,11 +73,21 @@ fn short_sha(sha256: &str) -> String {
 /// which is the property `subagents::packet` exists to hold and the reason there
 /// is no branch here that copies text into a packet.
 ///
-/// Unknown keys are ignored rather than refused. A model that passed `pages`
-/// when it meant `files` gets the refusal from the worker, which can say what
-/// *that role* needed; a refusal here would only be able to say what this
-/// function understands.
-fn delegation_inputs(call: &ToolCall) -> Vec<crate::subagents::InputRef> {
+/// An unknown *argument* never reaches here: the gateway refuses any name the
+/// tool does not declare, and says which names it does. Inside an `artifacts`
+/// item, keys other than `id`, `revision` and `sha256` are ignored.
+///
+/// ## An artifact reference names its revision, or it is refused
+///
+/// This used to default a missing revision to 1. That is a plausible number
+/// standing in for one nobody gave: the child would re-open revision 1 of a
+/// note the parent has since revised to 4, and its review would be of a file
+/// nobody asked about -- with a packet that says, precisely and wrongly, which
+/// revision it read. The revision may be given as `revision` or in the id as
+/// `art-7@4`, which is how `artifact.list` shows it. The hash is optional,
+/// because `artifact.list` does not show one; an absent hash is recorded as
+/// empty, which no reader can mistake for a hash.
+fn delegation_inputs(call: &ToolCall) -> Result<Vec<crate::subagents::InputRef>, String> {
     use crate::subagents::InputRef;
 
     let strings = |key: &str| -> Vec<String> {
@@ -110,12 +120,32 @@ fn delegation_inputs(call: &ToolCall) -> Vec<crate::subagents::InputRef> {
     // checked afterwards, and `{id, revision, sha256}` is.
     if let Some(items) = call.arguments.get("artifacts").and_then(|v| v.as_array()) {
         for item in items {
-            let Some(artifact_id) = item.get("id").and_then(|v| v.as_str()) else {
-                continue;
+            let Some(named) = item.get("id").and_then(|v| v.as_str()).map(str::trim) else {
+                return Err(
+                    "Each entry in `artifacts` needs an `id`, as artifact.list shows it. \
+                     Nothing was started."
+                        .to_string(),
+                );
+            };
+            // `art-7@4` carries its revision in the id.
+            let (artifact_id, in_id) = match named.rsplit_once('@') {
+                Some((id, revision)) => (id, revision.parse::<u32>().ok()),
+                None => (named, None),
+            };
+            let given = item
+                .get("revision")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok());
+            let Some(revision) = given.or(in_id).filter(|revision| *revision > 0) else {
+                return Err(format!(
+                    "The artifact {artifact_id:?} was named without a revision. Give it as \
+                     `{artifact_id}@N` or with `revision`, exactly as artifact.list shows it: a \
+                     worker cannot be pointed at \"whichever revision\". Nothing was started."
+                ));
             };
             inputs.push(InputRef::Artifact {
                 artifact_id: artifact_id.to_string(),
-                revision: item.get("revision").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                revision,
                 sha256: item
                     .get("sha256")
                     .and_then(|v| v.as_str())
@@ -124,7 +154,7 @@ fn delegation_inputs(call: &ToolCall) -> Vec<crate::subagents::InputRef> {
             });
         }
     }
-    inputs
+    Ok(inputs)
 }
 
 /// A file's name, without the directory it happens to live in.
@@ -231,6 +261,12 @@ pub struct LocalToolRunner<'a> {
     /// `None` falls back to the run, which is this product's task identity for
     /// a run that is one task.
     pub task_id: Option<&'a str>,
+    /// Which attempt at the parent run a delegation is sent from.
+    ///
+    /// A resumption is a new attempt at the same task; a child's packet
+    /// carries this so the trace can tell a child sent before an interruption
+    /// from one sent after it. `None` for a run with no checkpoint seed yet.
+    pub attempt_id: Option<&'a str>,
 }
 
 impl<'a> LocalToolRunner<'a> {
@@ -247,6 +283,7 @@ impl<'a> LocalToolRunner<'a> {
             models: None,
             parent_model: None,
             task_id: None,
+            attempt_id: None,
         }
     }
 
@@ -269,6 +306,7 @@ impl<'a> LocalToolRunner<'a> {
             models: None,
             parent_model: None,
             task_id: None,
+            attempt_id: None,
         }
     }
 
@@ -294,6 +332,7 @@ impl<'a> LocalToolRunner<'a> {
             models: None,
             parent_model: None,
             task_id: None,
+            attempt_id: None,
         }
     }
 
@@ -1066,8 +1105,27 @@ impl<'a> LocalToolRunner<'a> {
         // `Vec::new()` unconditionally, so every worker was started with
         // nothing to work on and three of the four roles had no way to know
         // what they were meant to read.
-        let inputs = delegation_inputs(call);
-        if inputs.is_empty() && profile != "knowledge-retriever" {
+        let inputs = delegation_inputs(call)?;
+
+        // The definition the child will run under, read now rather than from the
+        // start-up snapshot — so the model role an administrator saved is the
+        // one the model is chosen for, and so the rule below is asked of what
+        // the agent *does* rather than of what it is called. The manager
+        // resolves again when it dispatches; the two reads are microseconds
+        // apart, and a save landing between them changes only which model was
+        // offered, never what the child is permitted, which the manager's own
+        // resolution decides.
+        let declared = subagents
+            .resolve(&profile_owned)
+            .map_err(|refusal| refusal.explain())?;
+
+        // Only a retriever is asked a question; every other role is pointed at
+        // things. Keyed on the capability the definition resolves to, not on
+        // the name the call used: this compared `profile` with the literal
+        // "knowledge-retriever", so a clone of the retriever -- same worker,
+        // its own `ag-` id -- was refused for doing exactly what the retriever
+        // does.
+        if inputs.is_empty() && declared.capability != "knowledge-retriever" {
             return Err(format!(
                 "The {profile} worker is pointed at things rather than asked a question, and \
                  this call named none. Pass `files` (workspace paths), `artifacts` (files this \
@@ -1092,10 +1150,7 @@ impl<'a> LocalToolRunner<'a> {
             "The model registry is not in reach on this path, so a child's model cannot be \
              chosen. Nothing was started.",
         )?;
-        let declared = subagents
-            .profile(&profile_owned)
-            .ok_or_else(|| format!("There is no subagent profile called {profile_owned:?}."))?;
-        let role = declared.model_role;
+        let role = declared.profile.model_role;
         let candidates: Vec<(&crate::registry::ModelEntry, Option<&crate::model_recommendation::certified_catalog::PackageCertification>)> =
             registry
                 .all()
@@ -1123,6 +1178,9 @@ impl<'a> LocalToolRunner<'a> {
         );
         if let Some(after) = call.integer("after_revision") {
             dispatch = dispatch.after(after as i64);
+        }
+        if let Some(attempt) = self.attempt_id {
+            dispatch = dispatch.in_attempt(attempt);
         }
 
         let result = subagents
@@ -1326,6 +1384,76 @@ mod tests {
             models: None,
             parent_model: None,
             task_id: None,
+            attempt_id: None,
+        }
+    }
+
+    // ── The contract's routes (plan P01) ────────────────────────────────
+
+    /// Every tool the contract routes here is one this runner serves, and every
+    /// tool this runner hands back to the agent path is routed there.
+    ///
+    /// Called with no arguments: each handler refuses a call missing what it
+    /// needs before it touches anything, so this asks only *who* answers, never
+    /// runs code, writes a file or starts a child. Three agent-path tools --
+    /// search, the page-range read and validation -- are also implemented here,
+    /// as helpers the agent path calls; that is why the second direction is the
+    /// only one asserted for them.
+    #[tokio::test]
+    async fn the_runner_serves_exactly_what_the_contract_routes_to_it() {
+        use crate::orchestrator::contract::{route_of, Route};
+
+        let f = fixture();
+        for tool in ToolName::ALL.iter().copied() {
+            let answer = runner(&f)
+                .run(tool, &ToolCall::new(tool.as_str(), json!({})), None)
+                .await;
+            let handed_back = answer.as_ref().err().is_some_and(|reason| {
+                reason.contains("agent path") || reason.contains("not available on this path")
+            });
+            if route_of(tool).0 == Route::Runner {
+                assert!(
+                    !handed_back,
+                    "{} is routed to the runner and the runner refuses it: {answer:?}",
+                    tool.as_str()
+                );
+            }
+            if handed_back {
+                assert_eq!(
+                    route_of(tool).0,
+                    Route::AgentPath,
+                    "the runner hands {} to the agent path, and the contract routes it here",
+                    tool.as_str()
+                );
+            }
+        }
+    }
+
+    /// An artifact reference must name its revision; it is never assumed.
+    #[test]
+    fn an_artifact_reference_without_a_revision_is_refused_not_defaulted() {
+        let refused = delegation_inputs(&ToolCall::new(
+            "agent.delegate_readonly",
+            json!({ "profile": "artifact-reviewer", "task": "review", "artifacts": [{ "id": "art-7" }] }),
+        ))
+        .expect_err("a reference with no revision was accepted");
+        assert!(refused.contains("without a revision"), "{refused}");
+
+        // Both forms the model can know are accepted, and carry what was named.
+        for given in [json!({ "id": "art-7@4" }), json!({ "id": "art-7", "revision": 4 })] {
+            let inputs = delegation_inputs(&ToolCall::new(
+                "agent.delegate_readonly",
+                json!({ "profile": "artifact-reviewer", "task": "review", "artifacts": [given] }),
+            ))
+            .expect("a revisioned reference is accepted");
+            assert_eq!(
+                inputs,
+                vec![crate::subagents::InputRef::Artifact {
+                    artifact_id: "art-7".to_string(),
+                    revision: 4,
+                    sha256: String::new(),
+                }]
+            );
         }
     }
 

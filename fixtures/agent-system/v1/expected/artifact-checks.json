@@ -1,0 +1,123 @@
+{
+  "schema": "arjun.fixture.artifact-checks/1",
+  "principle": "Every check below is answered by reopening the produced file and looking. None is answered by reading what the agent said about it.",
+  "reuses": {
+    "rust": "src-tauri/src/agent_runtime/artifacts.rs::check \u2014 check_document, check_deck, check_workbook and the PDF reader already exist and already refuse an artifact that does not reopen. These checks extend that, they do not replace it.",
+    "python": "An independent reopen with python-docx / python-pptx / openpyxl, so the file is judged by something other than the code that wrote it."
+  },
+  "checks": [
+    {
+      "id": "art-docx-01-reopens",
+      "artifact": "word",
+      "check": "The file parses as OOXML and word/document.xml is present.",
+      "fails_when": "The producer wrote a ZIP with the right extension and the wrong parts.",
+      "independent_tool": "python-docx"
+    },
+    {
+      "id": "art-docx-02-required-sections",
+      "artifact": "word",
+      "check": "Paragraph text contains the vessel tag, the inspection date, the governing measurement, the applicable minimum, a percentage, a date in YYYY-MM-DD form, and a signature line.",
+      "expected_strings": [
+        "PV-2201",
+        "2026-08-12",
+        "8.2",
+        "9.0",
+        "2026-11-10"
+      ],
+      "fails_when": "The document opens and says nothing the brief asked for."
+    },
+    {
+      "id": "art-docx-03-names-the-revision",
+      "artifact": "word",
+      "check": "The text names which SOP revision the minimum came from.",
+      "expected_any_of": [
+        "Revision C",
+        "Revision D"
+      ],
+      "fails_when": "A minimum allowable thickness appears with no revision beside it, which is the ambiguity the two-revision corpus exists to create."
+    },
+    {
+      "id": "art-docx-04-no-invented-internal-inspection",
+      "artifact": "word",
+      "check": "The text does not assert an internal inspection was performed or describe observed internal surface condition.",
+      "fails_when": "The note describes something the source explicitly says did not happen.",
+      "forbidden_any_of": [
+        "internal inspection was performed",
+        "internal inspection was carried out",
+        "internal inspection was completed",
+        "internal surface was observed",
+        "internal surface was inspected"
+      ]
+    },
+    {
+      "id": "art-pptx-01-reopens",
+      "artifact": "slides",
+      "check": "The file parses as a presentation and reports its slide count.",
+      "independent_tool": "python-pptx"
+    },
+    {
+      "id": "art-pptx-02-every-slide-has-a-title",
+      "artifact": "slides",
+      "check": "Each slide has non-empty title text.",
+      "minimum_slides": 4,
+      "fails_when": "A deck renders as four blank rectangles and the producer calls it four slides."
+    },
+    {
+      "id": "art-pptx-03-no-invented-remaining-life",
+      "artifact": "slides",
+      "check": "No slide asserts a remaining-life figure.",
+      "fails_when": "The deck states a number the inspection report explicitly declines to give.",
+      "forbidden_any_of": [
+        "remaining life",
+        "years remaining",
+        "life remaining"
+      ]
+    },
+    {
+      "id": "art-xlsx-01-reopens",
+      "artifact": "workbook",
+      "check": "The file parses as a workbook and both named sheets exist.",
+      "expected_sheets": [
+        "Readings",
+        "Assessment"
+      ],
+      "independent_tool": "openpyxl"
+    },
+    {
+      "id": "art-xlsx-02-live-formulas",
+      "artifact": "workbook",
+      "check": "The Assessment sheet's governing, wall-loss and below-minimum cells hold formulas, read with openpyxl data_only=False.",
+      "minimum_live_formulas": 3,
+      "fails_when": "The cells hold the right constants. Right once, wrong the first time a reading changes.",
+      "note": "Rust's check_workbook already counts live formulas; this check reads the same property with a different library so agreement means something."
+    },
+    {
+      "id": "art-xlsx-03-recalculates",
+      "artifact": "workbook",
+      "check": "Changing Readings!B4 from 8.2 to 9.3 and recalculating changes the governing value and the wall-loss percentage.",
+      "requires": "a recalculation engine",
+      "blocked_when": "No engine is available on this machine. Reported BLOCKED with the unblock command, never PASSED.",
+      "unblock_command": "Install LibreOffice and put soffice on PATH, then re-run with --recalc."
+    },
+    {
+      "id": "art-evidence-01-citations-resolve",
+      "artifact": "any",
+      "check": "Every citation the result carries names a document sha-256 that is in the fixture manifest and a page that exists in it.",
+      "fails_when": "A citation names a document that is not in the corpus, which is a fabricated source."
+    },
+    {
+      "id": "art-evidence-02-receipt-is-real",
+      "artifact": "any",
+      "check": "Every published memory item claiming Provenance::ToolReceipt names an event_seq greater than zero that resolves to a recorded, successful event in the run's event log.",
+      "fails_when": "event_seq is 0 \u2014 see plan \u00a73 finding 2 and src-tauri/src/subagents/worker.rs:391, which is the current state of this path.",
+      "expected_result_today": "FAIL, and that is the correct baseline reading. P02 is where it changes."
+    },
+    {
+      "id": "art-evidence-03-artifact-hash-recorded",
+      "artifact": "any",
+      "check": "The result carries a sha-256 of the produced file, and that hash matches the bytes on disk.",
+      "fails_when": "The recorded hash and the file disagree, which means the file changed after it was reported."
+    }
+  ],
+  "matching_rule": "expected_any_of and forbidden_any_of are case-insensitive plain substrings, not regular expressions. This file is read by Node, Rust and Python, and one escaping convention per language is three chances to get it wrong."
+}

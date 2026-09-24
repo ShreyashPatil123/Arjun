@@ -689,6 +689,37 @@ impl AgentRegistry {
                 .imported_from
                 .as_ref()
                 .is_some_and(|origin| origin.profile_sha256 == profile.sha256);
+
+            // A row this import itself wrote wrongly, repaired once.
+            //
+            // Every import before this fix stored the profile's one-line
+            // description as the agent's instructions, so an imported agent was
+            // told what it is *called* rather than what it is *for* (plan §13).
+            // Those rows have an unchanged hash and would otherwise never be
+            // touched again. The signature of the defect is exact -- the stored
+            // instructions equal the description while the profile carries a
+            // different body -- and the instructions are a field the profile
+            // owns (the changed-hash branch below overwrites them), so repairing
+            // them takes nothing an administrator set. A version bump, because a
+            // run that pinned the old text should be able to tell.
+            if unchanged
+                && held[position].instructions == profile.description
+                && !bundled_instructions(profile).eq(&profile.description)
+            {
+                let agent = &mut held[position];
+                agent.instructions = bundled_instructions(profile);
+                agent.definition_version += 1;
+                agent.updated_at = chrono::Utc::now().to_rfc3339();
+                let outcome = Mutation {
+                    agent_id: agent.agent_id.clone(),
+                    definition_version: agent.definition_version,
+                    action: "imported".into(),
+                    unchanged: false,
+                };
+                self.persist(&held)?;
+                return Ok(outcome);
+            }
+
             if unchanged {
                 return Ok(Mutation {
                     agent_id: held[position].agent_id.clone(),
@@ -702,7 +733,7 @@ impl AgentRegistry {
                 let agent = &mut held[position];
                 // The profile's half only.
                 agent.description = profile.description.clone();
-                agent.instructions = profile.description.clone();
+                agent.instructions = bundled_instructions(profile);
                 agent.role = profile.model_role;
                 agent.allowed_tools = profile.allowed_tools.clone();
                 agent.denied_tools = profile.disallowed_tools.clone();
@@ -738,7 +769,7 @@ impl AgentRegistry {
             definition_version: 1,
             display_name: profile.name.clone(),
             description: profile.description.clone(),
-            instructions: profile.description.clone(),
+            instructions: bundled_instructions(profile),
             role: profile.model_role,
             state: AgentState::Enabled,
             color: colour,
@@ -781,6 +812,21 @@ impl AgentRegistry {
         held.push(definition);
         self.persist(&held)?;
         Ok(outcome)
+    }
+}
+
+/// What an imported agent is told it is for.
+///
+/// The profile's Markdown body -- the role, its method, what it must refuse --
+/// and not its one-line description, which is what every import stored before
+/// plan §13 found it. The description stands in only when a profile genuinely
+/// has no body, because an agent told nothing at all would be worse than one
+/// told its summary.
+fn bundled_instructions(profile: &AgentProfile) -> String {
+    if profile.instructions.trim().is_empty() {
+        profile.description.clone()
+    } else {
+        profile.instructions.clone()
     }
 }
 

@@ -358,10 +358,31 @@ impl ToolName {
     /// name of anything — it is simply what a model writes when it has been
     /// asked for a flowchart, and refusing it ended the run.
     fn alias(raw: &str) -> Option<Self> {
-        match raw {
-            "create_flowchart" | "artifact.create_flowchart" => Some(ToolName::CreateDiagram),
-            _ => None,
-        }
+        ALIASES
+            .iter()
+            .find(|(spelling, _)| *spelling == raw)
+            .map(|(_, tool)| *tool)
+    }
+
+    /// The aliases that resolve to this tool, excluding its wire name and its
+    /// legacy name.
+    pub fn aliases(self) -> impl Iterator<Item = &'static str> {
+        ALIASES
+            .iter()
+            .filter(move |(_, tool)| *tool == self)
+            .map(|(spelling, _)| *spelling)
+    }
+
+    /// Every spelling [`Self::from_str`] resolves to this tool, wire name first.
+    ///
+    /// The one list a contract, a conformance test or a record reader should
+    /// consult, so "which names does this tool answer to" has one answer rather
+    /// than three partial ones.
+    pub fn accepted_spellings(self) -> Vec<&'static str> {
+        let mut out = vec![self.as_str()];
+        out.extend(self.legacy_str());
+        out.extend(self.aliases());
+        out
     }
 
     /// Whether this call produces a deliverable file.
@@ -548,6 +569,16 @@ impl ToolName {
     }
 }
 
+/// Spellings that resolve to a tool without being its name or its former name.
+///
+/// A table rather than a `match` so it can be listed: the tool contract and the
+/// runtime's conformance test both need to know every name a tool answers to,
+/// and a `match` can only be asked about one name at a time.
+const ALIASES: &[(&str, ToolName)] = &[
+    ("create_flowchart", ToolName::CreateDiagram),
+    ("artifact.create_flowchart", ToolName::CreateDiagram),
+];
+
 /// One required argument, and what it has to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgumentSpec {
@@ -563,6 +594,14 @@ pub enum ArgumentKind {
     Integer,
     /// A nested object, validated by the tool itself rather than here.
     Object,
+    /// A JSON array. What each element must be is the tool's own business, as
+    /// with `Object`; that it *is* a list is checked at the gateway.
+    ///
+    /// Added because `agent.delegate_readonly` takes its inputs as lists of
+    /// references and was declared `Object`, which no list satisfies -- so the
+    /// gateway refused every well-formed delegation that pointed a worker at
+    /// anything.
+    List,
 }
 
 /// Everything the gateway needs to know about a tool before allowing it.
@@ -571,6 +610,14 @@ pub struct ToolSpec {
     pub name: ToolName,
     /// What the user must hold for this to be permitted at all.
     pub permission: Permission,
+    /// Arguments a call must carry.
+    ///
+    /// With `optional_arguments`, the *whole* of what a call may carry: the
+    /// gateway refuses an argument named in neither list. So the two lists
+    /// are the tool's input schema, not a partial description of it, and they
+    /// must agree with the runtime's schema in `catalogue.ts` -- which the
+    /// published contract (`orchestrator::contract`) and the runtime's
+    /// conformance test check.
     pub arguments: &'static [ArgumentSpec],
     /// Arguments a caller may omit.
     ///
@@ -711,10 +758,22 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         ToolName::SearchDocuments => ToolSpec {
             permission: SearchKnowledge,
             arguments: &[ArgumentSpec { name: "query", kind: Text }],
+            // Both read by `LocalToolRunner::search_hits` / `search`. Declared
+            // because the gateway now refuses an argument it was not told
+            // about, and the runtime's schema has always offered these two.
+            optional_arguments: &[
+                ArgumentSpec { name: "detail", kind: Text },
+                ArgumentSpec { name: "maxResults", kind: Integer },
+            ],
             // Reads the index, which is on this machine.
             network: NetworkUse::None,
             ..defaults(name)
         },
+        // `toPage` is optional on all three page-range readers, and was
+        // required here while the runtime's schema -- the one the model fills --
+        // marked it optional. Every handler already reads it as
+        // `integer("toPage").unwrap_or(from_page)`, so a one-page read that
+        // omitted it was a correct call the gateway refused.
         ToolName::LoadMoreEvidence => ToolSpec {
             // The same permission as search, because it reads the same shelf
             // through the same clearance checks. A weaker permission here would
@@ -723,8 +782,8 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             arguments: &[
                 ArgumentSpec { name: "documentSha256", kind: Text },
                 ArgumentSpec { name: "fromPage", kind: Integer },
-                ArgumentSpec { name: "toPage", kind: Integer },
             ],
+            optional_arguments: &[ArgumentSpec { name: "toPage", kind: Integer }],
             ..defaults(name)
         },
         ToolName::MediaExtractFindings => ToolSpec {
@@ -734,8 +793,8 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             arguments: &[
                 ArgumentSpec { name: "documentSha256", kind: Text },
                 ArgumentSpec { name: "fromPage", kind: Integer },
-                ArgumentSpec { name: "toPage", kind: Integer },
             ],
+            optional_arguments: &[ArgumentSpec { name: "toPage", kind: Integer }],
             // The OCR and vision engines are Python sidecars this machine talks
             // to over loopback. Loopback is not egress, so this stays available
             // in Work mode — which is the mode a scanned inspection report is
@@ -751,11 +810,15 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             // the prose index does, and a row the asker cannot see is not
             // returned.
             permission: SearchKnowledge,
-            arguments: &[
-                ArgumentSpec { name: "query", kind: Text },
+            arguments: &[ArgumentSpec { name: "query", kind: Text }],
+            // Filters, and optional ones: `multimodal_retrieve` reads each as an
+            // `Option`. They were all required, and `page` -- which nothing
+            // reads and the runtime's schema does not offer -- was required
+            // too, so no call the model could make was one the gateway would
+            // allow. The tool was in every catalogue and could not be used.
+            optional_arguments: &[
                 ArgumentSpec { name: "documentType", kind: Text },
                 ArgumentSpec { name: "documentSha256", kind: Text },
-                ArgumentSpec { name: "page", kind: Integer },
                 ArgumentSpec { name: "maxResults", kind: Integer },
             ],
             // A search over a 200-page P&ID set is not as cheap as a text
@@ -791,8 +854,8 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             arguments: &[
                 ArgumentSpec { name: "documentSha256", kind: Text },
                 ArgumentSpec { name: "fromPage", kind: Integer },
-                ArgumentSpec { name: "toPage", kind: Integer },
             ],
+            optional_arguments: &[ArgumentSpec { name: "toPage", kind: Integer }],
             // Reads a file this machine already wrote. No model, no sidecar, no
             // socket.
             network: NetworkUse::None,
@@ -836,11 +899,14 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         // family was uncallable: the model asked for a notebook by name, the
         // grammar forbade the name, and the handler refused a call with no name.
         //
-        // `notebook` is declared on every tool that acts on one, even though a
-        // person with a single notebook need not name it. The grammar has no
-        // notion of an optional argument, so the model always sends the field
-        // and sends it empty when no name was given - which is exactly what
-        // `resolve_notebook` already treats as "not given".
+        // `notebook` is declared on every tool that acts on one, and declared
+        // *optional*: a person with a single notebook need not name it, and
+        // `resolve_notebook` takes an `Option` and treats absent and empty
+        // alike. It used to be required, for the grammar's sake -- which has no
+        // notion of an optional argument -- but the grammar has no production
+        // caller, and the schema the model actually fills (`catalogue.ts`)
+        // marks it optional. So a model that did the natural thing and left it
+        // out was refused by the gateway for a call its own schema allowed.
         ToolName::NotebookList => ToolSpec {
             permission: UseModel,
             arguments: &[],
@@ -851,7 +917,7 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         },
         ToolName::NotebookSources => ToolSpec {
             permission: UseModel,
-            arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
             network: NetworkUse::None,
             timeout: Duration::from_secs(10),
             max_response_bytes: 16 * 1024,
@@ -887,10 +953,8 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         },
         ToolName::NotebookRename => ToolSpec {
             permission: UseModel,
-            arguments: &[
-                ArgumentSpec { name: "notebook", kind: Text },
-                ArgumentSpec { name: "name", kind: Text },
-            ],
+            arguments: &[ArgumentSpec { name: "name", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
             // Runs on the asking, not on a second confirmation.
             //
             // `defaults` gives every tool that is not read-only
@@ -918,10 +982,8 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         },
         ToolName::NotebookAddSource | ToolName::NotebookRemoveSource => ToolSpec {
             permission: UseModel,
-            arguments: &[
-                ArgumentSpec { name: "notebook", kind: Text },
-                ArgumentSpec { name: "document", kind: Text },
-            ],
+            arguments: &[ArgumentSpec { name: "document", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
             // Runs on the asking, not on a second confirmation.
             //
             // `defaults` gives every tool that is not read-only
@@ -1047,7 +1109,7 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         },
         ToolName::NotebookDelete => ToolSpec {
             permission: UseModel,
-            arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
+            optional_arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
             // The one tool here that a person has to agree to. It drops the
             // notebook, its membership rows and the whole graph built over it,
             // and a chat turn acting on its own reading of an instruction is
@@ -1064,11 +1126,15 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             // operation, in `NotebookStore::graph`, which takes an owner id in
             // every `WHERE` - the same rule the rest of that store follows.
             permission: UseModel,
-            // Declared, not empty, for the reason above: an empty list is what
-            // the grammar admits, so `&[]` here meant the model could never say
-            // which notebook to draw. Sent empty when the person named none,
-            // which `resolve_notebook` reads as "not given".
-            arguments: &[ArgumentSpec { name: "notebook", kind: Text }],
+            // All three read by `build_document_graph` as optional: which
+            // notebook, which document inside it, and what to centre the drawing
+            // on. The last two were offered by the runtime's schema and
+            // undeclared here.
+            optional_arguments: &[
+                ArgumentSpec { name: "notebook", kind: Text },
+                ArgumentSpec { name: "documentSha256", kind: Text },
+                ArgumentSpec { name: "focus", kind: Text },
+            ],
             // Three SQLite reads. No model is started here and no socket is
             // opened; the relation pass that needs REBEL runs from the Notebooks
             // screen, deliberately, where the person can watch it.
@@ -1108,6 +1174,11 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
         ToolName::ReadScopedFile => ToolSpec {
             permission: UseModel,
             arguments: &[ArgumentSpec { name: "path", kind: Path }],
+            // The windowed read `LocalToolRunner::read` already implements.
+            optional_arguments: &[
+                ArgumentSpec { name: "fromLine", kind: Integer },
+                ArgumentSpec { name: "maxLines", kind: Integer },
+            ],
             // Large enough for a long report, small enough that one file cannot
             // fill the context window and push the task's own instructions out.
             max_bytes: Some(8 * 1024 * 1024),
@@ -1255,17 +1326,25 @@ pub fn spec_for(name: ToolName) -> ToolSpec {
             arguments: &[
                 ArgumentSpec { name: "profile", kind: Text },
                 ArgumentSpec { name: "task", kind: Text },
+            ],
+            // Everything else is optional, and was not.
+            //
+            // These six were in the *required* list, and four of them were
+            // declared `Object` while `delegation_inputs` reads each as an
+            // array. So the gateway refused every call that left one out --
+            // which is every call a retriever needs -- and refused every call
+            // that passed one as the list the runner expects. The runtime's own
+            // schema offered only `profile` and `task`. Delegation worked in
+            // the tests because they drive `LocalToolRunner` directly and never
+            // meet the gateway; on the production path it could not happen.
+            optional_arguments: &[
                 // What the worker is pointed at. References, never contents —
                 // see `subagents::packet`, and `runner::delegation_inputs`,
                 // which turns these into the packet's input list.
-                //
-                // Declared here so the model can actually pass them. They were
-                // absent, and the runner passed `Vec::new()` regardless, so
-                // three of the four roles had no way to be told what to read.
-                ArgumentSpec { name: "documents", kind: Object },
-                ArgumentSpec { name: "files", kind: Object },
-                ArgumentSpec { name: "expressions", kind: Object },
-                ArgumentSpec { name: "artifacts", kind: Object },
+                ArgumentSpec { name: "documents", kind: List },
+                ArgumentSpec { name: "files", kind: List },
+                ArgumentSpec { name: "expressions", kind: List },
+                ArgumentSpec { name: "artifacts", kind: List },
                 // What counts as done, which the parent's completion check
                 // reads back.
                 ArgumentSpec { name: "deliverable", kind: Text },

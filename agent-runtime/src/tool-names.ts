@@ -72,6 +72,11 @@ export const CANONICAL_TOOL_NAMES = [
   "notebook.list_sources",
   "notebook.remove_source",
   "notebook.rename",
+  // In Rust's catalogue and served on the agent path since they were added,
+  // and missing here and in the catalogue -- so `buildTools` skipped them and
+  // no model was ever offered the cross-turn artifact channel.
+  "artifact.list",
+  "artifact.read",
 ] as const;
 
 export type CanonicalToolName = (typeof CANONICAL_TOOL_NAMES)[number];
@@ -185,6 +190,13 @@ const SIDE_EFFECTING: ReadonlySet<CanonicalToolName> = new Set([
   "artifact.create_pdf",
   "artifact.create_table",
   "artifact.create_chart",
+  // Rust writes an intent before a notebook delete -- it is the one
+  // irreversible notebook operation -- and this set never listed it, so
+  // `isSideEffecting` disagreed with the gateway about it. The published
+  // contract's `sideEffecting` is what found the gap. (What the working notes
+  // can record for it is `targetOf`'s question, and it names no target for a
+  // call without a path.)
+  "notebook.delete",
 ]);
 
 /** Whether this tool returns numbered evidence. Accepts either spelling. */

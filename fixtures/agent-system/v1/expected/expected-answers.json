@@ -1,0 +1,142 @@
+{
+  "schema": "arjun.fixture.expected-answers/1",
+  "note": "Held out. See README.md in this directory for why, and for the harness assertion that keeps it held out.",
+  "derivation": {
+    "applicable_minimum_mm": 9.0,
+    "why": "Revision D section 3 reduces the hydrocarbon minimum to 8.0 mm, and section 3.1 suspends that reduction for any course recording pitting until a pitting assessment is accepted. The inspection report records external pitting adjacent to point C on the course being assessed, and no pitting assessment exists in the corpus. The Revision C value of 9.0 mm therefore governs.",
+    "trap": "An answer that cites Revision D's headline 8.0 mm concludes 8.2 mm is acceptable. It is the newest revision and it is the wrong answer, which is what makes this a conflict test rather than a recency test."
+  },
+  "cases": [
+    {
+      "id": "calc-01-wall-loss-mm",
+      "expected": 8.88888888888889,
+      "tolerance": {
+        "kind": "relative",
+        "value": 1e-09
+      },
+      "unit": "percent"
+    },
+    {
+      "id": "calc-02-mixed-units-inch",
+      "expected": 8.8038,
+      "tolerance": {
+        "kind": "absolute",
+        "value": 0.01
+      },
+      "unit": "percent",
+      "working": "0.354 in x 25.4 mm/in = 8.9916 mm. (8.9916 - 8.2) / 8.9916 * 100 = 8.8038. The 0.01 band covers rounding the conversion, not a different basis.",
+      "wrong_answer_to_reject": "Any answer derived from (0.354 - 8.2), which is negative and enormous as a percentage."
+    },
+    {
+      "id": "calc-03-percent-of-what",
+      "expected": "no",
+      "unit": "judgement",
+      "must_state": [
+        "31.7% is loss against the 12.0 mm nominal thickness",
+        "the SOP defines wall loss against the minimum allowable thickness",
+        "the SOP figure is 8.9% (to one decimal place)"
+      ],
+      "note": "The claimed arithmetic is correct: (12.0-8.2)/12.0*100 = 31.67. Verifying the arithmetic and stopping there is the failure this case detects."
+    },
+    {
+      "id": "calc-04-replacement-window",
+      "expected": "2026-11-10",
+      "unit": "date",
+      "wrong_answer_to_reject": "2026-11-12, which is three calendar months rather than 90 days."
+    },
+    {
+      "id": "calc-05-corrosion-rate",
+      "expected": 0.5831,
+      "tolerance": {
+        "kind": "absolute",
+        "value": 0.0006
+      },
+      "unit": "mm/year",
+      "working": "2024-03-18 to 2026-08-12 is 877 days. 1.4 mm lost. At 365.25 d/yr: 1.4 / (877/365.25) = 0.58307. At 365 d/yr: 0.58267. The band covers both conventions and nothing wider.",
+      "wrong_answer_to_reject": "0.70 mm/yr, which is 1.4 mm divided by 2 whole years."
+    },
+    {
+      "id": "calc-06-division-by-zero",
+      "expected": "refusal",
+      "unit": "refusal",
+      "must_state": [
+        "a minimum allowable thickness of zero gives no percentage",
+        "the input is not usable"
+      ],
+      "must_not_produce": [
+        "any numeric wall-loss value",
+        "Infinity",
+        "NaN",
+        "0"
+      ]
+    },
+    {
+      "id": "scan-01-governing-reading",
+      "expected": 8.2,
+      "unit": "mm",
+      "must_cite": {
+        "document": "inspection-report",
+        "page": 1
+      },
+      "note": "Read from the scanned page, not from the Markdown source."
+    },
+    {
+      "id": "scan-02-pitting-present",
+      "expected": true,
+      "unit": "boolean",
+      "must_cite": {
+        "document": "inspection-report",
+        "page": 2
+      },
+      "note": "External pitting adjacent to point C. This is the fact that engages Revision D section 3.1, so an extraction that misses it produces a wrong assessment downstream."
+    },
+    {
+      "id": "scan-03-no-internal-inspection",
+      "expected": false,
+      "unit": "boolean",
+      "must_cite": {
+        "document": "inspection-report",
+        "page": 2
+      },
+      "note": "The report states internal inspection was not performed. An agent that describes internal surface condition as observed has fabricated it."
+    },
+    {
+      "id": "sop-01-applicable-minimum",
+      "expected": 9.0,
+      "unit": "mm",
+      "must_cite": [
+        {
+          "document": "maintenance-sop-rev-d",
+          "section": "3.1"
+        },
+        {
+          "document": "maintenance-sop",
+          "section": "3"
+        }
+      ],
+      "must_state": [
+        "Revision D section 3.1 is engaged because pitting is recorded"
+      ],
+      "wrong_answer_to_reject": 8.0
+    },
+    {
+      "id": "sop-02-conflict-surfaced",
+      "expected": true,
+      "unit": "boolean",
+      "must_state": [
+        "two revisions of the SOP are in the corpus",
+        "they give different minimum allowable thicknesses for hydrocarbon service",
+        "which one governs this assessment, and why"
+      ],
+      "note": "Silently choosing either revision fails this case even when the number chosen is right."
+    },
+    {
+      "id": "code-01-thickness-helpers",
+      "expected": "hidden-tests pass",
+      "unit": "test-result",
+      "graded_by": "expected/hidden-tests/test_thickness.py",
+      "selected_cases": 11,
+      "note": "A run reporting zero selected cases is BLOCKED, never PASSED."
+    }
+  ]
+}

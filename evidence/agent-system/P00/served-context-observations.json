@@ -1,0 +1,74 @@
+{
+  "schema": "arjun.served-context-observations/1",
+  "note": "Measured on this machine by starting the real llama-server and reading its own /props, then driving the production task driver against it. Not copied from any advertised maximum.",
+  "machine": {
+    "gpu": "NVIDIA GeForce RTX 5060 Laptop GPU",
+    "vram_total_mib": 8151,
+    "driver": "595.95",
+    "cuda": "13.2",
+    "caveat": "A Laptop SKU. The build plan targets an RTX 5060 without saying desktop or laptop, and whether this is the target machine is not established."
+  },
+  "runtime": {
+    "program": "C:\\Users\\lenovo\\AppData\\Local\\Microsoft\\WinGet\\Packages\\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\\llama-server.exe",
+    "build": "b10970-bfdc32183",
+    "reported_by": "llama-server /props build_info"
+  },
+  "model_under_test": {
+    "id": "Spark-X2.5-4B-Q8_0",
+    "path": "C:\\Users\\lenovo\\AppData\\Roaming\\com.arjun.workbench\\models\\local\\Spark_Spark-X2.5-4B\\base\\Spark-X2.5-4B-Q8_0.gguf",
+    "sha256": "5c2c3c190e4337e1016b8593ca8e26e8b18c972200b107385d4ec61a25d9dea2",
+    "sha256_source": "measured",
+    "architecture": "spark2_5",
+    "trained_context": 1048576,
+    "registry_configured_context": 1048576,
+    "quantization": "Q8_0"
+  },
+  "observations": [
+    {
+      "requested_context": 4096,
+      "observed_served_context": 4096,
+      "total_slots": 4,
+      "vram_used_mib_at_rest": 4813,
+      "vram_free_mib_at_rest": 3087,
+      "load_seconds": 6,
+      "outcome": "The production driver's first turn was refused by the server: request (8852 tokens) exceeds the available context size (4096 tokens).",
+      "case_status": "failed",
+      "command": "llama-server -m <Spark-X2.5-4B-Q8_0.gguf> --port 8080 -c 4096 -ngl 99 --host 127.0.0.1 --no-warmup"
+    },
+    {
+      "requested_context": 16384,
+      "observed_served_context": 16384,
+      "total_slots": 4,
+      "vram_used_mib_at_rest": 5266,
+      "vram_free_mib_at_rest": 2634,
+      "load_seconds": 4,
+      "outcome": "A real model generated 12 characters through the production driver. Trace: agent_start, turn_start, message_start, message_update x3, context_ledger, message_end, turn_end, agent_end.",
+      "case_status": "passed",
+      "command": "llama-server -m <Spark-X2.5-4B-Q8_0.gguf> --port 8080 -c 16384 -ngl 99 --host 127.0.0.1 --no-warmup"
+    }
+  ],
+  "findings": [
+    {
+      "id": "P00-OBS-1",
+      "statement": "The tool schemas the runtime sends occupy 8584 tokens before any prompt, system message, history or evidence. A one-word question therefore costs 8852 input tokens.",
+      "measured_by": "the context_ledger event the production driver emitted on both runs: sections.toolSchema = 8584",
+      "consequence": "A 4096-token served context cannot complete a single turn of this runtime, whatever the model. The plan's instruction to report actual served context rather than the advertised maximum has a concrete floor on this machine: about 9k tokens are consumed before the work starts.",
+      "not_yet_established": "Whether the 8584-token schema cost is reducible by the role-scoped tool loading the plan proposes in \u00a74. Nothing here measured that."
+    },
+    {
+      "id": "P00-OBS-2",
+      "statement": "The same context_ledger reports window: 0 and headroom: 0.",
+      "consequence": "The runtime is not being told the served window, so its own budget accounting cannot bound anything. Plan \u00a73 does not list this; it belongs to P03, accurate rendered token accounting."
+    },
+    {
+      "id": "P00-OBS-3",
+      "statement": "Spark-X2.5-4B Q8_0 at a 16384 served context leaves 2634 MiB of 8151 MiB free with the desktop also resident.",
+      "consequence": "The plan's one-heavy-generation-slot policy is consistent with what this card does. Nothing here measured a second resident model, a vision projector, or the OCR service alongside it."
+    }
+  ],
+  "still_unmeasured": [
+    "Served context and VRAM for Qwen3.5-9B Q4_K_S, Gemma 4 E4B, Gemma 4 12B, Nemotron3-Nano-4B and Unlimited-OCR.",
+    "Peak VRAM during generation rather than at rest.",
+    "Any figure at all on the plan's target machine, which has not been established to be this one."
+  ]
+}

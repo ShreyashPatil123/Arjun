@@ -2294,7 +2294,8 @@ mod runtime_wiring {
         let session = deps.session().expect("signed in");
         let workspace = deps.root_for("r");
         let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
-        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None);
+        let runner =
+            runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None, None);
 
         assert!(runner.subagents.is_some(), "no subagent manager");
         assert!(runner.multimodal.is_some(), "no multimodal index");
@@ -2373,7 +2374,8 @@ mod runtime_wiring {
         let session = deps.session().expect("signed in");
         let workspace = deps.root_for("r");
         let inherited = inherited_policy_for(&deps, &session, "r", workspace.as_deref());
-        let runner = runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None);
+        let runner =
+            runner_for(&deps, &session, inherited.as_ref(), workspace.as_deref(), "r", None, None);
 
         let call = crate::orchestrator::tools::ToolCall::new(
             "agent.delegate_readonly",
@@ -2401,7 +2403,7 @@ mod runtime_wiring {
         // say it found nothing rather than that the tool has no index.
         let (deps, _dir) = deps_with(signed_in_user());
         let session = deps.session().expect("signed in");
-        let runner = runner_for(&deps, &session, None, None, "r", None);
+        let runner = runner_for(&deps, &session, None, None, "r", None, None);
 
         let call = crate::orchestrator::tools::ToolCall::new(
             "knowledge.multimodal_retrieve",
@@ -2553,5 +2555,97 @@ mod unknown_tool_tests {
         .expect("authorize should answer");
 
         assert_eq!(verdict["outcome"].as_str(), Some("refuse"), "{verdict}");
+    }
+}
+
+/// Plan P01: calls in the shape the runtime's schema allows cross the
+/// production path -- `tool.authorize`, then `tool.execute` -- and reach their
+/// handlers, rather than being refused by the gateway for arguments the schema
+/// never offered or let the model omit.
+#[cfg(test)]
+mod tool_contract_path {
+    use super::*;
+
+    /// Authorise, then spend the grant, as the runtime's `hostTool` does.
+    async fn through_the_production_path(
+        deps: &Arc<RuntimeDeps>,
+        tool: &str,
+        args: Value,
+    ) -> Result<String, String> {
+        let call = json!({
+            "runId": "r",
+            "toolCallId": format!("tc-contract-{tool}"),
+            "tool": tool,
+            "args": args,
+        });
+        let allowed = authorize(call.clone(), deps)
+            .await
+            .map_err(|error| format!("authorise: {}", error.message))?;
+        let grant = allowed
+            .get("grant")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("the gateway refused: {allowed}"))?
+            .to_string();
+        let mut spent = call;
+        spent["grant"] = json!(grant);
+        execute(spent, deps)
+            .await
+            .map(|result| result["text"].as_str().unwrap_or_default().to_string())
+            .map_err(|error| error.message)
+    }
+
+    /// The gateway used to require six arguments `agent.delegate_readonly`'s
+    /// schema never offered, so this call was refused at `authorize` and no
+    /// model could delegate on the production path. These deps carry a manager
+    /// with no roles, so the handler refuses too -- and that is the evidence:
+    /// the refusal is the delegation's own, naming the role, not the
+    /// gateway's, naming an argument.
+    #[tokio::test]
+    async fn a_delegation_the_schema_allows_reaches_the_delegation_handler() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let answer = through_the_production_path(
+            &deps,
+            "agent.delegate_readonly",
+            json!({ "profile": "knowledge-retriever", "task": "find the seal-wear limit" }),
+        )
+        .await;
+
+        let said = answer.as_ref().map_or_else(Clone::clone, Clone::clone);
+        assert!(!said.contains("the gateway refused"), "{said}");
+        assert!(!said.contains("argument"), "refused for its arguments: {said}");
+        assert!(
+            said.contains("knowledge-retriever"),
+            "the delegation handler did not answer: {said}"
+        );
+    }
+
+    /// A page-range read that leaves `toPage` out -- which the schema allows
+    /// and every handler reads as "one page" -- is no longer refused.
+    #[tokio::test]
+    async fn a_page_read_without_its_optional_end_page_is_not_refused_by_the_gateway() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let answer = through_the_production_path(
+            &deps,
+            "knowledge.load_evidence_region",
+            json!({ "documentSha256": "0123abcd", "fromPage": 4 }),
+        )
+        .await;
+        let said = answer.as_ref().map_or_else(Clone::clone, Clone::clone);
+        assert!(!said.contains("the gateway refused"), "{said}");
+        assert!(!said.contains("\"toPage\""), "refused for omitting toPage: {said}");
+    }
+
+    /// And an argument no schema declares is refused before anything runs.
+    #[tokio::test]
+    async fn an_undeclared_argument_is_refused_on_the_production_path() {
+        let (deps, _dir) = deps_with(signed_in_user());
+        let answer = through_the_production_path(
+            &deps,
+            "knowledge.search_authorized",
+            json!({ "query": "seal wear", "page": 2 }),
+        )
+        .await;
+        let said = answer.expect_err("an undeclared argument was accepted");
+        assert!(said.contains("no \\\"page\\\" argument") || said.contains("no \"page\" argument"), "{said}");
     }
 }

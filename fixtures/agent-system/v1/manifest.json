@@ -1,0 +1,161 @@
+{
+  "schema": "arjun.fixture-manifest/1",
+  "pack": "agent-system",
+  "version": "1.0.0",
+  "confidentiality": "Nonconfidential throughout (PS-K). Every vessel tag, reading, name and certificate number is invented. Nothing here came from a plant, a vendor or a customer.",
+  "licence": "Same licence as the repository. The pack contains no third-party content.",
+  "provenance": {
+    "scans": "Rendered by fixtures/agent-system/v1/sources/scan/make-scans.py from the text of the reused inspection report. Deterministic: seed 26117, no timestamps, byte-identical on re-run.",
+    "sop_revision_d": "Written for this pack. It contradicts Revision C on purpose — see its section 3.1.",
+    "code_task": "Written for this pack, with its grading tests held out under expected/hidden-tests/."
+  },
+  "held_out": {
+    "directory": "fixtures/agent-system/v1/expected",
+    "why": "Grading keys an evaluated agent must not read. See that directory README.",
+    "enforced_by": "scripts/agent-baseline.mjs asserts no expected/ path resolves inside a run workspace root before it hands any workspace out, and reports BLOCKED rather than grading against a readable key."
+  },
+  "regenerate": {
+    "scans": "python fixtures/agent-system/v1/sources/scan/make-scans.py",
+    "manifest": "node scripts/fixture-manifest.mjs",
+    "check": "node scripts/fixture-manifest.mjs --check"
+  },
+  "reused_in_place": [
+    {
+      "path": "src-tauri/tests/fixtures/inspection-report.md",
+      "role": "source.inspection-report",
+      "bytes": 2190,
+      "sha256": "084dde44465a7e75492b94bd18ac409911a8caf4c4c25fed5633ff022a4f53b8",
+      "note": "Pre-existing and sound. The Markdown ground truth behind the scanned pages: an extraction graded against the scans is graded against this text."
+    },
+    {
+      "path": "src-tauri/tests/fixtures/maintenance-sop.md",
+      "role": "source.sop.revision-c",
+      "bytes": 2013,
+      "sha256": "44b87174eae60b7603143d6e953c7270a47b2f51a3e1c735cc5f494eb7da751a",
+      "note": "Pre-existing and sound. Revision C, one half of the conflicting pair. Left where it is so the two revisions cannot drift apart in two directories."
+    },
+    {
+      "path": "src-tauri/tests/fixtures/pid-excerpt.png",
+      "role": "source.drawing",
+      "bytes": 95,
+      "sha256": "7a90e8b49adad4db9753e137eb3b5d67e4302593bc503a73fea82e08cd14df13",
+      "note": "Pre-existing. A P&ID excerpt for the engineering-drawing input class named in PS-E. It carries no known text ground truth, so it grades presence-of-handling, not accuracy."
+    }
+  ],
+  "files": [
+    {
+      "path": "fixtures/agent-system/v1/.gitignore",
+      "role": "pack",
+      "bytes": 19,
+      "sha256": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793"
+    },
+    {
+      "path": "fixtures/agent-system/v1/README.md",
+      "role": "pack",
+      "bytes": 3117,
+      "sha256": "ac38cac5d0df7dde32f38c4368bcc267328a44ff3973985f1797131fe65ea173"
+    },
+    {
+      "path": "fixtures/agent-system/v1/expected/README.md",
+      "role": "expected.held-out",
+      "bytes": 1217,
+      "sha256": "dac6ac0946c36026605dca46f31a988a71029802a794d13e957f4fe4681409b6"
+    },
+    {
+      "path": "fixtures/agent-system/v1/expected/artifact-checks.json",
+      "role": "expected.held-out",
+      "bytes": 6036,
+      "sha256": "d557170cae8c23ebee3e957e6c02e6d1e16a23eb9ddf5d437a027c5eefe89f17"
+    },
+    {
+      "path": "fixtures/agent-system/v1/expected/expected-answers.json",
+      "role": "expected.held-out",
+      "bytes": 5319,
+      "sha256": "7adf5f6d159ada62524eca6954e500e0f731484abe87cefc9436929498bc2467"
+    },
+    {
+      "path": "fixtures/agent-system/v1/expected/hidden-tests/reference_thickness.py",
+      "role": "expected.held-out",
+      "bytes": 1277,
+      "sha256": "a6bf2baa5f7531b26fc2aee523b84e944307584cae72ba05ea047e4f5e0f8319"
+    },
+    {
+      "path": "fixtures/agent-system/v1/expected/hidden-tests/test_thickness.py",
+      "role": "expected.held-out",
+      "bytes": 4527,
+      "sha256": "99ef093b0ce7ecb80b5be6bc2f6abc0f66cd017daacb50cfa4f74f8fbf12478a"
+    },
+    {
+      "path": "fixtures/agent-system/v1/failures/failure-cases.json",
+      "role": "failure-case",
+      "bytes": 6186,
+      "sha256": "e9bcb9c6344dba3defc3bf06a964dd042414520730b37e7dafddead96915d21b"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/briefs/slides-brief.md",
+      "role": "source.brief",
+      "bytes": 880,
+      "sha256": "34e77860f3110683c754293eb7768e85bdad1f67dc520947ac79bdea0eb6c3f7"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/briefs/word-brief.md",
+      "role": "source.brief",
+      "bytes": 1230,
+      "sha256": "63520f0f3e32d706ec3cce5a79863c2bff6a97a526e5016e57258b16518c18ac"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/briefs/workbook-task.md",
+      "role": "source.brief",
+      "bytes": 991,
+      "sha256": "4ad78849aed7c93c005c1cf7691831b2a2e7ac270f202bc94a40fd923da674a1"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/calc/unit-cases.json",
+      "role": "source.calculation",
+      "bytes": 3328,
+      "sha256": "17d9a3a54d91b8d0395e678dfd071898cc8bf9d2d4ebf0404dac403149f29d7b"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/code/README.md",
+      "role": "source.code-task",
+      "bytes": 1446,
+      "sha256": "115b2cc5c206e09aeb50427793f4e9cca870d45022d1334a4e537c931aadfac9"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/code/failing-example.py",
+      "role": "source.code-task",
+      "bytes": 1091,
+      "sha256": "09f604c295e807cd694afd006ffb16571876036a099fecf23a71f73106e10cc7"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/scan/make-scans.py",
+      "role": "generator",
+      "bytes": 8330,
+      "sha256": "8315d2e28a12030ce5eccd35aa7965ee5105e543fed272eacc885753dca40f93"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/scan/page-01-readings.png",
+      "role": "source.scan",
+      "bytes": 838143,
+      "sha256": "a264e1318ba9703d6451d93410ef5c8a083e87b509f6616a523047d373f0dbe1"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/scan/page-02-condition.png",
+      "role": "source.scan",
+      "bytes": 919908,
+      "sha256": "cb9a030b82cb4ae62f1b4314d178513d1640c0018e224bcf977f611bb6edb454"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/scan/page-03-signature-illegible.png",
+      "role": "source.scan",
+      "bytes": 801639,
+      "sha256": "4bad0635e43ee07ac07683d8d00c472b07d7a38746894b651a361c2d57f9e00c"
+    },
+    {
+      "path": "fixtures/agent-system/v1/sources/sop/maintenance-sop-rev-d.md",
+      "role": "source.sop.revision-d",
+      "bytes": 3053,
+      "sha256": "782c0d3ea89a0b2a3f75a1334e4fbcd289db1e1000d876f6279a657ec97c34a1"
+    }
+  ]
+}

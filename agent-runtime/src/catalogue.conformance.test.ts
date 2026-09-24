@@ -15,12 +15,18 @@
  * than in a field report three months later.
  */
 
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { TOOL_DEFINITIONS, definitionFor, type ToolDefinition } from "./catalogue.js";
 import {
   CANONICAL_TOOL_NAMES,
   LEGACY_TOOL_NAMES,
   canonicalToolName,
+  isArtifactProducing,
+  isCalculation,
+  isCodeExecution,
+  isEvidenceProducing,
+  isSideEffecting,
 } from "./tool-names.js";
 
 /**
@@ -63,6 +69,10 @@ const RUST_WIRE_NAMES: ReadonlySet<string> = new Set([
   "notebook.list_sources",
   "notebook.add_source",
   "notebook.remove_source",
+  // Missing from this list, and therefore from the catalogue, since they were
+  // added to Rust. The published contract below is what found them.
+  "artifact.list",
+  "artifact.read",
 ]);
 
 /**
@@ -148,6 +158,8 @@ const EXPECTED_READ_ONLY: ReadonlyMap<string, boolean> = new Map([
   ["notebook.list_sources", true],
   ["notebook.add_source", false],
   ["notebook.remove_source", false],
+  ["artifact.list", true],
+  ["artifact.read", true],
 ]);
 
 describe("the shared canonicalisation layer agrees with this file's tables", () => {
@@ -259,6 +271,122 @@ describe("description completeness", () => {
       }
     });
   }
+});
+
+/**
+ * The contract Rust publishes, generated from `orchestrator::contract` and held
+ * byte-equal to it by a Rust test. Read here rather than typed here: the lists
+ * above were typed, and drifted exactly where it mattered -- the gateway
+ * required arguments this catalogue never offered, so four tools were in every
+ * catalogue and could not be called, and two Rust tools were never offered.
+ */
+interface PublishedArgument {
+  name: string;
+  kind: "text" | "path" | "integer" | "object" | "list";
+}
+interface PublishedTool {
+  name: string;
+  aliases: string[];
+  required: PublishedArgument[];
+  optional: PublishedArgument[];
+  readOnly: boolean;
+  sideEffecting: boolean;
+  output: "evidence" | "calculation" | "artifact" | "execution" | "childResult" | "text";
+}
+const PUBLISHED = JSON.parse(
+  readFileSync(new URL("./tool-contract.json", import.meta.url), "utf8"),
+) as { contractVersion: number; tools: PublishedTool[] };
+
+/** The kind the Rust gateway checks, for one property of a TypeBox schema. */
+function kindOf(property: Record<string, unknown>): PublishedArgument["kind"] | "unknown" {
+  if (Array.isArray(property.anyOf)) {
+    // A union of string literals is text to the gateway.
+    const allText = (property.anyOf as Array<Record<string, unknown>>).every(
+      (member) => member.type === "string" || typeof member.const === "string",
+    );
+    return allText ? "text" : "unknown";
+  }
+  switch (property.type) {
+    case "string":
+      return "text";
+    case "integer":
+      return "integer";
+    case "object":
+      return "object";
+    case "array":
+      return "list";
+    default:
+      return "unknown";
+  }
+}
+
+describe("the published Rust tool contract", () => {
+  it("names exactly the tools this runtime's tables name", () => {
+    const published = new Set(PUBLISHED.tools.map((tool) => tool.name));
+    expect(published).toEqual(RUST_WIRE_NAMES);
+    expect(new Set(CANONICAL_TOOL_NAMES)).toEqual(published);
+  });
+
+  for (const tool of PUBLISHED.tools) {
+    describe(tool.name, () => {
+      const definition = definitionFor(tool.name);
+
+      it("has a definition the model can be offered", () => {
+        expect(definition).toBeDefined();
+      });
+
+      it("offers only arguments the gateway accepts, and requires none it does not", () => {
+        const schema = definition!.parameters as unknown as {
+          properties?: Record<string, Record<string, unknown>>;
+          required?: string[];
+        };
+        const offered = Object.keys(schema.properties ?? {});
+        const requiredHere = new Set(schema.required ?? []);
+        const accepted = new Map(
+          [...tool.required, ...tool.optional].map((argument) => [argument.name, argument.kind]),
+        );
+
+        // Every argument the model may send is one the gateway will accept.
+        for (const name of offered) {
+          expect(accepted.has(name), `${tool.name} offers ${name}, which the gateway refuses`).toBe(
+            true,
+          );
+        }
+        // The gateway never requires what the model's schema lets it omit.
+        for (const argument of tool.required) {
+          expect(
+            requiredHere.has(argument.name),
+            `${tool.name} requires ${argument.name} at the gateway and the schema makes it optional`,
+          ).toBe(true);
+        }
+        // And each is the same kind on both sides. A path is text to a schema.
+        for (const name of offered) {
+          const expected = accepted.get(name);
+          const here = kindOf(schema.properties?.[name] ?? {});
+          expect(here, `${tool.name}.${name}`).toBe(expected === "path" ? "text" : expected);
+        }
+      });
+
+      it("agrees about read-only, side effects and what it returns", () => {
+        expect(definition!.readOnly).toBe(tool.readOnly);
+        expect(isSideEffecting(tool.name)).toBe(tool.sideEffecting);
+        expect(isEvidenceProducing(tool.name)).toBe(tool.output === "evidence");
+        expect(isCalculation(tool.name)).toBe(tool.output === "calculation");
+        expect(isArtifactProducing(tool.name)).toBe(tool.output === "artifact");
+        expect(isCodeExecution(tool.name)).toBe(tool.output === "execution");
+      });
+    });
+  }
+
+  it("resolves every alias this runtime knows to the tool Rust resolves it to", () => {
+    const owner = new Map<string, string>();
+    for (const tool of PUBLISHED.tools) {
+      for (const alias of tool.aliases) owner.set(alias, tool.name);
+    }
+    for (const [alias, current] of LEGACY_TOOL_NAMES) {
+      expect(owner.get(alias), alias).toBe(current);
+    }
+  });
 });
 
 describe("legacy name compatibility", () => {

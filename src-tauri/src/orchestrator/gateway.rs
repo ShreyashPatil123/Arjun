@@ -208,8 +208,61 @@ impl ToolGateway {
         }
     }
 
-    /// Confirms every declared argument is present and of the right kind.
+    /// Confirms the call carries exactly what the tool declares: every required
+    /// argument, of the right kind, and nothing the tool did not ask for.
+    ///
+    /// ## Why an undeclared argument is refused rather than ignored
+    ///
+    /// The runtime's schemas are closed (`additionalProperties: false` in
+    /// `catalogue.ts`), and this is the same rule held on the side that decides.
+    /// An argument nothing reads is a call that will do something other than
+    /// what the model asked for -- `pages: "4-6"` beside `fromPage` quietly
+    /// becomes page 1 -- and a model told which names exist corrects itself in
+    /// one step. It also closes the case where two sides disagree about a
+    /// tool's arguments and each quietly believes the other: the disagreement
+    /// is now a refusal that names the argument, in the build that introduced
+    /// it.
     fn check_arguments(call: &ToolCall, spec: &ToolSpec) -> Result<(), String> {
+        let declared = || {
+            spec.arguments
+                .iter()
+                .chain(spec.optional_arguments)
+                .map(|argument| argument.name)
+        };
+
+        // The payload itself must be named values. `null` reads as "none",
+        // which is what a tool that takes nothing is ordinarily sent; a list or
+        // a bare value is not a set of arguments at all.
+        match &call.arguments {
+            serde_json::Value::Object(given) => {
+                if let Some(unknown) = given.keys().find(|key| !declared().any(|name| name == *key)) {
+                    let accepted: Vec<&str> = declared().collect();
+                    return Err(if accepted.is_empty() {
+                        format!(
+                            "{} takes no arguments, and was given {unknown:?}. Call it with \
+                             an empty object.",
+                            spec.name.as_str()
+                        )
+                    } else {
+                        format!(
+                            "{} has no {unknown:?} argument. It takes: {}. Remove {unknown:?} \
+                             and call it again.",
+                            spec.name.as_str(),
+                            accepted.join(", ")
+                        )
+                    });
+                }
+            }
+            serde_json::Value::Null => {}
+            other => {
+                return Err(format!(
+                    "{}'s arguments must be an object of named values, but were {}.",
+                    spec.name.as_str(),
+                    describe_json(other)
+                ))
+            }
+        }
+
         // Required first, then the optional ones — which are checked for kind
         // when they are present and skipped when they are not. Omitting one is
         // allowed; supplying the wrong shape is not.
@@ -232,6 +285,7 @@ impl ToolGateway {
                 ArgumentKind::Text | ArgumentKind::Path => value.is_string(),
                 ArgumentKind::Integer => value.is_i64() || value.is_u64(),
                 ArgumentKind::Object => value.is_object(),
+                ArgumentKind::List => value.is_array(),
             };
 
             if !right_kind {
@@ -243,6 +297,7 @@ impl ToolGateway {
                         ArgumentKind::Text | ArgumentKind::Path => "text",
                         ArgumentKind::Integer => "a whole number",
                         ArgumentKind::Object => "an object",
+                        ArgumentKind::List => "a list",
                     },
                     describe_json(value)
                 ));
@@ -571,5 +626,152 @@ mod tests {
             &context(&s, &roots),
         );
         assert!(verdict.message().contains("missing"), "{}", verdict.message());
+    }
+
+    // ── Malformed arguments (plan P01) ───────────────────────────────────
+
+    /// An argument the tool never declared is refused, by name, with the list
+    /// of names that do exist.
+    #[test]
+    fn an_undeclared_argument_is_refused_and_the_real_ones_are_named() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        let verdict = ToolGateway::decide(
+            &ToolCall::new(
+                "knowledge.load_evidence_region",
+                json!({ "documentSha256": "ab12", "fromPage": 4, "pages": "4-6" }),
+            ),
+            &context(&s, &roots),
+        );
+        assert!(!verdict.is_allowed());
+        let message = verdict.message();
+        assert!(message.contains("no \"pages\" argument"), "{message}");
+        assert!(message.contains("fromPage") && message.contains("toPage"), "{message}");
+    }
+
+    /// A tool that takes nothing says so, rather than listing an empty set.
+    #[test]
+    fn a_tool_with_no_arguments_refuses_any() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        let verdict = ToolGateway::decide(
+            &ToolCall::new("sovereignty.get_evidence", json!({ "verbose": true })),
+            &context(&s, &roots),
+        );
+        assert!(verdict.message().contains("takes no arguments"), "{}", verdict.message());
+    }
+
+    /// Arguments are named values. A list or a bare string is not a call.
+    #[test]
+    fn a_payload_that_is_not_an_object_is_refused() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        for payload in [json!(["query", "seal"]), json!("seal wear"), json!(7)] {
+            let verdict = ToolGateway::decide(
+                &ToolCall::new("knowledge.search_authorized", payload.clone()),
+                &context(&s, &roots),
+            );
+            assert!(!verdict.is_allowed(), "{payload} was accepted as arguments");
+            assert!(verdict.message().contains("must be an object"), "{}", verdict.message());
+        }
+    }
+
+    /// A list argument must be a list.
+    #[test]
+    fn a_list_argument_given_as_anything_else_is_refused() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        let verdict = ToolGateway::decide(
+            &ToolCall::new(
+                "agent.delegate_readonly",
+                json!({ "profile": "document-extractor", "task": "read it", "files": "a.pdf" }),
+            ),
+            &context(&s, &roots),
+        );
+        assert!(verdict.message().contains("should be a list"), "{}", verdict.message());
+    }
+
+    /// The regression the closed schema found.
+    ///
+    /// `agent.delegate_readonly` required six arguments the runtime's schema
+    /// never offered, and typed four of them `Object` while the runner reads
+    /// them as arrays. Every delegation the model could express was refused
+    /// here -- the tests that "proved" delegation drove the runner directly.
+    #[test]
+    fn a_well_formed_delegation_passes_the_gateway() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        for arguments in [
+            // The shape the runtime's schema allows today.
+            json!({ "profile": "knowledge-retriever", "task": "find the seal-wear limit" }),
+            // And the fuller one `delegation_inputs` reads.
+            json!({
+                "profile": "document-extractor",
+                "task": "read the inspection pages",
+                "files": ["scan-1.pdf"],
+                "documents": ["ab12cd34"],
+                "expressions": ["9.0 mm - 8.2 mm"],
+                "artifacts": [{ "id": "art-1", "revision": 2, "sha256": "ff00" }],
+                "deliverable": "one finding per page",
+                "after_revision": 12,
+            }),
+        ] {
+            let verdict = ToolGateway::decide(
+                &ToolCall::new("agent.delegate_readonly", arguments.clone()),
+                &context(&s, &roots),
+            );
+            assert!(verdict.is_allowed(), "{arguments} was refused: {}", verdict.message());
+        }
+    }
+
+    /// The optional arguments the handlers read as optional are optional here.
+    ///
+    /// Each of these was required at the gateway while the runtime's schema --
+    /// the one the model fills -- marked it optional.
+    #[test]
+    fn calls_that_omit_an_optional_argument_are_allowed() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        for (tool, arguments) in [
+            ("knowledge.load_evidence_region", json!({ "documentSha256": "ab12", "fromPage": 3 })),
+            ("media.extract_findings", json!({ "documentSha256": "ab12", "fromPage": 3 })),
+            ("document.read_pages", json!({ "documentSha256": "ab12", "fromPage": 3 })),
+            ("knowledge.multimodal_retrieve", json!({ "query": "flange rating" })),
+            ("notebook.list_sources", json!({})),
+            ("notebook.rename", json!({ "name": "Seal study" })),
+            ("knowledge.build_graph", json!({ "focus": "supplier" })),
+            ("workspace.read_text", json!({ "path": "C:/arjun/tasks/42/a.txt", "fromLine": 10 })),
+        ] {
+            let verdict =
+                ToolGateway::decide(&ToolCall::new(tool, arguments.clone()), &context(&s, &roots));
+            assert!(
+                !matches!(verdict, GatewayVerdict::Refuse { .. }),
+                "{tool} {arguments} was refused: {}",
+                verdict.message()
+            );
+        }
+    }
+
+    /// Every spelling a tool answers to reaches the same verdict as its wire
+    /// name. Old task records and models that write the bare verb both depend
+    /// on this.
+    #[test]
+    fn every_accepted_spelling_is_decided_as_the_tool_itself() {
+        let s = session(vec![Role::Employee]);
+        let roots = workspace();
+        for tool in ToolName::ALL {
+            for spelling in tool.accepted_spellings() {
+                let verdict = ToolGateway::decide(
+                    &ToolCall::new(spelling, json!({})),
+                    &context(&s, &roots),
+                );
+                assert!(
+                    !verdict.message().contains("no tool called"),
+                    "{spelling} is listed for {} and does not resolve",
+                    tool.as_str()
+                );
+                assert_eq!(ToolName::from_str(spelling), Some(*tool), "{spelling}");
+            }
+        }
     }
 }

@@ -487,8 +487,8 @@ pub async fn agent_preview(
         .collect();
     let installed_models: Vec<String> =
         models.all().iter().map(|entry| entry.id.clone()).collect();
-    // The profile name, not the role. See `agents::worker_key`.
-    let worker_available = subagents.has_worker(&crate::commands::agents::worker_key(&definition));
+    // The capability its output resolves to, not a name. See `agents::worker_key`.
+    let worker_available = crate::commands::agents::has_worker_for(&subagents, &definition);
 
     Ok(preview_of(
         &definition,
@@ -524,7 +524,12 @@ pub async fn agent_dependents(
     let definition = agents
         .get(&agent_id, Visibility::of(&signed_in))
         .map_err(|error| error.explain())?;
-    let profile = crate::commands::agents::worker_key(&definition);
+    // Its id, and for an imported agent the bundled role name older children
+    // recorded. It used to be the role name alone -- and a child dispatched
+    // through the registry records the agent's `ag-` id, so every child of a
+    // registry agent was invisible here and archiving one reported "no
+    // dependents" with work in flight.
+    let keys = crate::commands::agents::trace_keys(&definition);
 
     let mut active_runs = Vec::new();
     for snapshot in events.running()? {
@@ -543,11 +548,13 @@ pub async fn agent_dependents(
             };
             match event.event_type {
                 TaskEventType::SubagentStarted => {
-                    let names_us = event
-                        .payload
-                        .get("profile")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|named| named == profile);
+                    let names_us = ["agentId", "profile"].iter().any(|field| {
+                        event
+                            .payload
+                            .get(*field)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|named| keys.iter().any(|key| key == named))
+                    });
                     if names_us {
                         live.push(child);
                     }
@@ -662,11 +669,13 @@ pub async fn agent_test_run(
     let definition = agents
         .get(&agent_id, Visibility::of(&signed_in))
         .map_err(|error| error.explain())?;
-    let profile = crate::commands::agents::worker_key(&definition);
-
-    if !subagents.has_worker(&profile) {
+    // By capability, as dispatch finds it -- and a contract with no worker in
+    // this build (document, deck, workbook) is said so rather than attempted.
+    if !crate::commands::agents::has_worker_for(&subagents, &definition) {
         return Err(format!(
-            "No worker is registered for {profile:?}, so there is nothing to run. This agent              would accept a task and never perform it."
+            "No worker in this build produces a {} result, so there is nothing to run. This \
+             agent is registered and cannot yet be run.",
+            definition.output_schema.as_str()
         ));
     }
 
@@ -707,8 +716,12 @@ pub async fn agent_test_run(
     let objective =
         "Report your configuration and confirm you can run. Do not read or change anything.";
 
+    // Dispatched by this agent's own id, so the manager resolves *this* agent
+    // at its current version. It was dispatched by a name, which for a clone
+    // was its display name -- a key the registry rightly refuses -- so a clone
+    // could never be test-run.
     match subagents
-        .spawn(&profile, &inherited, objective, Vec::new(), model, &dispatch)
+        .spawn(&agent_id, &inherited, objective, Vec::new(), model, &dispatch)
         .await
     {
         Ok(spawned) => {

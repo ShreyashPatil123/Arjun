@@ -45,6 +45,22 @@ pub enum ChildStatus {
     /// It was never started: the policy refused it. Distinct from `Failed`
     /// because nothing went wrong — the answer was no.
     Refused,
+    /// It ran, did part of the work, and says what it did not do.
+    ///
+    /// Not a success, and not a failure a retry would fix: the part it did is
+    /// real and the part it did not is named in `missing`. Reported separately
+    /// so a parent cannot fold three pages of a four-page extraction into a
+    /// note as though it had read the fourth.
+    Partial,
+    /// It could not start or could not finish for want of something this
+    /// machine does not have -- a renderer, a container daemon, a model.
+    ///
+    /// Distinct from `Failed`, which is the work going wrong, and from
+    /// `Refused`, which is a policy saying no. A blocked result names the
+    /// prerequisite in `missing`, and is the honest state of a deployment that
+    /// lacks it; reporting it as either of the others would mislead whoever
+    /// decides what to fix.
+    Blocked,
 }
 
 impl ChildStatus {
@@ -55,6 +71,8 @@ impl ChildStatus {
             ChildStatus::TimedOut => "timed_out",
             ChildStatus::Cancelled => "cancelled",
             ChildStatus::Refused => "refused",
+            ChildStatus::Partial => "partial",
+            ChildStatus::Blocked => "blocked",
         }
     }
 
@@ -73,8 +91,54 @@ impl ChildStatus {
             }
             ChildStatus::Cancelled => "was stopped before it finished",
             ChildStatus::Refused => "was not started, because it was not permitted",
+            ChildStatus::Partial => {
+                "did part of the work; what it did not do is listed, and the rest is not done"
+            }
+            ChildStatus::Blocked => {
+                "could not run for want of something this machine does not have, which is named"
+            }
         }
     }
+}
+
+/// A file a child produced, at the exact version it produced.
+///
+/// The version and the hash both: a claim about "the approval note" that does
+/// not say which revision, and whose bytes, is not checkable afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactVersion {
+    pub artifact_id: String,
+    pub version: u32,
+    pub sha256: String,
+}
+
+/// The durable event a finding rests on.
+///
+/// A reference into the run's own event log, which is what a receipt *is*:
+/// the record, written as it happened, that a named tool ran and succeeded. Not
+/// the tool's output, and not the model's account of it. Plan §3 finding 2 is
+/// that workers have been publishing receipts with no event behind them; this
+/// is the shape the real one takes, and P02 is where it gets filled in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptRef {
+    pub run_id: String,
+    pub tool: String,
+    /// The event's sequence number. Never zero for a real receipt.
+    pub event_seq: i64,
+}
+
+/// A check run on what a child produced, and how it came out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationCheck {
+    /// Stable id of the check, e.g. `art-docx-02-required-sections`.
+    pub check_id: String,
+    /// `passed`, `failed` or `blocked`. A string rather than a bool because a
+    /// check that could not be run is neither, and a bool would have to lie.
+    pub outcome: String,
+    pub detail: String,
 }
 
 /// A passage or file a finding rests on. A reference, never the text.
@@ -137,6 +201,23 @@ pub struct ChildResult {
     /// Defaulted so a result recorded before this existed still parses.
     #[serde(default)]
     pub published: Vec<String>,
+    /// Files this child produced, at exact versions.
+    ///
+    /// Defaulted, like every field below, so a result recorded before these
+    /// existed still parses -- the idempotency ledger replays settled results
+    /// for the life of a task.
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactVersion>,
+    /// The events the findings rest on.
+    #[serde(default)]
+    pub receipts: Vec<ReceiptRef>,
+    /// Checks run on what was produced.
+    #[serde(default)]
+    pub validation: Vec<ValidationCheck>,
+    /// What was not done, for a `Partial` result, or the prerequisite that was
+    /// missing, for a `Blocked` one. Empty for a completed result.
+    #[serde(default)]
+    pub missing: Vec<String>,
     /// SHA-256 over the findings and status, so the parent's record of what
     /// came back can be checked against the child's.
     pub result_hash: String,
@@ -224,6 +305,10 @@ impl ChildResult {
             // shape a result must have, and where its findings landed is known
             // only once they have.
             published: Vec::new(),
+            artifacts: Vec::new(),
+            receipts: Vec::new(),
+            validation: Vec::new(),
+            missing: Vec::new(),
             confidence,
             uncertainty,
             detail,
@@ -231,6 +316,62 @@ impl ChildResult {
             result_hash,
             finished_at: Utc::now(),
         }
+    }
+
+    /// Records a file this child produced, and re-seals.
+    pub fn with_artifact(mut self, artifact: ArtifactVersion) -> Self {
+        self.artifacts.push(artifact);
+        self.reseal()
+    }
+
+    /// Records the event a finding rests on, and re-seals.
+    ///
+    /// Refuses a receipt that names no event. Sequence numbers in the event
+    /// log start at 1, so `event_seq <= 0` is a receipt with nothing behind it
+    /// -- the exact shape plan §3 finding 2 found workers publishing -- and a
+    /// result carrying one would present an unbacked claim as a verified one.
+    pub fn with_receipt(mut self, receipt: ReceiptRef) -> Result<Self, String> {
+        if receipt.event_seq <= 0 || receipt.run_id.trim().is_empty() || receipt.tool.trim().is_empty()
+        {
+            return Err(format!(
+                "a receipt must name the run, the tool and a recorded event; got run {:?}, tool \
+                 {:?}, event {}",
+                receipt.run_id, receipt.tool, receipt.event_seq
+            ));
+        }
+        self.receipts.push(receipt);
+        Ok(self.reseal())
+    }
+
+    /// Records a check on what was produced, and re-seals.
+    pub fn with_validation(mut self, check: ValidationCheck) -> Self {
+        self.validation.push(check);
+        self.reseal()
+    }
+
+    /// Names what a partial or blocked result did not do, and re-seals.
+    pub fn with_missing(mut self, what: impl Into<String>) -> Self {
+        self.missing.push(what.into());
+        self.reseal()
+    }
+
+    /// Recomputes the hash over everything the result now carries.
+    ///
+    /// The new fields enter the hash only when they are non-empty, so a result
+    /// that carries none of them hashes exactly as it did before they existed
+    /// -- which is what keeps every hash already recorded in an event log
+    /// verifiable.
+    fn reseal(mut self) -> Self {
+        self.result_hash = hash_with_contract(
+            &self.status,
+            self.schema,
+            &self.findings,
+            &self.artifacts,
+            &self.receipts,
+            &self.validation,
+            &self.missing,
+        );
+        self
     }
 
     /// Whether the parent may treat this as the work being done.
@@ -263,6 +404,67 @@ impl ChildResult {
 /// Over the status as well as the findings, so a record that kept the findings
 /// and changed the status does not match — which is exactly the alteration
 /// requirement 8 is about.
+/// The hash, over the whole contract.
+///
+/// Identical to [`hash_of`] when the four newer lists are empty. Each list is
+/// fed in only when it has something in it, behind its own tag, so adding a
+/// field to a result that never uses it cannot move a hash that was already
+/// recorded.
+fn hash_with_contract(
+    status: &ChildStatus,
+    schema: SchemaKind,
+    findings: &[Finding],
+    artifacts: &[ArtifactVersion],
+    receipts: &[ReceiptRef],
+    validation: &[ValidationCheck],
+    missing: &[String],
+) -> String {
+    if artifacts.is_empty() && receipts.is_empty() && validation.is_empty() && missing.is_empty() {
+        return hash_of(status, schema, findings);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(hash_of(status, schema, findings).as_bytes());
+    if !artifacts.is_empty() {
+        hasher.update(b"\x1cartifacts");
+        for artifact in artifacts {
+            hasher.update(artifact.artifact_id.as_bytes());
+            hasher.update(b"\x1d");
+            hasher.update(artifact.version.to_string().as_bytes());
+            hasher.update(b"\x1d");
+            hasher.update(artifact.sha256.as_bytes());
+            hasher.update(b"\x1f");
+        }
+    }
+    if !receipts.is_empty() {
+        hasher.update(b"\x1creceipts");
+        for receipt in receipts {
+            hasher.update(receipt.run_id.as_bytes());
+            hasher.update(b"\x1d");
+            hasher.update(receipt.tool.as_bytes());
+            hasher.update(b"\x1d");
+            hasher.update(receipt.event_seq.to_string().as_bytes());
+            hasher.update(b"\x1f");
+        }
+    }
+    if !validation.is_empty() {
+        hasher.update(b"\x1cvalidation");
+        for check in validation {
+            hasher.update(check.check_id.as_bytes());
+            hasher.update(b"\x1d");
+            hasher.update(check.outcome.as_bytes());
+            hasher.update(b"\x1f");
+        }
+    }
+    if !missing.is_empty() {
+        hasher.update(b"\x1cmissing");
+        for what in missing {
+            hasher.update(what.as_bytes());
+            hasher.update(b"\x1f");
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn hash_of(status: &ChildStatus, schema: SchemaKind, findings: &[Finding]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(status.as_str().as_bytes());

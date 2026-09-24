@@ -121,6 +121,8 @@ describe("host tools", () => {
       "artifact.create_diagram",
       "artifact.create_pdf",
       "artifact.create_table",
+      "artifact.list",
+      "artifact.read",
       "artifact.verify_docx",
       "calculation.evaluate_with_units",
       "capability.search",

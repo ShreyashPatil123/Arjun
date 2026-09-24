@@ -495,8 +495,19 @@ impl SpecialistWorker {
         cancel: &Stopping,
     ) -> Result<Work, String> {
         cancel.check()?;
+        // The definition this child was *sent under*, not the one this worker
+        // was built with. The packet carries the instructions pinned at dispatch
+        // — see `subagents::definitions` — so an administrator's edit reaches
+        // the next child that runs, and a child already running keeps its own.
+        // Empty only for a packet from before definitions were pinned, and then
+        // the construction-time body is the only text there is.
+        let instructions = if packet.instructions.trim().is_empty() {
+            self.instructions.as_str()
+        } else {
+            packet.instructions.as_str()
+        };
         let report = child_loop
-            .run(packet, policy, &self.instructions)
+            .run(packet, policy, instructions)
             .await
             .map_err(|detail| format!("this worker's model loop did not run: {detail}"))?;
         cancel.check()?;

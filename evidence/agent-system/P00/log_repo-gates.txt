@@ -1,0 +1,8 @@
+=== check:ipc ===
+IPC contract OK: 172 commands (18 admin, 3 external, 135 frontend, 16 frontend-pending).
+=== check:reachable ===
+Reachability OK: 196 module(s) reachable from the entry points, 1 reached only by tests.
+=== check:egress ===
+egress gate: pass — one chokepoint, no unapproved hosts
+=== check:no-lora ===
+LoRA removal gate passed across 588 product files.

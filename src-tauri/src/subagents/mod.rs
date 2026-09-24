@@ -55,6 +55,7 @@
 
 pub mod certification;
 pub mod child_loop;
+pub mod definitions;
 pub mod graph_io;
 pub mod inherit;
 pub mod manager;
@@ -67,14 +68,21 @@ pub mod worker;
 use std::path::Path;
 
 pub use child_loop::{ChildLoop, LoopReport};
+pub use definitions::{
+    capability_for, DefinitionOrigin, DefinitionSource, ResolvedDefinition, Unresolved,
+};
 pub use graph_io::{Claim, NotAvailable, Published, Requirement, TaskMemory};
 pub use inherit::{EffectivePolicy, InheritRefusal, InheritedPolicy};
-pub use manager::{ChildWorker, SpawnRefusal, Spawned, SubagentManager, MAX_CONCURRENT_READERS};
-pub use packet::{derive_idempotency_key, ChildTaskPacket, InputRef};
+pub use manager::{
+    ChildWorker, DelegationMode, SpawnRefusal, Spawned, SubagentManager, MAX_CONCURRENT_READERS,
+};
+pub use packet::{derive_idempotency_key, ChildTaskPacket, InputRef, ModelPolicy};
 pub use profile::{
     AgentProfile, Isolation, Limits, MemoryScope, ProfileError, SchemaKind, WritePolicy,
 };
-pub use result::{ChildResult, ChildStatus, EvidenceRef, Finding};
+pub use result::{
+    ArtifactVersion, ChildResult, ChildStatus, EvidenceRef, Finding, ReceiptRef, ValidationCheck,
+};
 pub use scheduling::{ModelLease, ModelScheduler, Residency, SchedulingRefusal};
 pub use worker::{SpecialistWorker, WorkerServices};
 
@@ -154,6 +162,8 @@ pub fn load_profiles(directory: &Path) -> LoadedProfiles {
     loaded
 }
 
+#[cfg(test)]
+mod definitions_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

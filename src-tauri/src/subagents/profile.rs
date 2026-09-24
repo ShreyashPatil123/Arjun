@@ -170,6 +170,20 @@ pub enum SchemaKind {
     Review,
     /// A program, and whether it ran.
     Code,
+    /// A Word document, reopened and checked against its brief.
+    ///
+    /// Registered for the Document Author (plan §5.4) before that role has a
+    /// worker, so a definition can declare it and the result contract is fixed
+    /// first. [`super::definitions::capability_for`] has no worker for it, and
+    /// a dispatch is refused as "registered and cannot yet be run" -- plan P01:
+    /// do not report a role ready before its real handler is wired.
+    Document,
+    /// A slide deck, reopened with its slides counted and titled. Presentation
+    /// Creator, plan §5.5. No worker yet; see `Document`.
+    Deck,
+    /// A workbook whose assessment cells are live formulas. Spreadsheet
+    /// Analyst, plan §5.6. No worker yet; see `Document`.
+    Workbook,
 }
 
 impl SchemaKind {
@@ -180,6 +194,9 @@ impl SchemaKind {
             "calculation" => SchemaKind::Calculation,
             "review" => SchemaKind::Review,
             "code" => SchemaKind::Code,
+            "document" => SchemaKind::Document,
+            "deck" => SchemaKind::Deck,
+            "workbook" => SchemaKind::Workbook,
             _ => return None,
         })
     }
@@ -191,6 +208,9 @@ impl SchemaKind {
             SchemaKind::Calculation => "calculation",
             SchemaKind::Review => "review",
             SchemaKind::Code => "code",
+            SchemaKind::Document => "document",
+            SchemaKind::Deck => "deck",
+            SchemaKind::Workbook => "workbook",
         }
     }
 }
