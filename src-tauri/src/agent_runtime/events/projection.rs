@@ -406,6 +406,9 @@ impl TaskSnapshot {
             TaskEventType::MemoryPromoted => self.memory_promotions += 1,
             TaskEventType::MemoryRefused => self.memory_refusals += 1,
             TaskEventType::MemoryForgotten => {}
+            // The graph is where publications are read; the run's snapshot
+            // does not need a second count of them.
+            TaskEventType::MemoryPublished => {}
 
             TaskEventType::ApprovalRequested => self.approvals_pending += 1,
             TaskEventType::ApprovalDecided => {

@@ -1,0 +1,56 @@
+# P02 checks — 2026-09-24T12:34:36Z — HEAD 9dd01ec3844121fc8131dfbd4de1f314cb26035f (working tree carries P00+P01+P02, uncommitted)
+
+## cargo test --lib --no-fail-fast (first run after the P02 changes)
+test knowledge::graph::runtime_memory::tests::an_item_written_before_the_p02_fields_still_reads ... FAILED
+test result: FAILED. 2718 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 37.59s
+
+## cargo test --lib -- knowledge::graph subagents:: agent_runtime::context_compiler
+test result: ok. 356 passed; 0 failed; 0 ignored; 0 measured; 2382 filtered out; finished in 20.93s
+
+## mutation check: receipt refusal turned into a pass, staleness propagation disabled
+test knowledge::graph::p02_tests::a_correction_makes_everything_derived_from_the_corrected_fact_stale ... FAILED
+test knowledge::graph::p02_tests::only_a_receipt_resolved_in_the_event_log_admits ... FAILED
+test subagents::worker_tests::a_receipt_the_event_log_does_not_back_stays_a_proposal ... FAILED
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2735 filtered out; finished in 0.03s
+
+## node scripts/check-ipc.mjs
+IPC contract OK: 176 commands (18 admin, 3 external, 135 frontend, 20 frontend-pending).
+
+## npm run check:targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.10s
+
+## cargo test --lib --no-fail-fast (final)
+test result: ok. 2735 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 37.27s
+
+## cargo test --test production_acceptance --test production_hardening
+     Running tests\production_acceptance.rs (src-tauri\target\debug\deps\production_acceptance-43653ef2aab73108.exe)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running tests\production_hardening.rs (src-tauri\target\debug\deps\production_hardening-9ad91788ba2e4c2d.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+## P02 tests that ran (final lib run)
+test agent_runtime::context_compiler::tests::a_context_frozen_at_a_revision_reads_that_revision_and_not_the_latest ... ok
+test knowledge::graph::p02_tests::a_changed_or_removed_legacy_record_is_found_and_followed_by_the_next_pass ... ok
+test knowledge::graph::p02_tests::a_correction_makes_everything_derived_from_the_corrected_fact_stale ... ok
+test knowledge::graph::p02_tests::a_derived_record_inherits_the_restrictions_of_its_inputs ... ok
+test knowledge::graph::p02_tests::a_failed_delivery_is_recovered_exactly_once_after_a_restart ... ok
+test knowledge::graph::p02_tests::a_migrated_item_has_a_stable_derived_id ... ok
+test knowledge::graph::p02_tests::a_read_as_of_a_cursor_is_that_cursor_and_not_the_latest_rows ... ok
+test knowledge::graph::p02_tests::a_result_whose_input_moved_during_the_work_is_published_stale ... ok
+test knowledge::graph::p02_tests::a_revoked_reader_sees_nothing_of_the_item_on_any_path ... ok
+test knowledge::graph::p02_tests::a_write_against_a_revision_that_moved_is_a_named_conflict ... ok
+test knowledge::graph::p02_tests::only_a_receipt_resolved_in_the_event_log_admits ... ok
+test knowledge::graph::p02_tests::the_migration_is_repeatable_verifiable_and_reversible ... ok
+test knowledge::graph::receipts::tests::a_failed_call_is_not_a_receipt ... ok
+test knowledge::graph::receipts::tests::a_recorded_action_verifies_and_every_mismatch_is_refused ... ok
+test knowledge::graph::receipts::tests::recording_the_same_action_twice_is_one_event ... ok
+test knowledge::graph::runtime_memory::tests::a_revoked_reader_cannot_read_the_item_and_others_still_can ... ok
+test knowledge::graph::runtime_memory::tests::a_scratch_scope_key_round_trips ... ok
+test knowledge::graph::runtime_memory::tests::a_well_formed_receipt_the_log_does_not_back_is_a_proposal ... ok
+test knowledge::graph::runtime_memory::tests::an_item_written_before_the_p02_fields_still_reads ... ok
+test knowledge::graph::runtime_memory::tests::the_basis_is_derived_from_what_happened_and_not_chosen ... ok
+test subagents::worker_tests::a_definition_that_does_not_share_publishes_privately ... ok
+test subagents::worker_tests::a_publication_reaches_the_parent_run_through_the_outbox ... ok
+test subagents::worker_tests::a_publishes_real_observations_each_on_its_own_receipt_and_b_reads_that_version ... ok
+test subagents::worker_tests::a_receipt_the_event_log_does_not_back_stays_a_proposal ... ok
+test subagents::worker_tests::a_retrieval_is_published_as_source_text_on_its_own_search ... ok

@@ -751,7 +751,70 @@ pub fn run() {
                 // were not advancing.
                 if let Some(graph) = graph.as_ref() {
                     use tauri::Emitter as _;
+
+                    // Receipts are resolved against the task event log before
+                    // they may admit anything (plan P02). Without this every
+                    // receipt would stay a proposal, which is the safe failure.
+                    graph.set_receipts(StdArc::clone(&worker_events)
+                        as StdArc<dyn knowledge::graph::receipts::ReceiptLedger>);
+
+                    // Restart recovery for the graph -> event log bridge: rows
+                    // a previous process committed and never delivered are
+                    // delivered now, once each (the consumer is idempotent).
+                    let at = chrono::Utc::now().to_rfc3339();
+                    match graph.deliver_pending(&[worker_events.as_ref()], &at) {
+                        Ok(report) if report.delivered + report.failed + report.no_consumer > 0 => {
+                            log::info!(
+                                "[memory-graph] outbox at start: {} delivered, {} failed, {} with no consumer",
+                                report.delivered, report.failed, report.no_consumer
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::warn!(
+                            "[memory-graph] the outbox could not be drained at start: {}",
+                            error.explain()
+                        ),
+                    }
+
+                    // The runtime's scoped memory -- the store `memory_api`
+                    // answers from -- mirrored under the graph, each record
+                    // carrying its own ACL and marked as a copy of the legacy
+                    // store, which stays the authority. Restartable: a record
+                    // already here and unchanged is left alone.
+                    let runtime_memory =
+                        app.state::<StdArc<agent_runtime::memory::MemoryStore>>();
+                    let mirrored = graph
+                        .begin_migration_run(
+                            knowledge::graph::migration::LegacySource::RuntimeScopedMemory.key(),
+                            "migrate",
+                            &at,
+                        )
+                        .and_then(|run| {
+                            let outcome =
+                                knowledge::graph::migration::migrate_runtime_scoped_memory(
+                                    runtime_memory.inner().as_ref(),
+                                    graph,
+                                    &at,
+                                )?;
+                            graph.finish_migration_run(&run, &format!("{outcome:?}"), &at)?;
+                            Ok(outcome)
+                        });
+                    match mirrored {
+                        Ok(outcome) if !outcome.unreadable.is_empty() => log::warn!(
+                            "[memory-graph] runtime memory mirrored with {} unreadable record(s): {:?}",
+                            outcome.unreadable.len(),
+                            outcome.unreadable
+                        ),
+                        Ok(_) => {}
+                        Err(error) => log::warn!(
+                            "[memory-graph] runtime memory could not be mirrored: {}",
+                            error.explain()
+                        ),
+                    }
+
                     let notify = app.handle().clone();
+                    let deliver_to = StdArc::clone(&worker_events);
+                    let held = StdArc::downgrade(graph);
                     graph.on_change(StdArc::new(move |revision: i64| {
                         // Deliberately only a number. See the module note on
                         // `commands::memory_graph`: this reaches every window,
@@ -760,6 +823,15 @@ pub fn run() {
                             commands::memory_graph::MEMORY_GRAPH_EVENT,
                             commands::memory_graph::GraphMoved { revision },
                         );
+                        // And the outbox this commit may have written, after
+                        // the commit and outside its lock. A failure leaves the
+                        // row pending for the next commit or the next start.
+                        if let Some(graph) = held.upgrade() {
+                            let _ = graph.deliver_pending(
+                                &[deliver_to.as_ref()],
+                                &chrono::Utc::now().to_rfc3339(),
+                            );
+                        }
                     }));
                     app.manage(StdArc::clone(graph));
                 }
@@ -1163,6 +1235,10 @@ pub fn run() {
             commands::knowledge::knowledge_health,
             commands::memory_graph::memory_graph_snapshot,
             commands::memory_graph::memory_graph_changes,
+            commands::memory_graph::memory_graph_neighbours,
+            commands::memory_graph::memory_graph_history,
+            commands::memory_graph::memory_graph_correct,
+            commands::memory_graph::memory_graph_revoke_reader,
             commands::agent::agent_steer_run,
             commands::agent::agent_pin_context,
             commands::agent::agent_task_context,

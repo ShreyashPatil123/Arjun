@@ -42,10 +42,11 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use super::receipts::{OutboxConsumer, ReceiptLedger};
 use super::runtime_feed::{ChangeBatch, FeedChange, FeedEntry, MemorySnapshot, Subject, MAX_BATCH};
 use super::runtime_memory::{
-    admit, edge_id, may_supersede, EdgeKind, ItemStatus, MemoryEdge, MemoryItem, MemoryScope,
-    MEMORY_SCHEMA_VERSION,
+    admit, edge_id, may_supersede, Authority, Basis, EdgeKind, ItemStatus, MemoryEdge, MemoryItem,
+    MemoryScope, Provenance, ReceiptVerdict, MEMORY_SCHEMA_VERSION,
 };
 use crate::identity::Session;
 
@@ -116,6 +117,14 @@ pub struct Committed {
     pub because: String,
 }
 
+/// What [`MemoryGraph::commit_within`] did.
+enum Written {
+    /// The same write had already been applied; nothing changed.
+    Duplicate(Committed),
+    /// A new revision was written.
+    Fresh(Committed),
+}
+
 /// One pending cross-store effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,6 +136,48 @@ pub struct OutboxRow {
     pub idempotency_key: String,
     pub payload: String,
     pub created_at: String,
+    /// How many deliveries have been tried and failed.
+    #[serde(default)]
+    pub attempts: i64,
+    /// Why the last one failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// What one pass of the outbox deliverer did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryReport {
+    pub delivered: usize,
+    pub failed: usize,
+    /// Rows naming a target nothing was offered to deliver to. Left pending,
+    /// not dropped: a consumer that is registered later still gets them.
+    pub no_consumer: usize,
+}
+
+/// What a migrated record's write did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MigratedWrite {
+    /// First time across.
+    Inserted,
+    /// Already here, with the same content. A re-run changes nothing.
+    Unchanged,
+    /// Already here, and the legacy record has changed since: a new revision.
+    Updated,
+    /// It was rolled back, and is being brought back.
+    Restored,
+}
+
+/// One immutable revision of an item, as it was written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemVersion {
+    pub item_id: String,
+    pub revision: u64,
+    /// The changefeed position this revision was written at.
+    pub graph_revision: i64,
+    pub item: MemoryItem,
 }
 
 /// The runtime memory graph.
@@ -149,6 +200,13 @@ pub struct MemoryGraph {
     /// *something* moved, which is precisely the amount a reader needs to know
     /// in order to go and ask, as itself, what it is now allowed to see.
     watcher: Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>,
+    /// Where a tool receipt is resolved before it may admit anything.
+    ///
+    /// `None` is a graph with no event log in reach, and then *no* receipt
+    /// admits: an item claiming one stays a proposal and says why. There is no
+    /// fallback that trusts the shape of a receipt, because the shape is
+    /// exactly what anybody can forge. See [`super::receipts`].
+    receipts: std::sync::RwLock<Option<Arc<dyn ReceiptLedger>>>,
 }
 
 impl MemoryGraph {
@@ -167,6 +225,7 @@ impl MemoryGraph {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             watcher: Mutex::new(None),
+            receipts: std::sync::RwLock::new(None),
         })
     }
 
@@ -177,7 +236,53 @@ impl MemoryGraph {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             watcher: Mutex::new(None),
+            receipts: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Installs the event log receipts are resolved against.
+    pub fn set_receipts(&self, ledger: Arc<dyn ReceiptLedger>) {
+        if let Ok(mut held) = self.receipts.write() {
+            *held = Some(ledger);
+        }
+    }
+
+    /// The same, as a builder.
+    pub fn with_receipts(self, ledger: Arc<dyn ReceiptLedger>) -> Self {
+        self.set_receipts(ledger);
+        self
+    }
+
+    /// What the event log says about the receipt this item claims.
+    ///
+    /// Asked *outside* the graph's transaction: the event log is its own
+    /// connection with its own lock, and holding this one across it would make
+    /// the two stores' locks an ordering nobody wrote down.
+    fn verdict_for(&self, item: &MemoryItem) -> ReceiptVerdict {
+        let Provenance::ToolReceipt {
+            run_id,
+            tool,
+            event_seq,
+            output_sha256,
+        } = &item.provenance
+        else {
+            return ReceiptVerdict::NotAReceipt;
+        };
+        let Some(output) = output_sha256.as_deref() else {
+            return ReceiptVerdict::Refused {
+                because: "it names no output hash".to_string(),
+            };
+        };
+        let ledger = self.receipts.read().ok().and_then(|held| held.clone());
+        match ledger {
+            None => ReceiptVerdict::Refused {
+                because: "no event log is in reach to check it against".to_string(),
+            },
+            Some(ledger) => match ledger.verify(run_id, *event_seq, tool, output) {
+                Ok(()) => ReceiptVerdict::Verified,
+                Err(because) => ReceiptVerdict::Refused { because },
+            },
+        }
     }
 
     fn prepare(conn: &Connection) -> Result<()> {
@@ -272,7 +377,234 @@ impl MemoryGraph {
                 return Err(error).context("the changefeed's subject column could not be added");
             }
         }
+
+        // ── P02: history, dependencies, delivery, migration ──────────────
+        //
+        // All additive. Nothing here drops, rewrites or deletes a row that
+        // was already written; a database opened by the previous build keeps
+        // every row it had, and gains the columns and tables below.
+        for (statement, what) in [
+            (
+                "ALTER TABLE agent_memory_log ADD COLUMN item_revision INTEGER",
+                "the changefeed's item revision column",
+            ),
+            (
+                "ALTER TABLE agent_memory_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                "the outbox's attempt count",
+            ),
+            (
+                "ALTER TABLE agent_memory_outbox ADD COLUMN last_error TEXT",
+                "the outbox's last error",
+            ),
+        ] {
+            if let Err(error) = conn.execute(statement, []) {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(error).with_context(|| format!("{what} could not be added"));
+                }
+            }
+        }
+
+        conn.execute_batch(
+            "
+            -- Every revision of every item, as it was written, never updated.
+            --
+            -- What a historical read and a replay read from. `agent_memory_items`
+            -- holds only the latest body, so a context manifest that recorded
+            -- 'graph revision 12' could not be reproduced once the item moved to
+            -- revision 13 -- and the compiler was labelling latest rows with an
+            -- older cursor. This is the immutable half.
+            CREATE TABLE IF NOT EXISTS agent_memory_versions (
+                item_id        TEXT NOT NULL,
+                revision       INTEGER NOT NULL,
+                graph_revision INTEGER NOT NULL,
+                scope_key      TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                body           TEXT NOT NULL,
+                PRIMARY KEY (item_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS agent_memory_versions_scope
+                ON agent_memory_versions (scope_key, graph_revision);
+
+            -- Which items rest on which, so a change reaches what depends on it
+            -- without scanning every body.
+            CREATE TABLE IF NOT EXISTS agent_memory_dependencies (
+                item_id    TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                PRIMARY KEY (item_id, depends_on)
+            );
+            CREATE INDEX IF NOT EXISTS agent_memory_dependencies_on
+                ON agent_memory_dependencies (depends_on);
+
+            -- One row per migration or rollback pass. A pass with no
+            -- `finished_at` was interrupted; running it again is safe because
+            -- every migrated write is addressed by what it came from.
+            CREATE TABLE IF NOT EXISTS agent_memory_migration_runs (
+                run_id      TEXT PRIMARY KEY,
+                source      TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT,
+                report      TEXT
+            );
+
+            -- Items written before versions were kept get their current body as
+            -- the one version known. What their earlier revisions said was never
+            -- stored, and is not invented here.
+            INSERT OR IGNORE INTO agent_memory_versions
+                (item_id, revision, graph_revision, scope_key, status, body)
+            SELECT i.item_id, i.revision,
+                   COALESCE((SELECT MAX(l.revision) FROM agent_memory_log l
+                             WHERE l.item_id = i.item_id AND l.subject_kind = 'item'), 0),
+                   i.scope_key, i.status, i.body
+              FROM agent_memory_items i;
+            ",
+        )?;
         Ok(())
+    }
+
+    // ── One revision, written whole ─────────────────────────────────────
+
+    /// Writes one revision of an item inside the caller's transaction: the
+    /// current row, its immutable version, its dependency edges and its
+    /// changefeed entry. Returns the changefeed position.
+    ///
+    /// The single place an item is written. Every path that changes an item --
+    /// a commit, a supersede, a tombstone, a source invalidation, a revocation,
+    /// staleness -- comes through here, so none of them can change a row
+    /// without a new revision, a version a replay can read, and a feed entry a
+    /// subscriber sees. The previous code updated `status` and `body` in place
+    /// on four of those paths and left the revision where it was, so an
+    /// optimistic writer holding "revision 3" could not tell the item had been
+    /// superseded under it.
+    fn write_revision(
+        transaction: &Connection,
+        item: &MemoryItem,
+        change: &str,
+    ) -> Result<i64, MemoryError> {
+        let body = serde_json::to_string(item).map_err(storage)?;
+        let scope_key = item.scope.key();
+        transaction
+            .execute(
+                "INSERT INTO agent_memory_items
+                     (item_id, revision, scope_key, agent_id, kind, status,
+                      idempotency_key, schema_version, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                     revision = excluded.revision,
+                     status = excluded.status,
+                     body = excluded.body",
+                params![
+                    item.item_id,
+                    item.revision as i64,
+                    scope_key,
+                    item.agent_id,
+                    item.kind.as_str(),
+                    item.status.as_str(),
+                    item.idempotency_key,
+                    MEMORY_SCHEMA_VERSION,
+                    body,
+                ],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_memory_log
+                     (item_id, scope_key, change, at, subject_kind, item_revision)
+                 VALUES (?1, ?2, ?3, ?4, 'item', ?5)",
+                params![item.item_id, scope_key, change, item.updated_at, item.revision as i64],
+            )
+            .map_err(storage)?;
+        let graph_revision = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "INSERT INTO agent_memory_versions
+                     (item_id, revision, graph_revision, scope_key, status, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    item.item_id,
+                    item.revision as i64,
+                    graph_revision,
+                    scope_key,
+                    item.status.as_str(),
+                    body,
+                ],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "DELETE FROM agent_memory_dependencies WHERE item_id = ?1",
+                params![item.item_id],
+            )
+            .map_err(storage)?;
+        for dependency in &item.depends_on {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO agent_memory_dependencies (item_id, depends_on)
+                     VALUES (?1, ?2)",
+                    params![item.item_id, dependency.item_id],
+                )
+                .map_err(storage)?;
+        }
+        Ok(graph_revision)
+    }
+
+    /// The items that rest on `item_id`: those that pinned it as a dependency,
+    /// and those linked to it as derived from or citing it.
+    fn dependents_within(transaction: &Connection, item_id: &str) -> Result<Vec<String>, MemoryError> {
+        let mut statement = transaction
+            .prepare(
+                "SELECT item_id FROM agent_memory_dependencies WHERE depends_on = ?1
+                 UNION
+                 SELECT from_item FROM agent_memory_edges
+                  WHERE to_item = ?1 AND kind IN ('derivedFrom', 'cites')",
+            )
+            .map_err(storage)?;
+        let found = statement
+            .query_map(params![item_id], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(found)
+    }
+
+    /// Marks everything that rests on `roots`, transitively, as stale.
+    ///
+    /// Each gets a new revision -- a stale item is a changed item, and a reader
+    /// holding the old one must be told -- and nothing is deleted. Items already
+    /// superseded, rejected, tombstoned or stale keep that more specific answer,
+    /// and the walk still continues through them, so a chain does not stop at a
+    /// link that happened to be withdrawn already.
+    fn propagate_staleness(
+        transaction: &Connection,
+        roots: &[String],
+        because: &str,
+        at: &str,
+    ) -> Result<Vec<String>, MemoryError> {
+        let mut queue: std::collections::VecDeque<String> = roots.iter().cloned().collect();
+        let mut seen: BTreeSet<String> = roots.iter().cloned().collect();
+        let mut marked = Vec::new();
+        while let Some(changed) = queue.pop_front() {
+            for dependent in Self::dependents_within(transaction, &changed)? {
+                if !seen.insert(dependent.clone()) {
+                    continue;
+                }
+                if let Some(mut item) = Self::read_item(transaction, &dependent)? {
+                    if item.status.can_go_stale() {
+                        item.status = ItemStatus::Stale;
+                        item.revision += 1;
+                        item.updated_at = at.to_string();
+                        Self::write_revision(
+                            transaction,
+                            &item,
+                            &format!("stale: {because} ({changed})"),
+                        )?;
+                        marked.push(dependent.clone());
+                    }
+                }
+                queue.push_back(dependent);
+            }
+        }
+        Ok(marked)
     }
 
     // ── Writing ──────────────────────────────────────────────────────────
@@ -301,57 +633,98 @@ impl MemoryGraph {
     /// effect, which is the pair that must not come apart.
     pub fn commit(
         &self,
-        mut item: MemoryItem,
+        item: MemoryItem,
         expected_revision: Option<u64>,
         effects: &[(String, String, String)],
     ) -> Result<Committed, MemoryError> {
+        // The receipt is resolved before the graph is locked -- see
+        // `verdict_for` for why the two stores' locks are never held together.
+        let verdict = self.verdict_for(&item);
+
         let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
             detail: "the memory graph was left locked by a failed write".into(),
         })?;
-
-        let outcome = admit(&item);
-        item.status = outcome.status;
-
         let transaction = conn.transaction().map_err(storage)?;
+
+        let committed = match Self::commit_within(&transaction, item, expected_revision, &verdict)? {
+            Written::Duplicate(committed) => return Ok(committed),
+            Written::Fresh(committed) => committed,
+        };
+
+        for (target, key, payload) in effects {
+            transaction
+                .execute(
+                    "INSERT INTO agent_memory_outbox
+                         (target, idempotency_key, payload, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![target, key, payload, chrono::Utc::now().to_rfc3339()],
+                )
+                .map_err(storage)?;
+        }
+
+        transaction.commit().map_err(storage)?;
+        // The connection lock goes before the watcher runs. A watcher that
+        // reached back into the graph would otherwise deadlock on a mutex this
+        // frame is still holding, and "notifying somebody wedges the writer" is
+        // a failure that only shows up under load.
+        drop(conn);
+        self.announce(committed.graph_revision);
+        Ok(committed)
+    }
+
+    /// The whole of a commit's decision, inside a transaction the caller owns.
+    ///
+    /// Shared by [`Self::commit`] and [`Self::correct`], so a correction is one
+    /// transaction rather than a commit followed by a separate supersede --
+    /// which is what it was, and a crash between the two left a correction
+    /// standing beside the fact it corrected, both current.
+    fn commit_within(
+        transaction: &Connection,
+        mut item: MemoryItem,
+        expected_revision: Option<u64>,
+        verdict: &ReceiptVerdict,
+    ) -> Result<Written, MemoryError> {
+        let outcome = admit(&item, verdict);
+        item.status = outcome.status;
+        // Computed, never taken from the writer. See `Basis`.
+        item.basis = Some(Basis::of(&item.provenance));
+        let mut because = outcome.because;
 
         // A key already applied is the same write arriving twice.
         if let Some(key) = item.idempotency_key.as_deref() {
-            let held: Option<(String, i64)> = transaction
+            let held: Option<(String, i64, String)> = transaction
                 .query_row(
-                    "SELECT item_id, revision FROM agent_memory_items WHERE idempotency_key = ?1",
+                    "SELECT item_id, revision, status FROM agent_memory_items
+                      WHERE idempotency_key = ?1",
                     params![key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(storage)?;
-            if let Some((item_id, revision)) = held {
-                let graph_revision = Self::latest_revision(&transaction).unwrap_or(0);
-                return Ok(Committed {
+            if let Some((item_id, revision, status)) = held {
+                let graph_revision = Self::latest_revision(transaction).unwrap_or(0);
+                return Ok(Written::Duplicate(Committed {
                     item_id,
                     revision: revision as u64,
                     graph_revision,
                     duplicate: true,
-                    status: outcome.status,
-                    because: outcome.because,
-                });
+                    // What is stored, not what this attempt would have been:
+                    // a retry does not re-decide a settled write.
+                    status: ItemStatus::parse(&status).unwrap_or(outcome.status),
+                    because,
+                }));
             }
         }
 
-        let existing: Option<i64> = transaction
-            .query_row(
-                "SELECT revision FROM agent_memory_items WHERE item_id = ?1",
-                params![item.item_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
+        let existing = Self::read_item(transaction, &item.item_id)?;
+        let existing_revision = existing.as_ref().map(|held| held.revision);
 
-        match (existing, expected_revision) {
-            (Some(actual), Some(expected)) if actual as u64 != expected => {
+        match (existing_revision, expected_revision) {
+            (Some(actual), Some(expected)) if actual != expected => {
                 return Err(MemoryError::RevisionConflict {
                     item_id: item.item_id,
                     expected,
-                    actual: actual as u64,
+                    actual,
                 })
             }
             // A writer that expected nothing and found something is the same
@@ -360,7 +733,7 @@ impl MemoryGraph {
                 return Err(MemoryError::RevisionConflict {
                     item_id: item.item_id,
                     expected: 0,
-                    actual: actual as u64,
+                    actual,
                 })
             }
             (None, Some(expected)) if expected > 0 => {
@@ -373,79 +746,117 @@ impl MemoryGraph {
             _ => {}
         }
 
-        item.revision = existing.map(|held| held as u64 + 1).unwrap_or(1);
-        let body = serde_json::to_string(&item).map_err(storage)?;
-        let scope_key = item.scope.key();
-
-        transaction
-            .execute(
-                "INSERT INTO agent_memory_items
-                     (item_id, revision, scope_key, agent_id, kind, status,
-                      idempotency_key, schema_version, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(item_id) DO UPDATE SET
-                     revision = excluded.revision,
-                     status = excluded.status,
-                     body = excluded.body",
-                params![
-                    item.item_id,
-                    item.revision as i64,
-                    scope_key,
-                    item.agent_id,
-                    item.kind.as_str(),
-                    item.status.as_str(),
-                    item.idempotency_key,
-                    MEMORY_SCHEMA_VERSION,
-                    body,
-                ],
-            )
-            .map_err(storage)?;
-
-        transaction
-            .execute(
-                "INSERT INTO agent_memory_log (item_id, scope_key, change, at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    item.item_id,
-                    scope_key,
-                    if existing.is_some() {
-                        "updated"
-                    } else {
-                        "created"
-                    },
-                    item.updated_at,
-                ],
-            )
-            .map_err(storage)?;
-
-        for (target, key, payload) in effects {
-            transaction
-                .execute(
-                    "INSERT INTO agent_memory_outbox
-                         (target, idempotency_key, payload, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![target, key, payload, item.updated_at],
-                )
-                .map_err(storage)?;
+        // Explicit per-record authority. A record the graph holds as a copy of
+        // a legacy store is written only by the migration that copies it; a
+        // second writer here would race the legacy writer that is still live.
+        if let Some(held) = &existing {
+            if let Authority::Legacy { store } = &held.authority {
+                if !matches!(item.provenance, Provenance::Migrated { .. }) {
+                    return Err(MemoryError::NotPermitted {
+                        because: format!(
+                            "{} is a copy of a record in {store}, which is still where it is \
+                             written. Change it there; the graph follows at the next migration \
+                             pass, and becomes the authority when {store} is cut over.",
+                            held.item_id
+                        ),
+                    });
+                }
+            }
         }
 
-        let graph_revision = Self::latest_revision(&transaction).unwrap_or(0);
-        transaction.commit().map_err(storage)?;
-        // The connection lock goes before the watcher runs. A watcher that
-        // reached back into the graph would otherwise deadlock on a mutex this
-        // frame is still holding, and "notifying somebody wedges the writer" is
-        // a failure that only shows up under load.
-        drop(conn);
-        self.announce(graph_revision);
+        // ── Revalidate the inputs, and inherit their restrictions ────────
+        //
+        // Every pinned dependency is read *now*, in this transaction. An input
+        // that moved on, was withdrawn or disappeared while the work was in
+        // flight makes this result stale rather than silently current; and a
+        // derived record is never less restricted than what it was derived
+        // from. Plan §6.
+        let mut stale_because: Vec<String> = Vec::new();
+        for dependency in item.depends_on.clone() {
+            match Self::read_item(transaction, &dependency.item_id)? {
+                None => stale_because.push(format!("its input {} no longer exists", dependency.item_id)),
+                Some(input) => {
+                    Self::inherit_restrictions(&mut item, &input)?;
+                    if input.status.withdrawn() {
+                        stale_because.push(format!(
+                            "its input {} is now {}",
+                            input.item_id,
+                            input.status.as_str()
+                        ));
+                    } else if input.revision != dependency.revision {
+                        stale_because.push(format!(
+                            "its input {} moved from revision {} to {} while it was being worked out",
+                            input.item_id, dependency.revision, input.revision
+                        ));
+                    }
+                }
+            }
+        }
+        if !stale_because.is_empty() && item.status.can_go_stale() {
+            item.status = ItemStatus::Stale;
+            because = format!("{because}; published as stale because {}", stale_because.join("; "));
+        }
 
-        Ok(Committed {
+        item.revision = existing_revision.map(|held| held + 1).unwrap_or(1);
+        let graph_revision = Self::write_revision(
+            transaction,
+            &item,
+            if existing.is_some() { "updated" } else { "created" },
+        )?;
+
+        Ok(Written::Fresh(Committed {
             item_id: item.item_id,
             revision: item.revision,
             graph_revision,
             duplicate: false,
-            status: outcome.status,
-            because: outcome.because,
-        })
+            status: item.status,
+            because,
+        }))
+    }
+
+    /// Narrows `item` to be no more visible than `input`.
+    ///
+    /// The restrictive combination, field by field: the cleared roles are the
+    /// intersection; a project or an owner the input is confined to confines
+    /// the result too, and two different ones cannot be combined at all; a
+    /// classification above `Internal` is carried; and anybody revoked from the
+    /// input is revoked from what was derived from it.
+    fn inherit_restrictions(item: &mut MemoryItem, input: &MemoryItem) -> Result<(), MemoryError> {
+        item.acl
+            .cleared_roles
+            .retain(|role| input.acl.cleared_roles.contains(role));
+        match (&item.acl.project_id, &input.acl.project_id) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                return Err(MemoryError::NotPermitted {
+                    because: format!(
+                        "this combines material confined to project {mine} with material confined \
+                         to project {theirs}, and nothing may be readable in both"
+                    ),
+                })
+            }
+            (None, Some(theirs)) => item.acl.project_id = Some(theirs.clone()),
+            _ => {}
+        }
+        match (&item.acl.owner, &input.acl.owner) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                return Err(MemoryError::NotPermitted {
+                    because: "this combines two different people's own material".to_string(),
+                })
+            }
+            (None, Some(theirs)) => item.acl.owner = Some(theirs.clone()),
+            _ => {}
+        }
+        if item.classification == crate::policy::Classification::Internal
+            && input.classification != crate::policy::Classification::Internal
+        {
+            item.classification = input.classification;
+        }
+        for reader in &input.revoked_readers {
+            if !item.revoked_readers.contains(reader) {
+                item.revoked_readers.push(reader.clone());
+            }
+        }
+        Ok(())
     }
 
     fn latest_revision(conn: &Connection) -> Option<i64> {
@@ -462,38 +873,79 @@ impl MemoryGraph {
     /// Nothing is deleted. "The model said 150 PSI and a person changed it to
     /// 10 bar" is the record somebody will need, and erasing the first half
     /// turns a correction into an assertion with no history.
+    ///
+    /// ## One transaction
+    ///
+    /// The correction, the supersede, the edge and the staleness of everything
+    /// derived from the corrected item land together or not at all. They were
+    /// two transactions, and a crash between them left the correction and the
+    /// fact it corrected both current, with nothing marked stale.
+    ///
+    /// `expected_revision` is the revision of the item being corrected that the
+    /// corrector read. A correction of something that has moved on since is a
+    /// [`MemoryError::RevisionConflict`], for the same reason a commit is.
     pub fn correct(
         &self,
         correction: MemoryItem,
         supersedes_item: &str,
     ) -> Result<Committed, MemoryError> {
-        let existing = self.raw(supersedes_item)?.ok_or(MemoryError::NotFound {
-            item_id: supersedes_item.to_string(),
-        })?;
-        may_supersede(&correction, &existing)
-            .map_err(|because| MemoryError::NotPermitted { because })?;
+        self.correct_at(correction, supersedes_item, None)
+    }
 
-        let mut correction = correction;
-        correction.supersedes = Some(supersedes_item.to_string());
-        let committed = self.commit(correction.clone(), None, &[])?;
-
+    /// [`Self::correct`], checked against the revision the corrector read.
+    pub fn correct_at(
+        &self,
+        correction: MemoryItem,
+        supersedes_item: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<Committed, MemoryError> {
+        let verdict = self.verdict_for(&correction);
         let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
             detail: "the memory graph was left locked by a failed write".into(),
         })?;
         let transaction = conn.transaction().map_err(storage)?;
 
-        let mut superseded = existing;
-        superseded.status = ItemStatus::Superseded;
-        let body = serde_json::to_string(&superseded).map_err(storage)?;
-        transaction
-            .execute(
-                "UPDATE agent_memory_items SET status = ?1, body = ?2 WHERE item_id = ?3",
-                params![ItemStatus::Superseded.as_str(), body, supersedes_item],
-            )
-            .map_err(storage)?;
+        let mut existing = Self::read_item(&transaction, supersedes_item)?.ok_or(
+            MemoryError::NotFound {
+                item_id: supersedes_item.to_string(),
+            },
+        )?;
+        if let Some(expected) = expected_revision {
+            if existing.revision != expected {
+                return Err(MemoryError::RevisionConflict {
+                    item_id: supersedes_item.to_string(),
+                    expected,
+                    actual: existing.revision,
+                });
+            }
+        }
+        if let Authority::Legacy { store } = &existing.authority {
+            return Err(MemoryError::NotPermitted {
+                because: format!(
+                    "{supersedes_item} is a copy of a record in {store}; correct it there until \
+                     {store} is cut over to the graph"
+                ),
+            });
+        }
+        may_supersede(&correction, &existing)
+            .map_err(|because| MemoryError::NotPermitted { because })?;
+
+        let mut correction = correction;
+        correction.supersedes = Some(supersedes_item.to_string());
+        let at = correction.updated_at.clone();
+        let committed = match Self::commit_within(&transaction, correction.clone(), None, &verdict)? {
+            // Corrected before, by this same write. Nothing more to do.
+            Written::Duplicate(committed) => return Ok(committed),
+            Written::Fresh(committed) => committed,
+        };
+
+        existing.status = ItemStatus::Superseded;
+        existing.revision += 1;
+        existing.updated_at = at.clone();
+        Self::write_revision(&transaction, &existing, "superseded")?;
 
         let id = edge_id(&correction.item_id, EdgeKind::Supersedes, supersedes_item);
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT INTO agent_memory_edges
                      (edge_id, from_item, to_item, kind, agent_id, scope_key, created_at)
@@ -506,22 +958,29 @@ impl MemoryGraph {
                     EdgeKind::Supersedes.as_str(),
                     correction.agent_id,
                     correction.scope.key(),
-                    correction.updated_at,
+                    at,
                 ],
             )
             .map_err(storage)?;
+        if inserted > 0 {
+            transaction
+                .execute(
+                    "INSERT INTO agent_memory_log
+                         (item_id, scope_key, change, at, subject_kind)
+                     VALUES (?1, ?2, 'linked', ?3, 'edge')",
+                    params![id, correction.scope.key(), at],
+                )
+                .map_err(storage)?;
+        }
 
-        transaction
-            .execute(
-                "INSERT INTO agent_memory_log (item_id, scope_key, change, at)
-                 VALUES (?1, ?2, 'superseded', ?3)",
-                params![
-                    supersedes_item,
-                    superseded.scope.key(),
-                    correction.updated_at
-                ],
-            )
-            .map_err(storage)?;
+        // What was built on the corrected item is no longer standing on
+        // anything a person agrees with.
+        Self::propagate_staleness(
+            &transaction,
+            &[supersedes_item.to_string()],
+            "an input was corrected",
+            &at,
+        )?;
 
         let revision = Self::latest_revision(&transaction).unwrap_or(0);
         transaction.commit().map_err(storage)?;
@@ -591,38 +1050,74 @@ impl MemoryGraph {
     }
 
     /// Marks an item deleted without removing its row.
+    ///
+    /// A new revision, so every reader holding the old one is told; its earlier
+    /// versions stay in the history. What was derived from it goes stale.
     pub fn tombstone(&self, item_id: &str, at: &str) -> Result<(), MemoryError> {
-        let Some(mut item) = self.raw(item_id)? else {
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked by a failed write".into(),
+        })?;
+        let transaction = conn.transaction().map_err(storage)?;
+        let Some(mut item) = Self::read_item(&transaction, item_id)? else {
             return Err(MemoryError::NotFound {
                 item_id: item_id.to_string(),
             });
         };
         item.status = ItemStatus::Tombstoned;
+        item.revision += 1;
         item.updated_at = at.to_string();
-        let body = serde_json::to_string(&item).map_err(storage)?;
-
-        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
-            detail: "the memory graph was left locked by a failed write".into(),
-        })?;
-        let transaction = conn.transaction().map_err(storage)?;
-        transaction
-            .execute(
-                "UPDATE agent_memory_items SET status = ?1, body = ?2 WHERE item_id = ?3",
-                params![ItemStatus::Tombstoned.as_str(), body, item_id],
-            )
-            .map_err(storage)?;
-        transaction
-            .execute(
-                "INSERT INTO agent_memory_log (item_id, scope_key, change, at)
-                 VALUES (?1, ?2, 'tombstoned', ?3)",
-                params![item_id, item.scope.key(), at],
-            )
-            .map_err(storage)?;
+        Self::write_revision(&transaction, &item, "tombstoned")?;
+        Self::propagate_staleness(&transaction, &[item_id.to_string()], "an input was removed", at)?;
         let revision = Self::latest_revision(&transaction).unwrap_or(0);
         transaction.commit().map_err(storage)?;
         drop(conn);
         self.announce(revision);
         Ok(())
+    }
+
+    /// Withdraws one person's access to one item -- and to everything derived
+    /// from it, which inherits the restriction.
+    ///
+    /// A per-reader revocation: narrower than changing the item's ACL, and it
+    /// wins over every role that person holds. A new revision, so the
+    /// changefeed tells that reader's window to drop its copy
+    /// ([`FeedChange::ItemDropped`] carries no content).
+    pub fn revoke_reader(&self, item_id: &str, user_id: &str, at: &str) -> Result<Vec<String>, MemoryError> {
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked by a failed write".into(),
+        })?;
+        let transaction = conn.transaction().map_err(storage)?;
+        if Self::read_item(&transaction, item_id)?.is_none() {
+            return Err(MemoryError::NotFound {
+                item_id: item_id.to_string(),
+            });
+        }
+
+        let mut queue = std::collections::VecDeque::from([item_id.to_string()]);
+        let mut seen: BTreeSet<String> = BTreeSet::from([item_id.to_string()]);
+        let mut revoked = Vec::new();
+        while let Some(next) = queue.pop_front() {
+            if let Some(mut item) = Self::read_item(&transaction, &next)? {
+                if !item.revoked_readers.iter().any(|held| held == user_id) {
+                    item.revoked_readers.push(user_id.to_string());
+                    item.revision += 1;
+                    item.updated_at = at.to_string();
+                    Self::write_revision(&transaction, &item, "readerRevoked")?;
+                    revoked.push(next.clone());
+                }
+            }
+            for dependent in Self::dependents_within(&transaction, &next)? {
+                if seen.insert(dependent.clone()) {
+                    queue.push_back(dependent);
+                }
+            }
+        }
+
+        let revision = Self::latest_revision(&transaction).unwrap_or(0);
+        transaction.commit().map_err(storage)?;
+        drop(conn);
+        self.announce(revision);
+        Ok(revoked)
     }
 
     /// Invalidates every item whose evidence came from a source that has been
@@ -637,7 +1132,7 @@ impl MemoryGraph {
             .all_raw()?
             .into_iter()
             .filter(|item| item.sources.iter().any(|source| source.sha256 == sha256))
-            .filter(|item| item.is_readable())
+            .filter(|item| item.is_readable() && !matches!(item.status, ItemStatus::Rejected))
             .collect();
 
         let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
@@ -645,25 +1140,20 @@ impl MemoryGraph {
         })?;
         let transaction = conn.transaction().map_err(storage)?;
         let mut ids = Vec::new();
-        for mut item in affected {
+        for item in affected {
+            // Re-read inside the transaction: the list above was taken without
+            // the lock, and the revision written must follow the one stored.
+            let Some(mut item) = Self::read_item(&transaction, &item.item_id)? else {
+                continue;
+            };
             item.status = ItemStatus::Rejected;
+            item.revision += 1;
             item.updated_at = at.to_string();
-            let body = serde_json::to_string(&item).map_err(storage)?;
-            transaction
-                .execute(
-                    "UPDATE agent_memory_items SET status = ?1, body = ?2 WHERE item_id = ?3",
-                    params![ItemStatus::Rejected.as_str(), body, item.item_id],
-                )
-                .map_err(storage)?;
-            transaction
-                .execute(
-                    "INSERT INTO agent_memory_log (item_id, scope_key, change, at)
-                     VALUES (?1, ?2, 'sourceInvalidated', ?3)",
-                    params![item.item_id, item.scope.key(), at],
-                )
-                .map_err(storage)?;
+            Self::write_revision(&transaction, &item, "sourceInvalidated")?;
             ids.push(item.item_id);
         }
+        // And what rested on those, transitively.
+        Self::propagate_staleness(&transaction, &ids, "a source it rests on was withdrawn", at)?;
         let revision = Self::latest_revision(&transaction).unwrap_or(0);
         transaction.commit().map_err(storage)?;
         drop(conn);
@@ -683,7 +1173,7 @@ impl MemoryGraph {
         })?;
         let mut statement = conn
             .prepare(
-                "SELECT outbox_id, target, idempotency_key, payload, created_at
+                "SELECT outbox_id, target, idempotency_key, payload, created_at, attempts, last_error
                  FROM agent_memory_outbox WHERE delivered_at IS NULL ORDER BY outbox_id",
             )
             .map_err(storage)?;
@@ -695,12 +1185,68 @@ impl MemoryGraph {
                     idempotency_key: row.get(2)?,
                     payload: row.get(3)?,
                     created_at: row.get(4)?,
+                    attempts: row.get(5)?,
+                    last_error: row.get(6)?,
                 })
             })
             .map_err(storage)?
             .filter_map(Result::ok)
             .collect();
         Ok(rows)
+    }
+
+    /// Records that a delivery was tried and did not land. The row stays
+    /// pending; the next pass -- in this process or the next one -- tries it
+    /// again, and the consumer's idempotency makes that safe.
+    pub fn record_delivery_failure(&self, outbox_id: i64, error: &str) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        conn.execute(
+            "UPDATE agent_memory_outbox SET attempts = attempts + 1, last_error = ?1
+             WHERE outbox_id = ?2 AND delivered_at IS NULL",
+            params![error, outbox_id],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Delivers every pending effect it has a consumer for.
+    ///
+    /// Run at start-up -- which is the "after restart" half of recovery -- and
+    /// after a publication. A row is marked delivered only *after* its
+    /// consumer accepted it; a crash between the two leaves it pending, and the
+    /// next pass delivers it again, which the consumer recognises by key. So
+    /// every row is applied exactly once however many times it is delivered.
+    pub fn deliver_pending(
+        &self,
+        consumers: &[&dyn OutboxConsumer],
+        at: &str,
+    ) -> Result<DeliveryReport, MemoryError> {
+        let mut report = DeliveryReport::default();
+        for row in self.pending_effects()? {
+            let Some(consumer) = consumers.iter().find(|consumer| consumer.target() == row.target)
+            else {
+                report.no_consumer += 1;
+                continue;
+            };
+            match consumer.deliver(&row) {
+                Ok(()) => {
+                    self.mark_delivered(row.outbox_id, at)?;
+                    report.delivered += 1;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[memory-graph] outbox row {} to {} was not delivered: {error}",
+                        row.outbox_id,
+                        row.target
+                    );
+                    self.record_delivery_failure(row.outbox_id, &error)?;
+                    report.failed += 1;
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Marks one effect delivered. Safe to call twice.
@@ -719,23 +1265,14 @@ impl MemoryGraph {
 
     // ── Reading ──────────────────────────────────────────────────────────
 
-    /// One item, without any authorisation. Internal use only.
+    /// One item, without any authorisation. For tests that inspect the row a
+    /// write left behind; production code reads inside its own transaction.
+    #[cfg(test)]
     fn raw(&self, item_id: &str) -> Result<Option<MemoryItem>, MemoryError> {
         let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
             detail: "the memory graph was left locked".into(),
         })?;
-        let body: Option<String> = conn
-            .query_row(
-                "SELECT body FROM agent_memory_items WHERE item_id = ?1",
-                params![item_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        Ok(match body {
-            Some(text) => Some(serde_json::from_str(&text).map_err(storage)?),
-            None => None,
-        })
+        Self::read_item(&conn, item_id)
     }
 
     fn all_raw(&self) -> Result<Vec<MemoryItem>, MemoryError> {
@@ -1025,6 +1562,355 @@ impl MemoryGraph {
         })
     }
 
+    /// The graph as it stood at `cursor`, read from the immutable versions.
+    ///
+    /// ## Why this exists
+    ///
+    /// Plan P02: "never label latest rows with an old cursor." A context
+    /// compiled at graph revision 12 and replayed after the graph moved to 20
+    /// must see what revision 12 held, not what is there now under 12's label.
+    /// Each item is read at its latest version written at or before `cursor`;
+    /// an item created after it is absent; an edge is present if it was linked
+    /// at or before `cursor` and both its ends are.
+    ///
+    /// ## Current authorisation still decides
+    ///
+    /// A historical read is not a way round a revocation. An item is returned
+    /// only if the reader may see it *now* and could see it *then*: an item
+    /// since tombstoned, or withdrawn from this reader, is not handed back in
+    /// its old form.
+    ///
+    /// A cursor ahead of the graph is refused. Labelling the present with a
+    /// future position would claim to have seen writes that have not happened.
+    pub fn snapshot_as_of(
+        &self,
+        session: &Session,
+        scope: &MemoryScope,
+        project_id: Option<&str>,
+        cursor: i64,
+    ) -> Result<MemorySnapshot, MemoryError> {
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        let transaction = conn.transaction().map_err(storage)?;
+        let head = Self::latest_revision(&transaction).unwrap_or(0);
+        if cursor > head {
+            return Err(MemoryError::NotPermitted {
+                because: format!(
+                    "the graph is at revision {head}, so it cannot be read as of {cursor}: that \
+                     would label the present with a position nothing has reached"
+                ),
+            });
+        }
+        let scope_key = scope.key();
+
+        let historical: Vec<MemoryItem> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT v.body FROM agent_memory_versions v
+                       JOIN (SELECT item_id, MAX(revision) AS revision
+                               FROM agent_memory_versions
+                              WHERE scope_key = ?1 AND graph_revision <= ?2
+                              GROUP BY item_id) latest
+                         ON latest.item_id = v.item_id AND latest.revision = v.revision",
+                )
+                .map_err(storage)?;
+            let bodies: Vec<String> = statement
+                .query_map(params![scope_key, cursor], |row| row.get::<_, String>(0))
+                .map_err(storage)?
+                .filter_map(Result::ok)
+                .collect();
+            bodies
+                .into_iter()
+                .filter_map(|text| serde_json::from_str::<MemoryItem>(&text).ok())
+                .collect()
+        };
+
+        let mut items = Vec::new();
+        for item in historical {
+            let now_readable = Self::read_item(&transaction, &item.item_id)?
+                .is_some_and(|current| current.readable_by(session, project_id));
+            if now_readable && item.readable_by(session, project_id) {
+                items.push(item);
+            }
+        }
+
+        let visible: BTreeSet<&str> = items.iter().map(|item| item.item_id.as_str()).collect();
+        let edges: Vec<MemoryEdge> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT e.edge_id, e.from_item, e.to_item, e.kind, e.agent_id, e.scope_key,
+                            e.created_at
+                       FROM agent_memory_edges e
+                      WHERE e.scope_key = ?1
+                        AND EXISTS (SELECT 1 FROM agent_memory_log l
+                                     WHERE l.item_id = e.edge_id AND l.subject_kind = 'edge'
+                                       AND l.revision <= ?2)",
+                )
+                .map_err(storage)?;
+            let rows: Vec<(String, String, String, String, String, String, String)> = statement
+                .query_map(params![scope_key, cursor], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .map_err(storage)?
+                .filter_map(Result::ok)
+                .collect();
+            rows.into_iter()
+                .filter(|(_, from, to, ..)| {
+                    visible.contains(from.as_str()) && visible.contains(to.as_str())
+                })
+                .filter_map(|(id, from, to, kind, agent, key, created)| {
+                    Some(MemoryEdge {
+                        edge_id: id,
+                        from_item: from,
+                        to_item: to,
+                        kind: EdgeKind::parse(&kind)?,
+                        agent_id: agent,
+                        scope: scope_from_key(&key)?,
+                        created_at: created,
+                    })
+                })
+                .collect()
+        };
+        transaction.commit().map_err(storage)?;
+
+        Ok(MemorySnapshot {
+            items,
+            edges,
+            cursor,
+            in_context: Vec::new(),
+            context_revision: None,
+        })
+    }
+
+    /// Every revision of one item this reader may see, oldest first.
+    ///
+    /// Empty when the reader may not see the item as it stands now -- the same
+    /// rule as [`Self::snapshot_as_of`], and the same answer for "no such item",
+    /// so the history cannot be used to discover what exists.
+    pub fn versions_of(
+        &self,
+        session: &Session,
+        item_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<ItemVersion>, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        let current_visible = Self::read_item(&conn, item_id)?
+            .is_some_and(|current| current.readable_by(session, project_id));
+        if !current_visible {
+            return Ok(Vec::new());
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT revision, graph_revision, body FROM agent_memory_versions
+                  WHERE item_id = ?1 ORDER BY revision",
+            )
+            .map_err(storage)?;
+        let rows: Vec<(i64, i64, String)> = statement
+            .query_map(params![item_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(storage)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter_map(|(revision, graph_revision, body)| {
+                let item: MemoryItem = serde_json::from_str(&body).ok()?;
+                Some(ItemVersion {
+                    item_id: item_id.to_string(),
+                    revision: revision as u64,
+                    graph_revision,
+                    item,
+                })
+            })
+            .collect())
+    }
+
+    // ── Migration support ────────────────────────────────────────────────
+
+    /// Writes one record brought across from a legacy store.
+    ///
+    /// Addressed by the item id the migration derives from the legacy record,
+    /// so it is restartable by construction: a re-run finds what the last run
+    /// wrote and changes nothing when the content is the same. A legacy record
+    /// that changed since is a new revision -- the graph follows its authority
+    /// -- and one that was rolled back is restored. Nothing is ever deleted.
+    pub fn upsert_migrated(&self, mut item: MemoryItem) -> Result<MigratedWrite, MemoryError> {
+        if !matches!(item.provenance, Provenance::Migrated { .. }) {
+            return Err(MemoryError::NotPermitted {
+                because: "only a migrated record may be written through the migration path"
+                    .to_string(),
+            });
+        }
+        let outcome = admit(&item, &ReceiptVerdict::NotAReceipt);
+        item.status = outcome.status;
+        item.basis = Some(Basis::of(&item.provenance));
+
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked by a failed write".into(),
+        })?;
+        let transaction = conn.transaction().map_err(storage)?;
+        let written = match Self::read_item(&transaction, &item.item_id)? {
+            None => {
+                item.revision = 1;
+                Self::write_revision(&transaction, &item, "migrated")?;
+                MigratedWrite::Inserted
+            }
+            Some(held) if held.status == ItemStatus::Tombstoned => {
+                item.revision = held.revision + 1;
+                Self::write_revision(&transaction, &item, "migrationRestored")?;
+                MigratedWrite::Restored
+            }
+            Some(held) if held.content == item.content && held.sources == item.sources
+                && held.artifacts == item.artifacts =>
+            {
+                MigratedWrite::Unchanged
+            }
+            Some(held) => {
+                item.revision = held.revision + 1;
+                Self::write_revision(&transaction, &item, "migrationResynced")?;
+                Self::propagate_staleness(
+                    &transaction,
+                    &[item.item_id.clone()],
+                    "its legacy source changed",
+                    &item.updated_at,
+                )?;
+                MigratedWrite::Updated
+            }
+        };
+        let revision = Self::latest_revision(&transaction).unwrap_or(0);
+        transaction.commit().map_err(storage)?;
+        drop(conn);
+        if written != MigratedWrite::Unchanged {
+            self.announce(revision);
+        }
+        Ok(written)
+    }
+
+    /// Rolls back one legacy source: every record migrated from it is
+    /// tombstoned, as a new revision, and nothing is deleted.
+    ///
+    /// The legacy store was never touched by the migration and is still where
+    /// those records are written, so rolling back returns the deployment to
+    /// the state before the migration ran. Re-running the migration restores
+    /// them ([`MigratedWrite::Restored`]).
+    pub fn retire_migrated(&self, legacy_store: &str, at: &str) -> Result<Vec<String>, MemoryError> {
+        self.retire_migrated_where(legacy_store, |_| true, at)
+    }
+
+    /// Retires the records migrated from `legacy_store` whose legacy id `pick`
+    /// selects -- the orphans a pass finds when a legacy record has gone.
+    pub fn retire_migrated_where(
+        &self,
+        legacy_store: &str,
+        pick: impl Fn(&str) -> bool,
+        at: &str,
+    ) -> Result<Vec<String>, MemoryError> {
+        let targets: Vec<String> = self
+            .all_raw()?
+            .into_iter()
+            .filter(|item| {
+                matches!(&item.provenance, Provenance::Migrated { legacy_store: store, legacy_id }
+                    if store == legacy_store && pick(legacy_id))
+                    && item.status != ItemStatus::Tombstoned
+            })
+            .map(|item| item.item_id)
+            .collect();
+        if targets.is_empty() {
+            return Ok(targets);
+        }
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked by a failed write".into(),
+        })?;
+        let transaction = conn.transaction().map_err(storage)?;
+        for id in &targets {
+            if let Some(mut item) = Self::read_item(&transaction, id)? {
+                item.status = ItemStatus::Tombstoned;
+                item.revision += 1;
+                item.updated_at = at.to_string();
+                Self::write_revision(&transaction, &item, "migrationRolledBack")?;
+            }
+        }
+        Self::propagate_staleness(&transaction, &targets, "its migrated source was rolled back", at)?;
+        let revision = Self::latest_revision(&transaction).unwrap_or(0);
+        transaction.commit().map_err(storage)?;
+        drop(conn);
+        self.announce(revision);
+        Ok(targets)
+    }
+
+    /// Opens a migration pass in the run ledger.
+    pub fn begin_migration_run(&self, source: &str, action: &str, at: &str) -> Result<String, MemoryError> {
+        let run_id = format!("mig-{}", uuid::Uuid::new_v4());
+        let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        conn.execute(
+            "INSERT INTO agent_memory_migration_runs (run_id, source, action, started_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, source, action, at],
+        )
+        .map_err(storage)?;
+        Ok(run_id)
+    }
+
+    /// Closes a migration pass with what it did.
+    pub fn finish_migration_run(&self, run_id: &str, report: &str, at: &str) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        conn.execute(
+            "UPDATE agent_memory_migration_runs SET finished_at = ?1, report = ?2 WHERE run_id = ?3",
+            params![at, report, run_id],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Migration passes that started and never finished.
+    pub fn unfinished_migration_runs(&self) -> Result<Vec<(String, String, String)>, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Storage {
+            detail: "the memory graph was left locked".into(),
+        })?;
+        let mut statement = conn
+            .prepare(
+                "SELECT run_id, source, action FROM agent_memory_migration_runs
+                  WHERE finished_at IS NULL ORDER BY started_at",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(storage)?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    /// Items migrated from one legacy store, whatever their status, keyed by
+    /// the legacy id they came from. What a verification compares against.
+    pub fn migrated_from(&self, legacy_store: &str) -> Result<HashMap<String, MemoryItem>, MemoryError> {
+        Ok(self
+            .all_raw()?
+            .into_iter()
+            .filter_map(|item| match &item.provenance {
+                Provenance::Migrated {
+                    legacy_store: store,
+                    legacy_id,
+                } if store == legacy_store => Some((legacy_id.clone(), item)),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Everything that happened after `cursor`, as this reader may see it.
     ///
     /// ## Why the current row is resolved rather than the logged one
@@ -1268,19 +2154,7 @@ impl MemoryGraph {
 }
 
 fn scope_from_key(key: &str) -> Option<MemoryScope> {
-    let (kind, value) = key.split_once(':')?;
-    Some(match kind {
-        "task" => MemoryScope::Task {
-            task_id: value.to_string(),
-        },
-        "workspace" => MemoryScope::Workspace {
-            project_id: value.to_string(),
-        },
-        "user" => MemoryScope::User {
-            user_id: value.to_string(),
-        },
-        _ => return None,
-    })
+    MemoryScope::from_key(key)
 }
 
 #[cfg(test)]

@@ -61,11 +61,11 @@ use sha2::{Digest, Sha256};
 
 use super::assertions::AssertionStatus;
 use super::runtime_memory::{
-    ArtifactRef, ItemStatus, MemoryItem, MemoryKind, MemoryScope, Provenance, SourceRef,
-    MEMORY_SCHEMA_VERSION,
+    ArtifactRef, Authority, ItemStatus, MemoryItem, MemoryKind, MemoryScope, Provenance,
+    SourceRef, MEMORY_SCHEMA_VERSION,
 };
 use super::store::NotebookStore;
-use super::runtime_store::{MemoryError, MemoryGraph};
+use super::runtime_store::{MemoryError, MemoryGraph, MigratedWrite};
 use crate::agent_runtime::conversations::ConversationStore;
 use crate::agent_runtime::memory::Acl;
 use crate::agents::store::{AgentRegistry, Visibility};
@@ -90,6 +90,15 @@ pub enum LegacySource {
     NotebookAssertions,
     /// The artifact store's produced-document references, at exact revisions.
     ArtifactReferences,
+    /// `agent_runtime::memory::MemoryStore` -- `<app data>/memory/*.json`,
+    /// the store `memory.recall_authorized` and `memory.promote_approved`
+    /// answer from.
+    ///
+    /// The sixth store, and the one the "uncovered" list was kept for. It was
+    /// missing from the five above because it lives beside the agent runtime
+    /// rather than under `memory_engine`, and it is the one the model actually
+    /// reaches memory through. Found in P02 by tracing `memory_api`.
+    RuntimeScopedMemory,
 }
 
 impl LegacySource {
@@ -103,6 +112,7 @@ impl LegacySource {
             Self::ScopedMemoryJson => "memory_engine/scoped",
             Self::NotebookAssertions => "knowledge/assertions",
             Self::ArtifactReferences => "artifacts/references",
+            Self::RuntimeScopedMemory => "agent_runtime/memory",
         }
     }
 
@@ -122,6 +132,7 @@ impl LegacySource {
         Self::ScopedMemoryJson,
         Self::NotebookAssertions,
         Self::ArtifactReferences,
+        Self::RuntimeScopedMemory,
     ];
 }
 
@@ -150,6 +161,15 @@ pub struct SourceOutcome {
     /// population and `migrated` is zero — that is the property that makes an
     /// interrupted migration safe to retry.
     pub already_present: usize,
+    /// Already migrated, and the legacy record changed since: a new revision
+    /// in the graph, following its authority.
+    pub updated: usize,
+    /// Rolled back earlier and brought back by this pass.
+    pub restored: usize,
+    /// Migrated earlier, and the legacy record is gone: tombstoned by this
+    /// pass, as a new revision, so the graph follows its authority. Not part
+    /// of `examined` -- there is no legacy record left to examine.
+    pub retired: usize,
     /// Named, never merely counted, so an operator can go and look.
     pub unreadable: Vec<String>,
 }
@@ -157,7 +177,18 @@ pub struct SourceOutcome {
 impl SourceOutcome {
     /// Whether this source finished with nothing left unexplained.
     pub fn clean(&self) -> bool {
-        self.unreadable.is_empty() && self.examined == self.migrated + self.already_present
+        self.unreadable.is_empty()
+            && self.examined == self.migrated + self.already_present + self.updated + self.restored
+    }
+}
+
+/// Counts one write into the outcome it belongs to.
+fn tally(outcome: &mut SourceOutcome, written: MigratedWrite) {
+    match written {
+        MigratedWrite::Inserted => outcome.migrated += 1,
+        MigratedWrite::Unchanged => outcome.already_present += 1,
+        MigratedWrite::Updated => outcome.updated += 1,
+        MigratedWrite::Restored => outcome.restored += 1,
     }
 }
 
@@ -202,10 +233,13 @@ impl MigrationReport {
         )];
         for (source, outcome) in &self.per_source {
             lines.push(format!(
-                "  {source}: examined {}, migrated {}, already present {}, unreadable {}",
+                "  {source}: examined {}, migrated {}, already present {}, updated {}, restored {}, \
+                 unreadable {}",
                 outcome.examined,
                 outcome.migrated,
                 outcome.already_present,
+                outcome.updated,
+                outcome.restored,
                 outcome.unreadable.len()
             ));
         }
@@ -269,6 +303,15 @@ fn migrated_item(
         idempotency_key: Some(item_id),
         created_at: at.to_string(),
         updated_at: at.to_string(),
+        basis: None,
+        depends_on: Vec::new(),
+        revoked_readers: Vec::new(),
+        // A copy. The legacy store is still written directly by its own code,
+        // so it is the authority until that source is cut over; a graph write
+        // to this record is refused rather than racing the legacy writer.
+        authority: Authority::Legacy {
+            store: source.key().to_string(),
+        },
     }
 }
 
@@ -324,12 +367,7 @@ pub fn migrate_agent_profiles(
             content,
             at,
         );
-        let committed = store.commit(item, None, &[])?;
-        if committed.duplicate {
-            outcome.already_present += 1;
-        } else {
-            outcome.migrated += 1;
-        }
+        tally(&mut outcome, store.upsert_migrated(item)?);
     }
 
     Ok(outcome)
@@ -386,12 +424,7 @@ pub fn migrate_conversation_pins(
             // User scope: the owner is the boundary, so it goes on the ACL.
             // `for_classification` cannot know it.
             item.acl.owner = Some(owner_user_id.to_string());
-            let committed = store.commit(item, None, &[])?;
-            if committed.duplicate {
-                outcome.already_present += 1;
-            } else {
-                outcome.migrated += 1;
-            }
+            tally(&mut outcome, store.upsert_migrated(item)?);
         }
     }
 
@@ -484,12 +517,7 @@ pub fn migrate_notebook_assertions(
                 AssertionStatus::Proposed => {}
             }
 
-            let committed = store.commit(item, None, &[])?;
-            if committed.duplicate {
-                outcome.already_present += 1;
-            } else {
-                outcome.migrated += 1;
-            }
+            tally(&mut outcome, store.upsert_migrated(item)?);
         }
     }
 
@@ -547,12 +575,7 @@ pub fn migrate_scoped_memory(
         item.created_at = row.created_at.clone();
         item.updated_at = row.updated_at.clone();
 
-        let committed = store.commit(item, None, &[])?;
-        if committed.duplicate {
-            outcome.already_present += 1;
-        } else {
-            outcome.migrated += 1;
-        }
+        tally(&mut outcome, store.upsert_migrated(item)?);
     }
 
     Ok(outcome)
@@ -618,16 +641,205 @@ pub fn migrate_artifact_references(
             }];
             item.created_at = record.created_at.clone();
 
-            let committed = store.commit(item, None, &[])?;
-            if committed.duplicate {
-                outcome.already_present += 1;
-            } else {
-                outcome.migrated += 1;
-            }
+            tally(&mut outcome, store.upsert_migrated(item)?);
         }
     }
 
     Ok(outcome)
+}
+
+/// Moves the runtime's own scoped memory under the graph.
+///
+/// Every durable item keeps its own ACL, classification and scope -- the same
+/// `Acl` type the graph reads with -- so nothing becomes visible to anybody who
+/// could not read it in the legacy store. Its source, when it was a document,
+/// becomes a [`SourceRef`] at the page it came from.
+pub fn migrate_runtime_scoped_memory(
+    memory: &crate::agent_runtime::memory::MemoryStore,
+    store: &MemoryGraph,
+    at: &str,
+) -> Result<SourceOutcome, MemoryError> {
+    use crate::agent_runtime::memory::{MemoryKind as LegacyKind, MemoryScope as LegacyScope, MemorySource};
+
+    let mut outcome = SourceOutcome::default();
+    let (items, unreadable) = memory.durable_items_on_disk();
+    outcome.unreadable.extend(unreadable);
+    let mut seen = std::collections::BTreeSet::new();
+
+    for legacy in items {
+        outcome.examined += 1;
+        let scope = match &legacy.scope {
+            LegacyScope::Workspace { project_id } => MemoryScope::Workspace {
+                project_id: project_id.clone(),
+            },
+            LegacyScope::User { user_id } => MemoryScope::User {
+                user_id: user_id.clone(),
+            },
+            // Run scope is never written to disk by that store, so a file
+            // holding one is a file this module does not understand.
+            LegacyScope::Run { run_id } => {
+                outcome
+                    .unreadable
+                    .push(format!("item {} claims run scope {run_id} on disk", legacy.id));
+                continue;
+            }
+        };
+        let (kind, label) = match legacy.kind {
+            LegacyKind::Decision => (MemoryKind::Decision, "decision"),
+            LegacyKind::RunState => (MemoryKind::Plan, "runState"),
+            LegacyKind::Terminology => (MemoryKind::Fact, "terminology"),
+            LegacyKind::Template => (MemoryKind::Fact, "template"),
+            LegacyKind::ProjectFact => (MemoryKind::Fact, "projectFact"),
+            LegacyKind::Preference => (MemoryKind::Fact, "preference"),
+        };
+        let agent = match &legacy.source {
+            MemorySource::Operator { user_id } => user_id.clone(),
+            MemorySource::Run { run_id } => format!("run:{run_id}"),
+            MemorySource::Document { .. } => "document".to_string(),
+        };
+        let mut item = migrated_item(
+            LegacySource::RuntimeScopedMemory,
+            &legacy.id,
+            &agent,
+            kind,
+            scope,
+            legacy.classification,
+            format!("[{label}] {}: {}", legacy.key, legacy.value),
+            at,
+        );
+        // Its own list, as stored -- not re-derived from the classification,
+        // which could widen what a reviewer already agreed to.
+        item.acl = legacy.acl.clone();
+        if let MemorySource::Document {
+            document_sha256,
+            page,
+            ..
+        } = &legacy.source
+        {
+            item.sources = vec![SourceRef {
+                sha256: document_sha256.clone(),
+                locator: format!("page {page}"),
+                extraction_revision: None,
+            }];
+        }
+        item.valid_until = legacy.expires_at.clone();
+        item.created_at = legacy.created_at.clone();
+        item.updated_at = legacy.updated_at.clone();
+        seen.insert(legacy.id.clone());
+        tally(&mut outcome, store.upsert_migrated(item)?);
+    }
+
+    // A record migrated earlier whose legacy record is gone -- deleted, or
+    // replaced under a new id when its value changed -- is retired, so the
+    // graph does not keep answering with what its authority has withdrawn.
+    // Only when every legacy file was read: a file that could not be read is
+    // not evidence that its records are gone.
+    if outcome.unreadable.is_empty() {
+        outcome.retired = store
+            .retire_migrated_where(
+                LegacySource::RuntimeScopedMemory.key(),
+                |legacy_id| !seen.contains(legacy_id),
+                at,
+            )?
+            .len();
+    }
+    Ok(outcome)
+}
+
+/// Undoes one source's migration, without deleting anything.
+///
+/// Every record migrated from `source` is tombstoned as a new revision (its
+/// earlier versions stay in the history), and anything derived from them goes
+/// stale. The legacy store was never written by the migration and is still
+/// the authority, so this returns the deployment to where it was. Running the
+/// migration again restores each record.
+pub fn rollback_source(
+    source: LegacySource,
+    store: &MemoryGraph,
+    at: &str,
+) -> Result<Vec<String>, MemoryError> {
+    let run = store.begin_migration_run(source.key(), "rollback", at)?;
+    let retired = store.retire_migrated(source.key(), at)?;
+    store.finish_migration_run(&run, &format!("{} record(s) rolled back", retired.len()), at)?;
+    Ok(retired)
+}
+
+/// Where the graph and a legacy source disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Verification {
+    /// Legacy ids with no migrated record.
+    pub missing: Vec<String>,
+    /// Migrated records whose content differs from the legacy record now.
+    pub differing: Vec<String>,
+    /// Migrated records with no legacy record behind them any more.
+    pub orphaned: Vec<String>,
+    /// Migrated records that were rolled back.
+    pub rolled_back: Vec<String>,
+}
+
+impl Verification {
+    /// Whether the legacy writer could be retired against this mapping.
+    pub fn clean(&self) -> bool {
+        self.missing.is_empty()
+            && self.differing.is_empty()
+            && self.orphaned.is_empty()
+            && self.rolled_back.is_empty()
+    }
+}
+
+/// Checks the content and revision mapping for the runtime's scoped memory.
+///
+/// The check that must pass before its legacy writer is retired: every durable
+/// legacy item has exactly one migrated record, with the same content, and no
+/// migrated record is left over. Plan P02: "verify content/revision mappings
+/// before retiring legacy writers." Read-only.
+pub fn verify_runtime_scoped_memory(
+    memory: &crate::agent_runtime::memory::MemoryStore,
+    store: &MemoryGraph,
+) -> Result<Verification, MemoryError> {
+    let mut verification = Verification::default();
+    let migrated = store.migrated_from(LegacySource::RuntimeScopedMemory.key())?;
+    let (items, _) = memory.durable_items_on_disk();
+    let mut seen = std::collections::BTreeSet::new();
+    for legacy in items {
+        seen.insert(legacy.id.clone());
+        match migrated.get(&legacy.id) {
+            None => verification.missing.push(legacy.id.clone()),
+            Some(item) if item.status == ItemStatus::Tombstoned => {
+                verification.rolled_back.push(legacy.id.clone())
+            }
+            Some(item) if !item.content.ends_with(&format!("{}: {}", legacy.key, legacy.value)) => {
+                verification.differing.push(legacy.id.clone())
+            }
+            Some(_) => {}
+        }
+    }
+    // Still standing with no legacy record behind it. One the pass already
+    // retired is not an orphan: the graph has followed its authority.
+    for (legacy_id, item) in &migrated {
+        if !seen.contains(legacy_id) && item.status != ItemStatus::Tombstoned {
+            verification.orphaned.push(legacy_id.clone());
+        }
+    }
+    Ok(verification)
+}
+
+/// One full migration pass, recorded in the migration run ledger.
+///
+/// The ledger row is opened before anything is written and closed with the
+/// report after. A row left open is a pass that was interrupted; nothing needs
+/// repairing, because running the pass again is safe (see the module docs).
+pub fn run_migration_pass(
+    stores: LegacyStores<'_>,
+    store: &MemoryGraph,
+    project_id: &str,
+    owner_user_id: &str,
+    at: &str,
+) -> Result<MigrationReport, MemoryError> {
+    let run = store.begin_migration_run("all", "migrate", at)?;
+    let report = migrate_all(stores, store, project_id, owner_user_id, at)?;
+    store.finish_migration_run(&run, &report.explain(), at)?;
+    Ok(report)
 }
 
 /// The stores a full migration reads from.
@@ -642,6 +854,8 @@ pub struct LegacyStores<'a> {
     pub conversations: &'a ConversationStore,
     pub notebooks: &'a NotebookStore,
     pub memories: &'a PersistenceManager,
+    /// The runtime's own scoped memory. See [`LegacySource::RuntimeScopedMemory`].
+    pub runtime_memory: &'a crate::agent_runtime::memory::MemoryStore,
     pub artifacts: &'a ConversationArtifacts,
     /// The conversations whose artifacts to move. Passed rather than
     /// discovered, because the artifact store is keyed by conversation and a
@@ -690,6 +904,10 @@ pub fn migrate_all(
             project_id,
             at,
         )?,
+    );
+    report.per_source.insert(
+        LegacySource::RuntimeScopedMemory.key(),
+        migrate_runtime_scoped_memory(stores.runtime_memory, store, at)?,
     );
 
     // Every source in `LegacySource` must have been attempted, or the report

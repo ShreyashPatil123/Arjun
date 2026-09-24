@@ -59,7 +59,8 @@ use async_trait::async_trait;
 use crate::agent_runtime::cancellation::CancelToken;
 use crate::agent_runtime::events::TaskEventLog;
 use crate::identity::Session;
-use crate::knowledge::graph::runtime_memory::{ArtifactRef, MemoryKind, Provenance, SourceRef};
+use crate::knowledge::graph::receipts::{record_tool_receipt, Receipt};
+use crate::knowledge::graph::runtime_memory::{ArtifactRef, Dependency, MemoryKind, SourceRef};
 use crate::knowledge::graph::runtime_store::MemoryGraph;
 use crate::knowledge::KnowledgeIndex;
 use crate::orchestrator::tools::ToolName;
@@ -196,7 +197,7 @@ impl SpecialistWorker {
     /// The task memory this child reads and writes through.
     fn memory(&self, packet: &ChildTaskPacket, policy: &EffectivePolicy) -> Option<TaskMemory> {
         let graph = self.services.graph.as_ref()?;
-        Some(TaskMemory::new(
+        let memory = TaskMemory::new(
             Arc::clone(graph),
             &packet.task_id,
             // The agent, not the child. A child id belongs to one attempt; the
@@ -209,7 +210,53 @@ impl SpecialistWorker {
             &packet.parent_run_id,
             policy.classification_ceiling,
             None,
-        ))
+        )
+        // The child's own run: its tool events are the receipts it publishes.
+        .for_child(&packet.child_id);
+        // Sharing is the definition's decision (P01's `shared_with_task`),
+        // pinned on the packet at dispatch. A definition that does not share
+        // publishes into this agent's own scratch, which its siblings cannot
+        // read -- enforced by the scope, not by a promise.
+        Some(if packet.shared_with_task {
+            memory
+        } else {
+            memory.private()
+        })
+    }
+
+    /// Records one action this worker performed itself, as the receipt the
+    /// findings built from it rest on.
+    ///
+    /// Under the child's own run and keyed by the action, so a retry after the
+    /// worker died is the same event. A receipt that could not be recorded is
+    /// said, and what was found is then published as a proposal rather than as
+    /// something a tool established.
+    fn receipt(
+        &self,
+        packet: &ChildTaskPacket,
+        tool: ToolName,
+        action: &str,
+        output: &str,
+        actor: &str,
+        work: &mut Work,
+    ) -> Option<Receipt> {
+        match record_tool_receipt(
+            &self.services.events,
+            &packet.child_id,
+            tool,
+            &format!("{}:{action}", packet.child_id),
+            actor,
+            output,
+        ) {
+            Ok(receipt) => Some(receipt),
+            Err(problem) => {
+                work.uncertainty.push(format!(
+                    "{problem}; what it found is published as a proposal, not as something a tool \
+                     established"
+                ));
+                None
+            }
+        }
     }
 
     /// What this child stops on.
@@ -345,11 +392,11 @@ impl ChildWorker for SpecialistWorker {
             )),
             None => match self.profile.as_str() {
                 "knowledge-retriever" => self.retrieve(packet, policy, &session, &cancel),
-                "document-extractor" => self.extract(packet, policy, &cancel),
+                "document-extractor" => self.extract(packet, policy, &session, &cancel),
                 "calculation-checker" => {
                     self.check_calculations(packet, policy, &session, memory.as_ref(), &cancel)
                 }
-                "artifact-reviewer" => self.review(packet, policy, &cancel),
+                "artifact-reviewer" => self.review(packet, policy, &session, &cancel),
                 other => Err(format!(
                     "this build has no worker for the {other} role, so nothing was done"
                 )),
@@ -379,17 +426,13 @@ impl ChildWorker for SpecialistWorker {
         // nothing is passed between workers directly.
         if let Some(memory) = memory.as_ref() {
             for claim in std::mem::take(&mut work.claims) {
+                // Each claim carries the receipt of the call that produced it,
+                // and the store resolves that receipt against the event log
+                // before admitting anything. This used to publish every claim
+                // as `event_seq: 0` on the *parent's* run, attributed to
+                // whichever tool this worker called first -- P00 finding 2.
                 match memory.publish(
                     claim,
-                    // A receipt, because every claim these workers make is a
-                    // tool's own output rather than a model's account of it.
-                    // See the module header: that is the whole reason these
-                    // roles are performed this way.
-                    Provenance::ToolReceipt {
-                        run_id: packet.parent_run_id.clone(),
-                        tool: work.tool.as_str().to_string(),
-                        event_seq: 0,
-                    },
                     lease.as_ref().map(|lease| lease.model_id.clone()),
                     &session,
                 ) {
@@ -449,6 +492,10 @@ impl ChildWorker for SpecialistWorker {
 }
 
 /// What one routine produced, before it is published.
+///
+/// There is no single tool here any more. It named "the" tool every claim was
+/// attributed to, which for a child that called three tools was two wrong
+/// attributions; each claim now carries its own receipt.
 struct Work {
     findings: Vec<Finding>,
     claims: Vec<Claim>,
@@ -456,11 +503,10 @@ struct Work {
     uncertainty: Vec<String>,
     confidence: f32,
     turns: u32,
-    tool: ToolName,
 }
 
 impl Work {
-    fn of(tool: ToolName) -> Self {
+    fn new() -> Self {
         Self {
             findings: Vec::new(),
             claims: Vec::new(),
@@ -468,7 +514,6 @@ impl Work {
             uncertainty: Vec::new(),
             confidence: 0.0,
             turns: 0,
-            tool,
         }
     }
 }
@@ -512,22 +557,32 @@ impl SpecialistWorker {
             .map_err(|detail| format!("this worker's model loop did not run: {detail}"))?;
         cancel.check()?;
 
-        let mut work = Work::of(
-            // The tool a claim is attributed to. The child chose which to call,
-            // so the honest label is the one it used most — and where it called
-            // several, the first, because that is the one the rest rest on.
-            report
-                .receipts()
-                .next()
-                .and_then(|call| ToolName::from_str(&call.tool))
-                .unwrap_or(ToolName::SearchDocuments),
-        );
+        let mut work = Work::new();
         work.turns = report.tool_calls.len() as u32;
+
+        // The receipt each successful call was recorded as, on the child's own
+        // run. A call whose event could not be written has none, and what came
+        // from it is published as a proposal rather than as a tool's result.
+        let receipt_of = |call: &crate::agent_runtime::tasks::ToolCallRecord| -> Option<Receipt> {
+            Some(Receipt {
+                run_id: packet.child_id.clone(),
+                tool: call.tool.clone(),
+                event_seq: call.event_seq?,
+                output_sha256: call.output_sha256.clone()?,
+            })
+        };
 
         // Evidence first, because a finding that cites one is worth more than a
         // finding that does not, and these are the passages the index returned
         // rather than anything the model said about them.
         for (position, hit) in report.passages.iter().enumerate() {
+            // The one successful call that returned this chunk. Two searches
+            // that both returned it: the first, which is when it entered the
+            // run's evidence.
+            let receipt = report
+                .receipts()
+                .find(|call| call.evidence_chunks.iter().any(|chunk| chunk == &hit.chunk_id))
+                .and_then(receipt_of);
             work.findings.push(Finding {
                 statement: format!("{} bears on this task.", hit.citation()),
                 evidence: vec![EvidenceRef {
@@ -549,6 +604,8 @@ impl SpecialistWorker {
                 confidence: Some(0.9),
                 causal_parents: Vec::new(),
                 idempotency_key: format!("{}:{}", packet.idempotency_key, hit.chunk_id),
+                receipt,
+                depends_on: Vec::new(),
             });
         }
 
@@ -556,10 +613,18 @@ impl SpecialistWorker {
         // artifact — each is a receipt the gateway wrote, and each is reported
         // as what the tool returned rather than as what the model said about it.
         for call in report.receipts() {
-            if call.tool == ToolName::SearchDocuments.as_str() {
-                // Already accounted for, in the passages above, and with
-                // evidence attached rather than as a line of text.
+            if !call.evidence_chunks.is_empty() {
+                // A retrieval: already accounted for, in the passages above,
+                // each with the receipt of this call attached.
                 continue;
+            }
+            let receipt = receipt_of(call);
+            if receipt.is_none() {
+                work.uncertainty.push(format!(
+                    "the {} call's event could not be tied to this finding, so it is published \
+                     as a proposal",
+                    call.tool
+                ));
             }
             work.findings.push(Finding {
                 statement: format!("{}: {}", call.tool, call.detail),
@@ -572,7 +637,13 @@ impl SpecialistWorker {
                 artifacts: Vec::new(),
                 confidence: Some(1.0),
                 causal_parents: Vec::new(),
-                idempotency_key: format!("{}:{}:{}", packet.idempotency_key, call.tool, call.at),
+                idempotency_key: format!(
+                    "{}:{}",
+                    packet.idempotency_key,
+                    call.tool_call_id.clone().unwrap_or_else(|| format!("{}:{}", call.tool, call.at))
+                ),
+                receipt,
+                depends_on: Vec::new(),
             });
         }
 
@@ -640,7 +711,7 @@ impl SpecialistWorker {
             .search(session, &query, RETRIEVAL_LIMIT)
             .map_err(|error| format!("the document index could not be searched: {error}"))?;
 
-        let mut work = Work::of(ToolName::SearchDocuments);
+        let mut work = Work::new();
         work.turns = 1;
         if hits.is_empty() {
             work.uncertainty.push(format!(
@@ -650,6 +721,24 @@ impl SpecialistWorker {
             work.confidence = 1.0;
             return Ok(work);
         }
+
+        // The search this worker ran, recorded as the receipt every passage it
+        // returned rests on. The output is the result set -- which chunks, in
+        // which documents, on which pages -- so the hash names exactly what the
+        // search returned and nothing the worker added afterwards.
+        let listing: String = hits
+            .iter()
+            .map(|hit| format!("{}\t{}\t{}", hit.chunk_id, hit.document_sha256, hit.page))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let receipt = self.receipt(
+            packet,
+            ToolName::SearchDocuments,
+            "search",
+            &listing,
+            &session.user.id,
+            &mut work,
+        );
 
         for (position, hit) in hits.iter().enumerate() {
             work.findings.push(Finding {
@@ -677,6 +766,8 @@ impl SpecialistWorker {
                 confidence: Some(0.9),
                 causal_parents: Vec::new(),
                 idempotency_key: format!("{}:{}", packet.idempotency_key, hit.chunk_id),
+                receipt: receipt.clone(),
+                depends_on: Vec::new(),
             });
         }
         // Retrieval either found passages or it did not; nothing here was
@@ -690,12 +781,13 @@ impl SpecialistWorker {
         &self,
         packet: &ChildTaskPacket,
         policy: &EffectivePolicy,
+        session: &Session,
         cancel: &Stopping,
     ) -> Result<Work, String> {
         require(policy, ToolName::ReadScopedFile)?;
 
         let root = policy.inherited.workspace_root.clone();
-        let mut work = Work::of(ToolName::ReadScopedFile);
+        let mut work = Work::new();
         let wanted: Vec<&String> = packet
             .inputs
             .iter()
@@ -730,6 +822,17 @@ impl SpecialistWorker {
                 Ok(text) => {
                     let lines = text.lines().count();
                     let bytes = text.len();
+                    // This read, and only this read, backs this finding. A file
+                    // that could not be read has no receipt and no claim: a
+                    // failed call establishes nothing beyond its own failure.
+                    let receipt = self.receipt(
+                        packet,
+                        ToolName::ReadScopedFile,
+                        &format!("read:{path}"),
+                        &text,
+                        &session.user.id,
+                        &mut work,
+                    );
                     work.findings.push(Finding {
                         statement: format!("{path} holds {lines} line(s), {bytes} byte(s)."),
                         evidence: Vec::new(),
@@ -742,6 +845,8 @@ impl SpecialistWorker {
                         confidence: Some(1.0),
                         causal_parents: Vec::new(),
                         idempotency_key: format!("{}:{path}", packet.idempotency_key),
+                        receipt,
+                        depends_on: Vec::new(),
                     });
                 }
                 Err(error) => work
@@ -779,8 +884,14 @@ impl SpecialistWorker {
             .collect();
 
         // The graph read. Everything a sibling published to this task that
-        // looks like something to check.
+        // looks like something to check -- and, for each, the item and the
+        // revision it was read at. That pin is what the store re-checks at
+        // publication: a figure corrected while this worker was re-deriving it
+        // makes the check stale rather than silently about the old figure, and
+        // the check inherits whatever restricts the figure it checked.
         let mut from_memory = 0usize;
+        let mut origins: std::collections::HashMap<String, Dependency> =
+            std::collections::HashMap::new();
         if let Some(memory) = memory {
             for kind in [MemoryKind::Fact, MemoryKind::ToolObservation] {
                 let published = memory
@@ -789,6 +900,13 @@ impl SpecialistWorker {
                 for item in published {
                     if let Some(expression) = expression_in(&item.content) {
                         if !expressions.iter().any(|held| held == &expression) {
+                            origins.insert(
+                                expression.clone(),
+                                Dependency {
+                                    item_id: item.item_id.clone(),
+                                    revision: item.revision,
+                                },
+                            );
                             expressions.push(expression);
                             from_memory += 1;
                         }
@@ -805,7 +923,7 @@ impl SpecialistWorker {
             );
         }
 
-        let mut work = Work::of(ToolName::RunCalculation);
+        let mut work = Work::new();
         if from_memory > 0 {
             work.uncertainty.push(format!(
                 "{from_memory} of these came from what another worker published to this task \
@@ -818,18 +936,29 @@ impl SpecialistWorker {
             work.turns += 1;
             match crate::orchestrator::calculation::evaluate(&expression) {
                 Ok(record) => {
+                    let receipt = self.receipt(
+                        packet,
+                        ToolName::RunCalculation,
+                        &format!("calc:{expression}"),
+                        &format!("{expression} = {}", record.formatted),
+                        &session.user.id,
+                        &mut work,
+                    );
                     work.findings.push(Finding {
                         statement: format!("{expression} = {}", record.formatted),
                         evidence: Vec::new(),
                     });
+                    let origin = origins.get(&expression).cloned();
                     work.claims.push(Claim {
                         kind: MemoryKind::ToolObservation,
                         content: format!("{expression}: {}", record.formatted),
                         sources: Vec::new(),
                         artifacts: Vec::new(),
                         confidence: Some(1.0),
-                        causal_parents: Vec::new(),
+                        causal_parents: origin.iter().map(|d| d.item_id.clone()).collect(),
                         idempotency_key: format!("{}:{expression}", packet.idempotency_key),
+                        receipt,
+                        depends_on: origin.into_iter().collect(),
                     });
                 }
                 Err(error) => work
@@ -847,12 +976,13 @@ impl SpecialistWorker {
         &self,
         packet: &ChildTaskPacket,
         policy: &EffectivePolicy,
+        session: &Session,
         cancel: &Stopping,
     ) -> Result<Work, String> {
         require(policy, ToolName::ValidateArtifact)?;
 
         let root = policy.inherited.workspace_root.clone();
-        let mut work = Work::of(ToolName::ValidateArtifact);
+        let mut work = Work::new();
         let mut reviewed = 0usize;
 
         for input in &packet.inputs {
@@ -884,6 +1014,14 @@ impl SpecialistWorker {
                     "{artifact_id} exists and is empty, so it is not a usable file."
                 )),
                 Ok(metadata) => {
+                    let receipt = self.receipt(
+                        packet,
+                        ToolName::ValidateArtifact,
+                        &format!("review:{artifact_id}@{revision}"),
+                        &format!("{artifact_id} revision {revision}: {} byte(s)", metadata.len()),
+                        &session.user.id,
+                        &mut work,
+                    );
                     work.findings.push(Finding {
                         statement: format!(
                             "{artifact_id} revision {revision} exists and holds {} byte(s).",
@@ -906,6 +1044,8 @@ impl SpecialistWorker {
                         confidence: Some(1.0),
                         causal_parents: Vec::new(),
                         idempotency_key: format!("{}:{artifact_id}", packet.idempotency_key),
+                        receipt,
+                        depends_on: Vec::new(),
                     });
                 }
                 Err(error) => work

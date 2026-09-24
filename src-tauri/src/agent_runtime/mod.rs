@@ -2012,7 +2012,17 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
                     }),
                 );
                 let outcome = recorded.replay();
-                record_call(deps, &call.run_id, tool.as_str(), &outcome);
+                // A replay is not a new call and writes no new event; the
+                // receipt, if any, is the first call's.
+                record_call(
+                    deps,
+                    &call.run_id,
+                    tool.as_str(),
+                    &outcome,
+                    &call.tool_call_id,
+                    None,
+                    Vec::new(),
+                );
                 // Counted like any other call. A replay still costs a turn and
                 // a slice of the context window, and a budget that did not
                 // count it is one a model repeating itself never reaches.
@@ -2088,6 +2098,9 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
     // the tool's own reply unkept. The file was there the whole time; nothing
     // had written down where.
     let mut written: Option<std::path::PathBuf> = None;
+    // The chunks a retrieval call returned, so each passage the run holds can
+    // be traced to the one call -- and the one durable event -- behind it.
+    let mut evidence_chunks: Vec<String> = Vec::new();
 
     let outcome = match tool {
         ToolName::CreateDocx => {
@@ -2131,13 +2144,18 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
         // [`retrieval`].
         ToolName::SearchDocuments => LocalToolRunner::new(deps.index.as_ref(), &session)
             .search_hits(&tool_call)
-            .map(|(query, hits)| retrieval::record(&deps.passages, &call.run_id, &query, &hits)),
+            .map(|(query, hits)| {
+                // Which chunks *this* call returned, for the receipt.
+                evidence_chunks = hits.iter().map(|hit| hit.chunk_id.clone()).collect();
+                retrieval::record(&deps.passages, &call.run_id, &query, &hits)
+            }),
         // Handled here for the same reason as search: a page pulled back later
         // is this run's evidence and has to be numbered against the same table,
         // or the marker the model cites will resolve to a different passage.
         ToolName::LoadMoreEvidence => LocalToolRunner::new(deps.index.as_ref(), &session)
             .region_hits(&tool_call)
             .map(|(_, from_page, to_page, hits)| {
+                evidence_chunks = hits.iter().map(|hit| hit.chunk_id.clone()).collect();
                 let name = hits
                     .first()
                     .map(|hit| hit.document_name.clone())
@@ -2342,8 +2360,19 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
             &tool_call,
         );
     }
-    record_call(deps, &call.run_id, tool.as_str(), &outcome);
-    remember_outcome(deps, &call, tool, resolved_path.as_deref(), &outcome);
+    // The durable event first, so the in-memory record can carry the receipt
+    // it was written as -- a child's findings name *this* event, not the first
+    // call, the parent run or whichever event happened to be last.
+    let recorded = remember_outcome(deps, &call, tool, resolved_path.as_deref(), &outcome);
+    record_call(
+        deps,
+        &call.run_id,
+        tool.as_str(),
+        &outcome,
+        &call.tool_call_id,
+        recorded,
+        evidence_chunks,
+    );
 
     // Counted whatever the tool returned. A failed call cost the same wall
     // clock and the same context window as a successful one, and a budget that
@@ -2756,6 +2785,9 @@ fn record_call(
     run_id: &str,
     tool: &str,
     outcome: &Result<String, String>,
+    tool_call_id: &str,
+    receipt: Option<(i64, String)>,
+    evidence_chunks: Vec<String>,
 ) {
     let record = match outcome {
         Ok(text) => tasks::ToolCallRecord::new(tool, tasks::CallOutcome::Succeeded, text),
@@ -2776,7 +2808,8 @@ fn record_call(
             };
             tasks::ToolCallRecord::new(tool, kind, reason)
         }
-    };
+    }
+    .receipted(tool_call_id, receipt, evidence_chunks);
 
     if let Ok(mut table) = deps.calls.lock() {
         table.entry(run_id.to_string()).or_default().push(record);

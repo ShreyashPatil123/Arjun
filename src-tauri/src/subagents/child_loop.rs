@@ -197,7 +197,10 @@ impl ChildLoop {
             "messageId": packet.child_id,
             "attemptId": packet.child_id,
             "agentId": packet.agent_id,
-            "definitionVersion": 0,
+            // The version the child was dispatched under, or null for a bundled
+            // profile, which has none. It was a literal 0 -- a plausible number
+            // standing in for one nobody had.
+            "definitionVersion": packet.definition_version,
             "prompt": objective_prompt(packet),
             "systemPrompt": system_prompt(packet, policy, instructions),
             // Deliberately empty. A child receives an objective and references,

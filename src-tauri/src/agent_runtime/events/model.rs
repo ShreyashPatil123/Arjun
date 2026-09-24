@@ -146,6 +146,14 @@ pub enum TaskEventType {
     MemoryPromoted,
     /// An item was removed, or lapsed past its retention.
     MemoryForgotten,
+    /// A memory item this run committed to the shared graph, delivered here by
+    /// the graph's outbox after the graph transaction committed.
+    ///
+    /// The bridge between two stores that cannot share a transaction: the graph
+    /// commits the item and an outbox row together, and a deliverer writes this
+    /// event with an id derived from the outbox key, so a redelivery after a
+    /// crash is refused as the duplicate it is. Carries ids and revisions only.
+    MemoryPublished,
 
     // -- Approval ---------------------------------------------------------
     ApprovalRequested,
@@ -288,6 +296,7 @@ impl TaskEventType {
             TaskEventType::MemoryRefused => "memory_refused",
             TaskEventType::MemoryPromoted => "memory_promoted",
             TaskEventType::MemoryForgotten => "memory_forgotten",
+            TaskEventType::MemoryPublished => "memory_published",
             TaskEventType::ApprovalRequested => "approval_requested",
             TaskEventType::ApprovalDecided => "approval_decided",
             TaskEventType::HookEvaluated => "hook_evaluated",
@@ -349,6 +358,7 @@ impl TaskEventType {
             "memory_refused" => TaskEventType::MemoryRefused,
             "memory_promoted" => TaskEventType::MemoryPromoted,
             "memory_forgotten" => TaskEventType::MemoryForgotten,
+            "memory_published" => TaskEventType::MemoryPublished,
             "approval_requested" => TaskEventType::ApprovalRequested,
             "approval_decided" => TaskEventType::ApprovalDecided,
             "hook_evaluated" => TaskEventType::HookEvaluated,

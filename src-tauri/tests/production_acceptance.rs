@@ -41,6 +41,7 @@ use sarathi_lib::identity::{Role, Session, User};
 use sarathi_lib::knowledge::graph::runtime_memory::{
     item_id, ArtifactRef, ItemStatus, MemoryItem, MemoryKind, MemoryScope, Provenance, SourceRef,
 };
+use sarathi_lib::knowledge::graph::receipts::{record_tool_receipt, ReceiptLedger};
 use sarathi_lib::knowledge::graph::runtime_store::{MemoryError, MemoryGraph};
 use sarathi_lib::policy::Classification;
 
@@ -122,7 +123,7 @@ fn definition(display_name: &str, colour: &str) -> AgentDefinition {
 
 struct Journey {
     graph: MemoryGraph,
-    events: TaskEventLog,
+    events: std::sync::Arc<TaskEventLog>,
     registry: AgentRegistry,
     _dir: tempfile::TempDir,
 }
@@ -130,12 +131,27 @@ struct Journey {
 impl Journey {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory");
+        let events = std::sync::Arc::new(TaskEventLog::in_memory().expect("an event log"));
         Self {
-            graph: MemoryGraph::in_memory().expect("a graph"),
-            events: TaskEventLog::in_memory().expect("an event log"),
+            // Receipts resolve against this journey's own event log, as they
+            // do in the application. Before P02 the graph admitted any receipt
+            // with a positive sequence number, and these steps named events 12
+            // and 19 that were never written.
+            graph: MemoryGraph::in_memory()
+                .expect("a graph")
+                .with_receipts(events.clone() as std::sync::Arc<dyn ReceiptLedger>),
+            events,
             registry: AgentRegistry::open(dir.path()).expect("a registry"),
             _dir: dir,
         }
+    }
+
+    /// A tool action actually recorded in this journey's event log, named as
+    /// the receipt an item rests on.
+    fn receipt(&self, tool: ToolName, action: &str, output: &str) -> Provenance {
+        record_tool_receipt(&self.events, RUN, tool, action, "ada", output)
+            .expect("the receipt is recorded")
+            .provenance()
     }
 
     fn task_scope() -> MemoryScope {
@@ -179,6 +195,10 @@ impl Journey {
             idempotency_key: None,
             created_at: AT.to_string(),
             updated_at: AT.to_string(),
+            basis: None,
+            depends_on: Vec::new(),
+            revoked_readers: Vec::new(),
+            authority: Default::default(),
         }
     }
 
@@ -252,11 +272,7 @@ fn step_2_a_records_a_fact_a_correction_and_a_versioned_artifact() {
         "agent-a",
         MemoryKind::Fact,
         "The seal torque for PV-2201 is 47.5 N.m at ambient.",
-        Provenance::ToolReceipt {
-            run_id: RUN.into(),
-            tool: "search_documents".into(),
-            event_seq: 12,
-        },
+        journey.receipt(ToolName::SearchDocuments, "search:pv-2201", "chunk-1\tpage 4"),
     );
     fact.sources = vec![SourceRef {
         sha256: SOURCE_SHA.into(),
@@ -312,11 +328,7 @@ fn step_2_a_records_a_fact_a_correction_and_a_versioned_artifact() {
         "agent-a",
         MemoryKind::ArtifactRef,
         "Commissioning note for PV-2201, revision 2.",
-        Provenance::ToolReceipt {
-            run_id: RUN.into(),
-            tool: "produce_artifact".into(),
-            event_seq: 19,
-        },
+        journey.receipt(ToolName::CreateDocx, "note:rev-2", "art-commissioning-note@2"),
     );
     artifact.artifacts = vec![ArtifactRef {
         artifact_id: "art-commissioning-note".into(),
@@ -349,11 +361,7 @@ fn step_3_b_reads_a_s_fact_and_artifact_through_authorised_memory_only() {
         "agent-a",
         MemoryKind::Fact,
         "The seal torque for PV-2201 is 47.5 N.m at ambient.",
-        Provenance::ToolReceipt {
-            run_id: RUN.into(),
-            tool: "search_documents".into(),
-            event_seq: 12,
-        },
+        journey.receipt(ToolName::SearchDocuments, "search:pv-2201", "chunk-1\tpage 4"),
     );
     fact.sources = vec![SourceRef {
         sha256: SOURCE_SHA.into(),
@@ -370,11 +378,7 @@ fn step_3_b_reads_a_s_fact_and_artifact_through_authorised_memory_only() {
         "agent-a",
         MemoryKind::ArtifactRef,
         "Commissioning note for PV-2201, revision 2.",
-        Provenance::ToolReceipt {
-            run_id: RUN.into(),
-            tool: "produce_artifact".into(),
-            event_seq: 19,
-        },
+        journey.receipt(ToolName::CreateDocx, "note:rev-2", "art-commissioning-note@2"),
     );
     artifact.artifacts = vec![ArtifactRef {
         artifact_id: "art-commissioning-note".into(),
@@ -936,11 +940,7 @@ fn step_7_invalidating_a_source_rejects_what_cited_it_and_keeps_it_labelled() {
         "agent-a",
         MemoryKind::Fact,
         "The seal torque for PV-2201 is 47.5 N.m at ambient.",
-        Provenance::ToolReceipt {
-            run_id: RUN.into(),
-            tool: "search_documents".into(),
-            event_seq: 12,
-        },
+        journey.receipt(ToolName::SearchDocuments, "search:pv-2201", "chunk-1\tpage 4"),
     );
     grounded.sources = vec![SourceRef {
         sha256: SOURCE_SHA.into(),

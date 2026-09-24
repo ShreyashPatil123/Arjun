@@ -211,6 +211,21 @@ pub struct ToolCallRecord {
     pub detail: String,
     /// RFC 3339, UTC.
     pub at: String,
+    /// The call's id in the runtime's protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The durable `tool_succeeded` / `tool_failed` event this call was recorded
+    /// as -- the receipt a finding built from it names. `None` for a call whose
+    /// event could not be written, and for a record from before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<i64>,
+    /// SHA-256 of the full output, as that event recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
+    /// For a retrieval, the chunks this call returned. What ties a passage the
+    /// run holds to the one call that retrieved it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_chunks: Vec<String>,
 }
 
 /// Longest tool result kept per call.
@@ -228,7 +243,27 @@ impl ToolCallRecord {
                 trimmed
             },
             at: chrono::Utc::now().to_rfc3339(),
+            tool_call_id: None,
+            event_seq: None,
+            output_sha256: None,
+            evidence_chunks: Vec::new(),
         }
+    }
+
+    /// Ties this record to the durable event it was written as.
+    pub fn receipted(
+        mut self,
+        tool_call_id: &str,
+        event: Option<(i64, String)>,
+        evidence_chunks: Vec<String>,
+    ) -> Self {
+        self.tool_call_id = Some(tool_call_id.to_string());
+        if let Some((seq, hash)) = event {
+            self.event_seq = Some(seq);
+            self.output_sha256 = Some(hash);
+        }
+        self.evidence_chunks = evidence_chunks;
+        self
     }
 }
 

@@ -364,12 +364,14 @@ fn every_declared_source_is_attempted_by_a_full_run() {
     let notebooks = NotebookStore::open(dir.path()).expect("a notebook store");
     let memories = PersistenceManager::new(dir.path()).expect("a memory store");
     let artifacts = ConversationArtifacts::open(dir.path()).expect("an artifact store");
+    let runtime_memory = crate::agent_runtime::memory::MemoryStore::open(dir.path());
 
     let stores = LegacyStores {
         agents: &registry,
         conversations: &conversations,
         notebooks: &notebooks,
         memories: &memories,
+        runtime_memory: &runtime_memory,
         artifacts: &artifacts,
         conversation_ids: &[],
     };

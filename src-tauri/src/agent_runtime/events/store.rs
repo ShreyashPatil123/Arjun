@@ -365,6 +365,28 @@ impl TaskEventLog {
         read_since(&conn, run_id, after_seq)
     }
 
+    /// One event, by run and sequence, read through the same checks as
+    /// [`Self::events_since`].
+    ///
+    /// `Ok(None)` is "there is no such event". An event that exists and cannot
+    /// be trusted -- an unknown type, a payload that no longer matches its seal
+    /// -- is `Err`, naming the problem: a receipt resolved against a rewritten
+    /// row must not verify, and must not look like a missing one either.
+    pub fn event_at(&self, run_id: &str, seq: i64) -> Result<Option<TaskEvent>, String> {
+        if seq <= 0 {
+            return Ok(None);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "the task event log is poisoned".to_string())?;
+        let page = read_since(&conn, run_id, seq - 1)?;
+        if let Some(problem) = page.unreadable.iter().find(|bad| bad.seq == seq) {
+            return Err(format!("event {seq} of run {run_id} cannot be trusted: {}", problem.problem));
+        }
+        Ok(page.events.into_iter().find(|event| event.seq == seq))
+    }
+
     /// The latest state of a run, without replaying its whole history.
     ///
     /// Reads the stored snapshot and folds only what has happened since. Falls

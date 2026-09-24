@@ -462,6 +462,26 @@
       "consumer": "frontend",
       "note": "Called from src/."
     },
+    "memory_graph_correct": {
+      "owner": "memory-graph",
+      "consumer": "frontend-pending",
+      "note": "A person correcting a memory item they can see, at the revision they read (plan P02). Operator provenance from the session; the correction carries the item's scope, classification and ACL; supersede, new revisions and staleness of everything derived from it land in one graph transaction; a moved revision is a conflict. The graph panel control that would call it is still to be built."
+    },
+    "memory_graph_history": {
+      "owner": "memory-graph",
+      "consumer": "frontend-pending",
+      "note": "Every revision of one memory item the caller may see, from the immutable version table (plan P02). Empty for an item the caller may not see now, which is the same answer as no such item. The node detail view that would call it is still to be built."
+    },
+    "memory_graph_neighbours": {
+      "owner": "memory-graph",
+      "consumer": "frontend-pending",
+      "note": "The links of one memory item inside the caller's authorised set, at most 200 (plan P02). An edge to an item the caller may not see is not returned at all. The expand-on-demand graph control that would call it is still to be built."
+    },
+    "memory_graph_revoke_reader": {
+      "owner": "memory-graph",
+      "consumer": "frontend-pending",
+      "note": "Administrator only. Withdraws one person's access to one memory item and to everything derived from it, as new revisions, so that person's window is told to drop its copy (plan P02). The administration control that would call it is still to be built."
+    },
     "memory_graph_snapshot": {
       "owner": "memory-graph",
       "consumer": "frontend",

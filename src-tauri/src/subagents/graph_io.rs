@@ -45,9 +45,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_runtime::memory::Acl;
 use crate::identity::Session;
+use crate::knowledge::graph::receipts::{Receipt, EVENTS_TARGET};
 use crate::knowledge::graph::runtime_memory::{
-    item_id, may_supersede, ArtifactRef, ItemStatus, MemoryItem, MemoryKind, MemoryScope,
-    Provenance, SourceRef,
+    item_id, may_supersede, ArtifactRef, Authority, Dependency, ItemStatus, MemoryItem,
+    MemoryKind, MemoryScope, Provenance, SourceRef,
 };
 use crate::knowledge::graph::runtime_store::MemoryGraph;
 use crate::policy::Classification;
@@ -174,6 +175,10 @@ pub struct Published {
     /// refused a supersede.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts_with: Vec<String>,
+    /// Where it landed: the task's shared memory, or this agent's private
+    /// scratch. A sibling can read only the first.
+    #[serde(default)]
+    pub scope: String,
 }
 
 impl Published {
@@ -187,9 +192,14 @@ impl Published {
                 self.conflicts_with.len()
             )
         };
+        let private = if self.scope.starts_with("scratch:") {
+            " in this agent's private scratch -- its definition does not share with the task"
+        } else {
+            ""
+        };
         format!(
-            "{} revision {} at graph revision {} ({}){}",
-            self.item_id, self.revision, self.graph_revision, self.status, conflict
+            "{} revision {} at graph revision {} ({}){}{}",
+            self.item_id, self.revision, self.graph_revision, self.status, private, conflict
         )
     }
 }
@@ -214,6 +224,17 @@ pub struct Claim {
     /// Supplied so a retry after a worker died is recognised as the same write
     /// rather than performed twice. Derived from the packet, not generated.
     pub idempotency_key: String,
+    /// The recorded call that produced *this* claim, and nothing else.
+    ///
+    /// Per claim, because a child that searched twice and calculated once made
+    /// three calls, and each finding rests on the one that returned it -- not
+    /// on the first call, the parent's run or whatever event happened last.
+    /// `None` means nothing outside a model backs it, and it is published as a
+    /// proposal. See `knowledge::graph::receipts`.
+    pub receipt: Option<Receipt>,
+    /// The shared items this claim was computed from, at the revisions they
+    /// were read at. Re-checked by the store at publication.
+    pub depends_on: Vec<Dependency>,
 }
 
 /// One worker's view of the task's shared memory.
@@ -228,6 +249,13 @@ pub struct TaskMemory {
     run_id: String,
     classification: Classification,
     project_id: Option<String>,
+    /// Whether what this agent publishes is readable by the task's other
+    /// agents, or kept in its own scratch. From the definition the child was
+    /// dispatched under (P01's `shared_with_task`); promotion beyond the task
+    /// is a separate, approved act and never happens here.
+    shared: bool,
+    /// The child's own run, whose tool events its receipts name.
+    child_run_id: Option<String>,
 }
 
 impl TaskMemory {
@@ -246,12 +274,43 @@ impl TaskMemory {
             run_id: run_id.into(),
             classification,
             project_id,
+            shared: true,
+            child_run_id: None,
         }
+    }
+
+    /// Publishes into this agent's private scratch rather than the task's
+    /// shared memory.
+    pub fn private(mut self) -> Self {
+        self.shared = false;
+        self
+    }
+
+    /// Names the child run whose tool events back this worker's receipts.
+    pub fn for_child(mut self, child_run_id: impl Into<String>) -> Self {
+        self.child_run_id = Some(child_run_id.into());
+        self
     }
 
     fn scope(&self) -> MemoryScope {
         MemoryScope::Task {
             task_id: self.task_id.clone(),
+        }
+    }
+
+    fn scratch(&self) -> MemoryScope {
+        MemoryScope::Scratch {
+            task_id: self.task_id.clone(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+
+    /// Where this agent's publications land.
+    fn publish_scope(&self) -> MemoryScope {
+        if self.shared {
+            self.scope()
+        } else {
+            self.scratch()
         }
     }
 
@@ -326,12 +385,26 @@ impl TaskMemory {
     /// [`MemoryGraph::snapshot`] filters by `readable_by` before anything comes
     /// back, so a worker with a narrower clearance than its parent genuinely
     /// sees less — which is the point of giving it one.
+    ///
+    /// The task's shared memory and this agent's own scratch -- never another
+    /// agent's scratch. What an agent keeps private is private from its
+    /// siblings; it is not private from itself.
     pub fn read(&self, session: &Session) -> Result<Vec<MemoryItem>, NotAvailable> {
-        self.graph
-            .snapshot(session, &self.scope(), self.project_id.as_deref())
-            .map_err(|error| NotAvailable::Storage {
+        let unavailable = |error: crate::knowledge::graph::runtime_store::MemoryError| {
+            NotAvailable::Storage {
                 detail: error.explain(),
-            })
+            }
+        };
+        let mut items = self
+            .graph
+            .snapshot(session, &self.scope(), self.project_id.as_deref())
+            .map_err(unavailable)?;
+        items.extend(
+            self.graph
+                .snapshot(session, &self.scratch(), self.project_id.as_deref())
+                .map_err(unavailable)?,
+        );
+        Ok(items)
     }
 
     /// Items of one kind, newest revision first.
@@ -356,27 +429,44 @@ impl TaskMemory {
 
     /// Writes one thing a worker established into the task's shared memory.
     ///
-    /// ## Why the provenance is a parameter and not a claim
+    /// ## Where the provenance comes from
     ///
-    /// Because it decides what the item may do. A `ToolReceipt` may correct a
-    /// model's guess; a `Model` proposal may not overwrite an established fact.
-    /// A worker that could name its own provenance could name the stronger one,
-    /// so the caller sets it from what actually happened — a receipt when the
-    /// durable log holds the event, a proposal otherwise.
+    /// From the claim's own receipt, and from nothing the worker says about
+    /// itself. A claim carrying the receipt of the call that produced it is
+    /// published as that receipt -- and the store resolves the receipt against
+    /// the event log before it admits anything. A claim with no receipt is a
+    /// model's proposal. There is no parameter through which a worker could
+    /// name the stronger provenance for a weaker claim.
+    ///
+    /// ## What else is committed with it
+    ///
+    /// An outbox row, in the same transaction, for the task event log: the
+    /// deliverer writes a `memory_published` event against the parent run once
+    /// the graph has committed. Publishing only after commit, and never losing
+    /// the record of a publication to a crash between two stores.
     pub fn publish(
         &self,
         claim: Claim,
-        provenance: Provenance,
         model_id: Option<String>,
         session: &Session,
     ) -> Result<Published, NotAvailable> {
+        let provenance = match &claim.receipt {
+            Some(receipt) => receipt.provenance(),
+            None => Provenance::Model {
+                model_id: model_id
+                    .clone()
+                    .unwrap_or_else(|| format!("worker:{}", self.agent_id)),
+                run_id: self.child_run_id.clone().unwrap_or_else(|| self.run_id.clone()),
+            },
+        };
+        let scope = self.publish_scope();
         let now = chrono::Utc::now().to_rfc3339();
         let mut item = MemoryItem {
             item_id: item_id(),
             revision: 1,
             kind: claim.kind,
             agent_id: self.agent_id.clone(),
-            scope: self.scope(),
+            scope: scope.clone(),
             classification: self.classification,
             acl: Acl::for_classification(self.classification, self.project_id.as_deref()),
             creator_model_id: model_id,
@@ -394,9 +484,13 @@ impl TaskMemory {
             supersedes: None,
             conflicts_with: Vec::new(),
             causal_parents: claim.causal_parents,
-            idempotency_key: Some(claim.idempotency_key),
+            idempotency_key: Some(claim.idempotency_key.clone()),
             created_at: now.clone(),
             updated_at: now,
+            basis: None,
+            depends_on: claim.depends_on,
+            revoked_readers: Vec::new(),
+            authority: Authority::Graph,
         };
 
         // Anything already in this task's memory that says something different
@@ -407,12 +501,30 @@ impl TaskMemory {
         let contradicted = contradictions(&item, &existing);
         item.conflicts_with = contradicted.clone();
 
-        let committed =
-            self.graph
-                .commit(item, None, &[])
-                .map_err(|error| NotAvailable::Storage {
-                    detail: error.explain(),
-                })?;
+        let effect = serde_json::json!({
+            "runId": self.run_id,
+            "event": {
+                "itemId": item.item_id,
+                "agentId": self.agent_id,
+                "kind": item.kind.as_str(),
+                "scope": scope.key(),
+                "childRunId": self.child_run_id,
+            },
+        });
+        let committed = self
+            .graph
+            .commit(
+                item,
+                None,
+                &[(
+                    EVENTS_TARGET.to_string(),
+                    format!("memory-published:{}", claim.idempotency_key),
+                    effect.to_string(),
+                )],
+            )
+            .map_err(|error| NotAvailable::Storage {
+                detail: error.explain(),
+            })?;
 
         Ok(Published {
             item_id: committed.item_id,
@@ -422,6 +534,7 @@ impl TaskMemory {
             because: committed.because,
             duplicate: committed.duplicate,
             conflicts_with: contradicted,
+            scope: scope.key(),
         })
     }
 }
@@ -504,15 +617,20 @@ mod tests {
             confidence: Some(0.9),
             causal_parents: Vec::new(),
             idempotency_key: key.to_string(),
+            receipt: Some(Receipt {
+                run_id: "child-run-1".into(),
+                tool: "knowledge.search_authorized".into(),
+                event_seq: 7,
+                output_sha256: "a".repeat(64),
+            }),
+            depends_on: Vec::new(),
         }
     }
 
-    fn receipt() -> Provenance {
-        Provenance::ToolReceipt {
-            run_id: "run-1".into(),
-            tool: "knowledge.search_authorized".into(),
-            event_seq: 7,
-        }
+    /// A claim nothing outside a model backs.
+    fn unbacked(mut claim: Claim) -> Claim {
+        claim.receipt = None;
+        claim
     }
 
     /// The acceptance case, in miniature: A publishes, B finds it by querying
@@ -526,7 +644,6 @@ mod tests {
         let published = a
             .publish(
                 claim("commissioning tag: the tag is VX-7741-QRT", "key-a"),
-                receipt(),
                 Some("model-a".into()),
                 &session,
             )
@@ -593,9 +710,9 @@ mod tests {
         let session = session();
         let a = memory(Arc::clone(&graph), "ag-retriever");
         let first = a
-            .publish(claim("tag: one", "key-1"), receipt(), None, &session)
+            .publish(claim("tag: one", "key-1"), None, &session)
             .expect("published");
-        a.publish(claim("other: two", "key-2"), receipt(), None, &session)
+        a.publish(claim("other: two", "key-2"), None, &session)
             .expect("published again");
 
         let refusal = a
@@ -620,7 +737,6 @@ mod tests {
         let a = memory(Arc::clone(&graph), "ag-retriever");
         a.publish(
             claim("seal torque: the seal torque is 47.5 N\u{b7}m", "key-a"),
-            receipt(),
             None,
             &session,
         )
@@ -630,11 +746,7 @@ mod tests {
         let b = memory(Arc::clone(&graph), "ag-checker");
         let theirs = b
             .publish(
-                claim("seal torque: the seal torque is 52.0 N\u{b7}m", "key-b"),
-                Provenance::Model {
-                    model_id: "model-b".into(),
-                    run_id: "run-1".into(),
-                },
+                unbacked(claim("seal torque: the seal torque is 52.0 N\u{b7}m", "key-b")),
                 Some("model-b".into()),
                 &session,
             )
@@ -659,10 +771,10 @@ mod tests {
         let a = memory(Arc::clone(&graph), "ag-retriever");
 
         let first = a
-            .publish(claim("tag: VX-1", "same-key"), receipt(), None, &session)
+            .publish(claim("tag: VX-1", "same-key"), None, &session)
             .expect("first");
         let again = a
-            .publish(claim("tag: VX-1", "same-key"), receipt(), None, &session)
+            .publish(claim("tag: VX-1", "same-key"), None, &session)
             .expect("retry");
 
         assert!(again.duplicate, "the retry was written a second time");
@@ -676,10 +788,10 @@ mod tests {
         let graph = Arc::new(MemoryGraph::in_memory().expect("a graph"));
         let session = session();
         memory(Arc::clone(&graph), "ag-a")
-            .publish(claim("tag: VX-1", "key-a"), receipt(), None, &session)
+            .publish(claim("tag: VX-1", "key-a"), None, &session)
             .expect("A");
         let theirs = memory(Arc::clone(&graph), "ag-b")
-            .publish(claim("tag: VX-1", "key-b"), receipt(), None, &session)
+            .publish(claim("tag: VX-1", "key-b"), None, &session)
             .expect("B");
         assert!(theirs.conflicts_with.is_empty(), "{theirs:?}");
     }

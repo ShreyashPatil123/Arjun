@@ -301,13 +301,30 @@ impl<'a> ContextCompiler<'a> {
         // Everything below ranks, expands and deduplicates inside this. A
         // ranking computed over rows the reader may not see changes what they
         // do see, which is a disclosure even when the returned rows are clean.
-        let authorised = self.graph.snapshot(
-            session,
-            &MemoryScope::Task {
-                task_id: scope.task_id.clone(),
-            },
-            scope.project_id.as_deref(),
-        )?;
+        //
+        // And read *at the cursor the scope was frozen at*, from the immutable
+        // versions -- P00 finding 1. This used to read the latest rows with a
+        // plain `snapshot` and label them `scope.graph_revision`, so a write
+        // landing between the freeze and the read was in the context under a
+        // revision that did not contain it, and a replay could never reproduce
+        // what the model saw. A scope with no frozen position reads the current
+        // graph atomically and records the cursor that read actually saw.
+        let task_scope = MemoryScope::Task {
+            task_id: scope.task_id.clone(),
+        };
+        let read = if scope.graph_revision > 0 {
+            self.graph.snapshot_as_of(
+                session,
+                &task_scope,
+                scope.project_id.as_deref(),
+                scope.graph_revision,
+            )?
+        } else {
+            self.graph
+                .snapshot_at(session, &task_scope, scope.project_id.as_deref())?
+        };
+        let read_at = read.cursor;
+        let authorised = read.items;
 
         let usable: Vec<&MemoryItem> = authorised
             .iter()
@@ -468,7 +485,9 @@ impl<'a> ContextCompiler<'a> {
         Ok(CompiledContext {
             manifest: base.with_compilation(
                 Some(GraphBinding {
-                    graph_revision: scope.graph_revision,
+                    // The cursor the read above actually saw, never a label
+                    // chosen before it.
+                    graph_revision: read_at,
                     selected,
                 }),
                 Some(BudgetRecord {
@@ -590,6 +609,7 @@ fn render(item: &MemoryItem) -> String {
         ItemStatus::Superseded => "superseded",
         ItemStatus::Rejected => "rejected",
         ItemStatus::Tombstoned => "removed",
+        ItemStatus::Stale => "stale — an input it rests on changed; revalidate before use",
     };
     format!("[{} · {}] {}", item.kind.as_str(), label, item.content)
 }
@@ -707,6 +727,10 @@ pub(crate) mod tests {
             idempotency_key: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            basis: None,
+            depends_on: Vec::new(),
+            revoked_readers: Vec::new(),
+            authority: Default::default(),
         };
         let committed = graph.commit(item.clone(), None, &[]).expect("commits");
         item.status = committed.status;
@@ -725,6 +749,7 @@ pub(crate) mod tests {
             run_id: "run-1".into(),
             tool: "artifact.create_approval_note".into(),
             event_seq: 42,
+            output_sha256: Some("c0ffee".into()),
         }
     }
 
@@ -992,6 +1017,55 @@ pub(crate) mod tests {
             .contains("keyword overlap"));
     }
 
+    /// P00 finding 1, closed: a context frozen at a revision is compiled from
+    /// what that revision held, not from the latest rows under its label.
+    ///
+    /// A fact is written, the scope is frozen, and then -- before the compile --
+    /// the fact is corrected and a new goal lands. The compiled context must
+    /// carry the original fact at its original revision and must not carry the
+    /// goal that arrived after the freeze; and a replay later, at the same
+    /// cursor, must produce the same selection.
+    #[test]
+    fn a_context_frozen_at_a_revision_reads_that_revision_and_not_the_latest() {
+        let graph = MemoryGraph::in_memory().expect("opens");
+        let fact = write(&graph, MemoryKind::Constraint, "pressures in bar", operator());
+        let frozen_at = graph.graph_revision().expect("a head");
+
+        // After the freeze: the constraint is corrected, and a goal appears.
+        let mut correction = fact.clone();
+        correction.item_id = crate::knowledge::graph::runtime_memory::item_id();
+        correction.kind = MemoryKind::Correction;
+        correction.content = "pressures in kPa".into();
+        graph.correct(correction, &fact.item_id).expect("corrected");
+        write(&graph, MemoryKind::Goal, "a goal written after the freeze", operator());
+        assert!(graph.graph_revision().expect("a head") > frozen_at);
+
+        let mut at = scope();
+        at.graph_revision = frozen_at;
+        let compile = || {
+            ContextCompiler::new(&graph)
+                .compile(&session("priya"), &at, base_manifest(), "pressure", &BTreeSet::new(), reserves())
+                .expect("compiles")
+        };
+        let compiled = compile();
+        let binding = compiled.manifest.graph.as_ref().expect("bound");
+        assert_eq!(binding.graph_revision, frozen_at, "labelled with a cursor it did not read at");
+        let ids: Vec<&str> = binding.selected.iter().map(|s| s.item_id.as_str()).collect();
+        assert_eq!(ids, vec![fact.item_id.as_str()], "the read was not the frozen revision: {ids:?}");
+        assert_eq!(binding.selected[0].revision, fact.revision, "the latest revision was read");
+
+        // Replayed: the same cursor gives the same selection.
+        let replay = compile();
+        assert_eq!(replay.manifest.graph, compiled.manifest.graph);
+
+        // And a position the graph has not reached is refused, not labelled.
+        let mut ahead = scope();
+        ahead.graph_revision = graph.graph_revision().expect("a head") + 50;
+        assert!(ContextCompiler::new(&graph)
+            .compile(&session("priya"), &ahead, base_manifest(), "x", &BTreeSet::new(), reserves())
+            .is_err());
+    }
+
     /// The manifest records the cursor, the selected revisions, the budget and
     /// the hashes — and re-seals over all of it.
     #[test]
@@ -999,8 +1073,13 @@ pub(crate) mod tests {
         let graph = MemoryGraph::in_memory().expect("opens");
         write(&graph, MemoryKind::Goal, "a goal", operator());
 
+        // Frozen at the head, as `context.refresh` freezes it. This test used to
+        // freeze at 412 on a graph whose head was 1 and assert the manifest said
+        // 412 -- which is the mislabelling P00 finding 1 describes, pinned as
+        // correct. A position the graph has not reached is now refused.
+        let head = graph.graph_revision().expect("a head");
         let mut at_revision = scope();
-        at_revision.graph_revision = 412;
+        at_revision.graph_revision = head;
         let compiled = ContextCompiler::new(&graph)
             .compile(
                 &session("priya"),
@@ -1019,7 +1098,7 @@ pub(crate) mod tests {
         assert!(manifest.has_graph_binding());
 
         let graph_binding = manifest.graph.as_ref().expect("bound");
-        assert_eq!(graph_binding.graph_revision, 412);
+        assert_eq!(graph_binding.graph_revision, head);
         assert_eq!(graph_binding.selected.len(), 1);
         assert_eq!(graph_binding.selected[0].reason, "mandatory");
         assert_eq!(graph_binding.selected[0].revision, 1);

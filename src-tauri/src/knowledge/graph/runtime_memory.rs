@@ -185,6 +185,15 @@ pub enum ItemStatus {
     /// The row stays so that edges pointing at it still resolve and an export
     /// can say something was removed rather than silently omitting it.
     Tombstoned,
+    /// Something it rests on changed after it was written.
+    ///
+    /// A fact it was derived from was corrected, a source it cites was
+    /// withdrawn, or a dependency it pinned moved on before it was published.
+    /// Readable -- a person needs to see what went stale -- and not usable as
+    /// evidence until something revalidates it against its new inputs. Plan §6:
+    /// "descendant artifacts and cached answers whose inputs changed become
+    /// stale and require revalidation."
+    Stale,
 }
 
 impl ItemStatus {
@@ -195,6 +204,7 @@ impl ItemStatus {
             Self::Superseded => "superseded",
             Self::Rejected => "rejected",
             Self::Tombstoned => "tombstoned",
+            Self::Stale => "stale",
         }
     }
 
@@ -205,8 +215,27 @@ impl ItemStatus {
             "superseded" => Self::Superseded,
             "rejected" => Self::Rejected,
             "tombstoned" => Self::Tombstoned,
+            "stale" => Self::Stale,
             _ => return None,
         })
+    }
+
+    /// Whether a change of an input should make an item in this state stale.
+    ///
+    /// Only what is still standing can go stale. Something already superseded,
+    /// rejected or tombstoned says so already, and overwriting that with
+    /// "stale" would lose the more specific answer.
+    pub fn can_go_stale(self) -> bool {
+        matches!(self, Self::Admitted | Self::Proposed)
+    }
+
+    /// Whether an item in this state no longer stands, so anything resting on
+    /// it has lost an input.
+    pub fn withdrawn(self) -> bool {
+        matches!(
+            self,
+            Self::Superseded | Self::Rejected | Self::Tombstoned | Self::Stale
+        )
     }
 
     /// Whether an answer may be built on this.
@@ -233,10 +262,20 @@ pub enum Provenance {
     /// `event_seq` names the row. Carrying the sequence rather than a boolean
     /// is what makes the claim checkable later: somebody auditing can go and
     /// read the event this was admitted from.
+    ///
+    /// `run_id` is the run that *made the call* -- for a worker, the child's
+    /// own run, never its parent's -- and `output_sha256` is the hash of what
+    /// the tool returned, as the event recorded it. Admission resolves all four
+    /// against the event log ([`super::receipts`]); a positive sequence number
+    /// on its own proves nothing, because anyone can write one.
     ToolReceipt {
         run_id: String,
         tool: String,
         event_seq: i64,
+        /// Absent on a receipt written before outputs were hashed, and then it
+        /// cannot be verified and is kept as a proposal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_sha256: Option<String>,
     },
     /// A model said it. Stays [`ItemStatus::Proposed`] until admitted.
     Model { model_id: String, run_id: String },
@@ -262,6 +301,111 @@ impl Provenance {
             Self::Migrated { .. } => "migrated",
         }
     }
+}
+
+/// What kind of knowing an item is.
+///
+/// Plan §6: preserve the distinction between *the source says X*, *a tool
+/// measured X*, *the model inferred X* and *a user supplied X*. Computed by the
+/// store from the provenance and the receipt's tool -- never chosen by the
+/// writer, because a writer that could label its own inference "measured"
+/// could launder it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Basis {
+    /// A retrieval tool returned passages that say this. The claim is what the
+    /// source says, not that it is true.
+    SourceText,
+    /// A tool computed, read or re-opened something and reported it.
+    Measured,
+    /// A model said it.
+    Inferred,
+    /// A person said it.
+    Supplied,
+    /// Brought across from a store that predates this one.
+    Carried,
+}
+
+impl Basis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceText => "sourceText",
+            Self::Measured => "measured",
+            Self::Inferred => "inferred",
+            Self::Supplied => "supplied",
+            Self::Carried => "carried",
+        }
+    }
+
+    /// The basis a provenance implies.
+    ///
+    /// A receipt from a tool that returns evidence (`knowledge.search_authorized`
+    /// and the other retrieval tools) is what a source says; a receipt from any
+    /// other tool is a measurement. Decided by the tool's contract, so a new
+    /// retrieval tool is classified by being registered as one.
+    pub fn of(provenance: &Provenance) -> Self {
+        match provenance {
+            Provenance::ToolReceipt { tool, .. } => {
+                match crate::orchestrator::tools::ToolName::from_str(tool) {
+                    Some(name)
+                        if crate::orchestrator::contract::output_of(name)
+                            == crate::orchestrator::contract::OutputKind::Evidence =>
+                    {
+                        Self::SourceText
+                    }
+                    _ => Self::Measured,
+                }
+            }
+            Provenance::Model { .. } => Self::Inferred,
+            Provenance::Operator { .. } => Self::Supplied,
+            Provenance::Migrated { .. } => Self::Carried,
+        }
+    }
+}
+
+/// An item this one rests on, at the revision it was read at.
+///
+/// The dependency set a result was computed from. Publication re-checks every
+/// pin: an input that moved on while the work was in flight makes the result
+/// stale rather than silently current. Plan §6: "Record the source-version
+/// dependency set, then withhold publication or mark the result stale."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dependency {
+    pub item_id: String,
+    pub revision: u64,
+}
+
+/// Which store is the authority for a record.
+///
+/// Explicit, per record, because until every legacy writer is routed through
+/// the graph some records here are *copies*: the legacy store is still written
+/// directly and is what is true. A graph write to such a record would be a
+/// second writer racing the first. See [`super::migration`] for the cutover
+/// that moves authority here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Authority {
+    /// The graph is the only writer.
+    #[default]
+    Graph,
+    /// A mirror of a legacy record. Only the migration may write it; a
+    /// correction belongs in the legacy store until the source is cut over.
+    Legacy { store: String },
+}
+
+/// What the event log said about a receipt, when it was asked.
+///
+/// Passed into [`admit`] rather than decided inside it: the rule lives here,
+/// the lookup lives with the storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptVerdict {
+    /// The item does not claim a receipt.
+    NotAReceipt,
+    /// The event exists, succeeded, names the same tool and the same output.
+    Verified,
+    /// It does not, and this says which part failed.
+    Refused { because: String },
 }
 
 /// Source bytes, at the version they were read at.
@@ -304,6 +448,14 @@ pub enum MemoryScope {
     Task { task_id: String },
     Workspace { project_id: String },
     User { user_id: String },
+    /// One agent's private working notes on one task.
+    ///
+    /// Where a child publishes when its definition does not share with the
+    /// task (P01's `shared_with_task`): committed, attributed and replayable
+    /// like anything else, and invisible to the task's other agents, which read
+    /// the `Task` scope. Sharing is a decision the definition makes, and
+    /// promotion to a project is a further one that needs a person.
+    Scratch { task_id: String, agent_id: String },
 }
 
 impl MemoryScope {
@@ -319,7 +471,34 @@ impl MemoryScope {
             Self::Task { task_id } => format!("task:{task_id}"),
             Self::Workspace { project_id } => format!("workspace:{project_id}"),
             Self::User { user_id } => format!("user:{user_id}"),
+            // The agent first, and `@` between: agent ids and task ids are
+            // generated or file-derived and hold neither `@` nor `:`.
+            Self::Scratch { task_id, agent_id } => format!("scratch:{agent_id}@{task_id}"),
         }
+    }
+
+    /// The inverse of [`Self::key`].
+    pub fn from_key(key: &str) -> Option<Self> {
+        let (kind, value) = key.split_once(':')?;
+        Some(match kind {
+            "task" => Self::Task {
+                task_id: value.to_string(),
+            },
+            "workspace" => Self::Workspace {
+                project_id: value.to_string(),
+            },
+            "user" => Self::User {
+                user_id: value.to_string(),
+            },
+            "scratch" => {
+                let (agent_id, task_id) = value.split_once('@')?;
+                Self::Scratch {
+                    task_id: task_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                }
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -375,6 +554,22 @@ pub struct MemoryItem {
     pub idempotency_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// What kind of knowing this is. Set by the store from the provenance --
+    /// see [`Basis::of`]. `None` on an item written before it existed; read it
+    /// through [`MemoryItem::basis`], which derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<Basis>,
+    /// The items this was computed from, at the revisions they were read at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<Dependency>,
+    /// People whose access to this one item was withdrawn, whatever their
+    /// roles. A per-reader revocation: narrower than an ACL change, and
+    /// recorded as a new revision so a reader's cached copy is dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_readers: Vec<String>,
+    /// Which store is the authority for this record. See [`Authority`].
+    #[serde(default)]
+    pub authority: Authority,
 }
 
 impl MemoryItem {
@@ -395,6 +590,12 @@ impl MemoryItem {
         if !self.is_readable() {
             return false;
         }
+        // A person whose access to this item was withdrawn does not get it
+        // back through a role, a project or an owner field. Checked first
+        // because it is the most specific rule there is.
+        if self.revoked_readers.iter().any(|user| user == &session.user.id) {
+            return false;
+        }
         // A user-scope item belongs to one person, whatever roles anybody else
         // holds. Checked before the ACL because it is the narrower rule and the
         // ACL's `owner` field is optional.
@@ -411,6 +612,12 @@ impl MemoryItem {
             }
         }
         self.acl.admits(session, project_id)
+    }
+
+    /// What kind of knowing this is, derived for an item written before the
+    /// field existed.
+    pub fn basis(&self) -> Basis {
+        self.basis.unwrap_or_else(|| Basis::of(&self.provenance))
     }
 
     /// Whether this item is expired at the given instant.
@@ -483,14 +690,24 @@ pub struct AdmissionOutcome {
 /// | Provenance | Outcome |
 /// |---|---|
 /// | operator | admitted — a person is the authority this defers to |
-/// | tool receipt | admitted, if the receipt names a run, a tool and an event |
+/// | tool receipt | admitted **only if** the event log verified it: the event exists, is a success, names the same tool and the same output hash |
 /// | migrated | admitted — it was established under the old store's rules |
 /// | model | **proposed**, always |
 ///
 /// A model's confidence does not enter into it. A model that is certain and
 /// wrong is the ordinary failure this exists to contain, and letting a number
 /// the model chose decide whether the model is believed would be circular.
-pub fn admit(item: &MemoryItem) -> AdmissionOutcome {
+///
+/// ## Why the receipt is judged outside this function
+///
+/// It used to be judged here, by shape: a positive sequence number, a tool
+/// name and a run id were enough. Any writer can produce those, and the
+/// worker that published every finding did -- with `event_seq: 0` on the
+/// parent's run id, which this rule correctly refused, and which a one-line
+/// "fix" to a positive number would have turned into manufactured
+/// corroboration. So the shape check stays, as the first gate, and the
+/// verdict comes from the event log ([`super::receipts`]).
+pub fn admit(item: &MemoryItem, receipt: &ReceiptVerdict) -> AdmissionOutcome {
     match &item.provenance {
         Provenance::Operator { user_id } => AdmissionOutcome {
             status: ItemStatus::Admitted,
@@ -500,24 +717,42 @@ pub fn admit(item: &MemoryItem) -> AdmissionOutcome {
             run_id,
             tool,
             event_seq,
+            output_sha256,
         } => {
             // A receipt has to name something checkable. A sequence of zero is
             // what an unset field looks like, and admitting on it would let a
             // caller manufacture corroboration by leaving a field blank.
-            if *event_seq > 0 && !tool.is_empty() && !run_id.is_empty() {
-                AdmissionOutcome {
+            let named = *event_seq > 0
+                && !tool.is_empty()
+                && !run_id.is_empty()
+                && output_sha256.as_deref().is_some_and(|hash| !hash.is_empty());
+            match (named, receipt) {
+                (true, ReceiptVerdict::Verified) => AdmissionOutcome {
                     status: ItemStatus::Admitted,
                     because: format!(
-                        "{tool} succeeded in run {run_id}, recorded at event {event_seq}"
+                        "{tool} succeeded in run {run_id}, recorded at event {event_seq}, and the \
+                         event log holds that exact output"
                     ),
-                }
-            } else {
-                AdmissionOutcome {
+                },
+                (false, _) => AdmissionOutcome {
                     status: ItemStatus::Proposed,
-                    because: "this claims a tool receipt and does not name the event that would \
-                              corroborate it, so it is kept as a proposal"
+                    because: "this claims a tool receipt and does not name the run, tool, event \
+                              and output that would corroborate it, so it is kept as a proposal"
                         .to_string(),
-                }
+                },
+                (true, ReceiptVerdict::Refused { because }) => AdmissionOutcome {
+                    status: ItemStatus::Proposed,
+                    because: format!(
+                        "this claims {tool} event {event_seq} in run {run_id}, and the event log \
+                         does not back it ({because}), so it is kept as a proposal"
+                    ),
+                },
+                (true, ReceiptVerdict::NotAReceipt) => AdmissionOutcome {
+                    status: ItemStatus::Proposed,
+                    because: "this claims a tool receipt that was never checked against the \
+                              event log, so it is kept as a proposal"
+                        .to_string(),
+                },
             }
         }
         Provenance::Migrated {
@@ -619,6 +854,10 @@ pub(crate) mod tests {
             idempotency_key: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            basis: None,
+            depends_on: Vec::new(),
+            revoked_readers: Vec::new(),
+            authority: Authority::Graph,
         }
     }
 
@@ -629,11 +868,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// A receipt of the right shape. Whether it is *backed* is a separate
+    /// question the event log answers; see `receipts`.
     pub(crate) fn receipt() -> Provenance {
         Provenance::ToolReceipt {
             run_id: "run-1".into(),
             tool: "knowledge.search_authorized".into(),
             event_seq: 42,
+            output_sha256: Some("c0ffee".into()),
         }
     }
 
@@ -646,7 +888,7 @@ pub(crate) mod tests {
     /// The headline rule: a model asserting something does not make it so.
     #[test]
     fn a_model_assertion_stays_a_proposal() {
-        let outcome = admit(&item(MemoryKind::Fact, model()));
+        let outcome = admit(&item(MemoryKind::Fact, model()), &ReceiptVerdict::NotAReceipt);
         assert_eq!(outcome.status, ItemStatus::Proposed);
         assert!(outcome.because.contains("corroborates"));
     }
@@ -656,17 +898,40 @@ pub(crate) mod tests {
     fn confidence_does_not_admit_anything() {
         let mut confident = item(MemoryKind::Fact, model());
         confident.confidence = Some(1.0);
-        assert_eq!(admit(&confident).status, ItemStatus::Proposed);
+        assert_eq!(
+            admit(&confident, &ReceiptVerdict::Verified).status,
+            ItemStatus::Proposed,
+            "a model was admitted because something said 'verified'"
+        );
     }
 
     #[test]
-    fn a_tool_receipt_is_admitted_and_names_the_event() {
-        let outcome = admit(&item(MemoryKind::ToolObservation, receipt()));
+    fn a_verified_tool_receipt_is_admitted_and_names_the_event() {
+        let outcome = admit(
+            &item(MemoryKind::ToolObservation, receipt()),
+            &ReceiptVerdict::Verified,
+        );
         assert_eq!(outcome.status, ItemStatus::Admitted);
         assert!(outcome.because.contains("event 42"), "{}", outcome.because);
     }
 
-    /// A receipt that names nothing checkable is not a receipt.
+    /// Plan P02: a positive integer alone is not proof. A well-formed receipt
+    /// the event log did not back, or that nobody checked, stays a proposal.
+    #[test]
+    fn a_well_formed_receipt_the_log_does_not_back_is_a_proposal() {
+        for verdict in [
+            ReceiptVerdict::NotAReceipt,
+            ReceiptVerdict::Refused {
+                because: "no such event".into(),
+            },
+        ] {
+            let outcome = admit(&item(MemoryKind::ToolObservation, receipt()), &verdict);
+            assert_eq!(outcome.status, ItemStatus::Proposed, "{verdict:?}");
+        }
+    }
+
+    /// A receipt that names nothing checkable is not a receipt, whatever the
+    /// verdict says.
     #[test]
     fn a_receipt_with_no_event_behind_it_is_not_corroboration() {
         for provenance in [
@@ -674,20 +939,33 @@ pub(crate) mod tests {
                 run_id: "run-1".into(),
                 tool: "create_docx".into(),
                 event_seq: 0,
+                output_sha256: Some("aa".into()),
             },
             Provenance::ToolReceipt {
                 run_id: "run-1".into(),
                 tool: String::new(),
                 event_seq: 7,
+                output_sha256: Some("aa".into()),
             },
             Provenance::ToolReceipt {
                 run_id: String::new(),
                 tool: "create_docx".into(),
                 event_seq: 7,
+                output_sha256: Some("aa".into()),
+            },
+            Provenance::ToolReceipt {
+                run_id: "run-1".into(),
+                tool: "create_docx".into(),
+                event_seq: 7,
+                output_sha256: None,
             },
         ] {
             assert_eq!(
-                admit(&item(MemoryKind::ToolObservation, provenance)).status,
+                admit(
+                    &item(MemoryKind::ToolObservation, provenance),
+                    &ReceiptVerdict::Verified
+                )
+                .status,
                 ItemStatus::Proposed,
                 "an unverifiable receipt was admitted"
             );
@@ -697,9 +975,86 @@ pub(crate) mod tests {
     #[test]
     fn a_person_is_admitted_directly() {
         assert_eq!(
-            admit(&item(MemoryKind::Correction, operator())).status,
+            admit(
+                &item(MemoryKind::Correction, operator()),
+                &ReceiptVerdict::NotAReceipt
+            )
+            .status,
             ItemStatus::Admitted
         );
+    }
+
+    /// Plan §6: what a source says, what a tool measured, what a model
+    /// inferred and what a person supplied are four different things.
+    #[test]
+    fn the_basis_is_derived_from_what_happened_and_not_chosen() {
+        assert_eq!(Basis::of(&receipt()), Basis::SourceText);
+        assert_eq!(
+            Basis::of(&Provenance::ToolReceipt {
+                run_id: "r".into(),
+                tool: "calculation.evaluate_with_units".into(),
+                event_seq: 1,
+                output_sha256: Some("a".into()),
+            }),
+            Basis::Measured
+        );
+        assert_eq!(Basis::of(&model()), Basis::Inferred);
+        assert_eq!(Basis::of(&operator()), Basis::Supplied);
+        // An item written before the field existed still has an answer.
+        let old = item(MemoryKind::Fact, model());
+        assert_eq!(old.basis, None);
+        assert_eq!(old.basis(), Basis::Inferred);
+    }
+
+    /// A reader whose access to one item was withdrawn cannot read it, whatever
+    /// roles they hold.
+    #[test]
+    fn a_revoked_reader_cannot_read_the_item_and_others_still_can() {
+        let mut shared = item(MemoryKind::Fact, operator());
+        shared.revoked_readers = vec!["priya".into()];
+        assert!(!shared.readable_by(&session("priya", vec![Role::Administrator]), None));
+        assert!(shared.readable_by(&session("ravi", vec![Role::Employee]), None));
+    }
+
+    #[test]
+    fn a_scratch_scope_key_round_trips() {
+        let scratch = MemoryScope::Scratch {
+            task_id: "task-9".into(),
+            agent_id: "ag-3".into(),
+        };
+        assert_eq!(scratch.key(), "scratch:ag-3@task-9");
+        assert_eq!(MemoryScope::from_key(&scratch.key()), Some(scratch));
+        for scope in [
+            MemoryScope::Task { task_id: "t".into() },
+            MemoryScope::Workspace { project_id: "p".into() },
+            MemoryScope::User { user_id: "u".into() },
+        ] {
+            assert_eq!(MemoryScope::from_key(&scope.key()), Some(scope));
+        }
+    }
+
+    /// A body written before P02's fields existed still reads.
+    #[test]
+    fn an_item_written_before_the_p02_fields_still_reads() {
+        let mut body = serde_json::to_value(item(MemoryKind::Fact, receipt())).expect("serialises");
+        let fields = body.as_object_mut().expect("object");
+        for added in ["basis", "dependsOn", "revokedReaders", "authority"] {
+            fields.remove(added);
+        }
+        // Snake case: `rename_all` on this enum renames its variants, not the
+        // fields inside them, which is how `event_seq` was always stored too.
+        let provenance = fields["provenance"].as_object_mut().expect("provenance");
+        assert!(
+            provenance.remove("output_sha256").is_some(),
+            "the fixture did not carry an output hash to remove"
+        );
+        let read: MemoryItem = serde_json::from_value(body).expect("an old body reads");
+        assert_eq!(read.authority, Authority::Graph);
+        assert!(read.depends_on.is_empty() && read.revoked_readers.is_empty());
+        assert!(matches!(
+            read.provenance,
+            Provenance::ToolReceipt { output_sha256: None, .. }
+        ));
     }
 
     /// A proposal is retrievable — that is how somebody finds out the model
@@ -885,9 +1240,11 @@ pub(crate) mod tests {
             ItemStatus::Superseded,
             ItemStatus::Rejected,
             ItemStatus::Tombstoned,
+            ItemStatus::Stale,
         ] {
             assert_eq!(ItemStatus::parse(status.as_str()), Some(status));
         }
+        assert!(!ItemStatus::Stale.usable_as_evidence(), "a stale item was offered as evidence");
         assert_eq!(MemoryKind::parse("nonsense"), None);
     }
 

@@ -178,8 +178,8 @@ model-facing tool calls in this build (P05/P11).
 | every tool but delegation and the sandbox | `ToolSpec::timeout` bounds the runtime's *wait*; the Rust handler is not interrupted. | P03 |
 | `model_policy` | The definition's eligible set is recorded (`within_eligible`) and not enforced by routing. | P03 |
 | `skills` on the packet | Pinned and traced; the child loop does not load skills. | P05 |
-| `shared_with_task` | Carried on the packet; not enforced at publication (plan §3 finding 8). | P02 |
-| receipts | `ReceiptRef` refuses sequence 0; workers still publish no receipt (§3 finding 2). | P02 |
+| `shared_with_task` | **Closed in P02**: enforced at publication (task scope or the agent's private scratch). | — |
+| receipts | **Closed in P02**: each finding carries the receipt of its own call, resolved against the event log before admission. | — |
 | `SubagentManager::recall` | A replayed result is rebuilt with schema `retrieval` whatever the original was. | P02/P05 |
 | idempotency key | Derived from the dispatch key as given, so the same agent named by role key and by `ag-` id yields two keys. | P05 |
 | `artifact.create_flowchart` | Resolved by Rust, unknown to the runtime's alias table. | — |

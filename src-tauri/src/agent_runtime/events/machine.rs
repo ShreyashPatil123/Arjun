@@ -428,6 +428,9 @@ pub fn advance(current: RunState, event: TaskEventType) -> Transition {
         | E::MemoryRefused
         | E::MemoryPromoted
         | E::MemoryForgotten
+        // Delivered by the graph's outbox, possibly after the run has moved
+        // on. A record that something was published, not a step of the run.
+        | E::MemoryPublished
         // A subagent starting and stopping happens *within* whatever the parent
         // is doing. It does not move the parent's own state, and treating it as
         // a transition would make a fan-out of four readers look like four

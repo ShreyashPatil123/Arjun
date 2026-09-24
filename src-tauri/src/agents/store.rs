@@ -778,7 +778,15 @@ impl AgentRegistry {
             denied_tools: profile.disallowed_tools.clone(),
             memory: MemoryPolicy {
                 scope: profile.memory_scope,
-                shared_with_task: false,
+                // What every bundled worker has always done: publish its
+                // findings to the task, where a sibling reads them. This was
+                // hard-coded `false` while nothing read it (plan §3 finding 8);
+                // P02 enforces it, so an import now records the role's real
+                // behaviour. Rows imported earlier keep what they stored -- a
+                // stored `false` may be a person's choice, and nothing here can
+                // tell it from the old default -- and the Agents screen is where
+                // it is changed.
+                shared_with_task: true,
             },
             models: ModelBinding {
                 default_model_id: None,

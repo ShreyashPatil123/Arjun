@@ -34,7 +34,10 @@ pub mod migration;
 #[cfg(test)]
 mod migration_tests;
 pub mod notes;
+#[cfg(test)]
+mod p02_tests;
 pub mod persist;
+pub mod receipts;
 pub mod relations;
 pub mod render;
 pub mod research;

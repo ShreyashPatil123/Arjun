@@ -811,6 +811,47 @@ impl MemoryStore {
         })
     }
 
+    /// Every durable item on disk, read straight from the files, for the graph
+    /// migration.
+    ///
+    /// Bypasses recall on purpose: recall answers "what may this person see",
+    /// and a migration has to move *everything* -- each item keeps its own ACL
+    /// in the graph, and it is the graph's reads that apply it. A file that
+    /// cannot be read is named, never skipped silently. Writes nothing.
+    pub fn durable_items_on_disk(&self) -> (Vec<MemoryItem>, Vec<String>) {
+        let Some(root) = &self.root else {
+            return (Vec::new(), Vec::new());
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            // No directory is an installation that has never remembered
+            // anything durable, which is not an error.
+            return (Vec::new(), Vec::new());
+        };
+        let mut items = Vec::new();
+        let mut unreadable = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|body| {
+                    serde_json::from_slice::<Vec<MemoryItem>>(&body).map_err(|e| e.to_string())
+                }) {
+                Ok(read) => items.extend(read),
+                Err(error) => unreadable.push(format!("memory/{name}: {error}")),
+            }
+        }
+        (items, unreadable)
+    }
+
     /// Reads a durable scope's file the first time it is asked for.
     fn load_if_needed(&self, scope: &MemoryScope) {
         if !scope.is_durable() {

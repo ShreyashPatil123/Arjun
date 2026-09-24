@@ -31,7 +31,7 @@ prompts P00–P16. One ledger, updated at the end of each phase.
 |---|---|---|
 | P00 | Baseline, inventory, executable acceptance fixtures | **Complete** — see below |
 | P01 | Agent definitions, jobs, tool/result contracts | **Complete** (portable code and deterministic tests; no native gate) — see below |
-| P02 | Shared memory correctness and authority | In progress |
+| P02 | Shared memory correctness and authority | **Complete for the graph, receipts, versions, outbox, sharing and the sixth legacy store**; cutover of the other five legacy writers and graph-backed agent recall remain open — see below |
 | P03–P16 | — | Not started |
 
 ---
@@ -475,3 +475,142 @@ tool loading (P03) is the remedy; nothing here measured it.
 **Exact next step:** P02 — begin at `subagents/worker.rs:391`, which publishes
 `event_seq: 0`, and at `knowledge/graph/runtime_memory.rs:507`, which admits only
 `event_seq > 0`; the receipt must name the child's own successful tool event.
+
+---
+
+# P02 — Shared memory, provenance and graph authority
+
+Worked on 2026-09-24, on `main` at HEAD `b9ff7fb`, uncommitted, on top of P01.
+Raw output: `evidence/agent-system/P02/log_checks.txt`.
+
+## Found before changing anything
+
+| # | Finding | Where |
+|---|---|---|
+| 1 | P00 finding 2, and wider: the four mechanical worker routines wrote **no tool event at all**; the model path pinned every claim to the *first* tool the child called, on the *parent's* run, at `event_seq: 0`. | `subagents/worker.rs` |
+| 2 | `admit()` accepted any positive `event_seq` with a tool and run id beside it — a number anybody can write. | `knowledge/graph/runtime_memory.rs` |
+| 3 | P00 finding 1: the context compiler read the **latest** rows with a plain `snapshot` and labelled them with a cursor frozen earlier. | `agent_runtime/context_compiler.rs` |
+| 4 | Items were upserted in place with no version history; supersede, tombstone and source invalidation changed `status`/`body` **without moving the revision**, so an optimistic writer could not see the change. | `runtime_store.rs` |
+| 5 | `correct()` was two transactions; a crash between them left a correction and the fact it corrected both current. | `runtime_store.rs` |
+| 6 | The outbox table existed and **nothing ever drained it**. | `runtime_store.rs` |
+| 7 | `migrate_all` has **no production caller**, and the store `memory_api` answers from (`<app data>/memory/*.json`) was **not one of its five sources** — the sixth store its own docs predicted. | `migration.rs`, `agent_runtime/memory.rs` |
+| 8 | P00 finding 8: `shared_with_task` was carried by P01 and enforced nowhere; the registry import hard-coded `false`. | `agents/store.rs` |
+| 9 | `child_loop` sent `"definitionVersion": 0` to the runtime — a plausible number for one nobody had. | `subagents/child_loop.rs` |
+
+## Implemented
+
+| Area | Change |
+|---|---|
+| Receipts resolved in storage | `knowledge/graph/receipts.rs` (new): `ReceiptLedger::verify` reads the event back and requires it to exist, be `tool_succeeded`, name the same tool (either spelling) and record the same output hash. `MemoryGraph` asks before admitting; with no ledger in reach **nothing** is admitted by receipt. `Provenance::ToolReceipt` carries `output_sha256`. |
+| One receipt per finding | Each mechanical action records its own `tool_succeeded` event on the **child's** run (`record_tool_receipt`, idempotent per action). On the model path `remember_outcome` now returns the event it wrote, and `ToolCallRecord` carries `eventSeq`, `outputSha256`, `toolCallId` and, for retrievals, the chunk ids that call returned — so each passage is tied to the one search that returned it. `Claim.receipt` is per claim; `Work.tool` is gone. |
+| Source / measured / inferred / supplied | `Basis` computed by the store from provenance and the tool's contract (`SourceText` for evidence tools, `Measured` for others, `Inferred`, `Supplied`, `Carried`); never chosen by the writer. |
+| Versions and historical reads | `agent_memory_versions` (immutable, backfilled once), one `write_revision` path every change goes through (row + version + dependency index + feed entry, one transaction), `snapshot_as_of(cursor)` and `versions_of`. A cursor ahead of the head is refused. |
+| Compiler cursor (finding 1) | Reads `snapshot_as_of(frozen cursor)` or the atomic `snapshot_at`, and records the cursor actually read. |
+| Correction, staleness, revocation | `correct`/`correct_at` in one transaction with an optional expected revision; `Stale` status; staleness propagated transitively through pinned dependencies and `derivedFrom`/`cites` edges on correction, tombstone, source invalidation, migration re-sync and rollback; `revoke_reader` (per-reader, propagated to derived items, new revisions so the feed drops them). |
+| Dependency revalidation | `MemoryItem.depends_on` pins; at commit each pin is re-read — moved, withdrawn or missing inputs publish the result **stale** with the reason; the calculation checker pins the shared items its expressions came from. |
+| Derived restrictions | At commit a derived item takes the intersection of cleared roles, the input's project and owner (two different ones are refused), a non-`Internal` classification, and every revoked reader. |
+| Per-record authority | `Authority::{Graph, Legacy{store}}`; migrated copies are `Legacy`, and a graph write or correction to one is refused until its store is cut over. |
+| Outbox | `deliver_pending` + `record_delivery_failure` (attempts, last error); `TaskEventLog` is the `events` consumer, writing a new `memory_published` event whose id is derived from the outbox key — a redelivery is refused as a duplicate. Delivered at start-up and after every commit (`lib.rs`). Each worker publication commits its outbox row in the same transaction as the item. |
+| Sharing | `MemoryScope::Scratch{task, agent}`; a worker publishes to the task only when its pinned definition shares (`packet.shared_with_task`), otherwise to its own scratch, which it reads and its siblings do not. Import now records `sharedWithTask: true`. |
+| Migration | `LegacySource::RuntimeScopedMemory` (sixth store) with `durable_items_on_disk`; `upsert_migrated` (Inserted / Unchanged / Updated / Restored); orphan retirement; `rollback_source`; `verify_runtime_scoped_memory`; a run ledger (`agent_memory_migration_runs`); the sixth store is mirrored at every start-up. |
+| Service | Tauri commands `memory_graph_neighbours` (≤ 200, inside the authorised set), `memory_graph_history`, `memory_graph_correct` (operator provenance from the session, at the revision read) and `memory_graph_revoke_reader` (administrators). IPC 172 → 176, all four `frontend-pending`. |
+
+## Migration and rollback notes
+
+- **Schema changes are additive only.** Three new tables, three new columns; no
+  row is dropped or rewritten. A database from before P02 opens, gains the tables,
+  and has each existing item's *current* body backfilled as its one known version
+  — earlier revisions were never stored and are not invented.
+- **Restartable.** Every migrated record is addressed by
+  `migrated_item_id(store, legacy_id)`; a pass interrupted part-way is simply run
+  again. The run ledger shows a pass with no `finished_at`.
+- **Reversible without deletion.** `rollback_source(source)` tombstones each record
+  migrated from that source as a new revision and marks what was derived from them
+  stale. The legacy store was never written by the migration and remains the
+  authority; running the migration again restores each record (`Restored`).
+- **Verified before any cutover.** `verify_runtime_scoped_memory` reports records
+  missing, differing, orphaned or rolled back; `clean()` is the precondition for
+  retiring that legacy writer. **No legacy writer has been retired**: every
+  migrated record is `Authority::Legacy`, and the graph refuses to write it.
+- **A legacy change is followed, not overwritten**: a changed value is a new
+  revision (`Updated`), a vanished record is tombstoned (`retired`) — only when
+  every legacy file was read, since an unreadable file is not evidence of absence.
+- **Existing registry rows keep `sharedWithTask: false`** where the old import
+  wrote it. That value now takes effect: those agents publish to their own scratch
+  and their results say so. An administrator turns sharing on per agent on the
+  Agents screen; nothing flips it automatically, because a stored `false` may be a
+  person's choice.
+
+## Tests
+
+| Property named by the plan | Test |
+|---|---|
+| A publishes a real observation; B reads its version | `subagents::worker_tests::a_publishes_real_observations_each_on_its_own_receipt_and_b_reads_that_version` (production delegation path; two findings, two distinct verified receipts on the child run; B reads the version at the revision it landed) and `…::a_retrieval_is_published_as_source_text_on_its_own_search` |
+| conflicting updates do not overwrite silently | `knowledge::graph::p02_tests::a_write_against_a_revision_that_moved_is_a_named_conflict` |
+| correction invalidates an artifact | `…::a_correction_makes_everything_derived_from_the_corrected_fact_stale` (transitive, versions kept, feed told), `…::a_result_whose_input_moved_during_the_work_is_published_stale` |
+| denied users see no hidden data or metadata | `…::a_revoked_reader_sees_nothing_of_the_item_on_any_path` (snapshot, historical read, history, neighbours, count, feed), `…::a_derived_record_inherits_the_restrictions_of_its_inputs` |
+| failed outbox delivery recovers once after restart | `…::a_failed_delivery_is_recovered_exactly_once_after_a_restart` (file-backed; reopened; redelivery absorbed), `subagents::worker_tests::a_publication_reaches_the_parent_run_through_the_outbox` |
+| repeat migration does not duplicate rows | `…::the_migration_is_repeatable_verifiable_and_reversible`, `…::a_changed_or_removed_legacy_record_is_found_and_followed_by_the_next_pass` |
+| invalid receipts remain proposals | `subagents::worker_tests::a_receipt_the_event_log_does_not_back_stays_a_proposal` (missing event, failed call, wrong tool), `…::only_a_receipt_resolved_in_the_event_log_admits` (tampered hash, no log), `knowledge::graph::receipts::tests::*` |
+| cursor honesty (P00 finding 1) | `agent_runtime::context_compiler::tests::a_context_frozen_at_a_revision_reads_that_revision_and_not_the_latest`, `…::a_read_as_of_a_cursor_is_that_cursor_and_not_the_latest_rows` |
+| scratch versus task | `subagents::worker_tests::a_definition_that_does_not_share_publishes_privately` |
+| older records | `knowledge::graph::runtime_memory::tests::an_item_written_before_the_p02_fields_still_reads` |
+
+Two existing tests encoded the defects and were changed to prove the fix
+instead: the compiler test that froze at 412 on a graph whose head was 1, and
+`production_acceptance` step 2, which asserted that a receipt naming events 12
+and 19 — never written — was "corroborated". Its journey now records real
+receipts and resolves them.
+
+**Seen failing.** With the receipt refusal turned into a pass and staleness
+propagation disabled, `a_receipt_the_event_log_does_not_back_stays_a_proposal`,
+`only_a_receipt_resolved_in_the_event_log_admits` and
+`a_correction_makes_everything_derived_from_the_corrected_fact_stale` all failed;
+restored, all pass.
+
+## Checks run
+
+| Check | Result |
+|---|---|
+| `cargo test --lib --no-fail-fast` (final) | **2735 passed, 0 failed**, 3 ignored |
+| `cargo test --test production_acceptance --test production_hardening` | 12 passed · 8 passed |
+| `npm run check:targets` | pass |
+| `node scripts/check-ipc.mjs` | pass — 176 commands (20 frontend-pending) |
+
+Not re-run in P02 because nothing they cover changed: the runtime TypeScript
+suite, the UI suite, `check-reachable`, `check-egress`, `check-no-lora`, the
+baseline harness. P02 changed no TypeScript and no network path.
+
+## Unverified, open or deliberately left
+
+| What | State | Owner |
+|---|---|---|
+| Cutover of the other five legacy sources | `migrate_all` still has no production caller; their writers are live and authoritative. Only the sixth store is mirrored at start-up. | P14 |
+| Agent recall through the graph | `memory.recall_authorized` still answers from the legacy store (now mirrored in the graph). Routing it through the graph is the cutover of that store. | P03/P14 |
+| Coverage of partial results | Only `tool_succeeded` events establish anything, and each passage rests on the call that returned it; there is no finer per-claim coverage model inside one successful call. | P06/P07 |
+| Retrieval caches on source revocation | The graph and the compiler read current authorisation every time; the run's passage table (`RunPassages`) is not invalidated when a source is withdrawn mid-run. | P07 |
+| UI for correct / history / neighbours / revoke | Commands exist and are gated; no screen calls them. The reconnect path (`reset` → fresh atomic snapshot) was read, not changed, and has no new test. | P14 |
+| Commit-to-visible latency | Not measured. | P14 |
+| The installed app | Not rebuilt or redeployed. | — |
+
+## P02 close-out
+
+- **Implemented** — verified receipts per finding; basis; immutable versions and
+  historical reads; one-transaction corrections; staleness, dependency
+  revalidation, derived restrictions and per-reader revocation; per-record
+  authority; a working outbox; scratch versus task sharing; a restartable,
+  verifiable, reversible migration including the sixth store; four bounded service
+  commands.
+- **Wired** — `lib.rs` gives the graph the event log as its ledger, drains the
+  outbox at start and after each commit, and mirrors the runtime's memory; the
+  workers and the child loop publish through `TaskMemory` with real receipts; the
+  compiler reads at its cursor.
+- **Tested** — the table above; mutation-checked; full lib and the two changed
+  integration suites green.
+- **Remaining** — the five-source cutover and graph-backed agent recall (see
+  above).
+
+**Exact next step:** P03 — begin at `agent_runtime/mod.rs` `context.refresh`
+(the `FrozenScope` built near line 814), which now reads at its frozen cursor;
+the served window (P00-OBS-2, `window: 0`) and the 9 039-token tool-schema floor
+(P01-OBS-1) are what the context budget has to be built against.

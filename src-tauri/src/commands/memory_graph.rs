@@ -124,6 +124,140 @@ pub async fn memory_graph_changes(
         .map_err(|error| error.explain())
 }
 
+/// The most edges one neighbour request returns.
+const MAX_NEIGHBOURS: usize = 200;
+
+/// The links of one item, as this person may see them.
+///
+/// Bounded, and resolved inside the authorised set: an edge to an item the
+/// reader may not see is not returned at all, and an item they may not see has
+/// no neighbours -- the same answer as one that does not exist.
+#[tauri::command]
+pub async fn memory_graph_neighbours(
+    scope: MemoryScope,
+    project_id: Option<String>,
+    item_id: String,
+    limit: Option<usize>,
+    graph: State<'_, Arc<MemoryGraph>>,
+    session: State<'_, CurrentSession>,
+) -> Result<Vec<crate::knowledge::graph::runtime_memory::MemoryEdge>, String> {
+    let signed_in = require_session(&session)?;
+    let authorised = graph
+        .snapshot(&signed_in, &scope, project_id.as_deref())
+        .map_err(|error| error.explain())?;
+    let mut edges = graph
+        .neighbours(&item_id, &authorised)
+        .map_err(|error| error.explain())?;
+    edges.truncate(limit.unwrap_or(MAX_NEIGHBOURS).min(MAX_NEIGHBOURS));
+    Ok(edges)
+}
+
+/// Every revision of one item this person may see, oldest first.
+#[tauri::command]
+pub async fn memory_graph_history(
+    item_id: String,
+    project_id: Option<String>,
+    graph: State<'_, Arc<MemoryGraph>>,
+    session: State<'_, CurrentSession>,
+) -> Result<Vec<crate::knowledge::graph::runtime_store::ItemVersion>, String> {
+    let signed_in = require_session(&session)?;
+    graph
+        .versions_of(&signed_in, &item_id, project_id.as_deref())
+        .map_err(|error| error.explain())
+}
+
+/// A person correcting an item they can see, at the revision they read.
+///
+/// The correction is the person's own statement -- operator provenance from
+/// the session, never from an argument -- and carries the corrected item's
+/// scope, classification and ACL, so correcting something cannot make it more
+/// visible. The graph decides the rest: a supersede, a new revision, and
+/// everything derived from the corrected item marked stale, in one
+/// transaction. A correction against a revision that has moved is refused as
+/// a conflict rather than applied over somebody else's change.
+#[tauri::command]
+pub async fn memory_graph_correct(
+    item_id: String,
+    expected_revision: u64,
+    content: String,
+    project_id: Option<String>,
+    graph: State<'_, Arc<MemoryGraph>>,
+    session: State<'_, CurrentSession>,
+) -> Result<crate::knowledge::graph::runtime_store::Committed, String> {
+    use crate::knowledge::graph::runtime_memory::{
+        item_id as new_item_id, ItemStatus, MemoryItem, MemoryKind, Provenance,
+    };
+    let signed_in = require_session(&session)?;
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("A correction needs the corrected text.".to_string());
+    }
+    let held = graph
+        .versions_of(&signed_in, &item_id, project_id.as_deref())
+        .map_err(|error| error.explain())?
+        .pop()
+        .ok_or_else(|| format!("There is no memory item {item_id:?} for you."))?
+        .item;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let correction = MemoryItem {
+        item_id: new_item_id(),
+        revision: 1,
+        kind: MemoryKind::Correction,
+        agent_id: format!("person:{}", signed_in.user.id),
+        scope: held.scope.clone(),
+        classification: held.classification,
+        acl: held.acl.clone(),
+        creator_model_id: None,
+        creator_run_id: None,
+        provenance: Provenance::Operator {
+            user_id: signed_in.user.id.clone(),
+        },
+        content,
+        sources: held.sources.clone(),
+        artifacts: Vec::new(),
+        confidence: None,
+        status: ItemStatus::Proposed,
+        valid_from: now.clone(),
+        valid_until: None,
+        supersedes: None,
+        conflicts_with: Vec::new(),
+        causal_parents: vec![held.item_id.clone()],
+        idempotency_key: None,
+        created_at: now.clone(),
+        updated_at: now,
+        basis: None,
+        depends_on: Vec::new(),
+        revoked_readers: held.revoked_readers.clone(),
+        authority: Default::default(),
+    };
+    graph
+        .correct_at(correction, &item_id, Some(expected_revision))
+        .map_err(|error| error.explain())
+}
+
+/// Withdraws one person's access to one item and to what was derived from it.
+/// Administrators only.
+#[tauri::command]
+pub async fn memory_graph_revoke_reader(
+    item_id: String,
+    user_id: String,
+    graph: State<'_, Arc<MemoryGraph>>,
+    session: State<'_, CurrentSession>,
+) -> Result<Vec<String>, String> {
+    let signed_in = require_session(&session)?;
+    if !signed_in
+        .user
+        .roles
+        .contains(&crate::identity::Role::Administrator)
+    {
+        return Err("Only an administrator may withdraw a person's access to memory.".to_string());
+    }
+    graph
+        .revoke_reader(&item_id, user_id.trim(), &chrono::Utc::now().to_rfc3339())
+        .map_err(|error| error.explain())
+}
+
 /// What the turn carried, narrowed to what this reader may see.
 ///
 /// ## Two filters, both load-bearing

@@ -69,6 +69,10 @@ fn item(kind: MemoryKind, content: &str, provenance: Provenance) -> MemoryItem {
         idempotency_key: None,
         created_at: AT.to_string(),
         updated_at: AT.to_string(),
+        basis: None,
+        depends_on: Vec::new(),
+        revoked_readers: Vec::new(),
+        authority: Default::default(),
     }
 }
 

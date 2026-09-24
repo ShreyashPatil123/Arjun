@@ -49,19 +49,37 @@ impl RuntimeDeps {
     /// proceed because its history could not be written would trade a
     /// recoverable gap for a certain loss.
     pub(super) fn remember(&self, run_id: &str, event_type: events::TaskEventType, payload: Value) {
+        let _ = self.remember_event(run_id, event_type, payload);
+    }
+
+    /// [`Self::remember`], handing back the event as stored.
+    ///
+    /// For the one caller that needs the row itself: a tool outcome, whose
+    /// sequence number and output hash are the receipt a finding built from it
+    /// will name. `None` whenever the write did not happen.
+    pub(super) fn remember_event(
+        &self,
+        run_id: &str,
+        event_type: events::TaskEventType,
+        payload: Value,
+    ) -> Option<events::TaskEvent> {
         let draft = events::EventDraft::new(run_id, event_type, self.actor()).with(payload);
         match self.events.record(draft) {
             // Published only once it is on disk, and carrying the sequence
             // number the row was given. A client that receives these in order
             // can tell a gap from a quiet moment; one that received them before
             // the write could be told about an event that never landed.
-            Ok(event) => (self.emit_durable)(event.envelope()),
+            Ok(event) => {
+                (self.emit_durable)(event.envelope());
+                Some(event)
+            }
             // The run ended while a tool call was still in flight — an ordinary
             // race after an abort, not a fault.
             Err(events::AppendError::AlreadyEnded { .. })
-            | Err(events::AppendError::Duplicate { .. }) => {}
+            | Err(events::AppendError::Duplicate { .. }) => None,
             Err(error) => {
                 log::warn!("[tasks] run {run_id}: {error}");
+                None
             }
         }
     }
@@ -238,13 +256,16 @@ pub(super) fn refused_terminally(
 /// record is built from at the end. The two look redundant and are not: the
 /// in-memory one dies with the process, and this one is what a screen reads
 /// after a restart. A run interrupted halfway still shows the calls it made.
+///
+/// Returns the event's sequence number and the hash of the output it recorded,
+/// when it was written -- the receipt a finding built from this call names.
 pub(super) fn remember_outcome(
     deps: &Arc<RuntimeDeps>,
     call: &CallParams,
     tool: ToolName,
     resolved_path: Option<&Path>,
     outcome: &Result<String, String>,
-) {
+) -> Option<(i64, String)> {
     let (event_type, payload) = match outcome {
         // `detail` is redacted on the way in — a search result carries the
         // passage it found, and that is exactly what must not be copied here.
@@ -265,7 +286,17 @@ pub(super) fn remember_outcome(
             }),
         ),
     };
-    deps.remember(&call.run_id, event_type, payload);
+    let recorded = deps
+        .remember_event(&call.run_id, event_type, payload)
+        .and_then(|event| {
+            let hash = event
+                .payload
+                .get("detail")
+                .and_then(|detail| detail.get("sha256"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            Some((event.seq, hash))
+        });
 
     // Checkpointed after the outcome is recorded and before the loop is told,
     // so the resume point never claims a tool settled that the history does not
@@ -287,6 +318,7 @@ pub(super) fn remember_outcome(
             );
         }
     }
+    recorded
 }
 
 /// Keeps the two loop events a recovered trace would otherwise be missing.

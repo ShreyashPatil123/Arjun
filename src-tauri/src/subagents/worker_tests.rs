@@ -184,6 +184,10 @@ impl World {
 
         let graph = Arc::new(MemoryGraph::in_memory().expect("a graph"));
         let events = Arc::new(TaskEventLog::in_memory().expect("an event log"));
+        // As `lib.rs` wires it: receipts resolve against the task event log.
+        graph.set_receipts(
+            Arc::clone(&events) as Arc<dyn crate::knowledge::graph::receipts::ReceiptLedger>
+        );
         let cancellations = Arc::new(RunCancellations::new());
         let manager = manager_with_workers(
             Arc::clone(&events),
@@ -916,4 +920,298 @@ fn a_worker_that_legitimately_found_nothing_does_not_block_the_run() {
         chrono::Utc::now(),
     );
     assert!(verification.passed(), "{}", verification.explain());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan P02: receipts, versions and sharing on the production delegation path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every item a worker published in this task, whatever agent wrote it.
+fn published_items(world: &World) -> Vec<crate::knowledge::graph::runtime_memory::MemoryItem> {
+    world
+        .task_memory("reader")
+        .read(&world.session)
+        .expect("the graph reads")
+}
+
+/// **A publishes a real observation; B reads its version.**
+///
+/// A is dispatched through the production tool path (`agent.delegate_readonly`
+/// → manager → worker) and re-derives two figures. Each finding is published
+/// with the receipt of *its own* calculation -- two different events on A's
+/// own child run, not one event, not the parent's run -- and each receipt
+/// resolves against the event log, so each is admitted. B, a different agent,
+/// reads the exact version A published, at the revision it landed at.
+#[tokio::test]
+async fn a_publishes_real_observations_each_on_its_own_receipt_and_b_reads_that_version() {
+    use crate::knowledge::graph::receipts::ReceiptLedger;
+    use crate::knowledge::graph::runtime_memory::{Basis, ItemStatus, Provenance};
+
+    let world = World::new();
+    let out = world
+        .delegate(json!({
+            "profile": "calculation-checker",
+            "task": "re-derive the wall thickness margin",
+            "expressions": ["9.0 - 8.2", "47.5 * 2"],
+        }))
+        .await
+        .expect("A runs");
+    assert!(out.contains("status: completed"), "{out}");
+
+    let observations: Vec<_> = published_items(&world)
+        .into_iter()
+        .filter(|item| item.kind == MemoryKind::ToolObservation)
+        .collect();
+    assert_eq!(observations.len(), 2, "two calculations, two observations: {out}");
+
+    let mut seqs = std::collections::BTreeSet::new();
+    for item in &observations {
+        let Provenance::ToolReceipt {
+            run_id,
+            tool,
+            event_seq,
+            output_sha256,
+        } = &item.provenance
+        else {
+            panic!("an observation was published without a receipt: {item:?}");
+        };
+        // The child's own run, never the parent's.
+        assert_ne!(run_id, RUN, "attributed to the parent run");
+        assert_eq!(tool, ToolName::RunCalculation.as_str());
+        // Resolved in the event log, which is what admitted it.
+        world
+            .events
+            .verify(run_id, *event_seq, tool, output_sha256.as_deref().expect("a hash"))
+            .expect("the receipt is backed by a real event");
+        assert_eq!(item.status, ItemStatus::Admitted, "{item:?}");
+        assert_eq!(item.basis(), Basis::Measured);
+        seqs.insert(*event_seq);
+    }
+    assert_eq!(seqs.len(), 2, "two findings share one receipt: {seqs:?}");
+
+    // B reads the version A published, at the revision it landed at.
+    let chosen = &observations[0];
+    let versions = world
+        .graph
+        .versions_of(&world.session, &chosen.item_id, None)
+        .expect("the history reads");
+    assert_eq!(versions.len(), 1);
+    let landed_at = versions[0].graph_revision;
+    let b = world.task_memory("ag-other-agent");
+    b.await_requirement(
+        super::Requirement::AtLeast {
+            graph_revision: landed_at,
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("B reaches A's revision");
+    let as_of = world
+        .graph
+        .snapshot_as_of(
+            &world.session,
+            &crate::knowledge::graph::runtime_memory::MemoryScope::Task {
+                task_id: RUN.to_string(),
+            },
+            None,
+            landed_at,
+        )
+        .expect("B reads as of A's revision");
+    let read = as_of
+        .items
+        .iter()
+        .find(|item| item.item_id == chosen.item_id)
+        .expect("B found A's item at A's revision");
+    assert_eq!(read.revision, chosen.revision);
+    assert_eq!(read.content, chosen.content);
+    assert_eq!(read.agent_id, "calculation-checker");
+}
+
+/// A retrieval's passages are what a source says, each on the search that
+/// returned it; nothing a model inferred is labelled as either.
+#[tokio::test]
+async fn a_retrieval_is_published_as_source_text_on_its_own_search() {
+    use crate::knowledge::graph::runtime_memory::{Basis, ItemStatus};
+
+    let world = World::new();
+    world
+        .delegate(json!({ "profile": "knowledge-retriever", "task": "seal torque at ambient" }))
+        .await
+        .expect("A runs");
+    let facts: Vec<_> = published_items(&world)
+        .into_iter()
+        .filter(|item| item.kind == MemoryKind::Fact)
+        .collect();
+    assert!(!facts.is_empty());
+    for fact in facts {
+        assert_eq!(fact.basis(), Basis::SourceText, "{fact:?}");
+        assert_eq!(fact.status, ItemStatus::Admitted, "{}", fact.content);
+        assert!(!fact.sources.is_empty(), "a source-text claim with no source");
+    }
+}
+
+/// **Invalid receipts remain proposals.** A claim naming an event that does
+/// not exist, an event of another tool, or a failed call is kept -- labelled --
+/// and never admitted.
+#[tokio::test]
+async fn a_receipt_the_event_log_does_not_back_stays_a_proposal() {
+    use crate::agent_runtime::events::{EventDraft, TaskEventType};
+    use crate::knowledge::graph::receipts::Receipt;
+    use crate::knowledge::graph::runtime_memory::SourceRef;
+    use super::graph_io::Claim;
+
+    let world = World::new();
+    let failed = world
+        .events
+        .append(
+            EventDraft::new("child-x", TaskEventType::ToolFailed, "priya").with(json!({
+                "toolCallId": "tc-1",
+                "tool": "knowledge.search_authorized",
+                "reason": "the index was unavailable",
+            })),
+        )
+        .expect("appended");
+
+    let forged = |key: &str, seq: i64, tool: &str| Claim {
+        kind: MemoryKind::Fact,
+        content: format!("forged {key}: the torque is 90"),
+        sources: vec![SourceRef {
+            sha256: "c".repeat(64),
+            locator: "page 4".into(),
+            extraction_revision: None,
+        }],
+        artifacts: Vec::new(),
+        confidence: Some(1.0),
+        causal_parents: Vec::new(),
+        idempotency_key: key.to_string(),
+        receipt: Some(Receipt {
+            run_id: "child-x".into(),
+            tool: tool.into(),
+            event_seq: seq,
+            output_sha256: "d".repeat(64),
+        }),
+        depends_on: Vec::new(),
+    };
+    let memory = world.task_memory("ag-forger");
+    for claim in [
+        forged("no-such-event", 9_999, "knowledge.search_authorized"),
+        forged("failed-call", failed.seq, "knowledge.search_authorized"),
+        forged("wrong-tool", failed.seq, "calculation.evaluate_with_units"),
+    ] {
+        let key = claim.idempotency_key.clone();
+        let published = memory.publish(claim, None, &world.session).expect("kept");
+        assert_eq!(published.status, "proposed", "{key} was admitted: {}", published.because);
+        assert!(published.because.contains("does not back it"), "{key}: {}", published.because);
+    }
+}
+
+/// **Private scratch versus task sharing**, from the definition's own policy.
+///
+/// A worker whose definition does not share with its task publishes into its
+/// own scratch: it reads its own findings back, and a sibling does not see them.
+#[tokio::test]
+async fn a_definition_that_does_not_share_publishes_privately() {
+    use crate::subagents::{certification::Decision, manager::Dispatch, InputRef};
+
+    let world = World::new();
+    // The manager resolves this bundled role, and the packet carries sharing.
+    // A registry row with sharing off is the other way in; here the packet is
+    // what the worker reads, so the dispatch goes straight to the manager with
+    // a definition source that turns sharing off.
+    struct Private(Vec<crate::subagents::AgentProfile>);
+    impl crate::subagents::DefinitionSource for Private {
+        fn resolve(
+            &self,
+            key: &str,
+        ) -> Result<crate::subagents::ResolvedDefinition, crate::subagents::Unresolved> {
+            let profile = self
+                .0
+                .iter()
+                .find(|p| p.name == key)
+                .ok_or(crate::subagents::Unresolved::NoDefinition { key: key.into() })?;
+            let mut resolved = crate::subagents::ResolvedDefinition::from_bundled(profile);
+            resolved.shared_with_task = false;
+            Ok(resolved)
+        }
+    }
+    let profiles = load_profiles(&profiles_dir()).profiles;
+    let manager = manager_with_workers(
+        Arc::clone(&world.events),
+        services(
+            Arc::clone(&world.index),
+            Arc::clone(&world.graph),
+            Arc::clone(&world.events),
+            Arc::clone(&world.cancellations),
+        ),
+    )
+    .with_definitions(Arc::new(Private(profiles)));
+
+    manager
+        .spawn(
+            "calculation-checker",
+            &world.inherited,
+            "a private check",
+            vec![InputRef::Expression {
+                expression: "3 * 3".into(),
+            }],
+            Decision {
+                model_id: "model-parent".into(),
+                role: ModelRole::Reasoning,
+                cheaper_than_parent: false,
+                reason: "the run's own model".into(),
+                tier: None,
+                score: None,
+            },
+            &Dispatch::for_task("calculation-checker", RUN),
+        )
+        .await
+        .expect("runs");
+
+    let mine = world
+        .task_memory("calculation-checker")
+        .read(&world.session)
+        .expect("reads");
+    assert!(
+        mine.iter().any(|item| item.content.contains("3 * 3")),
+        "the agent could not read its own scratch: {mine:?}"
+    );
+    let sibling = world.task_memory("knowledge-retriever").read(&world.session).expect("reads");
+    assert!(
+        !sibling.iter().any(|item| item.content.contains("3 * 3")),
+        "a sibling read another agent's private scratch"
+    );
+}
+
+/// The worker's receipts are real events on the child's own run, one per
+/// action, and a publication reaches the parent run's history through the
+/// outbox after the graph committed.
+#[tokio::test]
+async fn a_publication_reaches_the_parent_run_through_the_outbox() {
+    use crate::agent_runtime::events::TaskEventType;
+
+    let world = World::new();
+    world
+        .delegate(json!({
+            "profile": "calculation-checker",
+            "task": "one figure",
+            "expressions": ["2 + 2"],
+        }))
+        .await
+        .expect("runs");
+    // The deliverer `lib.rs` runs after each commit and at start.
+    let report = world
+        .graph
+        .deliver_pending(&[world.events.as_ref()], "2026-09-24T00:00:00Z")
+        .expect("delivers");
+    assert_eq!(report.delivered, 1, "{report:?}");
+    let published: Vec<_> = world
+        .events
+        .events_since(RUN, 0)
+        .expect("reads")
+        .events
+        .into_iter()
+        .filter(|event| event.event_type == TaskEventType::MemoryPublished)
+        .collect();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].payload["agentId"], "calculation-checker");
 }
