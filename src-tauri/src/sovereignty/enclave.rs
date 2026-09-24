@@ -416,9 +416,9 @@ mod platform {
                 libc::prlimit64(
                     0, // current process
                     libc::RLIMIT_AS,
-                    &libc::rlimit {
-                        rlim_cur: peak_bytes as libc::rlim_t,
-                        rlim_max: peak_bytes as libc::rlim_t,
+                    &libc::rlimit64 {
+                        rlim_cur: peak_bytes as libc::rlim64_t,
+                        rlim_max: peak_bytes as libc::rlim64_t,
                     },
                     std::ptr::null_mut(),
                 )

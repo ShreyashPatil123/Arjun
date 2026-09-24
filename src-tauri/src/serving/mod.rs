@@ -55,8 +55,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "windows")]
-
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
