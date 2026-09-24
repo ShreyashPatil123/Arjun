@@ -159,7 +159,7 @@ pub const DEPENDENCIES: &[Dependency] = &[
     Dependency {
         id: "python",
         label: "Python",
-        needed_for: "the document, memory and voice sidecars",
+        needed_for: "the document, memory, graph, intent and voice sidecars",
         packaging: Packaging::External,
         criticality: Criticality::Core,
         env_override: Some("ARJUN_PYTHON"),
@@ -216,6 +216,20 @@ pub const DEPENDENCIES: &[Dependency] = &[
         bundle_path: Some("sidecars/graph_sidecar/main.py"),
         program: None,
         remedy: "Reinstall ARJUN; the graph sidecar ships inside the installer.",
+    },
+    Dependency {
+        id: "intent-sidecar",
+        label: "Intent sidecar",
+        needed_for: "reading what a request asks for with the Laya semantic model",
+        packaging: Packaging::Bundled,
+        // A Feature, not Core. Without it every turn reads its intent from the
+        // keyword classifier, which is what routing did before the sidecar
+        // existed; a missing semantic reader costs accuracy, not routing.
+        criticality: Criticality::Feature,
+        env_override: Some("ARJUN_INTENT_SIDECAR"),
+        bundle_path: Some("sidecars/intent_sidecar/main.py"),
+        program: None,
+        remedy: "Reinstall ARJUN; the intent sidecar ships inside the installer.",
     },
     Dependency {
         id: "memory-sidecar",

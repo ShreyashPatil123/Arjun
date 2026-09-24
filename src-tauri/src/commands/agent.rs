@@ -1920,9 +1920,20 @@ async fn drive_run(
             })
         });
 
-    let mut routing = ModelRouter::route_sticky(
-        &registry,
+    // What this turn is asking for. Read by Laya when the intent engine is
+    // running and calibrated, by the keyword classifier otherwise — see
+    // `capability::intent_analysis`. Read here and handed to the router rather
+    // than read inside it, so routing stays a function of its inputs and the
+    // same reading lands in the trace.
+    let intent = crate::capability::laya_sidecar::analyze_for_turn(
+        crate::capability::laya_sidecar::managed(&app),
         &question,
+    )
+    .await;
+
+    let mut routing = ModelRouter::route_sticky_analyzed(
+        &registry,
+        &intent,
         request.classification,
         vram,
         None,
@@ -2017,6 +2028,20 @@ async fn drive_run(
         preamble.append(&mut routing.reasons);
         routing.reasons = preamble;
     }
+
+    // One line that joins the intent reading to the model that will answer —
+    // the pair an operator reconstructs when asking "why did this model reply?".
+    log::info!(
+        "[ROUTING] intent={} source={} confidence={:.3} ambiguous={} fallback={} -> model={} role={} used_fallback={}",
+        routing.intent,
+        intent.source.label(),
+        intent.confidence,
+        intent.ambiguous,
+        intent.fallback_reason.as_deref().unwrap_or("-"),
+        routing.model_id,
+        routing.role.label(),
+        routing.used_fallback,
+    );
 
     reporter.stage_with(
         Stage::Routed,

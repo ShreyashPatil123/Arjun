@@ -1,0 +1,13 @@
+{
+  "version": "arjun-intent-v1",
+  "questionId": "intent",
+  "instructions": "Which kind of work is the user asking for in `request`?",
+  "criteria": {
+    "coding": "write, debug or explain software code, scripts or SQL (not ASME/API codes)",
+    "mathematics": "solve a calculation, equation, proof or unit conversion with numbers",
+    "reasoning": "weigh a decision: compare options, trade-offs, risks or root causes",
+    "tool-calling": "emit machine-readable JSON, schema output or function-call arguments",
+    "research": "summarise or extract findings from documents, reports, papers or manuals",
+    "general": "greeting, thanks, small talk, general knowledge, or a follow-up with no task"
+  }
+}

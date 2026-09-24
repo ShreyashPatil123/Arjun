@@ -762,6 +762,7 @@ pub(crate) mod tests {
                 reasons: vec!["it fits in VRAM".to_string()],
                 gpu_plan_summary: "all layers on GPU".to_string(),
                 fully_on_gpu: true,
+                intent_analysis: None,
             },
             endpoint: Endpoint {
                 base_url: "http://127.0.0.1:8080/v1".to_string(),

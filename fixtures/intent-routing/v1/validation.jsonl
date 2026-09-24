@@ -1,0 +1,180 @@
+{"id": "clear-001", "split": "fit", "category": "clear", "lang": "en", "prompt": "Write a Python function to reverse a linked list", "intent": "coding"}
+{"id": "clear-002", "split": "test", "category": "clear", "lang": "en", "prompt": "Refactor this class to use dependency injection", "intent": "coding"}
+{"id": "clear-003", "split": "fit", "category": "clear", "lang": "en", "prompt": "Why does my Rust code fail the borrow checker here?", "intent": "coding"}
+{"id": "clear-004", "split": "test", "category": "clear", "lang": "en", "prompt": "Implement a binary search in TypeScript", "intent": "coding"}
+{"id": "clear-005", "split": "fit", "category": "clear", "lang": "en", "prompt": "Fix the null pointer exception in this Java method", "intent": "coding"}
+{"id": "clear-006", "split": "test", "category": "clear", "lang": "en", "prompt": "Write a SQL query that joins users and orders by customer id", "intent": "coding"}
+{"id": "clear-007", "split": "fit", "category": "clear", "lang": "en", "prompt": "Convert this callback code to async/await in JavaScript", "intent": "coding"}
+{"id": "clear-008", "split": "test", "category": "clear", "lang": "en", "prompt": "Debug this segmentation fault in my C++ program", "intent": "coding"}
+{"id": "clear-009", "split": "fit", "category": "clear", "lang": "en", "prompt": "Write a regex to validate email addresses", "intent": "coding"}
+{"id": "clear-010", "split": "test", "category": "clear", "lang": "en", "prompt": "Create a CSS grid layout for this dashboard page", "intent": "coding"}
+{"id": "clear-011", "split": "fit", "category": "clear", "lang": "en", "prompt": "How do I write a unit test for this function?", "intent": "coding"}
+{"id": "clear-012", "split": "test", "category": "clear", "lang": "en", "prompt": "Write a bash script to rotate log files older than seven days", "intent": "coding"}
+{"id": "clear-013", "split": "fit", "category": "clear", "lang": "en", "prompt": "Review my pull request for the authentication refactor", "intent": "coding"}
+{"id": "clear-014", "split": "test", "category": "clear", "lang": "en", "prompt": "Write a Python function to call the REST API and retry on failure", "intent": "coding"}
+{"id": "clear-015", "split": "fit", "category": "clear", "lang": "en", "prompt": "Parse this JSON response in TypeScript and handle errors", "intent": "coding"}
+{"id": "clear-016", "split": "test", "category": "clear", "lang": "en", "prompt": "Optimise this Python loop, it is too slow on large lists", "intent": "coding"}
+{"id": "clear-017", "split": "fit", "category": "clear", "lang": "en", "prompt": "My script throws ModuleNotFoundError on startup, what is wrong?", "intent": "coding"}
+{"id": "clear-018", "split": "test", "category": "clear", "lang": "en", "prompt": "Add type hints to this Python module", "intent": "coding"}
+{"id": "clear-019", "split": "fit", "category": "clear", "lang": "en", "prompt": "Solve for x: 3x + 5 = 20", "intent": "mathematics"}
+{"id": "clear-020", "split": "test", "category": "clear", "lang": "en", "prompt": "What is the derivative of sin(x) times x squared?", "intent": "mathematics"}
+{"id": "clear-021", "split": "fit", "category": "clear", "lang": "en", "prompt": "Prove that the square root of two is irrational", "intent": "mathematics"}
+{"id": "clear-022", "split": "test", "category": "clear", "lang": "en", "prompt": "Compute the eigenvalues of the matrix [[2, 1], [1, 2]]", "intent": "mathematics"}
+{"id": "clear-023", "split": "fit", "category": "clear", "lang": "en", "prompt": "Evaluate the integral of 1/x from 1 to e", "intent": "mathematics"}
+{"id": "clear-024", "split": "test", "category": "clear", "lang": "en", "prompt": "What is the probability of getting three heads in five coin flips?", "intent": "mathematics"}
+{"id": "clear-025", "split": "fit", "category": "clear", "lang": "en", "prompt": "Factor the polynomial x^3 - 6x^2 + 11x - 6", "intent": "mathematics"}
+{"id": "clear-026", "split": "test", "category": "clear", "lang": "en", "prompt": "Solve this system: 2x + y = 7 and x - y = 2", "intent": "mathematics"}
+{"id": "clear-027", "split": "fit", "category": "clear", "lang": "en", "prompt": "What is log base 10 of 1000?", "intent": "mathematics"}
+{"id": "clear-028", "split": "test", "category": "clear", "lang": "en", "prompt": "Find the roots of 2x^2 - 8x + 6 = 0", "intent": "mathematics"}
+{"id": "clear-029", "split": "fit", "category": "clear", "lang": "en", "prompt": "Calculate the standard deviation of 4, 8, 15, 16, 23 and 42", "intent": "mathematics"}
+{"id": "clear-030", "split": "test", "category": "clear", "lang": "en", "prompt": "Convert 72 degrees Fahrenheit to Celsius and show the steps", "intent": "mathematics"}
+{"id": "clear-031", "split": "fit", "category": "clear", "lang": "en", "prompt": "What are the trade-offs between REST and GraphQL for our internal tools?", "intent": "reasoning"}
+{"id": "clear-032", "split": "test", "category": "clear", "lang": "en", "prompt": "Compare and contrast microservices and a monolith for a small team", "intent": "reasoning"}
+{"id": "clear-033", "split": "fit", "category": "clear", "lang": "en", "prompt": "Justify choosing Postgres over MongoDB for this workload", "intent": "reasoning"}
+{"id": "clear-034", "split": "test", "category": "clear", "lang": "en", "prompt": "What are the pros and cons of server-side rendering?", "intent": "reasoning"}
+{"id": "clear-035", "split": "fit", "category": "clear", "lang": "en", "prompt": "Walk through the implications of moving the plant historian to a new vendor", "intent": "reasoning"}
+{"id": "clear-036", "split": "test", "category": "clear", "lang": "en", "prompt": "Should we build the reporting tool in-house or buy it? Weigh the options", "intent": "reasoning"}
+{"id": "clear-037", "split": "fit", "category": "clear", "lang": "en", "prompt": "What is the rationale for using event sourcing here?", "intent": "reasoning"}
+{"id": "clear-038", "split": "test", "category": "clear", "lang": "en", "prompt": "Evaluate whether we should adopt this framework, considering the risks", "intent": "reasoning"}
+{"id": "clear-039", "split": "fit", "category": "clear", "lang": "en", "prompt": "Deduce what went wrong from these symptoms: high latency, no errors, CPU idle", "intent": "reasoning"}
+{"id": "clear-040", "split": "test", "category": "clear", "lang": "en", "prompt": "Which of these three vendor bids is the better choice and why?", "intent": "reasoning"}
+{"id": "clear-041", "split": "fit", "category": "clear", "lang": "en", "prompt": "Return valid JSON matching this schema: {name: string, age: number}", "intent": "tool-calling"}
+{"id": "clear-042", "split": "test", "category": "clear", "lang": "en", "prompt": "Emit a function call with the correct arguments for get_weather", "intent": "tool-calling"}
+{"id": "clear-043", "split": "fit", "category": "clear", "lang": "en", "prompt": "Produce structured output conforming to this JSON schema", "intent": "tool-calling"}
+{"id": "clear-044", "split": "test", "category": "clear", "lang": "en", "prompt": "Respond with only JSON, no prose: list the three fields and their types", "intent": "tool-calling"}
+{"id": "clear-045", "split": "fit", "category": "clear", "lang": "en", "prompt": "Generate the tool-call arguments to create a calendar event at 3 pm", "intent": "tool-calling"}
+{"id": "clear-046", "split": "test", "category": "clear", "lang": "en", "prompt": "Output a JSON object with keys equipment_tag, status and next_due_date", "intent": "tool-calling"}
+{"id": "clear-047", "split": "fit", "category": "clear", "lang": "en", "prompt": "Fill in the arguments for the search_documents tool: query and top_k", "intent": "tool-calling"}
+{"id": "clear-048", "split": "test", "category": "clear", "lang": "en", "prompt": "Give me the API payload to create a work order with priority high", "intent": "tool-calling"}
+{"id": "clear-049", "split": "fit", "category": "clear", "lang": "en", "prompt": "Summarize the key findings of this paper", "intent": "research"}
+{"id": "clear-050", "split": "test", "category": "clear", "lang": "en", "prompt": "Give me the key takeaways from this document", "intent": "research"}
+{"id": "clear-051", "split": "fit", "category": "clear", "lang": "en", "prompt": "Condense this meeting transcript into bullet points", "intent": "research"}
+{"id": "clear-052", "split": "test", "category": "clear", "lang": "en", "prompt": "Write a tl;dr of this article", "intent": "research"}
+{"id": "clear-053", "split": "fit", "category": "clear", "lang": "en", "prompt": "Summarise this literature review on corrosion inhibitors", "intent": "research"}
+{"id": "clear-054", "split": "test", "category": "clear", "lang": "en", "prompt": "Extract the main conclusions from the attached audit report", "intent": "research"}
+{"id": "clear-055", "split": "fit", "category": "clear", "lang": "en", "prompt": "What does this manual say about the start-up procedure? Summarise it", "intent": "research"}
+{"id": "clear-056", "split": "test", "category": "clear", "lang": "en", "prompt": "List the recommendations made in this inspection report", "intent": "research"}
+{"id": "clear-057", "split": "fit", "category": "clear", "lang": "en", "prompt": "Write release notes from these commit messages", "intent": "research"}
+{"id": "clear-058", "split": "test", "category": "clear", "lang": "en", "prompt": "Pull out every deadline mentioned in this contract", "intent": "research"}
+{"id": "clear-059", "split": "fit", "category": "clear", "lang": "en", "prompt": "Hello, how are you doing today?", "intent": "general"}
+{"id": "clear-060", "split": "test", "category": "clear", "lang": "en", "prompt": "Thanks, that was helpful", "intent": "general"}
+{"id": "clear-061", "split": "fit", "category": "clear", "lang": "en", "prompt": "Good morning!", "intent": "general"}
+{"id": "clear-062", "split": "test", "category": "clear", "lang": "en", "prompt": "Can you help me with something?", "intent": "general"}
+{"id": "clear-063", "split": "fit", "category": "clear", "lang": "en", "prompt": "Never mind, forget it", "intent": "general"}
+{"id": "clear-064", "split": "test", "category": "clear", "lang": "en", "prompt": "Who are you?", "intent": "general"}
+{"id": "clear-065", "split": "fit", "category": "clear", "lang": "en", "prompt": "What is the capital of Australia?", "intent": "general"}
+{"id": "clear-066", "split": "test", "category": "clear", "lang": "en", "prompt": "Tell me a fun fact about space", "intent": "general"}
+{"id": "refinery-001", "split": "fit", "category": "refinery", "lang": "en", "prompt": "What is the recommended inspection method for this class of vessel?", "intent": "general", "accept": ["research"]}
+{"id": "refinery-002", "split": "test", "category": "refinery", "lang": "en", "prompt": "As per the code, what is the minimum shell thickness?", "intent": "general", "accept": ["research", "mathematics"]}
+{"id": "refinery-003", "split": "fit", "category": "refinery", "lang": "en", "prompt": "What is the runtime of the standby pump module?", "intent": "general", "accept": ["research"]}
+{"id": "refinery-004", "split": "test", "category": "refinery", "lang": "en", "prompt": "Import the vendor drawing library and list what is in it", "intent": "research", "accept": ["general"]}
+{"id": "refinery-005", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Check the variable speed drive against the equipment register", "intent": "research", "accept": ["reasoning", "general"]}
+{"id": "refinery-006", "split": "test", "category": "refinery", "lang": "en", "prompt": "What is the function of the pressure relief valve on this line?", "intent": "general", "accept": ["research"]}
+{"id": "refinery-007", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Debug why the heat exchanger outlet temperature keeps dropping", "intent": "reasoning", "accept": ["general"]}
+{"id": "refinery-008", "split": "test", "category": "refinery", "lang": "en", "prompt": "Compile a list of all pumps due for maintenance next month", "intent": "research", "accept": ["general"]}
+{"id": "refinery-009", "split": "fit", "category": "refinery", "lang": "en", "prompt": "The DCS shows a runtime error on the compressor module, what should the operator check?", "intent": "reasoning", "accept": ["general"]}
+{"id": "refinery-010", "split": "test", "category": "refinery", "lang": "en", "prompt": "Refactor the maintenance schedule so the two turbines are not serviced in the same week", "intent": "reasoning", "accept": ["general"]}
+{"id": "refinery-011", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Build a unit test plan for the new flare system instrumentation", "intent": "general", "accept": ["reasoning", "research"]}
+{"id": "refinery-012", "split": "test", "category": "refinery", "lang": "en", "prompt": "Write the method statement for replacing the control valve on line 12", "intent": "general", "accept": ["research"]}
+{"id": "refinery-013", "split": "fit", "category": "refinery", "lang": "en", "prompt": "What does API 510 say about inspection intervals for pressure vessels?", "intent": "research", "accept": ["general"]}
+{"id": "refinery-014", "split": "test", "category": "refinery", "lang": "en", "prompt": "Explain the logic of the burner management system interlock", "intent": "reasoning", "accept": ["general", "research"]}
+{"id": "refinery-015", "split": "fit", "category": "refinery", "lang": "en", "prompt": "The pump trips on high vibration, deduce the likely cause", "intent": "reasoning"}
+{"id": "refinery-016", "split": "test", "category": "refinery", "lang": "en", "prompt": "Draft an approval note for replacing the corroded section of the crude line", "intent": "general", "accept": ["research"]}
+{"id": "refinery-017", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Summarise the findings of the last turnaround inspection of the crude distillation unit", "intent": "research"}
+{"id": "refinery-018", "split": "test", "category": "refinery", "lang": "en", "prompt": "Compare the corrosion rates of carbon steel and stainless steel in sour water service", "intent": "reasoning", "accept": ["research"]}
+{"id": "refinery-019", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Calculate the required wall thickness for a pipe at 40 bar design pressure and 150 mm diameter", "intent": "mathematics"}
+{"id": "refinery-020", "split": "test", "category": "refinery", "lang": "en", "prompt": "Convert 150 psi to bar", "intent": "mathematics"}
+{"id": "refinery-021", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Which class of flange is needed for 600 psi at 200 degrees C?", "intent": "general", "accept": ["research", "reasoning"]}
+{"id": "refinery-022", "split": "test", "category": "refinery", "lang": "en", "prompt": "List the tags on this P&ID and their service as JSON", "intent": "tool-calling", "accept": ["research"]}
+{"id": "refinery-023", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Execute the isolation procedure checklist for the reboiler and tell me what is missing", "intent": "research", "accept": ["reasoning", "general"]}
+{"id": "refinery-024", "split": "test", "category": "refinery", "lang": "en", "prompt": "Our historian export has an error in the flow column, which transmitter is at fault?", "intent": "reasoning", "accept": ["general"]}
+{"id": "refinery-025", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Write a Python script to parse the DCS alarm log CSV and count trips per unit", "intent": "coding"}
+{"id": "refinery-026", "split": "test", "category": "refinery", "lang": "en", "prompt": "Fix the SQL query that pulls tank levels from the historian", "intent": "coding"}
+{"id": "refinery-027", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Write a VBA macro to fill the inspection register in Excel", "intent": "coding"}
+{"id": "refinery-028", "split": "test", "category": "refinery", "lang": "en", "prompt": "Our Modbus polling script throws a timeout exception, help me debug it", "intent": "coding"}
+{"id": "refinery-029", "split": "fit", "category": "refinery", "lang": "en", "prompt": "Write a regex to extract tag numbers like PT-2201 from the drawing text", "intent": "coding"}
+{"id": "refinery-030", "split": "test", "category": "refinery", "lang": "en", "prompt": "Implement the API 520 relief valve sizing formula as a Python function", "intent": "coding", "accept": ["mathematics"]}
+{"id": "ambiguous-001", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "explain this", "intent": "general"}
+{"id": "ambiguous-002", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "can you look at this for me", "intent": "general"}
+{"id": "ambiguous-003", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "what do you think about the approach", "intent": "general", "accept": ["reasoning"]}
+{"id": "ambiguous-004", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "make it better", "intent": "general"}
+{"id": "ambiguous-005", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "check this", "intent": "general"}
+{"id": "ambiguous-006", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "is this right?", "intent": "general", "accept": ["reasoning"]}
+{"id": "ambiguous-007", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "go through it again", "intent": "general"}
+{"id": "ambiguous-008", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "handle this properly", "intent": "general"}
+{"id": "ambiguous-009", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "explain this code", "intent": "general", "accept": ["coding", "reasoning"]}
+{"id": "ambiguous-010", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "what's the best way to do this", "intent": "general", "accept": ["reasoning"]}
+{"id": "ambiguous-011", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "run it", "intent": "general"}
+{"id": "ambiguous-012", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "do the calculation", "intent": "general", "accept": ["mathematics"]}
+{"id": "ambiguous-013", "split": "fit", "category": "ambiguous", "lang": "en", "prompt": "clean this up", "intent": "general", "accept": ["coding"]}
+{"id": "ambiguous-014", "split": "test", "category": "ambiguous", "lang": "en", "prompt": "can you improve the structure", "intent": "general", "accept": ["coding", "research"]}
+{"id": "short-001", "split": "fit", "category": "short", "lang": "en", "prompt": "ok", "intent": "general"}
+{"id": "short-002", "split": "test", "category": "short", "lang": "en", "prompt": "thanks", "intent": "general"}
+{"id": "short-003", "split": "fit", "category": "short", "lang": "en", "prompt": "why?", "intent": "general", "accept": ["reasoning"]}
+{"id": "short-004", "split": "test", "category": "short", "lang": "en", "prompt": "hi", "intent": "general"}
+{"id": "short-005", "split": "fit", "category": "short", "lang": "en", "prompt": "continue", "intent": "general"}
+{"id": "short-006", "split": "test", "category": "short", "lang": "en", "prompt": "yes, go ahead", "intent": "general"}
+{"id": "short-007", "split": "fit", "category": "short", "lang": "en", "prompt": "fix it", "intent": "general", "accept": ["coding"]}
+{"id": "short-008", "split": "test", "category": "short", "lang": "en", "prompt": "sql", "intent": "general", "accept": ["coding"]}
+{"id": "short-009", "split": "fit", "category": "short", "lang": "en", "prompt": "json", "intent": "general", "accept": ["tool-calling"]}
+{"id": "short-010", "split": "test", "category": "short", "lang": "en", "prompt": "summarise", "intent": "research", "accept": ["general"]}
+{"id": "short-011", "split": "fit", "category": "short", "lang": "en", "prompt": "2+2", "intent": "mathematics", "accept": ["general"]}
+{"id": "short-012", "split": "test", "category": "short", "lang": "en", "prompt": "integral of x^2", "intent": "mathematics"}
+{"id": "short-013", "split": "fit", "category": "short", "lang": "en", "prompt": "reverse a string in python", "intent": "coding"}
+{"id": "short-014", "split": "test", "category": "short", "lang": "en", "prompt": "pros and cons?", "intent": "reasoning", "accept": ["general"]}
+{"id": "short-015", "split": "fit", "category": "short", "lang": "en", "prompt": "tl;dr", "intent": "research", "accept": ["general"]}
+{"id": "short-016", "split": "test", "category": "short", "lang": "en", "prompt": "debug", "intent": "general", "accept": ["coding"]}
+{"id": "hindi-001", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "एक पायथन फ़ंक्शन लिखो जो किसी सूची को उल्टा कर दे", "intent": "coding"}
+{"id": "hindi-002", "split": "test", "category": "hindi", "lang": "hi", "prompt": "इस कोड में बग ढूंढो और ठीक करो", "intent": "coding"}
+{"id": "hindi-003", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "SQL क्वेरी लिखो जो पिछले महीने के सभी ऑर्डर दिखाए", "intent": "coding"}
+{"id": "hindi-004", "split": "test", "category": "hindi", "lang": "hi", "prompt": "इस जावास्क्रिप्ट एरर का मतलब समझाओ और इसे ठीक करो", "intent": "coding"}
+{"id": "hindi-005", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "x का मान निकालो: 3x + 5 = 20", "intent": "mathematics"}
+{"id": "hindi-006", "split": "test", "category": "hindi", "lang": "hi", "prompt": "उस वृत्त का क्षेत्रफल निकालो जिसकी त्रिज्या 7 सेंटीमीटर है", "intent": "mathematics"}
+{"id": "hindi-007", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "150 psi को bar में बदलो और गणना दिखाओ", "intent": "mathematics"}
+{"id": "hindi-008", "split": "test", "category": "hindi", "lang": "hi", "prompt": "माइक्रोसर्विसेज़ और मोनोलिथ के फायदे और नुकसान की तुलना करो", "intent": "reasoning"}
+{"id": "hindi-009", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "हमें कौन सा पंप खरीदना चाहिए? दोनों विकल्पों के पक्ष और विपक्ष बताओ", "intent": "reasoning"}
+{"id": "hindi-010", "split": "test", "category": "hindi", "lang": "hi", "prompt": "इस निरीक्षण रिपोर्ट का सारांश दो", "intent": "research"}
+{"id": "hindi-011", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "इस दस्तावेज़ के मुख्य निष्कर्ष बताओ", "intent": "research"}
+{"id": "hindi-012", "split": "test", "category": "hindi", "lang": "hi", "prompt": "इस मैनुअल से स्टार्ट-अप प्रक्रिया के मुख्य बिंदु निकालो", "intent": "research"}
+{"id": "hindi-013", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "इस स्कीमा के अनुसार केवल वैध JSON लौटाओ", "intent": "tool-calling"}
+{"id": "hindi-014", "split": "test", "category": "hindi", "lang": "hi", "prompt": "नमस्ते, आप कैसे हैं?", "intent": "general"}
+{"id": "hindi-015", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "धन्यवाद, बहुत मदद मिली", "intent": "general"}
+{"id": "hindi-016", "split": "test", "category": "hindi", "lang": "hi", "prompt": "ठीक है", "intent": "general"}
+{"id": "hindi-017", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "इस वेसल के लिए निरीक्षण विधि क्या है?", "intent": "general", "accept": ["research"]}
+{"id": "hindi-018", "split": "test", "category": "hindi", "lang": "hi", "prompt": "कंप्रेसर मॉड्यूल का रनटाइम कितना है?", "intent": "general", "accept": ["research"]}
+{"id": "hindi-019", "split": "fit", "category": "hindi", "lang": "hi", "prompt": "पंप में ज़्यादा कंपन क्यों हो रहा है, संभावित कारण बताओ", "intent": "reasoning", "accept": ["general"]}
+{"id": "hindi-020", "split": "test", "category": "hindi", "lang": "hi", "prompt": "भारत की राजधानी क्या है?", "intent": "general"}
+{"id": "hinglish-001", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "mujhe ek python function likhna hai jo list sort kare", "intent": "coding"}
+{"id": "hinglish-002", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "is code mein bug hai, fix karo", "intent": "coding"}
+{"id": "hinglish-003", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "ek SQL query likho jo sabhi pending orders dikhaye", "intent": "coding"}
+{"id": "hinglish-004", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "yeh python function kya karta hai samjhao", "intent": "coding", "accept": ["general"]}
+{"id": "hinglish-005", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "इस Python script में error आ रहा है, fix करो", "intent": "coding"}
+{"id": "hinglish-006", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "x ka value nikalo agar 3x + 5 = 20 hai", "intent": "mathematics"}
+{"id": "hinglish-007", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "is triangle ka area calculate karo, base 10 aur height 6", "intent": "mathematics"}
+{"id": "hinglish-008", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "is report ka summary do", "intent": "research"}
+{"id": "hinglish-009", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "is paper ke key findings batao", "intent": "research"}
+{"id": "hinglish-010", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "इस report का summary दो", "intent": "research"}
+{"id": "hinglish-011", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "microservices aur monolith, dono ke pros and cons batao", "intent": "reasoning"}
+{"id": "hinglish-012", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "kaunsa vendor better hai aur kyun, samjhao", "intent": "reasoning"}
+{"id": "hinglish-013", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "sirf valid JSON return karo is schema ke hisaab se", "intent": "tool-calling"}
+{"id": "hinglish-014", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "hello bhai, kaise ho?", "intent": "general"}
+{"id": "hinglish-015", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "thanks yaar, bahut helpful tha", "intent": "general"}
+{"id": "hinglish-016", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "pressure vessel ki inspection method kya hai", "intent": "general", "accept": ["research"]}
+{"id": "hinglish-017", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "is pump ka runtime kitna hai", "intent": "general", "accept": ["research"]}
+{"id": "hinglish-018", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "maintenance schedule ko refactor karo taaki dono turbine ek hi hafte mein service na ho", "intent": "reasoning", "accept": ["general"]}
+{"id": "hinglish-019", "split": "fit", "category": "hinglish", "lang": "hi-en", "prompt": "heat exchanger ka outlet temperature kyun gir raha hai, debug karo", "intent": "reasoning", "accept": ["general"]}
+{"id": "hinglish-020", "split": "test", "category": "hinglish", "lang": "hi-en", "prompt": "theek hai, aage badho", "intent": "general"}
+{"id": "multi-001", "split": "fit", "category": "multi", "lang": "en", "prompt": "Read this error log and write a Python fix for the parser crash", "intent": "coding", "components": ["research", "coding"]}
+{"id": "multi-002", "split": "test", "category": "multi", "lang": "en", "prompt": "Fix the failing unit test and tell me why it failed", "intent": "coding", "components": ["coding", "reasoning"]}
+{"id": "multi-003", "split": "fit", "category": "multi", "lang": "en", "prompt": "Summarise the inspection report and draft an approval note from it", "intent": "research", "accept": ["general"], "components": ["research", "general"]}
+{"id": "multi-004", "split": "test", "category": "multi", "lang": "en", "prompt": "Summarise this paper and then implement its algorithm in Rust", "intent": "general", "accept": ["coding", "research"], "components": ["research", "coding"]}
+{"id": "multi-005", "split": "fit", "category": "multi", "lang": "en", "prompt": "Compare REST and GraphQL and write a JSON schema for the one you choose", "intent": "general", "accept": ["reasoning", "tool-calling"], "components": ["reasoning", "tool-calling"]}
+{"id": "multi-006", "split": "test", "category": "multi", "lang": "en", "prompt": "Calculate the pump head and write it up as a short approval note", "intent": "mathematics", "accept": ["general"], "components": ["mathematics", "general"]}
+{"id": "multi-007", "split": "fit", "category": "multi", "lang": "en", "prompt": "Solve this integral and write Python code to verify it numerically", "intent": "general", "accept": ["mathematics", "coding"], "components": ["mathematics", "coding"]}
+{"id": "multi-008", "split": "test", "category": "multi", "lang": "en", "prompt": "Explain the trade-offs and then refactor the module accordingly", "intent": "general", "accept": ["reasoning", "coding"], "components": ["reasoning", "coding"]}
+{"id": "multi-009", "split": "fit", "category": "multi", "lang": "en", "prompt": "Write a SQL query for monthly throughput and summarise the trend it shows", "intent": "general", "accept": ["coding", "research"], "components": ["coding", "research"]}
+{"id": "multi-010", "split": "test", "category": "multi", "lang": "en", "prompt": "Give me a JSON summary of the key findings from this report", "intent": "tool-calling", "accept": ["research"], "components": ["tool-calling", "research"]}
+{"id": "multi-011", "split": "fit", "category": "multi", "lang": "en", "prompt": "Translate this SOP into Hindi and list the key safety steps", "intent": "research", "accept": ["general"], "components": ["general", "research"]}
+{"id": "multi-012", "split": "test", "category": "multi", "lang": "hi-en", "prompt": "is report ka summary do aur ek python script likho jo graph banaye", "intent": "general", "accept": ["research", "coding"], "components": ["research", "coding"]}
+{"id": "multi-013", "split": "fit", "category": "multi", "lang": "en", "prompt": "Weigh the two relief valve options and calculate the required orifice area for each", "intent": "general", "accept": ["reasoning", "mathematics"], "components": ["reasoning", "mathematics"]}
+{"id": "multi-014", "split": "test", "category": "multi", "lang": "en", "prompt": "Find the bug in this function and add a unit test for it", "intent": "coding", "components": ["coding"]}

@@ -1,0 +1,24 @@
+# Intent sidecar dependencies.
+#
+# Pinned exactly, and installed from vendored wheels in an air-gapped
+# deployment -- the same rule as graph_sidecar/requirements.txt, and the same
+# torch and transformers pins, so the two sidecars share one set of wheels.
+# laya 0.3.20 declares torch>=2.0.0 and transformers>=4.48.0, which these meet.
+# Its other requirements (safetensors, huggingface_hub, numpy) are also
+# transformers 5.15.1 requirements, so the graph sidecar's wheel set already
+# resolves them; they are left to it rather than pinned twice.
+#
+# The CPU build of torch is deliberate. The two checkpoints are 421M and 322M
+# parameters -- about 1.7 GB and 1.3 GB of weights at fp32 before activations
+# (arithmetic, not a Laya figure; Laya publishes none) -- which is VRAM the chat
+# model needs on the 8 GB cards ARJUN is sized for.
+# Install with:
+#
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+#
+# The weights are not a pip dependency. They are the convaiinnovations/laya
+# bundle (the English checkpoint at its root, `multilingual/` beside it),
+# provisioned into <models>/local/convaiinnovations_laya like any other model.
+torch==2.14.0
+transformers==5.15.1
+laya==0.3.20

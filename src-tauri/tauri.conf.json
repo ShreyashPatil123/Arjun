@@ -43,6 +43,7 @@
       "../agents/",
       "../sidecars/document_sidecar/",
       "../sidecars/graph_sidecar/",
+      "../sidecars/intent_sidecar/",
       "../sidecars/memory_engine_sidecar/",
       "../sidecars/voice_sidecar/"
     ]

@@ -273,6 +273,19 @@ pub fn run() {
                     ));
                 }
             }
+
+            // The semantic intent reader in front of the router. Started now so
+            // the seconds a Laya checkpoint takes to load are spent at startup
+            // rather than inside somebody's first turn; until it has loaded —
+            // and whenever it is absent, slow or failing — turns read intent
+            // from the keyword classifier exactly as before. See
+            // `capability::laya_sidecar`.
+            {
+                let models_dir = data_dir.join("models");
+                let engine = Arc::new(capability::IntentEngine::from_environment(&models_dir));
+                engine.start();
+                app.manage(engine);
+            }
             // The knowledge index is the same SQLite file the rest of the app
             // uses. It is managed here so the health panel can count documents
             // without opening a second connection per request.

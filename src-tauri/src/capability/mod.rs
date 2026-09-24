@@ -16,6 +16,10 @@
 
 pub mod classifier;
 pub mod eval;
+pub mod intent_analysis;
+pub mod intent_eval;
+pub mod language;
+pub mod laya_sidecar;
 pub mod policy;
 pub mod profile;
 pub mod resolver;
@@ -27,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use crate::ai_engine::traits::{ChatMessage, GenerationParams};
 
 pub use classifier::{ClassificationResult, IntentClassifier};
+pub use intent_analysis::{IntentAnalysis, IntentSource};
+pub use laya_sidecar::IntentEngine;
 pub use policy::{CapabilityTracker, SwitchDecision, SwitchPolicy, GENERAL};
 pub use profile::{CapabilityBackend, CapabilitySpec, SamplingOverrides};
 pub use resolver::{CapabilityResolution, CapabilityResolver};

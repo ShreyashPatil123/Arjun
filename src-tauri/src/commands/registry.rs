@@ -721,9 +721,17 @@ pub async fn preview_routing(
         .max()
         .unwrap_or(0);
 
-    ModelRouter::route_with_orchestrator(
-        &registry,
+    // Read the same way a run reads it, so the preview names the model that
+    // will actually answer.
+    let intent = crate::capability::laya_sidecar::analyze_for_turn(
+        crate::capability::laya_sidecar::managed(&app),
         &prompt,
+    )
+    .await;
+
+    ModelRouter::route_analyzed(
+        &registry,
+        &intent,
         classification,
         vram,
         None,
@@ -762,9 +770,15 @@ pub async fn prepare_model_for(
         .max()
         .unwrap_or(0);
 
-    let routing = ModelRouter::route_with_orchestrator(
-        &registry,
+    let intent = crate::capability::laya_sidecar::analyze_for_turn(
+        crate::capability::laya_sidecar::managed(&app),
         &prompt,
+    )
+    .await;
+
+    let routing = ModelRouter::route_analyzed(
+        &registry,
+        &intent,
         classification,
         vram,
         None,

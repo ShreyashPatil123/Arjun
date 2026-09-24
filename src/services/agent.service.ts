@@ -286,6 +286,36 @@ export interface RoutingDecision {
   reasons: string[];
   gpuPlanSummary: string;
   fullyOnGpu: boolean;
+  /** How the intent was read. Absent on task records written before it was recorded. */
+  intentAnalysis?: IntentAnalysis;
+}
+
+/** One turn's intent reading. Mirrors `capability::intent_analysis::IntentAnalysis`. */
+export interface IntentAnalysis {
+  /** `PromptIntent`, serialised snake_case: `coding`, `tool_calling`, `general_chat`, … */
+  primaryIntent: string;
+  /** Laya's probability, or the keyword classifier's confidence; see `source`. */
+  confidence: number;
+  /** Laya's distribution over the six capability keys; empty for the keyword classifier. */
+  probabilities: Record<string, number>;
+  secondaryIntent: string | null;
+  secondaryConfidence: number | null;
+  ambiguous: boolean;
+  /** `en`, `hi`, `hi-en` or `und`. */
+  language: string;
+  /** The Laya checkpoint that answered (`english` / `multilingual`), if any. */
+  layaModel: string | null;
+  latencyMs: number;
+  fallbackUsed: boolean;
+  fallbackReason: string | null;
+  source: 'laya' | 'agreement' | 'keyword';
+  layaShadow?: {
+    intent: string;
+    probability: number;
+    runnerUp: string;
+    runnerUpProbability: number;
+    checkpoint: string;
+  };
 }
 
 /** Where the model actually ran. */

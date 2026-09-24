@@ -1,10 +1,11 @@
 //! Choosing a model for a task, and being able to say why.
 //!
 //! PS 26117 asks for *"model auto selection across at least two different task
-//! types"* — a coding request handled differently from a document summary. It
-//! also asks, in step 10, that the router **record why a model was selected**,
-//! and that an uncertain router fall back to something safe rather than quietly
-//! picking badly.
+//! types"* — a coding request handled differently from a document summary.
+//! ARJUN design rule 10 adds that the router **record why a model was
+//! selected**, and that an uncertain router fall back to something safe rather
+//! than quietly picking badly. Those two are ARJUN's requirements, not the
+//! problem statement's; see `docs/design-rules.md`.
 //!
 //! So the decision is a value, not a side effect: [`RoutingDecision`] carries the
 //! model, the intent that led to it, and the reasons in the order they applied.
@@ -13,9 +14,14 @@
 //!
 //! ## How it decides
 //!
-//! 1. **Classify the prompt.** Sarathi's weighted classifier, which scores every
+//! 1. **Classify the prompt.** An [`IntentAnalysis`]: Laya's semantic `choice`
+//!    over six intents behind a calibrated gate when the intent engine is
+//!    running, and otherwise Sarathi's weighted classifier, which scores every
 //!    intent and derives confidence from how far ahead the leader is *and* how
-//!    much evidence there was at all.
+//!    much evidence there was at all. The router reads only the verdict —
+//!    which intent, and whether it is clear enough for a specialist — so it
+//!    does not care which engine produced it. See
+//!    [`crate::capability::intent_analysis`].
 //! 2. **Low confidence routes to reasoning, not to nothing.** A general model
 //!    handles a coding question adequately; a coding model handles a summary
 //!    badly. When unsure, the cost of being wrong is lower in that direction.
@@ -32,16 +38,9 @@ use serde::{Deserialize, Serialize};
 use super::{ModelEntry, ModelRegistry, ModelRole, Modality};
 use crate::ai_engine::startup::StartupModelTarget;
 use crate::ai_engine::vram_planner::{plan_gpu_offload, GpuOffloadPlan};
-use crate::capability::classifier::IntentClassifier;
+use crate::capability::intent_analysis::IntentAnalysis;
 use crate::model_intelligence::intent::PromptIntent;
 use crate::policy::Classification;
-
-/// Below this, the classification is not trusted to pick a specialist.
-///
-/// Chosen to match the classifier's own calibration: it reaches this only when
-/// one intent leads clearly *and* several signals supported it. A single
-/// incidental keyword cannot get here.
-const SPECIALIST_CONFIDENCE: f32 = 0.55;
 
 /// What the router decided, and every reason that led there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +58,11 @@ pub struct RoutingDecision {
     pub reasons: Vec<String>,
     pub gpu_plan_summary: String,
     pub fully_on_gpu: bool,
+    /// How the intent was read: engine, probabilities, runner-up, language,
+    /// latency and any fallback. `None` in task records written before intent
+    /// analysis was recorded, and for routes that did not classify the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_analysis: Option<IntentAnalysis>,
 }
 
 /// What a conversation has already settled on.
@@ -159,7 +163,7 @@ impl ModelRouter {
     /// Only coding gets its own specialist. Mathematics, research and reasoning
     /// all want a strong general model rather than a differently-trained one,
     /// and inventing a role per intent would produce a registry nobody can fill.
-    fn role_for(intent: PromptIntent) -> ModelRole {
+    pub(crate) fn role_for(intent: PromptIntent) -> ModelRole {
         match intent {
             PromptIntent::Coding => ModelRole::Coding,
             PromptIntent::Reasoning
@@ -217,27 +221,43 @@ impl ModelRouter {
         allowed_licenses: &[String],
         orchestrator: Option<&StartupModelTarget>,
     ) -> Result<RoutingDecision, RoutingFailure> {
-        let classified = IntentClassifier::classify(prompt);
-        // Taken before `intent` is moved into `role_for` below.
-        let intent_label = classified.capability_name().to_string();
-        let confidence = classified.confidence;
-        let mut reasons = Vec::new();
+        Self::route_analyzed(
+            registry,
+            &IntentAnalysis::keyword(prompt),
+            classification,
+            vram_total_bytes,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
+            orchestrator,
+        )
+    }
 
+    /// Routes on an intent that has already been read — by the intent engine,
+    /// normally, which consults Laya and falls back to the keyword classifier.
+    ///
+    /// Everything after the first step is [`Self::route_with_orchestrator`]
+    /// unchanged. The intent decides the *role*; which model serves that role
+    /// is still decided here, against the registry, the gates and the VRAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_analyzed(
+        registry: &ModelRegistry,
+        intent: &IntentAnalysis,
+        classification: Option<Classification>,
+        vram_total_bytes: u64,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
+        orchestrator: Option<&StartupModelTarget>,
+    ) -> Result<RoutingDecision, RoutingFailure> {
         // Step 1–2: what kind of task is this, and do we trust the answer?
-        let confident = classified.confidence >= SPECIALIST_CONFIDENCE;
-        let role = if confident {
-            reasons.push(format!(
-                "Read as a {} request (confidence {:.0}%).",
-                intent_label,
-                confidence * 100.0
-            ));
-            Self::role_for(classified.intent)
+        let mut reasons = vec![intent.reading_reason()];
+        reasons.extend(intent.fallback_note());
+        let role = if intent.is_specialist_grade() {
+            Self::role_for(intent.primary_intent.clone())
         } else {
-            reasons.push(format!(
-                "Intent was unclear (confidence {:.0}%), so it is being handled by a general \
-                 reasoning model rather than a specialist.",
-                confidence * 100.0
-            ));
             ModelRole::Reasoning
         };
 
@@ -247,14 +267,15 @@ impl ModelRouter {
             classification,
             vram_total_bytes,
             reasons,
-            intent_label,
-            confidence,
+            intent.capability_name().to_string(),
+            intent.confidence,
             required_modality,
             require_structured_output,
             available_runtime_profiles,
             allowed_licenses,
             orchestrator,
         )
+        .map(|decision| decision.with_intent(intent))
     }
 
     /// Routes a turn that belongs to a conversation which may already have a
@@ -293,10 +314,43 @@ impl ModelRouter {
         orchestrator: Option<&StartupModelTarget>,
         sticky: Option<&StickyRoute>,
     ) -> Result<RoutingDecision, RoutingFailure> {
+        Self::route_sticky_analyzed(
+            registry,
+            &IntentAnalysis::keyword(prompt),
+            classification,
+            vram_total_bytes,
+            required_modality,
+            require_structured_output,
+            available_runtime_profiles,
+            allowed_licenses,
+            orchestrator,
+            sticky,
+        )
+    }
+
+    /// [`Self::route_sticky`] on an intent that has already been read.
+    ///
+    /// A thread moves only on a turn that is *specialist-grade* and asks for a
+    /// different role — for Laya, one that cleared the calibrated gate; for the
+    /// keyword classifier, one at or above its 0.55 confidence. An ambiguous
+    /// turn keeps the conversation's model, whichever engine found it ambiguous.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_sticky_analyzed(
+        registry: &ModelRegistry,
+        intent: &IntentAnalysis,
+        classification: Option<Classification>,
+        vram_total_bytes: u64,
+        required_modality: Option<Modality>,
+        require_structured_output: bool,
+        available_runtime_profiles: &[String],
+        allowed_licenses: &[String],
+        orchestrator: Option<&StartupModelTarget>,
+        sticky: Option<&StickyRoute>,
+    ) -> Result<RoutingDecision, RoutingFailure> {
         let Some(sticky) = sticky else {
-            return Self::route_with_orchestrator(
+            return Self::route_analyzed(
                 registry,
-                prompt,
+                intent,
                 classification,
                 vram_total_bytes,
                 required_modality,
@@ -307,12 +361,11 @@ impl ModelRouter {
             );
         };
 
-        let classified = IntentClassifier::classify(prompt);
-        let intent_label = classified.capability_name().to_string();
-        let confidence = classified.confidence;
-        let confident = confidence >= SPECIALIST_CONFIDENCE;
+        let intent_label = intent.capability_name().to_string();
+        let confidence = intent.confidence;
+        let confident = intent.is_specialist_grade();
         let asked_for = if confident {
-            Self::role_for(classified.intent)
+            Self::role_for(intent.primary_intent.clone())
         } else {
             ModelRole::Reasoning
         };
@@ -325,11 +378,8 @@ impl ModelRouter {
                 intent_label,
                 confidence * 100.0
             )];
-            reasons.push(format!(
-                "Read as a {} request (confidence {:.0}%).",
-                intent_label,
-                confidence * 100.0
-            ));
+            reasons.push(intent.reading_reason());
+            reasons.extend(intent.fallback_note());
             return Self::route_to_role(
                 registry,
                 asked_for,
@@ -343,7 +393,8 @@ impl ModelRouter {
                 available_runtime_profiles,
                 allowed_licenses,
                 orchestrator,
-            );
+            )
+            .map(|decision| decision.with_intent(intent));
         }
 
         // The thread keeps its role. Keep the model too, if it is still a
@@ -363,13 +414,14 @@ impl ModelRouter {
                 entry.context_length,
                 None,
             );
-            let reasons = vec![
+            let mut reasons = vec![
                 format!(
                     "Kept on {}, which has been answering this conversation. Re-routing every turn changes the model when the wording moves rather than when the work does, and costs a cold model server each time.",
                     entry.name
                 ),
                 plan.reason.clone(),
             ];
+            reasons.extend(intent.fallback_note());
             return Ok(Self::decide(
                 entry,
                 sticky.role,
@@ -378,7 +430,8 @@ impl ModelRouter {
                 plan,
                 false,
                 reasons,
-            ));
+            )
+            .with_intent(intent));
         }
 
         let reasons = vec![format!(
@@ -400,6 +453,7 @@ impl ModelRouter {
             allowed_licenses,
             orchestrator,
         )
+        .map(|decision| decision.with_intent(intent))
     }
 
     /// Routes to a named role directly, for work whose kind is already known —
@@ -897,7 +951,16 @@ impl ModelRouter {
             reasons,
             gpu_plan_summary: plan.reason,
             fully_on_gpu: plan.full_offload,
+            intent_analysis: None,
         }
+    }
+}
+
+impl RoutingDecision {
+    /// Records the intent reading that led to this decision, for the trace.
+    fn with_intent(mut self, intent: &IntentAnalysis) -> Self {
+        self.intent_analysis = Some(intent.clone());
+        self
     }
 }
 
@@ -1021,6 +1084,136 @@ mod tests {
             entry("qwen-8b", 8.0, vec![ModelRole::Reasoning]),
             entry("surya", 0.65, vec![ModelRole::DocumentOcr]),
         ])
+    }
+
+    // ── Semantic intent ──────────────────────────────────────────────────
+    //
+    // The router acts on an `IntentAnalysis`, whichever engine produced it.
+    // These pin the three things that must hold when Laya produced it: its
+    // verdict decides the role, an ambiguous verdict does not pick a
+    // specialist, and the model is still chosen by the registry and the VRAM.
+
+    use crate::capability::classifier::IntentClassifier;
+    use crate::capability::intent_analysis::tests::verdict;
+    use crate::capability::intent_analysis::{GatePolicy, IntentSource, LayaGate};
+    use crate::capability::language;
+
+    const GATE: LayaGate = LayaGate { min_probability: 0.5, min_margin: 0.2 };
+
+    fn laya_reads(prompt: &str, leader: &str, p: f32, second: &str, q: f32) -> IntentAnalysis {
+        IntentAnalysis::from_laya(
+            &verdict(leader, p, second, q),
+            &IntentClassifier::classify(prompt),
+            GATE,
+            GatePolicy::Laya,
+            language::detect(prompt),
+            300.0,
+        )
+        .unwrap()
+    }
+
+    fn route_on(registry: &ModelRegistry, intent: &IntentAnalysis, vram: u64) -> RoutingDecision {
+        ModelRouter::route_analyzed(registry, intent, None, vram, None, false, &[], &[], None).unwrap()
+    }
+
+    /// The refinery case the keyword table gets wrong, end to end: "refactor"
+    /// is a STRONG coding signal, so the keyword reading sends a maintenance
+    /// planning question to the coding model. Laya's reading does not.
+    #[test]
+    fn a_semantic_reading_keeps_plant_planning_off_the_coding_model() {
+        let registry = stocked();
+        let prompt = "Refactor the maintenance schedule so the two turbines are not serviced in the same week";
+
+        let by_keywords = route_on(&registry, &IntentAnalysis::keyword(prompt), 24 * GB);
+        assert_eq!(by_keywords.role, ModelRole::Coding, "the defect this exists to fix");
+
+        let by_laya = route_on(&registry, &laya_reads(prompt, "reasoning", 0.74, "coding", 0.11), 24 * GB);
+        assert_eq!(by_laya.role, ModelRole::Reasoning);
+        assert!(
+            by_laya.reasons[0].contains("semantic intent model"),
+            "the trace says which engine read it: {:?}",
+            by_laya.reasons
+        );
+    }
+
+    #[test]
+    fn a_clear_semantic_coding_reading_reaches_the_coding_model() {
+        let registry = stocked();
+        let intent = laya_reads("mujhe ek python function likhna hai", "coding", 0.81, "general", 0.07);
+        let decision = route_on(&registry, &intent, 24 * GB);
+        assert_eq!(decision.role, ModelRole::Coding);
+        assert_eq!(decision.model_id, "qwen-coder-14b");
+        let recorded = decision.intent_analysis.expect("the reading is recorded on the decision");
+        assert_eq!(recorded.source, IntentSource::Laya);
+        assert_eq!(recorded.language, "hi-en");
+    }
+
+    #[test]
+    fn an_ambiguous_semantic_reading_goes_to_reasoning() {
+        let registry = stocked();
+        let intent = laya_reads("summarise the paper and implement it", "coding", 0.46, "research", 0.39);
+        assert!(intent.ambiguous);
+        let decision = route_on(&registry, &intent, 24 * GB);
+        assert_eq!(decision.role, ModelRole::Reasoning);
+        assert!(decision.reasons[0].contains("unclear to the semantic intent model"), "{:?}", decision.reasons);
+    }
+
+    /// Laya names an intent, never a model. The same reading on a smaller GPU
+    /// reaches a different coding model — the VRAM planner's choice, not Laya's.
+    #[test]
+    fn the_model_is_still_chosen_by_the_registry_and_the_vram() {
+        let mut small = entry("nemotron-nano-4b", 4.0, vec![ModelRole::Reasoning, ModelRole::Coding]);
+        small.context_length = 8192;
+        let mut large = entry("qwen-9b", 9.0, vec![ModelRole::Reasoning, ModelRole::Coding]);
+        large.context_length = 8192;
+        let registry = registry(vec![large, small]);
+        let intent = laya_reads("write a linked list in cpp", "coding", 0.9, "general", 0.03);
+
+        let roomy = route_on(&registry, &intent, 24 * GB);
+        let tight = route_on(&registry, &intent, 6 * GB);
+        assert_eq!(roomy.model_id, "qwen-9b");
+        assert_eq!(tight.model_id, "nemotron-nano-4b", "the below-floor rescue still applies");
+        assert!(tight.used_fallback);
+    }
+
+    #[test]
+    fn a_keyword_fallback_is_explained_in_the_trace() {
+        let registry = stocked();
+        let intent = IntentAnalysis::keyword_fallback(
+            "Refactor this Python function",
+            "Laya did not answer within 1500 ms",
+            None,
+        );
+        let decision = route_on(&registry, &intent, 24 * GB);
+        assert_eq!(decision.role, ModelRole::Coding, "the fail-safe still routes");
+        assert!(
+            decision.reasons.iter().any(|r| r.contains("did not answer within 1500 ms")),
+            "{:?}",
+            decision.reasons
+        );
+    }
+
+    /// Stickiness reads the verdict too: an ambiguous semantic reading keeps
+    /// the thread, a clear one for different work moves it.
+    #[test]
+    fn stickiness_follows_the_semantic_verdict() {
+        let registry = stocked();
+        let held = sticky(ModelRole::Coding, "qwen-coder-14b");
+
+        let unclear = laya_reads("haan, aage badho", "general", 0.38, "coding", 0.30);
+        let kept = ModelRouter::route_sticky_analyzed(
+            &registry, &unclear, None, 24 * GB, None, false, &[], &[], None, Some(&held),
+        )
+        .unwrap();
+        assert_eq!(kept.model_id, "qwen-coder-14b");
+
+        let summary = laya_reads("is report ka summary do", "research", 0.83, "general", 0.06);
+        let moved = ModelRouter::route_sticky_analyzed(
+            &registry, &summary, None, 24 * GB, None, false, &[], &[], None, Some(&held),
+        )
+        .unwrap();
+        assert_eq!(moved.role, ModelRole::Reasoning);
+        assert!(moved.reasons.iter().any(|r| r.contains("different kind of task")));
     }
 
     /// The 8 GB laptop, reproduced.
