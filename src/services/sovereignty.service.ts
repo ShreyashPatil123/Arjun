@@ -24,12 +24,18 @@ export interface EgressEvent {
   canary: boolean;
 }
 
-/** One TCP connection the operating system attributes to the ARJUN process. */
+/**
+ * One TCP connection the operating system attributes to ARJUN: the app itself
+ * or a process it started (the WebView2 browser, a model server, a sidecar).
+ */
 export interface ObservedConnection {
   local: string;
   remote: string;
   /** False when the remote address leaves this machine — the thing that matters. */
   loopback: boolean;
+  pid: number;
+  /** Executable name of the owning process, e.g. `msedgewebview2.exe`. */
+  process: string;
 }
 
 /**
@@ -41,6 +47,8 @@ export interface ObservedConnection {
 export interface ObservationReport {
   connections: ObservedConnection[];
   externalCount: number;
+  /** Executable name of every process that was watched, the app's own first. */
+  processes: string[];
   unavailableReason: string | null;
 }
 
@@ -67,7 +75,7 @@ export const sovereigntyService = {
     return getBackendService().invoke<EgressEvent>('run_egress_canary');
   },
 
-  /** Asks Windows which connections this process owns. Does not consult the broker. */
+  /** Asks Windows which connections ARJUN's processes own. Does not consult the broker. */
   observeConnections(): Promise<ObservationReport> {
     return getBackendService().invoke<ObservationReport>('observe_process_connections');
   },

@@ -20,7 +20,8 @@
         "minHeight": 600,
         "center": true,
         "decorations": true,
-        "resizable": true
+        "resizable": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msOneAuthWAM --autoplay-policy=no-user-gesture-required --disable-component-update --disable-background-networking --no-proxy-server --host-resolver-rules=\"MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE *.localhost, EXCLUDE 127.0.0.1\""
       }
     ],
     "security": {

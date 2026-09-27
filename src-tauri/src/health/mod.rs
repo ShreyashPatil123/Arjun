@@ -280,13 +280,19 @@ fn observation_item(report: &ObservationReport) -> HealthItem {
     }
 
     if report.external_count > 0 {
+        let mut sources: Vec<&str> =
+            report.connections.iter().filter(|c| !c.loopback).map(|c| c.process.as_str()).collect();
+        sources.sort_unstable();
+        sources.dedup();
         return HealthItem::new(
             "Observed connections",
             Reading::Attention,
             format!("{} external", report.external_count),
-            "The operating system reports connections leaving this machine from this process. \
-             Open the network view and identify them before continuing confidential work."
-                .to_string(),
+            format!(
+                "The operating system reports connections leaving this machine from {}. \
+                 Open the network view and identify them before continuing confidential work.",
+                sources.join(", ")
+            ),
         );
     }
 
@@ -294,7 +300,7 @@ fn observation_item(report: &ObservationReport) -> HealthItem {
         "Observed connections",
         Reading::Ok,
         format!("{} loopback", report.connections.len()),
-        "Every connection this process holds ends on this machine.",
+        "Every connection held by ARJUN and the processes it started ends on this machine.",
     )
 }
 
@@ -365,6 +371,7 @@ mod tests {
         ObservationReport {
             connections: Vec::new(),
             external_count: 0,
+            processes: vec!["sarathi.exe".into()],
             unavailable_reason: None,
         }
     }
@@ -547,6 +554,8 @@ mod tests {
             local: "192.168.1.9:51234".into(),
             remote: "140.82.121.4:443".into(),
             loopback: false,
+            pid: 4242,
+            process: "msedgewebview2.exe".into(),
         }];
 
         let i = inputs(&observation);
@@ -554,6 +563,7 @@ mod tests {
         let item = find(&taken, "Observed connections");
         assert_eq!(item.state, Reading::Attention);
         assert!(item.note.contains("before continuing confidential work"));
+        assert!(item.note.contains("msedgewebview2.exe"), "the note names the process: {}", item.note);
     }
 
     // ── Queue, index, approvals ──────────────────────────────────────────

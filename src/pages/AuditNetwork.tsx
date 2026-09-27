@@ -231,7 +231,9 @@ export const AuditNetwork = () => {
             <span>
               Windows attributes{' '}
               <strong>{observedReading.value.connections.length}</strong> TCP connection
-              {observedReading.value.connections.length === 1 ? '' : 's'} to this process
+              {observedReading.value.connections.length === 1 ? '' : 's'} to ARJUN&rsquo;s{' '}
+              {observedReading.value.processes.length} process
+              {observedReading.value.processes.length === 1 ? '' : 'es'}
               {observedReading.value.connections.length > 0 ? (
                 <>
                   , and <strong>none of them leave this machine</strong>.
@@ -257,7 +259,9 @@ export const AuditNetwork = () => {
                   {c.loopback ? 'loopback' : 'external'}
                 </span>
                 <span className={styles.entryHost}>{c.remote}</span>
-                <span className={styles.entryReason}>from {c.local}</span>
+                <span className={styles.entryReason}>
+                  {c.process} · from {c.local}
+                </span>
               </li>
             ))}
           </ul>
@@ -321,10 +325,12 @@ export const AuditNetwork = () => {
 
       <p className={styles.footnote}>
         Two vantage points, deliberately. The lower panel is ARJUN vouching for itself; the upper
-        one is Windows answering <code>GetExtendedTcpTable</code> for this process ID, which needs
-        no administrator rights and no agent installed. They should agree &mdash; and if they ever
-        disagree, that disagreement is the finding. The OS view covers TCP for this process; it
-        does not see UDP or a connection opened and closed between two polls.
+        one is Windows answering <code>GetExtendedTcpTable</code> for ARJUN and every process it
+        started &mdash; the WebView2 browser that draws this window, the model servers, the
+        sidecars &mdash; which needs no administrator rights and no agent installed. They should
+        agree &mdash; and if they ever disagree, that disagreement is the finding. The OS view
+        covers TCP for those processes; it does not see UDP or a connection opened and closed
+        between two polls.
       </p>
     </div>
   );

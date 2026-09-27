@@ -105,7 +105,7 @@ minijinja = { version = "2", features = ["macros", "loop_controls", "adjacent_lo
 tauri-plugin-dialog = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_JobObjects"] }
+windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp"] }
 
 # libc exposes prlimit64 (Linux) and setrlimit (macOS), used by the
 # enclave module to install the per-process memory ceiling on
