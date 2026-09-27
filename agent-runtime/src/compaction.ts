@@ -420,6 +420,79 @@ export function alignCutToPairs(messages: AgentMessage[], cut: number): number {
   }
 }
 
+/**
+ * Removes the reasoning that earlier model calls produced from what is sent back.
+ *
+ * ## The failure this prevents
+ *
+ * A reasoning model's thinking is kept on the stored assistant message, and
+ * the Chat Completions replay sends it back as `reasoning_content` on every
+ * later call of the run. On a local model that is most of the window. A
+ * Word-note turn on Spark-X2.5-4B thought for about 14,500 tokens in its first
+ * call. Every call after that carried those tokens again beside a
+ * 10,700-token system prompt and catalogue, and the fourth call was refused at
+ * 32,960 tokens against a 32,768-token window. The run had called only small
+ * tools and never reached the document.
+ *
+ * The ceiling pass below could not help: it shortens text blocks, and thinking
+ * is not one.
+ *
+ * ## Why dropping it is safe
+ *
+ * What the model concluded is already in the transcript as its answer text,
+ * its tool calls and their results, and in the working notes. The thinking is
+ * how it got there, and a 4B model given its own 14k-token monologue back
+ * does not reason better for it. The stored transcript is untouched, so the
+ * audit record keeps every token.
+ *
+ * ## Why the provider's count goes with it
+ *
+ * A message's `usage` is the provider's count of the request that produced
+ * it, including this message's output, thinking and all. Left on a message
+ * whose thinking has been removed, that count describes a request that will
+ * never be sent again. Every later measurement would then read the old, larger
+ * number and never see the saving. So the count is removed with the thinking,
+ * and the estimate is made from the messages as they now are.
+ *
+ * Only for local Chat Completions servers, which is all ARJUN talks to. A
+ * provider that requires signed thinking blocks to be returned would need them
+ * kept.
+ */
+export function withoutReplayedReasoning(messages: AgentMessage[]): {
+  messages: AgentMessage[];
+  stripped: number;
+} {
+  let stripped = 0;
+  const replayed = messages.map((message) => {
+    const shape = message as { role?: string; content?: unknown };
+    if (shape.role !== "assistant" || !Array.isArray(shape.content)) return message;
+    const kept = shape.content.filter(
+      (block) =>
+        !(typeof block === "object" && block !== null && (block as { type?: string }).type === "thinking"),
+    );
+    if (kept.length === shape.content.length) return message;
+    stripped += 1;
+    const { usage: _measuredWithThinking, ...rest } = message as AgentMessage & { usage?: unknown };
+    return { ...rest, content: kept } as AgentMessage;
+  });
+  return { messages: replayed, stripped };
+}
+
+/**
+ * The first index at or after `cut` that leaves no tool result without its call.
+ *
+ * The forward counterpart of {@link alignCutToPairs}, for a pass that is
+ * *removing* the messages before the cut: dropping an assistant message that
+ * called a tool has to take that call's results with it. Walking backward
+ * instead, which is what the ceiling pass used to do, lands on the cut already
+ * made and removes nothing.
+ */
+export function alignDropToPairs(messages: AgentMessage[], cut: number, limit: number): number {
+  let aligned = Math.max(0, cut);
+  while (aligned < limit && !pairingIsIntact(messages.slice(aligned))) aligned += 1;
+  return aligned;
+}
+
 /** How many trailing messages are never pruned, however stale they look. */
 const PRUNE_KEEPS_RECENT = 6;
 
@@ -749,7 +822,11 @@ export class RunCompactor {
     // work exists to remove, pointing the other way.
     this.#ledger.applyPins(pinned);
 
-    const pruned = pruneStaleToolResults(messages, this.#notes.state.evidenceIds, pinned);
+    // Before anything is measured: the reasoning earlier calls produced is not
+    // sent back, and neither is the count that included it. See
+    // `withoutReplayedReasoning`.
+    const replayed = withoutReplayedReasoning(messages).messages;
+    const pruned = pruneStaleToolResults(replayed, this.#notes.state.evidenceIds, pinned);
     const working = pruned.messages;
     this.#cleared = pruned.cleared;
 
@@ -915,8 +992,23 @@ export class RunCompactor {
     // over-charge was paid in history.
     const ceiling = Math.max(1, window - this.#settings.reserveTokens);
     const drift = this.#ledger.driftFactor();
-    const cost = (messages: AgentMessage[]) => Math.ceil(this.#requestTokens(messages) * drift);
 
+    // The provider's own count answers "does this fit" when there is one.
+    if (Math.ceil(this.#requestTokens(projected) * drift) <= ceiling) return projected;
+
+    // From here on this pass rewrites the projection, and a provider count
+    // describes the request as it was sent, not as this pass leaves it. Measured
+    // through that count, dropping or shortening anything older than the last
+    // model call changed nothing, and the pass could not tell whether it had
+    // worked: a run was sent at 32,960 tokens straight after this pass reported
+    // it had made the request fit 26,215. So everything below is measured from
+    // the messages themselves, with the prefix added and the run's own drift
+    // applied.
+    const cost = (messages: AgentMessage[]) =>
+      Math.ceil(
+        (messages.reduce((sum, message) => sum + estimateTokens(message), 0) + this.#ledger.fixed()) *
+          drift,
+      );
     if (cost(projected) <= ceiling) return projected;
 
     // The notice this pass adds is itself part of the request, so it is charged
@@ -945,11 +1037,11 @@ export class RunCompactor {
 
     let dropped = 0;
     // Oldest first, from just after the preamble, and never into the protected
-    // tail. `alignCutToPairs` moves the cut forward off a tool result whose
-    // call would be left behind.
+    // tail. `alignDropToPairs` moves the cut forward, so a dropped tool call
+    // takes its results with it.
     while (cost(kept) > target && preamble < protectedFrom) {
-      const cut = alignCutToPairs(kept, preamble + 1);
-      if (cut <= preamble || cut > protectedFrom) break;
+      const cut = alignDropToPairs(kept, preamble + 1, protectedFrom);
+      if (cut <= preamble || cut > protectedFrom || !pairingIsIntact(kept.slice(cut))) break;
       const removed = cut - preamble;
       kept.splice(preamble, removed);
       protectedFrom -= removed;
@@ -984,7 +1076,8 @@ export class RunCompactor {
       process.stderr.write(
         `[agent-runtime:log] [context] ceiling enforced: ${dropped} message(s) dropped, ` +
           `${truncated} truncated, to fit ${ceiling} token(s) of a ${window}-token window ` +
-          `(fixed cost ${this.#ledger.fixed()}, drift x${drift.toFixed(2)})\n`,
+          `(fixed cost ${this.#ledger.fixed()}, drift x${drift.toFixed(2)}, ` +
+          `now estimated at ${cost(kept)})\n`,
       );
     }
     return kept;

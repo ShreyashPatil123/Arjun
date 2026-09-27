@@ -245,6 +245,16 @@ describe("the budget a window affords", () => {
     }
   });
 
+  it("counts the conversation seeded from earlier turns", () => {
+    // The recorded failure: a third document turn on a 32k window got the
+    // catalogue sized for an empty thread, and its searches overflowed.
+    const history = "Earlier turn: the SOP says the minimum is 5.0 mm on page 2. ".repeat(300);
+    const empty = toolBudgetFor(32_768, "system prompt", "question");
+    const long = toolBudgetFor(32_768, "system prompt", "question", history);
+    expect(long).toBeLessThan(empty);
+    expect(long).toBeGreaterThan(0);
+  });
+
   it("leaves room for the reply and the conversation at every size", () => {
     for (const window of [4_096, 8_192, 32_768]) {
       const budget = toolBudgetFor(window, "system prompt", "question");

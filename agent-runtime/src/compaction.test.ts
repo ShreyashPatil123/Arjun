@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { convertToLlm, estimateContextTokens, type AgentMessage } from "@openclaw/agent-core";
 import type { Model } from "@openclaw/ai";
-import { RunCompactor, settingsForWindow } from "./compaction.js";
+import {
+  pairingIsIntact,
+  RunCompactor,
+  settingsForWindow,
+  withoutReplayedReasoning,
+} from "./compaction.js";
 
 /** A local model with a small window, which is the case that matters. */
 function model(contextWindow: number): Model {
@@ -381,5 +386,128 @@ describe("a run that outgrows its window", () => {
         expect(calledIds.has((message as unknown as { toolCallId: string }).toolCallId)).toBe(true);
       }
     }
+  });
+});
+
+/** An assistant call that thought, then called a tool, as a reasoning model's does. */
+function thinkingCall(id: string, thoughtChars: number, input: number, output: number): AgentMessage {
+  return {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "t".repeat(thoughtChars), thinkingSignature: "reasoning_content" },
+      { type: "toolCall", id, name: "document_search", arguments: { query: "minimum wall thickness" } },
+    ],
+    api: "openai-completions",
+    provider: "llama-cpp",
+    model: "spark-x2.5-4b",
+    stopReason: "toolUse",
+    timestamp: 1,
+    usage: {
+      input,
+      output,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: input + output,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  } as unknown as AgentMessage;
+}
+
+function toolResult(id: string, text: string): AgentMessage {
+  return {
+    role: "toolResult",
+    toolCallId: id,
+    toolName: "document_search",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: 1,
+  } as unknown as AgentMessage;
+}
+
+function hasThinking(messages: AgentMessage[]): boolean {
+  return messages.some((m) => {
+    const content = (m as { content?: unknown }).content;
+    return Array.isArray(content) && content.some((b) => (b as { type?: string }).type === "thinking");
+  });
+}
+
+describe("a reasoning model's own thinking", () => {
+  it("is not sent back, and neither is the count that included it", () => {
+    const call = thinkingCall("c1", 4_000, 12_000, 1_200);
+    const { messages, stripped } = withoutReplayedReasoning([user("q"), call, toolResult("c1", "r")]);
+
+    expect(stripped).toBe(1);
+    expect(hasThinking(messages)).toBe(false);
+    // The tool call survives: dropping it would orphan its result.
+    expect(pairingIsIntact(messages)).toBe(true);
+    expect("usage" in (messages[1] as object)).toBe(false);
+    // The stored transcript is the audit record and keeps every token.
+    expect(hasThinking([call])).toBe(true);
+  });
+
+  /**
+   * The recorded failure, at its real sizes: a 32,768-token window, 10,700
+   * tokens of system prompt and catalogue, a first call that thought for about
+   * 14,500 tokens, then small searches. Replayed, the thinking alone pushed
+   * the fourth call to 32,960 tokens and the run never reached the document.
+   */
+  it("no longer fills the window of a Word-note turn", async () => {
+    const window = 32_768;
+    const compactor = new RunCompactor({ model: model(window), runtime: summariser(), apiKey: "local" });
+    compactor.ledger.setText("system", "s".repeat(23_540));
+    compactor.ledger.setText("toolSchema", "t".repeat(19_480));
+
+    const messages = [
+      user("Draft the approval note as a Word file for human review."),
+      thinkingCall("c1", 58_000, 13_000, 14_500),
+      toolResult("c1", "No passages matched."),
+      thinkingCall("c2", 2_400, 27_900, 700),
+      toolResult("c2", "maintenance_sop.pdf page 2: MINIMUM ALLOWED WALL THICKNESS 5.0 mm ".repeat(20)),
+      thinkingCall("c3", 3_000, 29_800, 900),
+      toolResult("c3", "inspection_scan.pdf page 1: EQ-047, point A 4.7 mm ".repeat(20)),
+    ];
+
+    const projected = await compactor.transform(messages);
+
+    expect(hasThinking(projected)).toBe(false);
+    expect(compactor.compactions).toBe(0);
+    expect(pairingIsIntact(projected)).toBe(true);
+    // Every message kept, whole: nothing had to be dropped or cut to fit.
+    expect(projected.filter((m) => m.role === "toolResult")).toHaveLength(3);
+    expect(JSON.stringify(projected)).not.toContain("Context notice");
+    const sent = estimateContextTokens(projected).tokens + compactor.ledger.fixed();
+    expect(sent).toBeLessThan(window - settingsForWindow(window, 2048).reserveTokens);
+  });
+});
+
+describe("the ceiling pass", () => {
+  /**
+   * What is left after the question has been summarised is tool calls and
+   * their results. The pass used to align its drop point backward, which put
+   * it back where it started, so it dropped nothing and cut text instead.
+   */
+  it("drops a tool call together with its results", async () => {
+    const failing = {
+      completeSimple: vi.fn(async () => {
+        throw new Error("the summariser is unavailable");
+      }),
+    } as never;
+    const window = 8_192;
+    const compactor = new RunCompactor({ model: model(window), runtime: failing, apiKey: "local" });
+    const messages: AgentMessage[] = [];
+    for (let i = 0; i < 24; i++) {
+      messages.push(thinkingCall(`c${i}`, 0, 0, 0));
+      messages.push(toolResult(`c${i}`, `page ${i} ${"y".repeat(1_600)}`));
+    }
+
+    const projected = await compactor.transform(messages);
+
+    expect(projected.length).toBeLessThan(messages.length);
+    expect(pairingIsIntact(projected)).toBe(true);
+    expect(JSON.stringify(projected)).toContain("Context notice");
+    // Dropping was enough, so nothing was cut mid-text.
+    expect(JSON.stringify(projected)).not.toContain("cut here to fit");
+    // The newest call and its result are what the model is working with.
+    expect(projected[projected.length - 1]).toEqual(messages[messages.length - 1]);
   });
 });

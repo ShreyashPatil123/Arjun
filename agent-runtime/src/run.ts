@@ -432,10 +432,14 @@ const TEMPLATE_OVERHEAD_TOKENS = 256;
  * tools cost.
  *
  * Tool *results* land in the transcript, and a run whose window is all schema
- * has nowhere to put the passage it just retrieved. A fifth is the smallest
- * share that leaves room for a search result and the turn that reads it.
+ * has nowhere to put the passage it just retrieved. A fifth was enough for one
+ * search and the turn that reads it; it was not enough for a document turn
+ * that searches three times. Measured on a 32k window: the full 9.4k catalogue
+ * went out, three six-passage searches followed, and the request reached
+ * 34,823 tokens and was refused. A little over a third keeps that turn inside
+ * the window, and the catalogue it costs is compression, not lost tools.
  */
-const CONVERSATION_FLOOR_SHARE = 0.2;
+const CONVERSATION_FLOOR_SHARE = 0.35;
 
 /**
  * The most of the window the tool catalogue may occupy, however much is free.
@@ -462,13 +466,24 @@ const TOOL_CEILING_SHARE = 0.45;
  * be read as "leave the catalogue alone", which is the behaviour that sent a
  * 9,238-token request at an 8,192-token server.
  */
-export function toolBudgetFor(window: number, systemPrompt: string, prompt: string): number {
+export function toolBudgetFor(
+  window: number,
+  systemPrompt: string,
+  prompt: string,
+  /**
+   * The text of the conversation seeded from earlier turns. It goes out on
+   * every call of this run exactly as the system prompt does, and leaving it
+   * out sized the catalogue for an empty thread on the third turn of one.
+   */
+  seededHistory = "",
+): number {
   if (!Number.isFinite(window) || window <= 0) return 0;
   const reserve = settingsForWindow(window).reserveTokens;
   const committed =
     reserve +
     estimateTextTokens(systemPrompt) +
     estimateTextTokens(prompt) +
+    estimateTextTokens(seededHistory) +
     TEMPLATE_OVERHEAD_TOKENS;
   const free = window - committed;
   const conversationFloor = Math.max(512, Math.floor(window * CONVERSATION_FLOOR_SHARE));
@@ -647,9 +662,23 @@ export async function startRun(
   // catalogue is compressed rather than truncated and why tools are dropped
   // only as a last resort.
   // ───────────────────────────────────────────────────────────────────────
+  const seededText = seeded
+    .map((message) => {
+      const content = (message as { content?: unknown }).content;
+      if (typeof content === "string") return content;
+      if (!Array.isArray(content)) return "";
+      return content
+        .map((block) =>
+          block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+            ? (block as { text: string }).text
+            : "",
+        )
+        .join("");
+    })
+    .join("\n");
   const fitted = fitToolsToBudget(
     offered,
-    toolBudgetFor(request.model.contextWindow ?? 0, request.systemPrompt, request.prompt),
+    toolBudgetFor(request.model.contextWindow ?? 0, request.systemPrompt, request.prompt, seededText),
   );
   const tools = fitted.tools;
   contextLedger.setText(
