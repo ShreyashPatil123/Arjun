@@ -2484,11 +2484,15 @@ async fn drive_run(
     // Reading the last few requests together is what makes a conversation's
     // second turn as capable as its first.
     //
-    // This can only widen the tool set, never narrow it: `derive` adds steps
-    // and permissions on a match and removes nothing on a miss. So the worst an
-    // older request can do is leave a tool available that this turn does not
-    // use, which costs a schema in the catalogue — against a follow-up that
-    // cannot do the thing it was asked to do.
+    // Only the tool set is read from the thread. `derive` adds permissions on a
+    // match and removes nothing on a miss, so the worst an older request can do
+    // there is leave a tool available that this turn does not use, which costs
+    // a schema in the catalogue — against a follow-up that cannot do the thing
+    // it was asked to do.
+    //
+    // The steps are not: they are what the run owes, and the union of several
+    // requests owes things none of them asked for. See
+    // `planning::derive_for_turn`, which every plan below goes through.
     let plan_source = {
         let mut parts = request
             .conversation_id
@@ -2515,7 +2519,7 @@ async fn drive_run(
 ")
     };
 
-    let task_plan = planning::plan_for(&run_id, &plan_source);
+    let task_plan = planning::plan_for_turn(&run_id, &question, &plan_source);
     let plan_note = describe_plan(&task_plan);
 
     // The skills this run will carry, chosen and loaded before the model is
@@ -3640,8 +3644,26 @@ async fn drive_run(
         };
 
         let generation = chain.generations().saturating_add(1);
+        // The plan's open steps beside the model's own notes. The notes can be
+        // empty — a Word-note turn that thought until the cap and called
+        // nothing left none — and on their own they then read as "finished".
+        // Which planned tools have succeeded is evidence the run keeps for
+        // itself; see `Checkpoint::with_open_plan_steps`.
+        let succeeded_so_far: Vec<String> = calls
+            .lock()
+            .ok()
+            .and_then(|table| table.get(&run_id).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|call| call.outcome == crate::agent_runtime::tasks::CallOutcome::Succeeded)
+            .map(|call| call.tool.clone())
+            .collect();
         let checkpoint =
-            crate::ai_engine::continuation::Checkpoint::from_run_memory(&memory, generation);
+            crate::ai_engine::continuation::Checkpoint::from_run_memory(&memory, generation)
+                .with_open_plan_steps(planning::open_tool_steps(
+                    &planning::derive_for_turn(&question, &plan_source).steps,
+                    &succeeded_so_far,
+                ));
         let decision = chain.record(checkpoint, true);
 
         // Durable, not merely logged. A person looking at an answer assembled
@@ -3680,6 +3702,14 @@ async fn drive_run(
                 log::info!(
                     "[continuation] run {run_id}: generation {generation} reached the output cap                      with work outstanding; continuing from its checkpoint"
                 );
+                // Bound again, because the surface has let go of it. The
+                // capped generation's closing `message_end` completes the chat
+                // cell, and completing a cell unbinds its run — so the next
+                // generation found "This run is not attached to a conversation"
+                // on every call that reads the conversation's documents. The
+                // run is still this conversation's, and the guard unbinds it
+                // when the run really ends.
+                run_to_conversation.0.bind(&run_id, &conversation_id);
                 // The checkpoint replaces the question. The history and system
                 // prompt are untouched, so the next generation runs with the
                 // same tools, the same policy and the same window.
@@ -3903,7 +3933,7 @@ async fn drive_run(
         // documents folded in — so on any turn with an attachment the steps
         // being settled were not the steps the run was held to, and they were
         // zipped together positionally regardless.
-        &planning::derive(&plan_source).steps,
+        &planning::derive_for_turn(&question, &plan_source).steps,
         &succeeded,
         !answer.trim().is_empty(),
         verification.is_some(),
@@ -4816,6 +4846,23 @@ fn describe_working_method(plan: &PlanRun) -> String {
              Write the files, prefer something the person can open and check for themselves \
              (a self-contained page needs no build step), and say plainly at the end that you \
              could not run it here and what they should check when they do.",
+        );
+    } else if plan
+        .budget
+        .permitted_tools
+        .contains(&crate::orchestrator::tools::ToolName::ExecuteCode)
+    {
+        // The other half of the same sentence. Running is not a plan step, for
+        // the reason above, so on a machine that *can* run code nothing told
+        // the model to: asked to "run the script in the sandbox and show its
+        // output, then save it", a coding model saved it and stopped in two of
+        // five rehearsals, reporting a program it had never executed.
+        note.push_str(
+            "\n\nTHIS MACHINE CAN RUN CODE in a container sandbox with no network. When the \
+             request asks you to run, execute or test the code, call sandbox.run_code with the \
+             complete program before you finish, and report the output it actually returned. \
+             Do this as well as saving the file, not instead of it. Never describe output you \
+             have not seen come back from the sandbox.",
         );
     }
 

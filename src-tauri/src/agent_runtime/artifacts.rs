@@ -407,6 +407,7 @@ pub fn create_docx_with_evidence(
     }
 
     let content = fields_from(tool_call)?;
+    refuse_fields_the_template_cannot_print(&template, &content)?;
     let supplied = content.len();
 
     let metadata = DocumentMetadata {
@@ -700,6 +701,54 @@ fn create_docx_from_sections(
 /// Values are required to be strings. A model that supplies a number or a
 /// nested object for a document field has misunderstood the template, and
 /// silently stringifying it would put `{"value":9}` into an approval note.
+/// Refuses content the template has no section for, naming the sections it has.
+///
+/// Such text used to be dropped without a word. A Word-note run supplied
+/// `limit` and `assessment` beside the template's own fields. The document was
+/// written without them, the call reported "10 field(s) supplied", and the run
+/// then told the person the note held the margins it had calculated. It did
+/// not: they were in no section the template prints. Refused, the next call has
+/// the real field names, and the figures go where a reviewer will see them.
+fn refuse_fields_the_template_cannot_print(
+    template: &str,
+    content: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(fields) = crate::artifacts::docx::template_for(template) else {
+        return Ok(());
+    };
+    // By the same rule the repair loop applies, so a near miss it will correct
+    // ("Recommendations", a heading used as a key) goes through to be corrected,
+    // and only a name it cannot place is refused.
+    use crate::artifacts::live_source::canonical;
+    let placeable = |key: &str| {
+        let key = canonical(key);
+        fields.iter().any(|field| {
+            key == canonical(field.key) || (!field.heading.is_empty() && key == canonical(field.heading))
+        })
+    };
+    let unprinted: Vec<String> = content
+        .keys()
+        .filter(|key| !placeable(key))
+        .map(|key| format!("{key:?}"))
+        .collect();
+    if unprinted.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<&str> = fields.iter().map(|field| field.key).collect();
+    let figures = if known.contains(&"calculation") {
+        " Figures, limits and margins belong in \"calculation\"."
+    } else {
+        ""
+    };
+    Err(format!(
+        "Nothing was written. The {template} template has no section for {}, so that text would \
+         not appear in the document. Its fields are: {}.{figures} Call again with the text moved \
+         into those fields.",
+        unprinted.join(", "),
+        known.join(", "),
+    ))
+}
+
 fn fields_from(tool_call: &ToolCall) -> Result<BTreeMap<String, String>, String> {
     let object = tool_call
         .arguments
@@ -1059,6 +1108,40 @@ mod tests {
             create_docx(&call_params("run-e"), Some(&path), &author(), &tool_call)
                 .expect("the template still produces its document");
             assert!(path.exists());
+        }
+
+        /// The recorded failure: a Word-note run put the SOP limit and the
+        /// margins in `limit` and `assessment`, which the template has no
+        /// section for. They were dropped without a word, and the run told the
+        /// person the note contained them.
+        #[test]
+        fn text_the_template_cannot_print_is_refused_not_dropped() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("note.docx");
+            let tool_call = ToolCall::new(
+                "create_docx",
+                json!({
+                    "path": "note.docx",
+                    "template": "approval_note",
+                    "content": {
+                        "title": "Approval Note: EQ-047 thickness",
+                        "recipient": "Inspection Engineer",
+                        "subject": "EQ-047 readings at points A and B",
+                        "findings": "A is 4.7 mm (page 1); B is 5.4 mm (page 2).",
+                        "limit": "Minimum 5.0 mm, SOP page 2.",
+                        "assessment": "A: -0.3 mm, below. B: +0.4 mm, above.",
+                        "recommendation": "Engineering review of point A.",
+                        "references": "inspection_scan.pdf pages 1-2; maintenance_sop.pdf page 2.",
+                        "assumptions": "Readings are representative."
+                    }
+                }),
+            );
+
+            let error = create_docx(&call_params("run-e"), Some(&path), &author(), &tool_call)
+                .expect_err("text with nowhere to go must not be dropped silently");
+            assert!(error.contains("\"assessment\"") && error.contains("\"limit\""), "{error}");
+            assert!(error.contains("calculation"), "it must say where the figures go: {error}");
+            assert!(!path.exists(), "nothing is written from a refused call");
         }
 
         #[test]

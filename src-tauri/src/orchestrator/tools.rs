@@ -552,8 +552,9 @@ impl ToolName {
             ToolName::CreateDocx => Some(concat!(
                 "`content` is an object of field name to text. The approval_note ",
                 "template requires title, recipient, subject, findings, ",
-                "recommendation, references and assumptions; calculation is optional. ",
-                "Supply every required field or nothing is written.",
+                "recommendation, references and assumptions; calculation is optional ",
+                "and is where figures, limits and margins go. No other field name is ",
+                "printed. Supply every required field or nothing is written.",
             )),
             ToolName::CreatePptx => Some(concat!(
                 "`content` is an object with a title and one list of bullet strings ",

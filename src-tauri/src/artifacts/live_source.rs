@@ -57,7 +57,10 @@ impl ModelSupplied {
 }
 
 /// `Recommendations` and `recommendation ` both mean `recommendation`.
-fn canonical(key: &str) -> String {
+///
+/// Also what the create-document tool uses to decide that a supplied name has
+/// no field at all, so "repairable" and "refused" can never disagree.
+pub(crate) fn canonical(key: &str) -> String {
     let collapsed: String = key
         .trim()
         .to_lowercase()

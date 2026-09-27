@@ -351,6 +351,33 @@ impl DerivedPlan {
     }
 }
 
+/// The planned steps a tool settles that no successful call has settled yet.
+///
+/// What a run still owes, read off the same evidence [`super::tasks::PlanRecord::settle`]
+/// judges it by — a successful call of the step's tool — and phrased so the
+/// model can act on it. Answer and verification steps are left out: they are
+/// settled by the run ending, not by anything the next generation could do.
+///
+/// The collection search is not listed. Every plan opens with it, so on its
+/// own it is not evidence of unfinished work: a run whose source is an attached
+/// file has done its reading by reading the file. Listed, it sent a resumed
+/// inspection-scan turn to search empty collections until its step budget ran
+/// out — measured, twelve searches and no answer — instead of answering.
+pub fn open_tool_steps(specs: &[StepSpec], succeeded: &[String]) -> Vec<String> {
+    specs
+        .iter()
+        .filter_map(|spec| match &spec.satisfied_by {
+            Satisfies::Tool(tool)
+                if *tool != ToolName::SearchDocuments
+                    && !succeeded.iter().any(|ran| ran == tool.as_str()) =>
+            {
+                Some(format!("{} Settled by a successful {} call.", spec.intent, tool.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Reads the prompt and decides how much rope this task gets.
 pub fn derive(prompt: &str) -> DerivedPlan {
     let lower = prompt.to_lowercase();
@@ -617,6 +644,37 @@ pub fn derive(prompt: &str) -> DerivedPlan {
         permitted.push(ToolName::MemoryPromoteApproved);
     }
 
+    // The tools this plan's steps are settled by, first.
+    //
+    // The runtime fits the catalogue to the model's window and, when even its
+    // most compressed form is too large, drops tools from the end — on the
+    // stated assumption (`agent-runtime/src/tool-budget.ts`) that this list is
+    // in the order the plan needs them. It was not: it was in the order above,
+    // with the sandbox pushed last. A coding run served at 16k tokens kept the
+    // notebook tools and lost `workspace.write_text` and `sandbox.run_code`,
+    // the two its plan could not finish without, and the model spent the turn
+    // unable to act.
+    //
+    // Each step's tool moves to the front in step order, then the sandbox for
+    // a code plan (not a step, see `writes_code` above, but what the plan
+    // exists to reach). Nothing is added: only tools already permitted move.
+    let mut front: Vec<ToolName> = Vec::new();
+    let needed = steps
+        .iter()
+        .filter_map(|step| match &step.satisfied_by {
+            Satisfies::Tool(tool) => Some(*tool),
+            _ => None,
+        })
+        .chain(writes_code.then_some(ToolName::ExecuteCode));
+    for tool in needed {
+        if permitted.contains(&tool) && !front.contains(&tool) {
+            front.push(tool);
+        }
+    }
+    permitted.retain(|tool| !front.contains(tool));
+    front.append(&mut permitted);
+    let mut permitted = front;
+
     // The sovereignty filter, applied once and last.
     //
     // Deliberately not folded into the list above. A tool is dropped here
@@ -641,15 +699,152 @@ pub fn derive(prompt: &str) -> DerivedPlan {
     DerivedPlan { steps, budget }
 }
 
+/// The plan for one turn of a conversation.
+///
+/// `turn` is what the person just asked; `thread` is that plus the few requests
+/// before it. The two settle different things.
+///
+/// Which tools the run may reach is read from the thread, so a follow-up ("now
+/// put that in a deck", "yes, go ahead") can still do what an earlier message
+/// asked for. What the run *owes* — the steps it is reported unfinished
+/// without, and continued for when it is cut off — is read from this turn
+/// alone.
+///
+/// Both used to come from the thread, and the steps were then the union of
+/// every recent request, which asks for things no single message did. An
+/// inspection thread that asked for a calculation one turn and a Word note the
+/// next planned a workbook (calculation plus document) that neither message
+/// wanted, and owed the calculation again after the earlier turn had finished
+/// it. The Word-note run spent its step budget on those and stopped with no
+/// note.
+///
+/// The tools this turn's plan needs keep their place at the front; tools only
+/// the thread earned go at the end, where a small window trims first.
+pub fn derive_for_turn(turn: &str, thread: &str) -> DerivedPlan {
+    let mut plan = derive(turn);
+    for tool in derive(thread).budget.permitted_tools {
+        if !plan.budget.permitted_tools.contains(&tool) {
+            plan.budget.permitted_tools.push(tool);
+        }
+    }
+    plan
+}
+
+/// The tools a plan's steps are settled by, which the end of its budget is held
+/// for. The same set [`open_tool_steps`] reports as owed: the collection
+/// search every plan opens with is not a deliverable.
+pub fn owed_tools(steps: &[StepSpec]) -> Vec<ToolName> {
+    let mut owed = Vec::new();
+    for step in steps {
+        if let Satisfies::Tool(tool) = step.satisfied_by {
+            if tool != ToolName::SearchDocuments && !owed.contains(&tool) {
+                owed.push(tool);
+            }
+        }
+    }
+    owed
+}
+
 /// Builds the run's plan, ready to be enforced.
 pub fn plan_for(run_id: &str, prompt: &str) -> PlanRun {
     let derived = derive(prompt);
-    PlanRun::new(run_id, derived.intents(), derived.budget)
+    let owed = owed_tools(&derived.steps);
+    PlanRun::new(run_id, derived.intents(), derived.budget).with_owed_tools(owed)
+}
+
+/// [`plan_for`] for one turn of a conversation; see [`derive_for_turn`].
+pub fn plan_for_turn(run_id: &str, turn: &str, thread: &str) -> PlanRun {
+    let derived = derive_for_turn(turn, thread);
+    let owed = owed_tools(&derived.steps);
+    PlanRun::new(run_id, derived.intents(), derived.budget).with_owed_tools(owed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recorded failure: a Word note turn that ran into the output cap
+    /// having called nothing. What it still owes is the document, and that
+    /// has to come before the collection search every plan opens with.
+    #[test]
+    fn the_unmade_document_is_what_a_capped_run_still_owes_and_it_comes_first() {
+        let plan = derive(
+            "Draft the approval note as a Word file for human review. Fill in: title, recipient, \
+             subject, findings with their source page numbers, recommendation, references, and \
+             assumptions.",
+        );
+        let open = open_tool_steps(&plan.steps, &[]);
+        assert!(open.first().is_some_and(|step| step.contains(ToolName::CreateDocx.as_str())), "got {open:?}");
+        assert!(
+            !open.iter().any(|step| step.contains(ToolName::SearchDocuments.as_str())),
+            "the opening collection search is not unfinished work: {open:?}"
+        );
+
+        // A reading turn owes no deliverable, so a capped one is not continued
+        // into a round of empty collection searches.
+        let reading = derive("Read the attached inspection_scan.pdf. What is the equipment ID?");
+        assert!(open_tool_steps(&reading.steps, &[]).is_empty());
+
+        let done = vec![ToolName::CreateDocx.as_str().to_string()];
+        assert!(
+            !open_tool_steps(&plan.steps, &done).iter().any(|step| step.contains(ToolName::CreateDocx.as_str())),
+            "a document that was written is not still owed"
+        );
+    }
+
+    /// The recorded failure: the Word-note turn of an inspection thread whose
+    /// previous turn asked for a calculation. Planned from the thread, it owed
+    /// a workbook nobody asked for and the calculation already done, and ran
+    /// out of steps before the note.
+    #[test]
+    fn a_follow_up_owes_only_what_it_asks_for_and_keeps_what_the_thread_permits() {
+        let earlier = "Now read the attached maintenance_sop.pdf. Find the minimum allowed wall \
+                       thickness it states and give its page number. Then calculate the margin of A \
+                       and B against that minimum, and say which point is below it.";
+        let now = "Draft the approval note as a Word file for human review. Fill in: title, \
+                   recipient (Inspection Engineer), subject, findings with their source page \
+                   numbers, recommendation, references, and assumptions.";
+        let thread = format!("{earlier}\n{now}");
+        assert!(
+            plans(&derive(&thread), ToolName::CreateXlsx),
+            "the premise: the two requests together plan a workbook neither asked for"
+        );
+
+        let plan = derive_for_turn(now, &thread);
+        assert!(plans(&plan, ToolName::CreateDocx));
+        assert!(!plans(&plan, ToolName::CreateXlsx), "no workbook was asked for");
+        assert!(!plans(&plan, ToolName::RunCalculation), "the calculation was the earlier turn's");
+        let at = |tool: ToolName| plan.budget.permitted_tools.iter().position(|t| *t == tool);
+        assert!(at(ToolName::CreateDocx) < at(ToolName::CreateXlsx), "this turn's tool leads");
+        // Reaching a tool is still the thread's to decide.
+        assert!(plan.budget.permitted_tools.contains(&ToolName::CreateXlsx));
+
+        // A confirmation plans nothing of its own and can still act.
+        let go = derive_for_turn(
+            "yes, go ahead",
+            "Write a Python script that flags readings below 5.0 and run it.\nyes, go ahead",
+        );
+        assert!(go.budget.permitted_tools.contains(&ToolName::ExecuteCode));
+        assert!(!plans(&go, ToolName::WriteScopedFile));
+    }
+
+    /// The runtime drops tools from the end of this list when a window is
+    /// small, so a code plan's write and sandbox tools must not be there.
+    #[test]
+    fn a_code_plan_offers_its_write_and_sandbox_tools_before_the_rest() {
+        let plan = derive(
+            "Write a Python script that checks wall-thickness readings against a minimum of 5.0. \
+             Run the script in the sandbox and show its output, then save it to the workspace.",
+        );
+        let order = &plan.budget.permitted_tools;
+        let at = |tool: ToolName| order.iter().position(|t| *t == tool).unwrap_or(usize::MAX);
+        assert!(at(ToolName::WriteScopedFile) < at(ToolName::NotebookList), "{order:?}");
+        assert!(at(ToolName::ExecuteCode) < at(ToolName::NotebookList), "{order:?}");
+        assert!(at(ToolName::ExecuteCode) <= 3, "the sandbox must survive a trim to a handful of tools: {order:?}");
+        // Reordering permits nothing new.
+        let unordered = derive("What does the SOP say about wall thickness?");
+        assert!(!unordered.budget.permitted_tools.contains(&ToolName::ExecuteCode));
+    }
 
     /// Helper: does this plan expect the run to use the tool?
     fn plans(plan: &DerivedPlan, tool: ToolName) -> bool {

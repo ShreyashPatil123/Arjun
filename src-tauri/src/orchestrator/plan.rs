@@ -163,6 +163,13 @@ pub enum StopReason {
     /// once was punished for it, which is the opposite of what running them in
     /// parallel is for.
     StepsInFlight { in_flight: u32, allowed: u32 },
+    /// Only the end of the budget is left, and it is held for the deliverable
+    /// the plan still owes.
+    ///
+    /// Not a halt, like [`Self::StepsInFlight`]: this call is refused, and the
+    /// call the plan is waiting for is still admitted. See
+    /// [`PlanRun::with_owed_tools`].
+    HeldForDeliverable { owed: Vec<String>, held: u32, allowed: u32 },
     /// The clock ran out.
     TimeExhausted { allowed_seconds: u64 },
     /// The same call kept coming back — the agent is going in circles.
@@ -227,6 +234,12 @@ impl StopReason {
             StopReason::StepsInFlight { in_flight, allowed } => format!(
                 "Not started: {in_flight} of {allowed} permitted steps are already under way, so                  there was no room for this call. Wait for the results you asked for and decide                  what to do with them."
             ),
+            StopReason::HeldForDeliverable { owed, held, allowed } => format!(
+                "Not started: the last {held} of {allowed} permitted steps are held for {}, which \
+                 this task still owes. Produce it now from what you already have; searching further \
+                 would leave no room to write it.",
+                owed.join(" or ")
+            ),
             StopReason::TimeExhausted { allowed_seconds } => format!(
                 "Stopped after {} minutes, the time allowed for one task. The work below is what \
                  was completed.",
@@ -274,7 +287,17 @@ pub struct PlanRun {
     /// and is what makes settling and releasing address one lease rather than
     /// "the most recent". See [`PlanRun::reserve_at`].
     leases: HashMap<String, Lease>,
+    /// Tools the plan's steps are settled by that no call has yet completed.
+    /// The end of the budget is held for them. See [`Self::with_owed_tools`].
+    owed: Vec<ToolName>,
 }
+
+/// How many steps at the end of a budget are held for what the plan owes.
+///
+/// Four: the deliverable, two corrected attempts after the tool refuses its
+/// content (a rehearsed Word-note run needed both, for field names the template
+/// does not have), and the re-open that checks it.
+pub const DELIVERABLE_RESERVE: u32 = 4;
 
 /// A slot in the budget, held between authorisation and settlement.
 #[derive(Debug, Clone)]
@@ -330,7 +353,38 @@ impl PlanRun {
             seen: HashMap::new(),
             stopped: None,
             leases: HashMap::new(),
+            owed: Vec::new(),
         }
+    }
+
+    /// Holds the end of the budget for the tools the plan's steps are settled by.
+    ///
+    /// ## The failure this prevents
+    ///
+    /// A Word-note turn, asked for a document, spent every one of its twelve
+    /// steps gathering what the conversation already held. It ran a memory
+    /// recall, four searches of empty collections, two whole-document reads,
+    /// four more searches and a calculation. When it finally called
+    /// `artifact.create_approval_note`, the budget was gone and no document was
+    /// written. The same prompt succeeded on other runs; how long a model
+    /// researches before it writes is its own choice, and the budget has to
+    /// hold whichever way that goes.
+    ///
+    /// So once only [`DELIVERABLE_RESERVE`] steps are left, they go to the owed
+    /// tools and to `validate_artifact`, which re-opens what was produced. Any
+    /// other call is refused with a sentence telling the model to write now.
+    /// When an owed tool succeeds ([`Self::delivered`]) the hold is released.
+    pub fn with_owed_tools(mut self, owed: Vec<ToolName>) -> Self {
+        self.owed = owed
+            .into_iter()
+            .filter(|tool| self.budget.permits(*tool))
+            .collect();
+        self
+    }
+
+    /// Records that an owed tool completed, releasing its hold on the budget.
+    pub fn delivered(&mut self, tool: ToolName) {
+        self.owed.retain(|owed| *owed != tool);
     }
 
     /// Marks an existing step as a milestone checkpoint.
@@ -572,6 +626,18 @@ impl PlanRun {
                     tool.as_str()
                 ),
             });
+        }
+
+        // The end of the budget, for what the plan still owes.
+        if !self.owed.is_empty() && !self.owed.contains(&tool) && tool != ToolName::ValidateArtifact {
+            let held = DELIVERABLE_RESERVE.min(self.budget.max_steps.saturating_sub(1));
+            if self.steps_committed().saturating_add(held) >= self.budget.max_steps {
+                return Continuation::Stop(StopReason::HeldForDeliverable {
+                    owed: self.owed.iter().map(|t| t.as_str().to_string()).collect(),
+                    held,
+                    allowed: self.budget.max_steps,
+                });
+            }
         }
 
         // Loop detection. Keyed on the whole call, so re-reading a *different*
@@ -1145,6 +1211,71 @@ mod reservations {
                 repeat_limit: 100,
             },
         )
+    }
+
+    /// The recorded failure: a Word-note turn spent its whole budget
+    /// searching and was refused the document it existed to write.
+    #[test]
+    fn the_end_of_the_budget_is_held_for_the_document_the_plan_owes() {
+        let mut plan = plan_with(12).with_owed_tools(vec![ToolName::CreateDocx]);
+        for i in 0..12 - DELIVERABLE_RESERVE {
+            let id = format!("tc-{i}");
+            assert_eq!(plan.reserve(&id, &call("search_documents", &i.to_string())), Continuation::Proceed);
+            assert!(plan.settle(&id));
+        }
+
+        // Research is refused, and the run is not ended by it.
+        match plan.reserve("tc-more", &call("search_documents", "one more")) {
+            Continuation::Stop(reason @ StopReason::HeldForDeliverable { .. }) => {
+                let said = reason.explain();
+                assert!(said.contains("artifact.create_approval_note"), "{said}");
+                assert!(said.contains("permitted steps"), "classified as a refusal: {said}");
+            }
+            other => panic!("expected the deliverable hold, got {other:?}"),
+        }
+        assert!(plan.stopped().is_none(), "a held slot refuses one call, it does not end the run");
+
+        // The document, and the re-open that checks it, still get in.
+        assert_eq!(plan.reserve("tc-docx", &call("create_docx", "note")), Continuation::Proceed);
+        assert!(plan.settle("tc-docx"));
+        plan.delivered(ToolName::CreateDocx);
+        assert_eq!(plan.reserve("tc-check", &call("validate_artifact", "note")), Continuation::Proceed);
+        assert!(plan.settle("tc-check"));
+
+        // Delivered, so the last step is anybody's.
+        assert_eq!(plan.reserve("tc-last", &call("search_documents", "after")), Continuation::Proceed);
+    }
+
+    /// A plan that owes no tool keeps its whole budget for whatever it needs.
+    #[test]
+    fn a_plan_that_owes_nothing_holds_nothing_back() {
+        let mut plan = plan_with(4);
+        for i in 0..4 {
+            let id = format!("tc-{i}");
+            assert_eq!(plan.reserve(&id, &call("search_documents", &i.to_string())), Continuation::Proceed);
+            assert!(plan.settle(&id));
+        }
+    }
+
+    /// A hold for a tool this run may not use would only block the rest.
+    #[test]
+    fn a_tool_the_plan_does_not_permit_is_not_owed() {
+        let mut plan = PlanRun::new(
+            "run-1",
+            vec!["read".to_string()],
+            Budget {
+                max_steps: 4,
+                max_duration: Duration::from_secs(600),
+                permitted_tools: vec![ToolName::SearchDocuments],
+                repeat_limit: 100,
+            },
+        )
+        .with_owed_tools(vec![ToolName::CreateDocx]);
+        for i in 0..4 {
+            let id = format!("tc-{i}");
+            assert_eq!(plan.reserve(&id, &call("search_documents", &i.to_string())), Continuation::Proceed);
+            assert!(plan.settle(&id));
+        }
     }
 
     #[test]

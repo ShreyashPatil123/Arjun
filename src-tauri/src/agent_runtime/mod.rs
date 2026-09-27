@@ -2026,7 +2026,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
                 // Counted like any other call. A replay still costs a turn and
                 // a slice of the context window, and a budget that did not
                 // count it is one a model repeating itself never reaches.
-                record_step(deps, &call.run_id, &call.tool_call_id, tool);
+                record_step(deps, &call.run_id, &call.tool_call_id, tool, outcome.is_ok());
                 return match outcome {
                     // Cut and sanitised exactly as a fresh result is. A replay
                     // that came back longer than the same call did the first
@@ -2377,7 +2377,7 @@ async fn execute(params: Value, deps: &Arc<RuntimeDeps>) -> Result<Value, WireEr
     // Counted whatever the tool returned. A failed call cost the same wall
     // clock and the same context window as a successful one, and a budget that
     // only counts successes is one a model going in circles never reaches.
-    record_step(deps, &call.run_id, &call.tool_call_id, tool);
+    record_step(deps, &call.run_id, &call.tool_call_id, tool, outcome.is_ok());
 
     match outcome {
         // Cut to the tool's own ceiling on the way out, in one place. Doing it
@@ -2858,7 +2858,13 @@ fn release_reservation(deps: &Arc<RuntimeDeps>, run_id: &str, tool_call_id: &str
     }
 }
 
-fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool_call_id: &str, tool: ToolName) {
+fn record_step(
+    deps: &Arc<RuntimeDeps>,
+    run_id: &str,
+    tool_call_id: &str,
+    tool: ToolName,
+    succeeded: bool,
+) {
     // Built inside the lock, published outside it: the handler is arbitrary
     // code, and holding the plan table across a slow listener would stall every
     // other run's authorisation.
@@ -2885,6 +2891,12 @@ fn record_step(deps: &Arc<RuntimeDeps>, run_id: &str, tool_call_id: &str, tool: 
                 tool.as_str()
             );
             return;
+        }
+        // A deliverable that was written releases the end of the budget it
+        // was holding. A failed attempt does not: the hold is what leaves room
+        // for the corrected one.
+        if succeeded {
+            plan.delivered(tool);
         }
         json!({
             "type": "plan_step",
