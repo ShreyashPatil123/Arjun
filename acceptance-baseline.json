@@ -1,16 +1,16 @@
 {
-  "at": "2026-09-01T16:45:21.313Z",
+  "at": "2026-09-25T21:10:58.856Z",
   "platform": "win32 x64",
   "results": [
     {
       "name": "1. Model auto-selection across task types",
       "status": "PASS",
-      "detail": "23 routing checks — different task types select different models, each with a recorded reason"
+      "detail": "40 routing checks — different task types select different models, each with a recorded reason"
     },
     {
       "name": "2. Agentic task, start to finish",
       "status": "PASS",
-      "detail": "264 checks — bounded plan, gated tools, grounded artifact that re-opens and verifies"
+      "detail": "500 checks — bounded plan, gated tools, grounded artifact that re-opens and verifies"
     },
     {
       "name": "3. Coding task run in the sandbox",
@@ -20,7 +20,7 @@
     {
       "name": "4. Multimodal task",
       "status": "PASS",
-      "detail": "77 document-pipeline checks, with a vision model provisioned at C:\\Users\\lenovo\\AppData\\Roaming\\com.sarathi.app\\models"
+      "detail": "125 document-pipeline checks, with a vision model provisioned at C:\\Users\\lenovo\\AppData\\Roaming\\com.sarathi.app\\models"
     },
     {
       "name": "5. Zero egress in Work mode",
