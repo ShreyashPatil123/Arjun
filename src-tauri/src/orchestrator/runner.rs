@@ -645,11 +645,19 @@ impl<'a> LocalToolRunner<'a> {
         let mut out = format!("Findings for {described}.\n\n");
 
         if read_pages.is_empty() {
+            // What this tool can know, and no more. It searches the knowledge
+            // index; a file attached to the conversation is stored beside it,
+            // not in it. This used to say "this deployment has no OCR or
+            // document vision model available" — never checked, and false on
+            // the machine it was said on — and a model reading an inspection
+            // scan that OCR had just read in full then reported page 2 as
+            // illegible while quoting the reading on it.
             out.push_str(
-                "No page in this range holds extracted text. These pages are images that no \
-                 installed engine has read: this deployment has no OCR or document vision model \
-                 available, so their contents are unknown. Do not describe or quote them. Say \
-                 that the pages could not be read and that a person needs to look at them.\n",
+                "The knowledge index holds no extracted text for this page range. That says \
+                 nothing about whether the pages are legible: a document attached to this \
+                 conversation is not in the index, and its pages are read with \
+                 document.read_pages. Do not conclude from this result that a page is \
+                 unreadable or that a value is missing.\n",
             );
             return Ok(out);
         }
@@ -661,10 +669,10 @@ impl<'a> LocalToolRunner<'a> {
         if !unread.is_empty() {
             // The load-bearing sentence. Without it a partial read looks whole.
             out.push_str(&format!(
-                "\nUnread in this range: page(s) {}. They hold no extracted text — they are \
-                 images, and no OCR or document vision model is installed to read them. Anything \
-                 on those pages is unknown, not absent: do not conclude from this result that a \
-                 clause or figure is missing from the document.\n",
+                "\nNot in the knowledge index for this range: page(s) {}. Anything on those \
+                 pages is unknown to this search, not absent: do not conclude from this result \
+                 that a clause or figure is missing, or that the page is illegible. An attached \
+                 document's pages are read with document.read_pages.\n",
                 unread
                     .iter()
                     .map(u32::to_string)

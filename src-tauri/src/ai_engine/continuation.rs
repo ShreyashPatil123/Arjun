@@ -178,6 +178,34 @@ impl Checkpoint {
 }
 
 impl Checkpoint {
+    /// Adds the plan's unsettled steps to what the working notes say is left.
+    ///
+    /// The notes are the model's own account and can be empty. A Word-note turn
+    /// that thought until the output cap and called nothing left notes with no
+    /// goal, no next action and no open questions — so the checkpoint read as
+    /// finished, the chain stopped, and the run was recorded as complete with
+    /// no document and the previous turn's answer repeated as its reply. The
+    /// plan still had "Produce the document" open; that is evidence the run
+    /// keeps independently of the model, and it is what says work remains.
+    ///
+    /// `steps` comes from [`crate::agent_runtime::planning::open_tool_steps`].
+    /// Nothing is removed and nothing is duplicated; an empty next step is
+    /// filled with the first open one, which is what the resumption prompt
+    /// tells the next generation to start with.
+    pub fn with_open_plan_steps(mut self, steps: Vec<String>) -> Self {
+        for step in steps {
+            if !self.pending_subtasks.iter().any(|pending| pending == &step) {
+                self.pending_subtasks.push(step);
+            }
+        }
+        if self.next_step.trim().is_empty() {
+            if let Some(first) = self.pending_subtasks.first() {
+                self.next_step = first.clone();
+            }
+        }
+        self
+    }
+
     /// A checkpoint from the working notes the run already keeps.
     ///
     /// Nothing here is new state. [`crate::agent_runtime::memory::RunMemory`]
@@ -393,6 +421,40 @@ mod tests {
         let mut chain = ContinuationChain::new();
         let decision = chain.record(checkpoint(&["all of it"], &[], ""), true);
         assert_eq!(decision, ContinuationDecision::Finished);
+    }
+
+    /// The recorded failure. The working notes were empty, so on their own
+    /// they said "finished"; the plan still owed the Word file. With the
+    /// plan's open steps added, the capped generation is continued and told to
+    /// make the document.
+    #[test]
+    fn empty_notes_do_not_finish_a_run_whose_plan_still_owes_a_document() {
+        let owed = "Produce the document and re-open it to confirm it is sound before saying it is ready. \
+                    Settled by a successful artifact.create_approval_note call.";
+        assert_eq!(
+            ContinuationChain::new().record(Checkpoint::default(), true),
+            ContinuationDecision::Finished,
+            "the notes alone read as finished, which is the defect"
+        );
+
+        let cp = Checkpoint::default().with_open_plan_steps(vec![owed.to_string()]);
+        assert_eq!(cp.next_step, owed);
+        match ContinuationChain::new().record(cp, true) {
+            ContinuationDecision::Continue { resumption_prompt, .. } => {
+                assert!(resumption_prompt.contains("artifact.create_approval_note"), "{resumption_prompt}");
+                assert!(resumption_prompt.contains("Start here"), "{resumption_prompt}");
+            }
+            other => panic!("expected a continuation, got {other:?}"),
+        }
+    }
+
+    /// The model's own next step is kept; the plan's steps only fill gaps.
+    #[test]
+    fn open_plan_steps_add_to_the_notes_without_replacing_them() {
+        let cp = checkpoint(&[], &["check page 2"], "check page 2")
+            .with_open_plan_steps(vec!["check page 2".into(), "make the file".into()]);
+        assert_eq!(cp.pending_subtasks, ["check page 2", "make the file"]);
+        assert_eq!(cp.next_step, "check page 2");
     }
 
     /// A model that stopped on its own is not overruled.

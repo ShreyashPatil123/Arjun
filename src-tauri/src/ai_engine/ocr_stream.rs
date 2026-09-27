@@ -167,6 +167,85 @@ pub struct StreamSummary {
 /// server accepts neither of the alternatives. See `request_body`.
 const DRY_NEVER_MATCHES: &str = "\u{001F}";
 
+/// Longest control-token marker the filter will wait for.
+///
+/// The longest the OCR vocabulary holds is a `<｜place▁holder▁no▁NNN｜>` at
+/// about thirty bytes. A `<` with no `>` inside this many bytes is prose, and
+/// it is released rather than held back indefinitely.
+const MAX_MARKER_BYTES: usize = 64;
+
+/// Removes the control-token markers `--special` makes visible, and keeps the
+/// table tags that are the reason the flag is set.
+///
+/// The OCR server is started with `--special` so that `<td>`, `</td>`, `<tr>`
+/// and `</tr>` — control tokens in Unlimited-OCR's vocabulary — survive into
+/// the text. The same flag also exposes the grounding markers
+/// (`<|det|>title [72, 44, 717, 66]<|/det|>…`) and the end-of-sequence token,
+/// which llama-server used to drop. Removing exactly those gives back the
+/// `label [x1, y1, x2, y2]text` lines [`super::ocr_spans`] was built on, byte
+/// for byte, with the cell boundaries restored. Measured on a real inspection
+/// sheet: `Equipment IDEQ - 047` became
+/// `<td>Equipment ID</td><td>EQ - 047</td>`.
+///
+/// Markers are single tokens, but chunks respect nothing, so a `<` at the end
+/// of a chunk is held until it is known to be a marker or not.
+#[derive(Debug, Default)]
+pub struct ControlMarkerFilter {
+    held: String,
+}
+
+impl ControlMarkerFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consumes a delta and returns the text that is now certain.
+    pub fn feed(&mut self, delta: &str) -> String {
+        self.held.push_str(delta);
+        let mut out = String::new();
+        loop {
+            let Some(start) = self.held.find('<') else {
+                out.push_str(&self.held);
+                self.held.clear();
+                break;
+            };
+            out.push_str(&self.held[..start]);
+            self.held.drain(..start);
+            match self.held.find('>') {
+                Some(end) => {
+                    if is_control_marker(&self.held[..=end]) {
+                        self.held.drain(..=end);
+                    } else {
+                        // `<table>`, `<td>`, or a `<` in prose: keep it and
+                        // look for the next one after it.
+                        out.push('<');
+                        self.held.drain(..1);
+                    }
+                }
+                None if self.held.len() > MAX_MARKER_BYTES => {
+                    out.push('<');
+                    self.held.drain(..1);
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// End of stream: whatever was held is text.
+    pub fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// A grounding marker, an end-of-sequence token or an image placeholder —
+/// what llama-server omits without `--special`. Table tags are not among them.
+fn is_control_marker(candidate: &str) -> bool {
+    (candidate.starts_with("<|") && candidate.ends_with("|>"))
+        || (candidate.starts_with("<｜") && candidate.ends_with("｜>"))
+        || candidate == "<image>"
+}
+
 /// Builds the request body for one page.
 ///
 /// Split out so the argument shape can be asserted without a server: the
@@ -316,6 +395,9 @@ where
 
     let mut sse = SseDecoder::new();
     let mut spans = SpanParser::new();
+    // Ahead of both consumers, so neither sees a grounding marker. A no-op for
+    // a server started without `--special`.
+    let mut markers = ControlMarkerFilter::new();
     let mut stream = response.bytes_stream();
     let mut tokens: u32 = 0;
     let mut hit_decode_cap = false;
@@ -362,6 +444,7 @@ where
                     }
                     if let Some(delta) = delta_text(&value) {
                         tokens += 1;
+                        let delta = markers.feed(&delta);
                         for event in spans.feed(&delta) {
                             on_event(event);
                         }
@@ -387,12 +470,16 @@ where
         if let SseFrame::Data(payload) = frame {
             if let Ok(value) = serde_json::from_str::<Value>(&payload) {
                 if let Some(delta) = delta_text(&value) {
+                    let delta = markers.feed(&delta);
                     for event in spans.feed(&delta) {
                         on_event(event);
                     }
                 }
             }
         }
+    }
+    for event in spans.feed(&markers.finish()) {
+        on_event(event);
     }
     for event in spans.finish() {
         on_event(event);
@@ -426,6 +513,102 @@ mod tests {
         let mut out: Vec<SseFrame> = chunks.iter().flat_map(|c| d.feed(c)).collect();
         out.extend(d.finish());
         out
+    }
+
+    /// Captured from Unlimited-OCR Q6_K served with `--special`, reading page 1
+    /// of a real inspection sheet (trimmed to the first regions and the end).
+    const WITH_SPECIAL: &str = concat!(
+        "<|det|>title [72, 44, 717, 66]<|/det|>NORTHRIDGE INDUSTRIAL SERVICES\n",
+        "<|det|>table [73, 127, 931, 219]<|/det|><table><tr><td>Equipment ID</td><td>EQ - 047</td>",
+        "<td>Inspection Date</td><td>2026 - 09 - 26</td></tr></table>\n",
+        "<|det|>table [74, 272, 925, 407]<|/det|><table><tr><td>Point</td><td>Reading</td></tr>",
+        "<tr><td>A</td><td>4.7</td></tr></table>\n",
+        "<|det|>footer [76, 949, 435, 959]<|/det|>CONTROLLED COPY<｜end▁of▁sentence｜>"
+    );
+
+    /// What the same page reads as once the markers are gone: the format the
+    /// span parser was built on, with the cell tags that were being lost.
+    const CLEANED: &str = concat!(
+        "title [72, 44, 717, 66]NORTHRIDGE INDUSTRIAL SERVICES\n",
+        "table [73, 127, 931, 219]<table><tr><td>Equipment ID</td><td>EQ - 047</td>",
+        "<td>Inspection Date</td><td>2026 - 09 - 26</td></tr></table>\n",
+        "table [74, 272, 925, 407]<table><tr><td>Point</td><td>Reading</td></tr>",
+        "<tr><td>A</td><td>4.7</td></tr></table>\n",
+        "footer [76, 949, 435, 959]CONTROLLED COPY"
+    );
+
+    fn filtered(chunks: &[&str]) -> String {
+        let mut filter = ControlMarkerFilter::new();
+        let mut out: String = chunks.iter().map(|chunk| filter.feed(chunk)).collect();
+        out.push_str(&filter.finish());
+        out
+    }
+
+    #[test]
+    fn grounding_markers_go_and_table_cells_stay() {
+        assert_eq!(filtered(&[WITH_SPECIAL]), CLEANED);
+    }
+
+    /// Every split point of the real capture, including inside a multi-byte
+    /// end-of-sequence marker, gives the same text.
+    #[test]
+    fn no_chunk_boundary_changes_the_filtered_text() {
+        let boundaries: Vec<usize> = (0..=WITH_SPECIAL.len())
+            .filter(|at| WITH_SPECIAL.is_char_boundary(*at))
+            .collect();
+        for at in boundaries {
+            let (a, b) = WITH_SPECIAL.split_at(at);
+            assert_eq!(filtered(&[a, b]), CLEANED, "split at byte {at}");
+        }
+        let one_char_at_a_time: Vec<String> = WITH_SPECIAL.chars().map(String::from).collect();
+        let chunks: Vec<&str> = one_char_at_a_time.iter().map(String::as_str).collect();
+        assert_eq!(filtered(&chunks), CLEANED);
+    }
+
+    /// A server without `--special` sends none of these markers, and the
+    /// filter must then change nothing — including prose that uses `<` and `>`.
+    #[test]
+    fn text_without_markers_passes_through_unchanged() {
+        let plain = "title [77, 51, 723, 86]REPORT\ntext [1, 2, 3, 4]pressure < 5 bar and > 2 bar, a <b> tag\n";
+        assert_eq!(filtered(&[plain]), plain);
+    }
+
+    /// A `<` that never closes is released once it cannot be a marker, not
+    /// held to the end of the page.
+    #[test]
+    fn an_unclosed_angle_bracket_is_released() {
+        let mut filter = ControlMarkerFilter::new();
+        let first = filter.feed("reading < ");
+        let second = filter.feed(&"x".repeat(MAX_MARKER_BYTES + 1));
+        assert_eq!(first, "reading ");
+        assert!(second.starts_with('<'), "released: {second:?}");
+        assert_eq!(filter.finish(), "");
+    }
+
+    /// The regions come out exactly as the parser read the marker-free stream,
+    /// so the scan view and page numbering are unaffected.
+    #[test]
+    fn the_span_parser_sees_the_same_regions_as_before() {
+        let mut parser = crate::ai_engine::ocr_spans::SpanParser::new();
+        let mut events = parser.feed(&filtered(&[WITH_SPECIAL]));
+        events.extend(parser.finish());
+        let labels: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::ai_engine::ocr_spans::OcrEvent::Region { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["title", "table", "table", "footer"]);
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::ai_engine::ocr_spans::OcrEvent::Text { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("<td>Equipment ID</td><td>EQ - 047</td>"), "got {text:?}");
+        assert!(!text.contains("<|") && !text.contains("<｜"), "a marker survived: {text:?}");
     }
 
     #[test]
