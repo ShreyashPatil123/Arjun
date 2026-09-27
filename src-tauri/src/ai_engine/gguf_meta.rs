@@ -117,6 +117,17 @@ pub struct GgufMetadata {
     /// is full" rather than as zero — under-charging the KV cache is how a
     /// plan that claimed to fit dies in `ggml_vulkan` at allocation time.
     pub full_attention_layers: Option<u32>,
+    /// How many blocks keep a KV cache at all, where the header lists KV heads
+    /// per layer.
+    ///
+    /// A hybrid recurrent model stores `<arch>.attention.head_count_kv` as a
+    /// per-layer array with zeros on its Mamba and feed-forward blocks.
+    /// NVIDIA-Nemotron3-Nano-4B (`nemotron_h`) has 42 blocks and KV heads on 4
+    /// of them. Reading the array as absent charged all 42 blocks at the full
+    /// head count — 26 times the real cache — and on an 8 GB card that put the
+    /// coding model entirely on the CPU. `None` when the count is a scalar,
+    /// which means every block.
+    pub kv_attention_layers: Option<u32>,
     /// From `general.parameter_count`, which not every converter writes.
     pub parameter_count: Option<u64>,
     /// Training context length, from `<arch>.context_length`.
@@ -177,7 +188,15 @@ impl GgufMetadata {
     /// dimensions carry the factor of two that the size-banded estimate spells
     /// out separately.
     pub fn kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token_for(self.block_count)
+        self.kv_bytes_per_token_for(self.kv_layers())
+    }
+
+    /// Blocks that hold a KV cache: all of them, unless the header lists KV
+    /// heads per layer. See [`Self::kv_attention_layers`].
+    fn kv_layers(&self) -> u32 {
+        self.kv_attention_layers
+            .filter(|layers| *layers > 0)
+            .map_or(self.block_count, |layers| layers.min(self.block_count))
     }
 
     /// The same arithmetic over a stated number of layers.
@@ -335,6 +354,10 @@ pub fn parse_gguf_metadata<R: Read + Seek>(r: &mut R) -> Result<GgufMetadata> {
             ArrayScan::Vocabulary
         } else if key.ends_with(".attention.sliding_window_pattern") {
             ArrayScan::AttentionPattern
+        } else if key.ends_with(".attention.head_count_kv") {
+            // Usually a scalar, which never reaches the array path. As an
+            // array it is per layer, and a zero marks a block with no cache.
+            ArrayScan::KvHeadsPerLayer
         } else {
             ArrayScan::None
         };
@@ -357,6 +380,10 @@ pub fn parse_gguf_metadata<R: Read + Seek>(r: &mut R) -> Result<GgufMetadata> {
                     FULL_ATTENTION_LAYERS.to_string(),
                     Scalar::U(u64::from(full_attention_layers)),
                 );
+            }
+            ArrayOrScalar::CountedKvHeads { layers, heads } => {
+                kv.insert(KV_ATTENTION_LAYERS.to_string(), Scalar::U(u64::from(layers)));
+                kv.insert(KV_HEADS_PER_LAYER.to_string(), Scalar::U(u64::from(heads)));
             }
             ArrayOrScalar::Skipped => {}
         }
@@ -394,6 +421,12 @@ const VOCABULARY_HAS_REASONING_TOKEN: &str = "arjun.vocabulary_has_reasoning_tok
 /// function of the parsed header.
 const FULL_ATTENTION_LAYERS: &str = "arjun.full_attention_layers";
 
+/// Where a per-layer `head_count_kv` array records how many blocks have KV
+/// heads, and how many heads the largest of them has. Pseudo-keys for the same
+/// reason as [`FULL_ATTENTION_LAYERS`].
+const KV_ATTENTION_LAYERS: &str = "arjun.kv_attention_layers";
+const KV_HEADS_PER_LAYER: &str = "arjun.kv_heads_per_layer";
+
 fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
     let architecture = kv
         .get("general.architecture")
@@ -411,10 +444,21 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
     let embedding_length = get("embedding_length").unwrap_or(0);
     let head_count = get("attention.head_count").unwrap_or(0);
 
-    // A GGUF may store head_count_kv as a per-layer array, which is skipped
-    // during parsing. Falling back to head_count over-states the KV cost rather
-    // than under-stating it, which is the safe direction — see vram_planner.
-    let head_count_kv = get("attention.head_count_kv").unwrap_or(head_count);
+    // A GGUF may store head_count_kv as a per-layer array. That array is
+    // reduced to the blocks that have KV heads and the most heads any of them
+    // has; see `kv_attention_layers`. Only with neither does this fall back to
+    // head_count on every block, which over-states rather than under-states.
+    let kv_attention_layers = kv
+        .get(KV_ATTENTION_LAYERS)
+        .and_then(Scalar::as_u32)
+        .filter(|layers| *layers > 0);
+    let head_count_kv = get("attention.head_count_kv")
+        .or_else(|| {
+            kv.get(KV_HEADS_PER_LAYER)
+                .and_then(Scalar::as_u32)
+                .filter(|heads| *heads > 0)
+        })
+        .unwrap_or(head_count);
 
     // llama.cpp applies the same default when these keys are absent.
     let default_head_dim = embedding_length.checked_div(head_count).unwrap_or(0);
@@ -505,6 +549,7 @@ fn from_kv(kv: &HashMap<String, Scalar>) -> Result<GgufMetadata> {
         value_length,
         sliding_window,
         full_attention_layers,
+        kv_attention_layers,
         parameter_count: kv.get("general.parameter_count").and_then(Scalar::as_u64),
         // Deliberately not defaulted here. A caller that needs a number when the
         // key is missing has to choose one and say why; a default invented in
@@ -562,6 +607,9 @@ enum ArrayOrScalar {
     ScannedVocabulary { has_reasoning_token: bool },
     /// The per-layer attention pattern, reduced to the count that matters.
     CountedAttentionPattern { full_attention_layers: u32 },
+    /// Per-layer KV heads, reduced to the blocks that have any and the most
+    /// any one has.
+    CountedKvHeads { layers: u32, heads: u32 },
 }
 
 /// Which array, if any, is worth looking inside.
@@ -578,6 +626,9 @@ enum ArrayScan {
     /// `<arch>.attention.sliding_window_pattern`, counted for full-attention
     /// layers. Bounded by the block count, so this is dozens of bytes.
     AttentionPattern,
+    /// `<arch>.attention.head_count_kv` when it is per layer. Also bounded by
+    /// the block count.
+    KvHeadsPerLayer,
 }
 
 /// Reads one value, stepping over arrays.
@@ -610,6 +661,9 @@ fn read_value<R: Read + Seek>(
                     ArrayOrScalar::CountedAttentionPattern {
                         full_attention_layers: count,
                     }
+                }
+                (ArrayScan::KvHeadsPerLayer, ArrayFinding::KvHeads { layers, heads }) => {
+                    ArrayOrScalar::CountedKvHeads { layers, heads }
                 }
                 _ => ArrayOrScalar::Skipped,
             });
@@ -667,6 +721,39 @@ fn skip_array<R: Read + Seek>(r: &mut R, scan: ArrayScan) -> Result<ArrayFinding
             }
             Ok(ArrayFinding::FullAttentionLayers(full))
         }
+        // Per-layer KV heads: an integer array as long as the block count.
+        Some(width)
+            if scan == ArrayScan::KvHeadsPerLayer && matches!(element_type, 0..=5 | 10 | 11) =>
+        {
+            if len > u64::from(MAX_ATTENTION_PATTERN_LAYERS) {
+                bail!("GGUF per-layer KV head count of {len} layers is not credible");
+            }
+            let mut layers = 0u32;
+            let mut heads = 0u32;
+            let mut buf = [0u8; 8];
+            for _ in 0..len {
+                let bytes = &mut buf[..width as usize];
+                r.read_exact(bytes)
+                    .context("GGUF header ended inside the per-layer KV head count")?;
+                let mut le = [0u8; 8];
+                le[..bytes.len()].copy_from_slice(bytes);
+                // Signed types store non-negative counts; a negative one is
+                // not a count and is read as no heads.
+                let value = match element_type {
+                    1 | 3 | 5 | 11 => {
+                        let shift = 64 - 8 * width as u32;
+                        let signed = (i64::from_le_bytes(le) << shift) >> shift;
+                        u64::try_from(signed).unwrap_or(0)
+                    }
+                    _ => u64::from_le_bytes(le),
+                };
+                if value > 0 {
+                    layers += 1;
+                    heads = heads.max(u32::try_from(value).unwrap_or(u32::MAX));
+                }
+            }
+            Ok(ArrayFinding::KvHeads { layers, heads })
+        }
         Some(width) => {
             let bytes = width
                 .checked_mul(len)
@@ -713,6 +800,7 @@ enum ArrayFinding {
     Nothing,
     ReasoningToken(bool),
     FullAttentionLayers(u32),
+    KvHeads { layers: u32, heads: u32 },
 }
 
 /// Ceiling on the per-layer attention pattern.
@@ -827,6 +915,73 @@ mod tests {
             kv_bool_array("spark2_5.attention.sliding_window_pattern", &pattern),
             kv_u32("spark2_5.context_length", 1_048_576),
         ]
+    }
+
+    /// An integer array of the given element type, as per-layer counts are stored.
+    fn kv_int_array(key: &str, element_type: u32, values: &[i64]) -> Vec<u8> {
+        let mut out = gguf_string(key);
+        out.extend_from_slice(&9u32.to_le_bytes());
+        out.extend_from_slice(&element_type.to_le_bytes());
+        out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            match element_type {
+                4 => out.extend_from_slice(&(*v as u32).to_le_bytes()),
+                5 => out.extend_from_slice(&(*v as i32).to_le_bytes()),
+                10 => out.extend_from_slice(&(*v as u64).to_le_bytes()),
+                other => panic!("helper does not write element type {other}"),
+            }
+        }
+        out
+    }
+
+    /// NVIDIA-Nemotron3-Nano-4B's real geometry, read from
+    /// `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`: 42 blocks, 40 query heads, and a
+    /// per-layer `head_count_kv` with 8 KV heads on 4 blocks and 0 elsewhere.
+    fn nemotron_h_entries(element_type: u32) -> Vec<Vec<u8>> {
+        let per_layer: Vec<i64> = (0..42).map(|layer| if [5, 12, 19, 26].contains(&layer) { 8 } else { 0 }).collect();
+        vec![
+            kv_str("general.architecture", "nemotron_h"),
+            kv_u32("nemotron_h.block_count", 42),
+            kv_u32("nemotron_h.embedding_length", 3136),
+            kv_u32("nemotron_h.attention.head_count", 40),
+            kv_int_array("nemotron_h.attention.head_count_kv", element_type, &per_layer),
+            kv_u32("nemotron_h.attention.key_length", 128),
+            kv_u32("nemotron_h.attention.value_length", 128),
+        ]
+    }
+
+    /// The recorded failure: the per-layer array was skipped, head_count (40)
+    /// was charged on all 42 blocks, and the 4B coding model was planned a
+    /// 6.56 GB cache at 16k tokens and given no GPU layers. Its real cache is
+    /// the 4 attention blocks.
+    #[test]
+    fn a_per_layer_kv_head_count_charges_only_the_blocks_that_have_a_cache() {
+        for element_type in [4, 5, 10] {
+            let meta = parse_gguf_metadata(&mut header(nemotron_h_entries(element_type))).expect("parses");
+            assert_eq!(meta.kv_attention_layers, Some(4), "element type {element_type}");
+            assert_eq!(meta.head_count_kv, 8, "element type {element_type}");
+            // 4 blocks x 8 heads x (128 + 128) x 2 bytes.
+            assert_eq!(meta.kv_bytes_per_token(), 16_384, "element type {element_type}");
+            assert_eq!(meta.kv_cost().per_token, 16_384);
+            assert_eq!(meta.kv_cost().fixed, 0);
+            assert_eq!(meta.block_count, 42, "the keys after the array must still be found");
+        }
+    }
+
+    /// A scalar head count still means every block, exactly as before.
+    #[test]
+    fn a_scalar_kv_head_count_still_charges_every_block() {
+        let meta = parse_gguf_metadata(&mut header(vec![
+            kv_str("general.architecture", "llama"),
+            kv_u32("llama.block_count", 32),
+            kv_u32("llama.attention.head_count", 32),
+            kv_u32("llama.attention.head_count_kv", 8),
+            kv_u32("llama.attention.key_length", 128),
+            kv_u32("llama.attention.value_length", 128),
+        ]))
+        .expect("parses");
+        assert_eq!(meta.kv_attention_layers, None);
+        assert_eq!(meta.kv_bytes_per_token(), 32 * 8 * 256 * 2);
     }
 
     /// A string array, as the tokenizer vocabulary is stored.
@@ -1442,6 +1597,19 @@ mod tests {
             assert_eq!(meta.block_count, 24, "value type {type_tag} did not decode");
         }
     }
+
+    /// The OCR model's table cells are control tokens; a chat model's are not
+    /// its concern. Serving a chat model with `--special` would put its own
+    /// end-of-turn markers into every answer, so the answer must be no for
+    /// everything that is not the measured architecture.
+    #[test]
+    fn only_the_ocr_architecture_writes_markup_as_control_tokens() {
+        assert!(emits_markup_as_control_tokens("deepseek2-ocr"));
+        assert!(emits_markup_as_control_tokens(" DeepSeek2-OCR "));
+        for chat in ["llama", "gemma3", "qwen2", "spark2_5", "nemotron_h", "deepseek2", ""] {
+            assert!(!emits_markup_as_control_tokens(chat), "{chat:?} must not be served with --special");
+        }
+    }
 }
 
 /// What a model's header says about how it must be run.
@@ -1475,6 +1643,32 @@ pub struct ModelCapabilities {
     /// model the band is wrong by a factor of four, and it is wrong in the
     /// direction that serves a short context on a card with room to spare.
     pub kv_cost: Option<KvCost>,
+    /// Whether part of this model's *output markup* is written as control
+    /// tokens. See [`emits_markup_as_control_tokens`].
+    pub emits_markup_as_control_tokens: bool,
+}
+
+/// Architectures whose document markup is written with control tokens.
+///
+/// Unlimited-OCR (`deepseek2-ocr`) writes table cells as `<td>`, `</td>`,
+/// `<tr>` and `</tr>`, and in its vocabulary those four are CONTROL tokens
+/// (ids 128821–128824, read from `Unlimited-OCR-Q6_K.gguf`). llama-server
+/// leaves control tokens out of the text it returns unless it is started with
+/// `--special`, so every table arrived with its cells run together. A real
+/// inspection sheet came back as `Equipment IDEQ - 047`, and the model reading
+/// it reported the equipment as `IDEQ - 047` — correct characters, wrong
+/// boundary, and nothing in the text to recover the right one from.
+///
+/// A list rather than a scan of the vocabulary because the header reader here
+/// keeps scalars, not the 129k-entry token arrays; the entry names the one
+/// architecture this was measured on.
+const CONTROL_TOKEN_MARKUP_ARCHITECTURES: &[&str] = &["deepseek2-ocr"];
+
+/// Whether a model of this architecture writes markup as control tokens.
+pub fn emits_markup_as_control_tokens(architecture: &str) -> bool {
+    CONTROL_TOKEN_MARKUP_ARCHITECTURES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(architecture.trim()))
 }
 
 /// Reads a model's capabilities once per file, then remembers them.
@@ -1507,6 +1701,7 @@ pub fn capabilities(weights: &Path) -> ModelCapabilities {
             emits_reasoning: meta.emits_reasoning,
             context_length: meta.context_length,
             kv_cost: Some(meta.kv_cost()).filter(|cost| cost.per_token > 0),
+            emits_markup_as_control_tokens: emits_markup_as_control_tokens(&meta.architecture),
         },
         Err(error) => {
             log::warn!(

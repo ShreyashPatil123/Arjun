@@ -713,11 +713,46 @@ impl ModelRouter {
             )
         };
         below_floor.retain(|entry| !entry.meets_floor(role));
+        // A model the operator marked preferred comes first here too, then the
+        // largest. Sorting by size alone made the preference meaningless below
+        // the floor: an operator who chose a 1.5B coder for this machine got
+        // the 4B general model instead, because the 4B was larger and also
+        // fitted. The preference is the same per-role choice the step above
+        // honours; the rescue must not quietly answer from a different model.
         below_floor.sort_by(|a, b| {
-            b.effective_parameters_b()
-                .partial_cmp(&a.effective_parameters_b())
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.routing
+                .preferred
+                .cmp(&a.routing.preferred)
+                .then_with(|| {
+                    b.effective_parameters_b()
+                        .partial_cmp(&a.effective_parameters_b())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
+        // The preferred model answers whether or not it fits entirely, as the
+        // orchestrator does above. Measured: the same preferred 4B coder fitted
+        // on one request and not on the next, because free VRAM read 7.96 GB
+        // with nothing resident and 7.44 GB with a model loaded, and the second
+        // coding request was quietly answered by a different model. Fitting is
+        // a question of speed, and the operator already chose.
+        if let Some(entry) = below_floor.first().copied().filter(|entry| entry.routing.preferred) {
+            let plan = plan_gpu_offload(vram_total_bytes, entry.weights_bytes, entry.context_length, None);
+            reasons.push(format!(
+                "No cleared {} model at or above the {}B floor fits in this machine's VRAM. {} is \
+                 marked as the preferred {} model; it is below the floor and {}, so it answers.",
+                role.label(),
+                role.minimum_parameters_b(),
+                entry.name,
+                role.label(),
+                if plan.full_offload {
+                    "fits entirely on the GPU"
+                } else {
+                    "runs partly on the CPU at the moment, which will be slower"
+                }
+            ));
+            reasons.push(plan.reason.clone());
+            return Ok(Self::decide(entry, role, intent_label, confidence, plan, true, reasons));
+        }
         for entry in &below_floor {
             let plan = plan_gpu_offload(
                 vram_total_bytes,
@@ -726,14 +761,30 @@ impl ModelRouter {
                 None,
             );
             if plan.full_offload {
-                reasons.push(format!(
-                    "No cleared {} model at or above the {}B floor fits in this machine's VRAM. \
-                     {} is below the floor but fits entirely on the GPU, so it answers rather \
-                     than a larger model running partly on the CPU at a few tokens a second.",
-                    role.label(),
-                    role.minimum_parameters_b(),
-                    entry.name
-                ));
+                // Said as it is: a preferred model answers because it was
+                // chosen, not because it was the largest that fitted, and a
+                // reason claiming the latter would be untrue whenever a larger
+                // model below the floor also fits.
+                reasons.push(if entry.routing.preferred {
+                    format!(
+                        "No cleared {} model at or above the {}B floor fits in this machine's \
+                         VRAM. {} is marked as the preferred {} model; it is below the floor and \
+                         fits entirely on the GPU, so it answers.",
+                        role.label(),
+                        role.minimum_parameters_b(),
+                        entry.name,
+                        role.label()
+                    )
+                } else {
+                    format!(
+                        "No cleared {} model at or above the {}B floor fits in this machine's VRAM. \
+                         {} is below the floor but fits entirely on the GPU, so it answers rather \
+                         than a larger model running partly on the CPU at a few tokens a second.",
+                        role.label(),
+                        role.minimum_parameters_b(),
+                        entry.name
+                    )
+                });
                 reasons.push(plan.reason.clone());
                 return Ok(Self::decide(
                     entry,
@@ -1272,6 +1323,84 @@ mod tests {
             "the reader is owed the reason the smaller model answered: {:?}",
             coding.reasons
         );
+    }
+
+    /// Below the floor, the operator's preferred coder answers rather than
+    /// the largest model that happens to fit.
+    #[test]
+    fn a_preferred_model_below_the_floor_answers_before_a_larger_one() {
+        let models = |prefer_coder: bool| {
+            let mut general = entry(
+                "nemotron-nano-4b",
+                4.0,
+                vec![ModelRole::Reasoning, ModelRole::Coding],
+            );
+            general.context_length = 8192;
+            let mut coder = entry("qwen2.5-coder-1.5b", 1.5, vec![ModelRole::Coding]);
+            coder.context_length = 8192;
+            coder.routing.preferred = prefer_coder;
+            let mut large = entry("qwen-9b", 9.0, vec![ModelRole::Reasoning, ModelRole::Coding]);
+            large.context_length = 8192;
+            registry(vec![large, general, coder])
+        };
+        let route = |registry: &ModelRegistry| {
+            ModelRouter::route(
+                registry,
+                "Write the example code for a linked list in cpp",
+                None,
+                6 * GB,
+                None,
+                false,
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+
+        let coding = route(&models(true));
+        assert_eq!(coding.model_id, "qwen2.5-coder-1.5b", "the chosen coder answers");
+        assert!(coding.fully_on_gpu);
+        assert!(coding.used_fallback, "it is still below the floor, and says so");
+        assert!(
+            coding.reasons.iter().any(|reason| reason.contains("preferred")),
+            "the reason is the preference, not size: {:?}",
+            coding.reasons
+        );
+
+        // Without the preference the rescue still takes the largest that fits.
+        assert_eq!(route(&models(false)).model_id, "nemotron-nano-4b");
+    }
+
+    /// With less VRAM free than it needs, the preferred coder still answers,
+    /// and the reason says it will be slower, rather than another model
+    /// answering in its place.
+    #[test]
+    fn a_preferred_model_below_the_floor_is_not_replaced_when_vram_is_short() {
+        let mut general = entry("nemotron-nano-4b", 4.0, vec![ModelRole::Reasoning, ModelRole::Coding]);
+        general.context_length = 8192;
+        general.weights_bytes = 2 * GB;
+        let mut coder = entry("qwen3-4b-instruct", 4.0, vec![ModelRole::Coding]);
+        coder.context_length = 8192;
+        coder.weights_bytes = 3 * GB;
+        coder.routing.preferred = true;
+        let mut large = entry("qwen-9b", 9.0, vec![ModelRole::Reasoning, ModelRole::Coding]);
+        large.context_length = 8192;
+        let registry = registry(vec![large, general, coder]);
+
+        let coding = ModelRouter::route(
+            &registry,
+            "Write the example code for a linked list in cpp",
+            None,
+            4 * GB,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(coding.model_id, "qwen3-4b-instruct");
+        assert!(coding.reasons.iter().any(|reason| reason.contains("preferred")), "{:?}", coding.reasons);
     }
 
     /// A deliberate choice is not overruled by the rescue.

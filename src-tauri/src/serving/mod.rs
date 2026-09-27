@@ -356,6 +356,22 @@ pub fn plan_launch(
         args.push("--jinja".to_string());
         args.push("--reasoning-format".to_string());
         args.push("deepseek".to_string());
+        args.extend(reasoning_budget_args(llama_server_help_text()));
+    }
+
+    // Control tokens in the output, for a model whose markup is made of them.
+    //
+    // Unlimited-OCR writes table cells as control tokens, and llama-server
+    // drops those from its text by default, so tables came back with their
+    // cells run together. See `gguf_meta::emits_markup_as_control_tokens`.
+    // The grounding markers and end-of-sequence token this also exposes are
+    // removed again by `ocr_stream::ControlMarkerFilter`, which leaves the
+    // stream exactly as before apart from the cell boundaries.
+    if wants_special_tokens(
+        crate::ai_engine::gguf_meta::capabilities(weights).emits_markup_as_control_tokens,
+        llama_server_help_text(),
+    ) {
+        args.push("--special".to_string());
     }
 
     LaunchPlan {
@@ -458,6 +474,54 @@ fn llama_server_splits_reasoning() -> bool {
     };
     // Both are needed together, so both are required before either is sent.
     help.contains("--reasoning-format") && help.contains("--jinja")
+}
+
+/// How many tokens a reasoning model may think for in one generation.
+///
+/// Measured on the demo thread: the scan-reading turn's longest call was 5,168
+/// chunks, answer included, and the SOP turn's calls were 500 to 2,000. The
+/// Word-note turn on Spark-X2.5-4B thought for 19,778, 19,697 and 15,938 in
+/// three successive generations, about eight minutes each. It reached the
+/// output cap every time without calling a tool and was continued from a
+/// checkpoint to do the same again. A 4B model thinking that long is not
+/// planning any more; it is circling. The limit sits above every call that
+/// went on to act and cuts the circling after about two and a half minutes on
+/// this GPU.
+const REASONING_BUDGET_TOKENS: u32 = 6144;
+
+/// What the server writes as the last line of the thinking when the budget is
+/// spent. The generation then continues from a decision rather than from
+/// mid-sentence.
+const REASONING_BUDGET_MESSAGE: &str =
+    " I have thought this through. Now I act on it: I call the tool the task needs next, or I give the answer.";
+
+/// `--reasoning-budget` and its closing message, when this llama-server has them.
+///
+/// Probed like every other flag: a build without them refuses to start on an
+/// unknown argument, which would be worse than a model that thinks too long.
+fn reasoning_budget_args(help: Option<&str>) -> Vec<String> {
+    let Some(help) = help else {
+        return Vec::new();
+    };
+    if !help.contains("--reasoning-budget") {
+        return Vec::new();
+    }
+    let mut args = vec!["--reasoning-budget".to_string(), REASONING_BUDGET_TOKENS.to_string()];
+    if help.contains("--reasoning-budget-message") {
+        args.push("--reasoning-budget-message".to_string());
+        args.push(REASONING_BUDGET_MESSAGE.to_string());
+    }
+    args
+}
+
+/// Whether to start a model with `--special`.
+///
+/// Only for a model whose markup is control tokens, and only when this
+/// llama-server documents the flag: a build that does not know it would refuse
+/// to start, which is worse than tables with their cells run together. Split
+/// out from `plan_launch` so the decision is testable without a real binary.
+fn wants_special_tokens(emits_markup_as_control_tokens: bool, help: Option<&str>) -> bool {
+    emits_markup_as_control_tokens && help.is_some_and(|help| help.contains("--special"))
 }
 
 /// The device llama.cpp should offload to, when an operator has named one.
@@ -1507,6 +1571,31 @@ mod tests {
     #[test]
     fn nothing_is_running_before_anything_starts() {
         assert!(ModelServers::new().running_endpoints().is_empty());
+    }
+
+    /// `--special` reaches only the model that needs it, and only a server
+    /// that knows the flag. The help line is the one build 10970 prints.
+    #[test]
+    fn special_tokens_are_asked_for_only_when_the_markup_needs_them_and_the_server_knows_the_flag() {
+        let help = "-sp,   --special                        special tokens output enabled (default: false)";
+        assert!(wants_special_tokens(true, Some(help)));
+        assert!(!wants_special_tokens(false, Some(help)), "a chat model must not be served with --special");
+        assert!(!wants_special_tokens(true, Some("--jinja --reasoning-format")), "a server without the flag would refuse to start");
+    }
+
+    #[test]
+    fn a_reasoning_model_is_given_a_thinking_budget_only_when_the_server_knows_it() {
+        let both = "--reasoning-budget N  token budget\n--reasoning-budget-message MESSAGE";
+        let args = reasoning_budget_args(Some(both));
+        assert_eq!(args[..2], ["--reasoning-budget".to_string(), REASONING_BUDGET_TOKENS.to_string()]);
+        assert_eq!(args.get(2).map(String::as_str), Some("--reasoning-budget-message"));
+
+        // Budget without the message: the budget alone is still sent.
+        assert_eq!(reasoning_budget_args(Some("--reasoning-budget N")).len(), 2);
+        // A build that does not know the flag, or cannot be asked, gets nothing.
+        assert!(reasoning_budget_args(Some("--jinja --reasoning-format")).is_empty());
+        assert!(reasoning_budget_args(None).is_empty());
+        assert!(!wants_special_tokens(true, None), "an unprobed server is assumed not to know it");
     }
 
     /// The race fix holds the lock across the check-and-insert critical

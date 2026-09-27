@@ -328,6 +328,7 @@ mod tests {
             supports_toggled_reasoning: false,
             sliding_window: None,
             full_attention_layers: None,
+            kv_attention_layers: None,
         }
         .expert_bytes(file_bytes, None);
 
