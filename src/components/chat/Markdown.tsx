@@ -1,7 +1,9 @@
 import React from 'react';
 import { CodeBlock } from './CodeBlock';
 import { isClosingFence, openingFenceLanguage } from './markdownFence';
+import { MathView } from './MathView';
 import { MermaidGraph } from './MermaidGraph';
+import { displayMathAt, inlineMathAt } from './texMath';
 import { WidgetFrame } from './WidgetFrame';
 import { sanitizeSvg } from './svgSanitize';
 import styles from './ChatSurface.module.css';
@@ -15,7 +17,7 @@ import styles from './ChatSurface.module.css';
  * - A model response typically only needs: paragraphs, inline code,
  *   fenced code blocks, bold, italic, unordered lists, headings, and
  *   links. That's a small, well-bounded set we can render correctly
- *   without pulling in a parser.
+ *   without pulling in a parser. Math in LaTeX is read by `texMath.ts`.
  *
  * Streaming-safe: rendering is a pure function of `content`, so each
  * new chunk produces a deterministic, valid React tree.
@@ -60,6 +62,17 @@ function renderInline(line: string, keyPrefix: string): React.ReactNode[] {
           </code>,
         );
         i = end + 1;
+        continue;
+      }
+    }
+    // Math: \( … \), \[ … \], $ … $, $$ … $$. Before bold and italic, so an
+    // asterisk inside a formula stays a formula.
+    if (line[i] === '\\' || line[i] === '$') {
+      const math = inlineMathAt(line, i);
+      if (math) {
+        flushBuf();
+        out.push(<MathView key={`${keyPrefix}-m-${key++}`} tex={math.tex} display={false} />);
+        i = math.end;
         continue;
       }
     }
@@ -130,7 +143,7 @@ function findUnescaped(s: string, ch: string, start: number): number {
 type ColumnAlign = 'left' | 'center' | 'right';
 
 interface Block {
-  kind: 'p' | 'h' | 'ul' | 'ol' | 'code' | 'blockquote' | 'table';
+  kind: 'p' | 'h' | 'ul' | 'ol' | 'code' | 'blockquote' | 'table' | 'math';
   level?: number;
   lang?: string;
   text: string;
@@ -237,6 +250,15 @@ function tokenize(input: string): Block[] {
       }
     }
 
+    // A display formula on lines of its own: `\[ … \]` or `$$ … $$`. Models
+    // write their working this way, and it used to be printed as LaTeX source.
+    const formula = displayMathAt(lines, i);
+    if (formula) {
+      blocks.push({ kind: 'math', text: formula.tex });
+      i = formula.next;
+      continue;
+    }
+
     // Heading: # ... ######
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
@@ -295,6 +317,8 @@ function tokenize(input: string): Block[] {
       !/^[\s]*[-*]\s+/.test(lines[i]) &&
       !/^[\s]*\d+\.\s+/.test(lines[i]) &&
       !/^>\s+/.test(lines[i]) &&
+      // So does a formula on a line of its own, which is set as a block.
+      displayMathAt(lines, i) === null &&
       // A table starting on the next line ends this paragraph, or its header
       // row would be absorbed into the prose above it.
       !(i + 1 < lines.length && lines[i].includes('|') && tableAlignments(lines[i + 1]))
@@ -469,6 +493,8 @@ export function Markdown({
                 {renderInline(block.text, `${key}-i`)}
               </blockquote>
             );
+          case 'math':
+            return <MathView key={key} tex={block.text} display />;
         }
         return null;
       })}

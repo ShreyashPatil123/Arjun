@@ -1712,6 +1712,58 @@
   border: none;
 }
 
+/* Math a model wrote in LaTeX (`\[ … \]`, `$ … $`), set as math rather than
+ * printed as source. Local math faces only: Cambria Math ships with Windows,
+ * and nothing is fetched. See texMath.ts. */
+.mdMath,
+.mdMathBlock {
+  font-family: 'Cambria Math', 'STIX Two Math', 'Latin Modern Math', Cambria, 'Times New Roman', serif;
+  color: var(--text-primary);
+  white-space: pre-line;
+  font-variant-numeric: tabular-nums;
+}
+.mdMath {
+  font-size: 1.05em;
+}
+.mdMathBlock {
+  margin: 2px 0;
+  padding: 6px 12px;
+  font-size: 1.12em;
+  line-height: 1.9;
+  text-align: center;
+  overflow-x: auto;
+}
+.mdFrac {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 0.18em;
+  font-size: 0.9em;
+  line-height: 1.25;
+}
+.mdFracNum {
+  padding: 0 0.25em 0.05em;
+  border-bottom: 1px solid currentColor;
+}
+.mdFracDen {
+  padding: 0.05em 0.25em 0;
+}
+.mdSqrt {
+  white-space: nowrap;
+}
+.mdSqrtBody {
+  border-top: 1px solid currentColor;
+  padding: 0.05em 0.1em 0;
+}
+.mdMath sup,
+.mdMath sub,
+.mdMathBlock sup,
+.mdMathBlock sub {
+  font-size: 0.72em;
+  line-height: 0;
+}
+
 .mdLink {
   color: var(--info, #3b82f6);
   text-decoration: underline;
