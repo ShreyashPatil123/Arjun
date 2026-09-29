@@ -38,17 +38,10 @@ using Open-Weight Multimodal LLMs for Confidential Industrial Work"*.
 **Who it is for:** engineers and officers who work with confidential documents, IT teams who must run
 AI inside an air-gapped network, and reviewers who need evidence that no data left the site.
 
-<div align="center">
+https://github.com/user-attachments/assets/fd3218f5-c17e-4c61-984d-7a1621bcb177
 
-<a href="docs/media/arjun-launch.mp4?raw=true">
-  <img src="docs/media/arjun-launch-poster.jpg" alt="ARJUN launch video" width="820">
-</a>
-
-**[▶ Watch the launch video (2:30)](docs/media/arjun-launch.mp4?raw=true)**: sign-in, automatic
-model choice, a scanned report read on-device, an SOP check, and an approval note written as a Word
-document.
-
-</div>
+<p align="center"><b>Launch video (2:30)</b>: sign-in, automatic model choice, a scanned report read
+on-device, an SOP check, and an approval note written as a Word document.</p>
 
 ---
 
@@ -364,7 +357,7 @@ src-tauri/        Rust core, crate `sarathi`
 agent-runtime/    vendored OpenClaw agent loop (TypeScript), cloud providers removed
 sidecars/         Python sidecars: documents, memory engine, graph
 scripts/          build, verification and evidence gates
-docs/             design notes; docs/sih/ holds the hackathon material; docs/media/ the images and video
+docs/             design notes; docs/sih/ holds the hackathon material; docs/media/ the screenshots
 evidence/         generated SBOM, test reports, visual evidence
 ```
 
