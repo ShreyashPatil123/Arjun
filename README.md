@@ -4,55 +4,118 @@
 
 ### A sovereign, on-premise AI workbench for confidential industrial work
 
-Open-weight models, running entirely on your own machine — and a build that lets you **prove** nothing leaves it.
+Open-weight AI models running entirely on your own machine, with a build that lets you **prove**
+nothing leaves it.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 ![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB)
-![Rust](https://img.shields.io/badge/core-Rust-B7410E)
-![React](https://img.shields.io/badge/UI-React%2019%20%2B%20TypeScript-3178C6)
 ![Offline](https://img.shields.io/badge/network-offline%20by%20design-2EA043)
 ![Version](https://img.shields.io/badge/version-0.2.0-555555)
 
-[What it does](#-what-arjun-does) · [How it works](#-how-it-works) · [Proof of no egress](#-proving-nothing-leaves-the-machine) · [Quick start](#-quick-start) · [Verify a build](#-verify-a-build) · [Docs](#-documentation)
+[Overview](#overview) · [Screenshots](#arjun-at-a-glance) · [Features](#features) ·
+[How it works](#how-it-works) · [Quick start](#quick-start) · [How to use](#how-to-use) ·
+[Troubleshooting](#troubleshooting)
 
 </div>
 
 ---
 
-## 💡 In one paragraph
+## Overview
 
-Refineries, PSUs and government offices produce sensitive everyday work — approval notes, engineering
-calculations, inspection reports, internal tools — that cannot be pasted into a cloud AI assistant.
-**ARJUN** is a desktop workbench that gives that work an AI assistant anyway, **without the data ever
-leaving the machine**. It serves open-weight models on the local GPU, picks the right model for each
-task, reads scanned documents with on-device OCR, plans and carries out multi-step work with local
-tools, and hands back real deliverables — Word, Excel and PowerPoint files, working code, calculations
-with their steps. Every network connection it makes is visible, and the build itself checks that no
-code path can reach the internet.
+Refineries, public-sector plants and government offices produce sensitive everyday work: inspection
+reports, maintenance procedures, approval notes and engineering calculations. None of it can be pasted
+into a cloud AI assistant.
 
-Built for **Smart India Hackathon 2026, PS 26117 (MRPL)**:
-*"Sovereign On-Premise Agentic AI Workbench using Open-Weight Multimodal LLMs for Confidential
-Industrial Work"*.
+**ARJUN** is a Windows desktop application that brings the AI to the data instead. It runs open-weight
+language models on the local GPU, reads scanned documents on the machine, carries out multi-step work
+with local tools, and hands back real deliverables: Word, Excel and PowerPoint files, working code, and
+calculations with their steps shown. In **Work mode** every outbound network call is refused, and the
+app shows what Windows itself reports about ARJUN's connections.
+
+Built for **Smart India Hackathon 2026, PS 26117 (MRPL)**: *"Sovereign On-Premise Agentic AI Workbench
+using Open-Weight Multimodal LLMs for Confidential Industrial Work"*.
+
+**Who it is for:** engineers and officers who work with confidential documents, IT teams who must run
+AI inside an air-gapped network, and reviewers who need evidence that no data left the site.
+
+<div align="center">
+
+<a href="docs/media/arjun-launch.mp4?raw=true">
+  <img src="docs/media/arjun-launch-poster.jpg" alt="ARJUN launch video" width="820">
+</a>
+
+**[▶ Watch the launch video (2:30)](docs/media/arjun-launch.mp4?raw=true)**: sign-in, automatic
+model choice, a scanned report read on-device, an SOP check, and an approval note written as a Word
+document.
+
+</div>
 
 ---
 
-## ✨ What ARJUN does
+## ARJUN at a glance
 
-| | Capability | How |
-|---|---|---|
-| 🧭 | **Picks the model for the task** | A router assigns each request a role — reasoning, coding or document OCR — and chooses among the installed models by role, fit in GPU memory and preference. The reasons are shown under **Why?** before you send. |
-| 🤖 | **Works like an agent** | Plans multi-step work, calls local tools, checks its own output, and keeps going until the deliverable exists — within a bounded step budget. |
-| 📄 | **Reads scanned documents** | Image-only PDFs are read page by page by an on-device OCR model; answers cite the page each value came from. |
-| 🧮 | **Calculates, doesn't guess** | Figures come from a units-aware calculation engine, and the working steps are recorded with the answer. |
-| 📦 | **Produces real deliverables** | Approval notes (`.docx`), calculation workbooks (`.xlsx`), briefing decks (`.pptx`), PDFs, charts, tables and diagrams — each re-opened and checked before it is reported ready. |
-| 🧪 | **Runs code in a sandbox** | Code runs in a Docker container with **no network**, a read-only filesystem, no capabilities, and memory, CPU and process limits. |
-| 📚 | **Grounds answers in your documents** | A local knowledge base of manuals, SOPs and correspondence; searches never leave the machine. |
-| ✋ | **Asks before it acts** | Writing a file or running code waits for a person to approve, showing the action, the target and the effect. |
-| 🔒 | **Refuses the network** | In **Work mode** every outbound call is refused, and the Audit & Network page shows what Windows itself reports for ARJUN's processes. |
+<table>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/media/01-sign-in.jpeg" alt="Local sign-in screen" width="100%"><br>
+<b>1. Local sign-in</b><br>
+Secure local sign-in, verified directly on the machine.
+</td>
+<td width="50%" valign="top">
+<img src="docs/media/02-model-choice.jpeg" alt="Model choice with its reasons" width="100%"><br>
+<b>2. Automatic model choice</b><br>
+Automatically selects the appropriate local model and explains the decision before processing.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/media/03-scanned-report.jpeg" alt="Answer from a scanned inspection report" width="100%"><br>
+<b>3. Scanned documents</b><br>
+Reads scanned reports entirely on-device with page-level references.
+</td>
+<td width="50%" valign="top">
+<img src="docs/media/04-calculation.jpeg" alt="Step-by-step unit conversion table" width="100%"><br>
+<b>4. Calculations</b><br>
+Performs calculations step by step and provides the exact result.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/media/05-audit-network.jpeg" alt="Audit and Network page" width="100%"><br>
+<b>5. Audit &amp; Network</b><br>
+Shows work-mode controls, auditing, and verifies that data stays on the machine.
+</td>
+<td width="50%" valign="top">
+<img src="docs/media/06-models.jpeg" alt="Models page listing installed models" width="100%"><br>
+<b>6. Local models</b><br>
+Shows open-weight models stored and available locally on the machine.
+</td>
+</tr>
+</table>
 
 ---
 
-## 🧩 How it works
+## Features
+
+| Capability | What it means |
+|---|---|
+| **Picks the model for the task** | A router gives each request a role (reasoning, coding or document OCR) and chooses among the installed models by role, fit in GPU memory and preference. The reasons are shown under **Why?** before you send. |
+| **Works like an agent** | Plans multi-step work, calls local tools, checks its own output, and keeps going until the deliverable exists, within a bounded step budget. |
+| **Reads scanned documents** | Image-only PDFs are read page by page by an on-device OCR model; answers cite the page each value came from. |
+| **Calculates, doesn't guess** | Figures come from a units-aware calculation engine, and the working steps are recorded with the answer. |
+| **Produces real deliverables** | Approval notes (`.docx`), calculation workbooks (`.xlsx`), briefing decks (`.pptx`), PDFs, charts, tables and diagrams, each re-opened and checked before it is reported ready. |
+| **Runs code in a sandbox** | Code runs in a Docker container with no network, a read-only filesystem, and memory, CPU and process limits. |
+| **Grounds answers in your documents** | A local knowledge base of manuals, SOPs and correspondence; searches never leave the machine. |
+| **Asks before it acts** | Writing a file or running code waits for a person to approve, showing the action, the target and the effect. |
+| **Refuses the network** | In **Work mode** every outbound call is refused, and the Audit & Network page shows the connections Windows attributes to ARJUN's processes. |
+
+---
+
+## How it works
+
+In plain terms: the window you see is a web-style interface; behind it a Rust program does the real
+work. It runs the AI models on your own GPU, reads documents with small helper programs, and is the
+only part of ARJUN allowed to talk to the network at all.
 
 ```mermaid
 flowchart LR
@@ -68,84 +131,152 @@ flowchart LR
 
 1. The **React frontend** calls typed services in `src/services/`, which invoke Tauri commands.
 2. The **Rust core** downloads, sizes and serves models, routes each request, and supervises the
-   **agent runtime** as a child process over stdio — it never opens a listening socket.
+   **agent runtime** as a child process over stdio. It never opens a listening socket.
 3. The runtime plans the work and calls back into the core for **tools**, each gated by capability
    grants and, where it matters, human approval.
-4. Models are served by **llama-server** on loopback; documents and memory are handled by
-   **Python sidecars**; code runs in a **network-less container**.
-5. Any outbound request goes through the **sovereignty broker** — the one audited chokepoint.
+4. Models are served by **llama-server** on loopback (`127.0.0.1`, reachable only from this machine);
+   documents and memory are handled by **Python sidecars** (helper processes); code runs in a
+   **network-less container**.
+5. Any outbound request goes through the **sovereignty broker**, the one audited chokepoint.
 6. Every run is written to an ordered, append-only history, so a window can reattach to a run and a
    restart can recover the runs it interrupted.
 
----
-
-## 🎯 Problem statement → ARJUN
-
-The official expected solution for PS 26117 (verbatim text in
-[`docs/sih/ps-26117-official.md`](docs/sih/ps-26117-official.md)) and where ARJUN meets it:
-
-| PS 26117 asks for | In ARJUN |
-|---|---|
-| *"model auto selection across at least two different task types"* | The router sends a summary to a reasoning model and a coding request to a coding model, with its reasons shown — [`docs/intent-routing.md`](docs/intent-routing.md) |
-| *"An agentic task carried through end to end"* | Read a scanned inspection report, compare it with an SOP, and draft the approval note as a Word file |
-| *"A coding task run and verified in a sandbox"* | `sandbox.run_code` in a Docker container with `--network=none`; the script's own asserts prove the result |
-| *"A multimodal task involving image or scanned document understanding"* | On-device OCR of image-only PDFs, with page references for every value |
-| *"no external calls are made at any point"* | An independent per-process monitor, ARJUN's Audit & Network page, and build-time egress gates — see below |
-
-Human approval, local accounts and the audit trail are **ARJUN's additions**, not requirements of
-the problem statement. The demo script is in [`docs/sih/demo-script.md`](docs/sih/demo-script.md).
+**Technologies:** Tauri 2, Rust, React 19 + TypeScript + Vite, llama.cpp (`llama-server`) with GGUF
+models, Python sidecars, Docker (optional, for the code sandbox), WebView2.
 
 ---
 
-## 🔐 Proving nothing leaves the machine
+## Security and privacy
 
-"It runs offline" is easy to say. ARJUN treats it as something the build has to demonstrate:
+"It runs offline" is easy to say. ARJUN treats it as something the build has to demonstrate.
 
 - **One egress chokepoint.** Only `src-tauri/src/sovereignty/broker.rs` may build an outbound HTTP
   client. `npm run check:egress` fails the build if a second one appears, and every external hostname
   in the tree must be on a reviewed allowlist (`arjun-egress-ok: <reason>` documents each exemption).
 - **The embedded browser is silenced.** WebView2 on its own contacts Microsoft (component updates,
   proxy auto-discovery, Microsoft sign-in). ARJUN starts it with those features off and DNS limited to
-  loopback, pinned by tests — findings and verification in
-  [`docs/sih/webview2-egress.md`](docs/sih/webview2-egress.md).
+  loopback, pinned by tests. See [`docs/sih/webview2-egress.md`](docs/sih/webview2-egress.md).
 - **Windows is the witness.** The Audit & Network page lists the connections Windows attributes to
-  every process in ARJUN's tree — the app, the model server, the sidecars, the browser — and says
+  every process in ARJUN's tree (the app, the model server, the sidecars, the browser) and says
   whether any of them leaves the machine.
 - **The agent loop has no cloud in it.** `agent-runtime/` vendors OpenClaw's loop with the cloud
   providers removed; `npm run runtime:audit` and `npm run check:bundle` check the source and the
   bundled artifact.
+- **Local accounts, hashed passwords.** Passwords are stored only as Argon2id hashes. There is no
+  password recovery by email; an administrator resets another account.
 - **An SBOM ships with the evidence.** `npm run sbom` regenerates `evidence/sbom.md` and
   `evidence/sbom.cdx.json` (CycloneDX).
 
+### Problem statement coverage
+
+The official expected solution for PS 26117 (verbatim in
+[`docs/sih/ps-26117-official.md`](docs/sih/ps-26117-official.md)) and where ARJUN meets it:
+
+| PS 26117 asks for | In ARJUN |
+|---|---|
+| *"model auto selection across at least two different task types"* | The router sends a summary to a reasoning model and a coding request to a coding model, with its reasons shown ([`docs/intent-routing.md`](docs/intent-routing.md)) |
+| *"An agentic task carried through end to end"* | Read a scanned inspection report, compare it with an SOP, and draft the approval note as a Word file |
+| *"A coding task run and verified in a sandbox"* | `sandbox.run_code` in a Docker container with `--network=none`; the script's own asserts prove the result |
+| *"A multimodal task involving image or scanned document understanding"* | On-device OCR of image-only PDFs, with page references for every value |
+| *"no external calls are made at any point"* | An independent per-process monitor, ARJUN's Audit & Network page, and build-time egress gates |
+
+Human approval, local accounts and the audit trail are **ARJUN's additions**, not requirements of the
+problem statement.
+
 ---
 
-## 🚀 Quick start
+## Quick start
 
-### Requirements
+### Prerequisites
 
-| Tool | Version | Notes |
+| | Component | Version / notes |
 |---|---|---|
-| Node.js | ≥ 22.19 | enforced by `agent-runtime/package.json` |
-| Rust | stable, 2021 edition | plus the [Tauri prerequisites](https://tauri.app/start/prerequisites/) |
-| Python | 3.10+ | for the sidecars and their tests |
-| Docker Desktop | optional | for the code sandbox; pull `python:3.11-slim` once while online — ARJUN never pulls |
+| **Required** | Windows 10 or 11 | ARJUN is a Windows desktop app (WebView2) |
+| **Required** | Node.js | ≥ 22.19 (enforced by `agent-runtime/package.json`) |
+| **Required** | Rust | stable toolchain, plus the [Tauri prerequisites](https://tauri.app/start/prerequisites/) |
+| **Required** | Python | 3.10+, for the document, memory and graph sidecars |
+| **Required** | Disk space | several GB per model; the installed models in the screenshot range from 2.6 GB to 8.3 GB |
+| Optional | NVIDIA GPU + CUDA toolkit, or the Vulkan SDK | GPU acceleration. The default orchestrator model needs a CUDA or Vulkan build; ARJUN is sized for 8 GB-VRAM cards |
+| Optional | Docker Desktop | the code sandbox. Pull `python:3.11-slim` once while online; ARJUN never pulls images itself |
 
-A GPU is optional: ARJUN builds against **CUDA** or **Vulkan**, or runs on the CPU.
+### Installation and setup
 
-### Install and run
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/Straw-hat-Luffy26/Arjun.git
+```
+
+**2. Enter the project directory**
+
+```bash
+cd Arjun
+```
+
+**3. Install dependencies**
 
 ```bash
 npm install
-npm run runtime:install   # installs the agent-runtime workspace, offline
-
-npm run dev:auto          # picks CUDA, Vulkan or CPU for you
-npm run tauri:dev:gpu     # or force CUDA
-npm run tauri:dev:vulkan  # or force Vulkan
+npm run runtime:install
 ```
 
-`npm run dev` starts only the Vite frontend — handy for UI work, but with no Rust backend behind it.
+`runtime:install` runs `npm ci --offline` for the agent runtime, so it installs only from the local
+npm cache and never fetches.
 
-### Build
+**4. Configure the GPU backend**
+
+No configuration file is needed. `npm run dev:auto` (step 6) probes the machine and picks the backend:
+
+| Found on the machine | Backend used |
+|---|---|
+| NVIDIA driver **and** CUDA toolkit (`nvcc`) | CUDA |
+| Vulkan SDK (`VULKAN_SDK` or `glslc`) | Vulkan |
+| neither | CPU |
+
+To force a backend, set `SARATHI_BACKEND` (`cuda`, `vulkan` or `cpu`) before running, or use
+`npm run tauri:dev:gpu` / `npm run tauri:dev:vulkan` directly.
+
+**5. Prepare local models and components**
+
+Models are installed from inside the app (see [How to use](#how-to-use)), from **Discover**, or found
+on disk with **Models → Detect models**. On a fresh configuration ARJUN uses
+`lmstudio-community/gemma-4-12B-it-QAT-GGUF` (`Q4_0`) as the default orchestrator and loads it at
+startup. This needs a CUDA or Vulkan build with at least one layer on the GPU; a CPU fallback is
+rejected rather than reported as GPU execution.
+
+For the code sandbox, start Docker Desktop and, while still online, pull the image once:
+
+```bash
+docker pull python:3.11-slim
+```
+
+**6. Start the application**
+
+```bash
+npm run dev:auto
+```
+
+The first run compiles the Rust core, which takes several minutes. `npm run dev` starts only the Vite
+frontend, which is useful for UI work but has no backend behind it.
+
+**7. Access the application**
+
+ARJUN opens as a desktop window; there is no URL to visit. On first launch no account has a password
+yet: sign in as the administrator account, **S. Kulkarni**, and set its password (at least 12
+characters). ARJUN ships with six local demo accounts, one Administrator and five Employees.
+
+**8. Verify that it is working**
+
+- The status pill in the top-right corner reads **Ready** once a model is loaded.
+- Ask a short question in a new conversation and click **Why?** to see which model was chosen.
+- Open **Audit & Network**: Windows should report 0 TCP connections leaving ARJUN's processes.
+- From the terminal, run the egress gate:
+
+```bash
+npm run check:egress
+```
+
+### Build an installer
 
 ```bash
 npm run build:auto        # pick a backend and build
@@ -153,21 +284,45 @@ npm run tauri:build:gpu   # CUDA
 npm run tauri:build:vulkan
 ```
 
-### Models
+---
 
-Install models from **Discover**, or let **Models → Detect models** find GGUF files already on disk.
-On a fresh configuration ARJUN uses `lmstudio-community/gemma-4-12B-it-QAT-GGUF` (`Q4_0`) as the
-default orchestrator and loads it at startup; this needs a CUDA or Vulkan build with at least one layer
-on the GPU — a CPU fallback is rejected rather than reported as GPU execution. An administrator can
-make any installed model the orchestrator from **Models → Set as orchestrator**, and startup loading can
-be turned off with `ai_settings.auto_load_on_startup`. New open-weight models are added through the
-registry — no redesign needed.
+## How to use
+
+1. **Launch and sign in.** Choose your account and enter your password. Sign-in is checked on this
+   machine; nothing about it leaves.
+2. **Install a model.** An administrator opens **Models** to see what is installed, adds models from
+   **Discover**, and can make any installed model the orchestrator with **Set as orchestrator**.
+3. **Switch on Work mode.** On **Audit & Network**, Work mode refuses every outbound call. **Test the
+   controls** makes ARJUN deliberately try, and the refusal appears on the page.
+4. **Ask a question.** Type in a new conversation. Before sending, **Why?** shows the model ARJUN
+   picked and its reasons.
+5. **Attach documents.** Attach a PDF, Word, Excel or PowerPoint file. Image-only scans are read by the
+   on-device OCR model, and answers cite the page each value came from.
+6. **Ask for a deliverable.** For example: *"Draft the approval note as a Word file."* ARJUN plans the
+   steps, uses its tools, and returns the file with a link to open it.
+7. **Approve actions.** When ARJUN wants to write a file or run code, it asks first and shows what the
+   action will do.
+8. **Review the record.** **Audit & Network** keeps an append-only, hash-chained record of what was
+   attempted and decided; **Verify the record** re-checks it.
 
 ---
 
-## ✅ Verify a build
+## Configuration
 
-`npm run verify` runs the whole chain — egress gate, offline-build check, vendor audit, typecheck,
+| Setting | Where | Effect |
+|---|---|---|
+| Orchestrator model | **Models → Set as orchestrator** | the model that plans and answers by default |
+| Load at startup | `ai_settings.auto_load_on_startup` | turn off to skip loading the orchestrator when ARJUN starts |
+| GPU backend | `SARATHI_BACKEND` = `cuda`, `vulkan` or `cpu` | overrides what `dev:auto` / `build:auto` detect |
+| Work mode | **Audit & Network** | refuses every outbound call |
+
+Models and app data live under `%APPDATA%\com.arjun.workbench\`.
+
+---
+
+## Verify a build
+
+`npm run verify` runs the whole chain: egress gate, offline-build check, vendor audit, typecheck,
 runtime tests, runtime build, bundle gates, SBOM, and the Rust and Python suites. Run it before
 shipping or reviewing.
 
@@ -181,7 +336,7 @@ shipping or reviewing.
 | `npm run runtime:audit` | the vendored OpenClaw copy still has its cloud providers removed |
 | `npm run runtime:typecheck` | types across the agent runtime |
 | `npm run runtime:test` | agent-runtime unit tests (Vitest) |
-| `npm run test:ui` | frontend logic tests — run recovery from the durable record |
+| `npm run test:ui` | frontend logic tests |
 | `npm run check:bundle` | inspects the built runtime artifact for surviving providers |
 | `npm run sbom` | regenerates the CycloneDX SBOM under `evidence/` |
 | `npm run test:rust` | Rust unit tests |
@@ -194,61 +349,7 @@ shipping or reviewing.
 
 ---
 
-## 🆕 What's new
-
-**Late September 2026 — hardening from end-to-end rehearsals of the SIH demo, run fully offline**
-
-- **Embedded browser egress closed.** WebView2's update checks, proxy auto-discovery and Microsoft
-  sign-in are switched off and its DNS is limited to loopback; tests pin every switch
-  ([`docs/sih/webview2-egress.md`](docs/sih/webview2-egress.md)).
-- **Every connection has a name.** The network observer covers ARJUN's whole process tree and
-  attributes each connection to the process that made it, guarding against reused process IDs.
-- **Scanned tables read correctly.** OCR table cells are no longer dropped; attached documents are read
-  page by page, and an empty knowledge-index result no longer claims a page is illegible.
-- **Plans that finish.** Steps come from the current request only, the last four steps are held for
-  the promised deliverable, and a Word field the template cannot print is refused with the real field
-  names instead of being dropped silently.
-- **Long document threads stay in the window.** Earlier reasoning is no longer replayed, and the tool
-  catalogue is sized with the conversation already in context.
-- **Steadier models.** Reasoning models get a 6,144-token thinking budget; a role's preferred model is
-  used even below the coding size floor, with the reason shown; tool calls written as JSON text are
-  turned into real calls; hybrid models' per-layer KV heads are read from the GGUF header.
-
-<details>
-<summary><b>Earlier engineering log (September 2026)</b></summary>
-
-#### Shared agent memory and context
-- **Chat memory bus** (`chat_memory_bus.rs`) with budget-aware truncation and deterministic token accounting.
-- **Dynamic context compiler** (`context_compiler.rs`) assembling instructions, history, grounded passages and pins into a hardware-bounded window.
-- **Context manifests and state commits** (`context_manifest.rs`, `state_commit.rs`) recording what each turn saw.
-- **Token pins** (`pins.rs`) that compaction never evicts.
-- **Model handoff** (`model_handoff.rs`, `model_transition.rs`) between the orchestrator and specialist models.
-
-#### Multi-agent administration
-- Persistent agent definitions with prompts, tool bindings, model preferences and role-based access (`src-tauri/src/agents/`).
-- Agent lifecycle IPC (`commands/agent_admin.rs`, `commands/agents.rs`) and the **Agents** page (`src/pages/Agents.tsx`).
-
-#### Knowledge and memory graph
-- Real-time memory feed and store (`runtime_feed.rs`, `runtime_memory.rs`, `runtime_store.rs`).
-- Graph canvas (`MemoryGraphCanvas.tsx`) with label collision avoidance (`labelGeometry.ts`) and a visual test harness (`evidence/memory-graph/`).
-
-#### Subagents
-- Supervised child loops and scheduling (`child_loop.rs`, `scheduling.rs`) streaming findings into the shared graph (`graph_io.rs`).
-
-#### Orchestration and hardware planning
-- Spark-X2.5-4B as an orchestrator candidate; a VRAM planner that reads GGUF geometry and KV-cache needs (`vram_planner.rs`); token budgeting (`token_budget.rs`); response continuation (`continuation.rs`).
-
-#### Documents and citations
-- Attachment extraction for PDF, Word, Excel and PowerPoint (`sidecars/document_sidecar/attachment_extract.py`); citations linking statements to source chunks (`EvidenceCitations.tsx`).
-
-#### Reliability
-- No console pop-ups when probing `llama-server` on Windows; a synchronous crash logger; a ratcheted lint budget; a regenerated CycloneDX SBOM.
-
-</details>
-
----
-
-## 🗂️ Project layout
+## Project structure
 
 ```
 src/              React 19 + TypeScript frontend (pages, components, typed services)
@@ -259,17 +360,30 @@ src-tauri/        Rust core, crate `sarathi`
   serving/          llama-server lifecycle and admission
   ai_engine/        token budgets, continuation, OCR streaming, GGUF metadata
   sovereignty/      the egress broker, network observer, WebView2 hardening
-  agents/ subagents/ knowledge/ model_manager/ policy/ audit/ identity/ …
+  identity/         local accounts, roles and password hashing
 agent-runtime/    vendored OpenClaw agent loop (TypeScript), cloud providers removed
 sidecars/         Python sidecars: documents, memory engine, graph
 scripts/          build, verification and evidence gates
-docs/             design notes; docs/sih/ holds the hackathon material
+docs/             design notes; docs/sih/ holds the hackathon material; docs/media/ the images and video
 evidence/         generated SBOM, test reports, visual evidence
 ```
 
 ---
 
-## 📖 Documentation
+## Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| The window opens but nothing answers | `npm run dev` starts only the frontend. Use `npm run dev:auto` (or a `tauri:dev:*` script). |
+| The default model will not load | It needs a CUDA or Vulkan build with at least one layer on the GPU. Install the CUDA toolkit or Vulkan SDK and rebuild, or pick a smaller model under **Models**. |
+| `dev:auto` chose CPU on a machine with an NVIDIA GPU | The CUDA toolkit (`nvcc`) is needed, not just the driver. Check `nvcc --version`, or set `SARATHI_BACKEND`. |
+| Code runs fail | The sandbox runs only while Docker Desktop's engine is up: check `docker info`, and pull `python:3.11-slim` once while online. |
+| `npm run runtime:install` fails | It installs with `--offline`, from the local npm cache only; the packages must already be in that cache. |
+| Forgotten administrator password | There is no email recovery on an air-gapped machine. Another administrator resets the account; otherwise follow your site's local recovery procedure. |
+
+---
+
+## Documentation
 
 | Document | What's in it |
 |---|---|
@@ -282,10 +396,10 @@ evidence/         generated SBOM, test reports, visual evidence
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, `perf:`, `ci:`).
-Run `npm run verify` before opening a pull request — the verification gates are the point of the
+Run `npm run verify` before opening a pull request. The verification gates are the point of the
 project, and a change that trips one needs a reason in review, not a new exemption.
 
 Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). ARJUN does not yet
